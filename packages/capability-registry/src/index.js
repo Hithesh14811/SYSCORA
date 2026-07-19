@@ -1,4 +1,5 @@
 import { RiskLevel } from "../../shared-types/src/domain.js";
+import { redactSensitiveData } from "../../shared-types/src/redaction.js";
 import crypto from "crypto";
 import {
   CAPABILITY_CONTRACT_VERSION,
@@ -36,7 +37,22 @@ export class CapabilityRegistry {
     this.listeners = new Set();
     if (onEvent) this.listeners.add(onEvent);
     this.pipeline = new CapabilityLifecyclePipeline({ registry: this, onEvent: (event) => this.emit(event.type, event) });
+    // Late-bound rollback manager. The session.rollback capability's execute()
+    // invokes it, but the manager needs a reference back to this registry to
+    // look up per-capability rollback handlers — a construction cycle. It is
+    // injected after construction via setRollbackManager (mirrors how the
+    // privileged helper is injected into the privileged capabilities), so no
+    // import cycle exists. Null until wired (the AgentRuntime wires it).
+    this.rollbackManager = null;
     for (const capability of capabilities) this.register(capability);
+  }
+
+  // Inject the RollbackManager the session.rollback capability delegates to.
+  // Called by the AgentRuntime so the capability and the runtime share exactly
+  // one manager instance (and therefore one rollback journal semantics).
+  setRollbackManager(manager) {
+    this.rollbackManager = manager;
+    return this;
   }
 
   onEvent(listener) {
@@ -1559,6 +1575,155 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     timeout: 600000,
     retryPolicy: { maxAttempts: 1 },
     lifecycleStatus: privilegedLifecycle
+  });
+
+  // session.rollback (canonical convergence). Rolling back is itself a
+  // state-mutating action (it restores env vars / PATH / files), so it must not
+  // run outside the pipeline. This capability is the ONLY sanctioned way to
+  // invoke the RollbackManager: the runtime translates a rollback request into a
+  // "session.rollback" intent, and the intent flows through the same planner ->
+  // risk -> policy -> permission -> scheduler -> observe -> verify path as any
+  // other mutation. execute() does NOT reimplement rollback logic — it delegates
+  // to the shared RollbackManager (injected via registry.setRollbackManager),
+  // moving only the *invocation* behind the capability boundary.
+  //
+  // Risk is MEDIUM: it performs the same class of mutation (env/PATH/file
+  // restore) as the actions it reverts. Ideally the risk would inherit from the
+  // highest-risk original record, but rollback records only carry
+  // taskId/capability/inputs/checkpoint (see RollbackManager.capture) — original
+  // risk metadata is not on the record — so MEDIUM is the honest floor. If richer
+  // risk provenance is added to records later, this should escalate to match.
+  registry.register({
+    name: "session.rollback",
+    version: "1.0.0",
+    description: "Revert recorded checkpoints for a session through the shared rollback manager",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        records: { type: "array" },
+        targetRecordIds: { type: "array" },
+        reason: { type: "string" }
+      },
+      required: ["sessionId"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.MEDIUM },
+    permissions: ["system:write"],
+    // Rolling back a rollback is out of scope for V1: it would just replay the
+    // original actions, which the user did not request. This is an HONEST
+    // NOT_REQUIRED (unlike capabilities that claim PARTIAL but ship rollback:null)
+    // — the contract guard added in Phase 2.4 enforces that distinction.
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.sessionId === "string" && args.sessionId.trim() !== "",
+    execute: async (args) => {
+      if (!registry.rollbackManager) {
+        return { rolledBack: false, reason: "Rollback manager is not configured for this runtime.", entries: [] };
+      }
+      // Records travel on the intent; the runtime populates them from the target
+      // session before dispatch. A targetRecordIds subset narrows what is reverted.
+      let records = Array.isArray(args?.records) ? args.records : [];
+      if (Array.isArray(args?.targetRecordIds) && args.targetRecordIds.length > 0) {
+        const wanted = new Set(args.targetRecordIds.map(String));
+        records = records.filter((r) => wanted.has(String(r?.taskId)));
+      }
+      if (records.length === 0) {
+        return { rolledBack: false, reason: "No rollback records available for the session.", entries: [] };
+      }
+      const result = await registry.rollbackManager.rollback(records);
+      return { ...result, sessionId: args.sessionId, reason: args?.reason ?? null };
+    },
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "session.rollback",
+      timestamp: new Date().toISOString(),
+      // The rollback result (entries + rolledBack flag) IS the observation — no
+      // new observation logic is invented.
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: (result?.entries ?? [])
+        .filter((e) => e?.status === "ROLLED_BACK")
+        .map((e) => `rollback:${e.capability}`),
+      confidence: result?.rolledBack ? 1 : 0,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation, args) => {
+      // A REAL, independent check — not a hardcoded VERIFIED, and not merely
+      // trusting the RollbackManager's own entries. Two gates:
+      //   1. Every record produced a ROLLED_BACK entry (the restore call
+      //      returned without error).
+      //   2. INDEPENDENT RE-READ: for each rolled-back record we capture a FRESH
+      //      checkpoint of current state (capability.createCheckpoint) and compare
+      //      it to the original pre-mutation checkpoint. If the state was truly
+      //      restored, the fresh reading must equal the pre-mutation snapshot.
+      //      This re-reads live state through the same adapter-backed method the
+      //      original capability used to snapshot it, so a rollback that "returned
+      //      OK" but left state wrong is still caught here.
+      const result = observation?.structuredState ?? {};
+      const entries = Array.isArray(result.entries) ? result.entries : [];
+      if (entries.length === 0) {
+        return { status: "FAILED", message: "No rollback entries were produced.", evidence: result, confidence: 1 };
+      }
+      const failed = entries.filter((e) => e?.status !== "ROLLED_BACK");
+      if (failed.length > 0) {
+        return {
+          status: "FAILED",
+          message: `${failed.length}/${entries.length} record(s) failed to roll back.`,
+          evidence: result,
+          confidence: 1
+        };
+      }
+
+      // Independent re-read against the original pre-mutation checkpoints.
+      //
+      // Records travel on the intent and are persisted through the session store,
+      // which redacts secret-shaped fields (value/secret/token/...). A fresh live
+      // re-read is UNredacted, so we must compare redaction-normalized snapshots on
+      // BOTH sides. This means every non-secret field (file existence, rawContents,
+      // PATH entries, etc.) IS verified byte-for-byte, while a redacted secret only
+      // has to still be present/absent — the secret's plaintext is unrecoverable
+      // once persisted, so demanding a plaintext match here would be a false
+      // negative, not stronger verification. Restore correctness for secret VALUES
+      // is the capability rollback's own responsibility (it restores from
+      // rawContents/filePath, not the redacted `values` map).
+      const records = Array.isArray(args?.records) ? args.records : [];
+      const mismatches = [];
+      let reReads = 0;
+      for (const record of records) {
+        const capability = registry.get(record?.capability);
+        if (!capability || typeof capability.createCheckpoint !== "function") continue;
+        try {
+          const fresh = await capability.createCheckpoint(record.inputs ?? {});
+          reReads += 1;
+          const freshNorm = JSON.stringify(redactSensitiveData(fresh));
+          const checkpointNorm = JSON.stringify(redactSensitiveData(record.checkpoint));
+          if (freshNorm !== checkpointNorm) {
+            mismatches.push(record.capability);
+          }
+        } catch (error) {
+          mismatches.push(`${record.capability} (re-read failed: ${error instanceof Error ? error.message : String(error)})`);
+        }
+      }
+      if (mismatches.length > 0) {
+        return {
+          status: "FAILED",
+          message: `Rollback reported success but a re-read shows ${mismatches.length} record(s) did not match the pre-mutation state: ${mismatches.join(", ")}.`,
+          evidence: { ...result, mismatches, reReads },
+          confidence: 1
+        };
+      }
+      return {
+        status: "VERIFIED",
+        message: `All ${entries.length} record(s) rolled back; ${reReads} independently re-read and confirmed restored to pre-mutation state.`,
+        evidence: { ...result, reReads },
+        confidence: 1
+      };
+    },
+    rollback: null,
+    timeout: 120000,
+    retryPolicy: { maxAttempts: 1 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
   return registry;

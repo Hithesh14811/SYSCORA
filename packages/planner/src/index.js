@@ -185,6 +185,26 @@ export const OPERATION_PLANS = {
       timeout: 600000
     })
   ],
+  // Rollback (canonical convergence). A rollback request maps 1:1 to the
+  // session.rollback capability, which delegates to the shared RollbackManager.
+  // The concrete records to revert travel on the intent entities; risk is MEDIUM
+  // because restoring env/PATH/files is the same mutation class it undoes.
+  "session.rollback": (e) => [
+    buildTask("session.rollback", {
+      sessionId: e.sessionId,
+      records: Array.isArray(e.records) ? e.records : [],
+      targetRecordIds: Array.isArray(e.targetRecordIds) ? e.targetRecordIds : [],
+      reason: e.reason ?? null
+    }, {
+      goal: "Roll back session",
+      description: "Revert recorded checkpoints for a session",
+      riskHints: "MEDIUM",
+      expectedStateChanges: ["rollback"],
+      completionCriteria: ["Recorded changes reverted and verified"],
+      timeout: 120000,
+      idempotency: false
+    })
+  ],
   "application.notepad.launch": (e) => [
     buildTask("application.notepad.launch", { content: e.content, filename: e.filename }, {
       goal: "Notepad task",

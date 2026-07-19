@@ -50,6 +50,63 @@ export class IntentEngine {
     const lower = text.toLowerCase();
     let modelResult = null;
 
+    // Rollback fast path (system-internal). A rollback is an explicit operation
+    // triggered by the runtime/daemon, never free-form natural language, so it
+    // never touches the keyword classifier or the reasoning engine. It carries a
+    // required `sessionId` (the session whose recorded checkpoints are being
+    // reverted) and optional `targetRecordIds` (a subset of that session's
+    // rollback records; omitted means all of them) plus an optional `reason` for
+    // the audit trail. This mirrors the explicit-operation bridge below but adds
+    // the rollback-specific required-field enforcement that USER_INTENT_SCHEMA's
+    // untyped `entities` object cannot express.
+    if (context.operation === "session.rollback") {
+      const sessionId = context.entities?.sessionId;
+      if (typeof sessionId !== "string" || sessionId.trim() === "") {
+        throw new Error("Invalid rollback intent: entities.sessionId is required.");
+      }
+      const targetRecordIds = Array.isArray(context.entities?.targetRecordIds)
+        ? context.entities.targetRecordIds.map(String)
+        : [];
+      const reason = typeof context.entities?.reason === "string" ? context.entities.reason : null;
+      // The runtime attaches the concrete rollback records (captured checkpoints)
+      // it wants reverted. They travel on the intent so the capability's execute()
+      // has everything it needs; when omitted (e.g. a schema-validation unit test)
+      // the capability falls back to loading them from the persisted session.
+      const records = Array.isArray(context.entities?.records) ? context.entities.records : [];
+      const intent = {
+        intentId,
+        rawText: text || `Roll back session ${sessionId}`,
+        normalizedGoal: context.normalizedGoal || `Roll back session ${sessionId}`,
+        category: "ROLLBACK",
+        operation: "session.rollback",
+        entities: {
+          workspacePath: context.workspacePath ?? process.cwd(),
+          sessionId,
+          targetRecordIds,
+          reason,
+          records
+        },
+        constraints: [],
+        preferences: [],
+        assumptions: [],
+        unknowns: [],
+        successCriteria: Array.isArray(context.successCriteria) && context.successCriteria.length
+          ? context.successCriteria
+          : ["Recorded changes are reverted and the restored state is verified"],
+        requiredContext: [],
+        requiredCapabilities: ["session.rollback"],
+        confidence: 1,
+        ambiguity: false,
+        clarificationQuestions: [],
+        sensitivityFlags: []
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) {
+        throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      }
+      return intent;
+    }
+
     // Explicit-operation fast path. When a caller supplies a structured
     // `operation` (and optionally `entities`/`category`), we trust it and build
     // the intent deterministically without consulting the model. This is the

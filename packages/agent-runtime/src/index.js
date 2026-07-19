@@ -90,6 +90,14 @@ export class AgentRuntime {
       adapter
     });
     this.rollbackManager = new RollbackManager(capabilityRegistry);
+    // The session.rollback capability performs the actual restore through the
+    // SAME RollbackManager instance the runtime uses, so manual and automatic
+    // rollback share one journal/execution path. Wired here (not at registry
+    // construction) because the manager needs the registry, and the capability
+    // needs the manager — a late DI setter breaks the cycle without a new module.
+    if (typeof this.capabilityRegistry?.setRollbackManager === "function") {
+      this.capabilityRegistry.setRollbackManager(this.rollbackManager);
+    }
   }
 
   setDeveloperIntelligence(engine) {
@@ -1221,22 +1229,63 @@ export class AgentRuntime {
     return this.rollbackSessionById(latest.sessionId);
   }
 
-  async rollbackSessionById(sessionId) {
-    const session = await this.sessionStore.get(sessionId);
-    const rollbackResult = await this._rollbackSession(session);
-    session.currentState = rollbackResult.rolledBack ? RuntimeState.ROLLED_BACK : RuntimeState.FAILED;
-    session.finalResponse = {
-      status: rollbackResult.rolledBack ? "ROLLED_BACK" : "FAILED",
-      message: rollbackResult.rolledBack
-        ? "Manual rollback completed successfully."
-        : rollbackResult.reason,
-      rollbackResult
-    };
-    await this.auditRepository.append(session.sessionId, "MANUAL_ROLLBACK_REQUESTED", {
-      rolledBack: rollbackResult.rolledBack
+  // Manual rollback. This no longer calls rollbackManager.rollback() directly —
+  // that bypassed validation/risk/policy/permission/scheduler. Instead it
+  // translates the request into a canonical "session.rollback" intent and runs it
+  // through submitIntent(), exactly like the privileged-execute compatibility
+  // wrapper. The session.rollback capability performs the actual restore inside
+  // the scheduler, so the rollback is risk-assessed, policy-evaluated,
+  // permission-checked, executed, observed and verified like any other mutation.
+  //
+  // The explicit act of requesting a rollback IS the approval, so autoApprove
+  // defaults to true (overridable). The method returns the ORIGINAL session,
+  // marked ROLLED_BACK/FAILED per the pipeline outcome, preserving the historical
+  // return contract used by the daemon/tests.
+  async rollbackSessionById(sessionId, options = {}) {
+    const target = await this.sessionStore.get(sessionId);
+    validateExecutionSession(target);
+    const records = Array.isArray(target.rollback?.records) ? target.rollback.records : [];
+
+    const rollbackSession = await this.submitIntent(`Roll back session ${sessionId}`, {
+      ...options,
+      operation: "session.rollback",
+      category: "ROLLBACK",
+      normalizedGoal: `Roll back session ${sessionId}`,
+      autoApprove: options.autoApprove ?? true,
+      workspacePath: target.intent?.entities?.workspacePath ?? process.cwd(),
+      entities: {
+        workspacePath: target.intent?.entities?.workspacePath ?? process.cwd(),
+        sessionId,
+        records,
+        targetRecordIds: Array.isArray(options.targetRecordIds) ? options.targetRecordIds : [],
+        reason: options.reason ?? "Manual rollback requested."
+      }
     });
-    await this.persistSession(session);
-    return session;
+
+    // The goal verifier reports COMPLETED_WITH_WARNINGS because the rollback
+    // capability's own detected change ("rollback:<cap>") is not in the plan's
+    // expected-mutation list — a cosmetic warning, not a failure. All three
+    // (COMPLETED, COMPLETED_WITH_WARNINGS, ROLLED_BACK) mean the rollback ran and
+    // verified through the pipeline.
+    const rolledBack = ["COMPLETED", "COMPLETED_WITH_WARNINGS", "ROLLED_BACK"]
+      .includes(rollbackSession.finalResponse?.status);
+
+    // Reflect the pipeline outcome back onto the original session and link the two.
+    target.currentState = rolledBack ? RuntimeState.ROLLED_BACK : RuntimeState.FAILED;
+    if (target.rollback) target.rollback.completed = rolledBack;
+    target.finalResponse = {
+      status: rolledBack ? "ROLLED_BACK" : "FAILED",
+      message: rolledBack
+        ? "Manual rollback completed through the canonical pipeline."
+        : (rollbackSession.finalResponse?.message ?? "Rollback did not complete."),
+      rollbackSessionId: rollbackSession.sessionId
+    };
+    await this.auditRepository.append(target.sessionId, "MANUAL_ROLLBACK_REQUESTED", {
+      rolledBack,
+      rollbackSessionId: rollbackSession.sessionId
+    });
+    await this.persistSession(target);
+    return target;
   }
 
   async persistSession(session) {

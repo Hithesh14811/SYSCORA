@@ -107,6 +107,24 @@ describe("End-to-end production runtime", () => {
       if (error.code !== "ENOENT") throw error;
     }
     assert.ok(!contentsAfterRollback.includes("ROLLBACK_KEY=temp"), "rollback must remove the written value");
+
+    // Task 1.3: the rollback is NOT a side-channel. It is dispatched as a real
+    // session.rollback intent that flows through the SAME canonical pipeline —
+    // risk assessment, policy decision, observation, and independent verification
+    // all run for it, and the restore is confirmed by verify()'s own re-read.
+    const rollbackSessionId = rolledBack.finalResponse.rollbackSessionId;
+    assert.ok(rollbackSessionId, "rollback should spawn its own pipeline session");
+    const rollbackSession = (await local.sessionStore.list()).find((s) => s.sessionId === rollbackSessionId);
+    assert.ok(rollbackSession, "the rollback session should be persisted");
+    const rollbackEvents = (rollbackSession.events ?? []).map((e) => e.eventType);
+    for (const expected of ["RISK_ASSESSED", "POLICY_DECIDED", "OBSERVATION_COLLECTED"]) {
+      assert.ok(rollbackEvents.includes(expected), `rollback session must emit ${expected} (full pipeline, not a side-channel)`);
+    }
+    const rollbackTask = rollbackSession.plan.taskGraph.tasks[0];
+    assert.equal(rollbackTask.capability, "session.rollback", "rollback runs via the session.rollback capability");
+    const rollbackVerification = rollbackSession.verifications.at(-1);
+    assert.equal(rollbackVerification.status, "VERIFIED", "verify() must independently confirm restoration");
+    assert.equal(rollbackVerification.evidence.reReads, 1, "verify() re-read the mutated capability's live state");
   });
 
   it("round-trips a real Windows DPAPI secret without exposing plaintext on the command line", async () => {
