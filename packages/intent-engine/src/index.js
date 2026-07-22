@@ -1,7 +1,29 @@
 import { validateSchema } from "../../model-providers/src/index.js";
 import { ReasoningEngine } from "../../reasoning-engine/src/index.js";
+import { OPERATION_PLANS } from "../../planner/src/index.js";
 import crypto from "crypto";
 const createId = () => crypto.randomBytes(16).toString("hex");
+
+// The allow-list of named operations the deterministic planner maps 1:1 to a task
+// graph. Surfaced to the model (LLM-first classification) so the LLM — not a
+// keyword matcher — chooses the operation; the runtime only trusts a returned
+// operation when it is in this set.
+const KNOWN_OPERATIONS = Object.freeze(Object.keys(OPERATION_PLANS));
+const KNOWN_OPERATION_SET = new Set(KNOWN_OPERATIONS);
+
+// Whether a provider is a REAL remote language model (as opposed to the
+// deterministic Mock, or a Failover chain that only wraps Mock). Only a real
+// model is authoritative for LLM-first routing; Mock/offline falls through to the
+// deterministic extractors, which are its intended offline path. Detected via the
+// provider's own capabilities() (remote: true), including through a Failover chain.
+function providerIsRemoteModel(provider) {
+  if (!provider || typeof provider.capabilities !== "function") return false;
+  let caps;
+  try { caps = provider.capabilities(); } catch { return false; }
+  if (caps?.remote === true) return true;
+  if (Array.isArray(caps?.providers)) return caps.providers.some((c) => c?.remote === true);
+  return false;
+}
 
 const USER_INTENT_SCHEMA = {
   type: "object",
@@ -49,6 +71,16 @@ export class IntentEngine {
     const text = String(rawText ?? "").trim();
     const lower = text.toLowerCase();
     let modelResult = null;
+
+    // One auditable ingress: all user text reaches the reasoning boundary before
+    // any trusted explicit operation or local fallback is considered.
+    const modelUnderstanding = this.reasoningEngine
+      ? await this.reasoningEngine.understandIntent(text, {
+          ...context,
+          knownOperations: KNOWN_OPERATIONS
+        })
+      : null;
+    if (modelUnderstanding?.ok) modelResult = modelUnderstanding.data;
 
     // Rollback fast path (system-internal). A rollback is an explicit operation
     // triggered by the runtime/daemon, never free-form natural language, so it
@@ -143,17 +175,127 @@ export class IntentEngine {
       return intent;
     }
 
-    // Reasoning-first: delegate to the ReasoningEngine when configured. It owns
-    // all model interaction, schema validation and bounded repair, and returns
+    // LLM-FIRST routing. Every free-text message is submitted to the reasoning
+    // boundary before *any* local extractor is consulted.  Local extractors are
+    // strictly a post-model availability fallback: they must never decide an
+    // intent while a model has supplied a usable interpretation.  This matters
+    // for arbitrary desktop work where a keyword list can never be complete.
+    const llmFirst = Boolean(modelResult);
+    if (modelResult) {
+      const chosen = typeof modelResult.operation === "string" ? modelResult.operation.trim() : "";
+      if (chosen && KNOWN_OPERATION_SET.has(chosen)) {
+        const intent = this._buildOperationIntent(intentId, text, chosen, modelResult, context);
+        const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+        if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+        return intent;
+      }
+    }
+
+    const spotifyRequest = llmFirst ? null : this.extractSpotifyTrackRequest(lower, text);
+    if (spotifyRequest) {
+      const { query, operation } = spotifyRequest;
+      const playing = operation === "spotify.track.play";
+      const intent = {
+        intentId, rawText: text,
+        normalizedGoal: playing ? `Play ${query} in Spotify` : `Open Spotify results for ${query}`,
+        category: "APPLICATION",
+        operation,
+        entities: { workspacePath: context.workspacePath ?? process.cwd(), query },
+        constraints: [], preferences: [], assumptions: [], unknowns: [],
+        successCriteria: [playing ? `Spotify is playing ${query}` : `Spotify opens results for ${query}`],
+        requiredContext: [], requiredCapabilities: [operation],
+        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    // Direct desktop controls are intentionally recognized before any model
+    // call. They are bounded, local operations with no planning benefit: the
+    // user expects "open Calculator" or "turn the volume down" to happen now.
+    const directDesktopAction = llmFirst ? null : this.extractDirectDesktopAction(lower, text);
+    if (directDesktopAction) {
+      const { operation, entities, normalizedGoal, successCriteria } = directDesktopAction;
+      const intent = {
+        intentId, rawText: text, normalizedGoal, category: "APPLICATION", operation,
+        entities: { workspacePath: context.workspacePath ?? process.cwd(), ...entities },
+        constraints: [], preferences: [], assumptions: [], unknowns: [],
+        successCriteria, requiredContext: [], requiredCapabilities: [operation],
+        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    const knownInstallId = llmFirst ? null : this.extractKnownInstallTarget(lower);
+    if (!llmFirst && /\binstall\b/.test(lower) && knownInstallId && !/\b(dependenc|project)\b/.test(lower)) {
+      const intent = {
+        intentId, rawText: text, normalizedGoal: `Install ${knownInstallId}`, category: "SYSTEM",
+        operation: "package.winget.install",
+        entities: { workspacePath: context.workspacePath ?? process.cwd(), id: knownInstallId },
+        constraints: [], preferences: [], assumptions: [], unknowns: [],
+        successCriteria: [`${knownInstallId} is installed and verified`],
+        requiredContext: [], requiredCapabilities: ["package.winget.install"],
+        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    if (!llmFirst && /\b(system info|computer info|system details|computer details|specs|specifications)\b/.test(lower)) {
+      const intent = {
+        intentId, rawText: text, normalizedGoal: "Show system information", category: "SYSTEM",
+        operation: "system.inspect", entities: { workspacePath: context.workspacePath ?? process.cwd() },
+        constraints: [], preferences: [], assumptions: [], unknowns: [],
+        successCriteria: ["System information is displayed"], requiredContext: [], requiredCapabilities: ["system.inspect"],
+        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    // Installed-package status is a read-only, well-scoped question. Handle it
+    // deterministically so it cannot degrade into a generic system inspection
+    // when a model omits the required capability.
+    const installedPackageId = llmFirst ? null : this.extractInstalledPackageId(lower);
+    if (installedPackageId) {
+      const intent = {
+        intentId,
+        rawText: text,
+        normalizedGoal: `Check whether ${installedPackageId} is installed`,
+        category: "SYSTEM",
+        operation: "package.winget.inspect",
+        entities: { workspacePath: context.workspacePath ?? process.cwd(), id: installedPackageId },
+        constraints: [], preferences: [], assumptions: [], unknowns: [],
+        successCriteria: [`Report whether ${installedPackageId} is installed`],
+        requiredContext: [], requiredCapabilities: ["package.winget.inspect"],
+        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    // Reasoning merge (offline / non-remote path). The LLM-first block above
+    // already consulted a REAL remote model (setting modelResult); this block is
+    // reached only when that did not run — i.e. Mock, no model, or a provider
+    // without a remote route — so it preserves the historical behavior of merging
+    // a deterministic provider's (e.g. Mock) structured output into the intent. It
+    // owns all model interaction, schema validation and bounded repair, and returns
     // { ok, data } — never throwing — so a failure here silently falls through
     // to the deterministic classifier below. The runtime never trusts the model
     // directly; whatever comes back is merged into a validated UserIntent.
-    if (this.reasoningEngine) {
-      const result = await this.reasoningEngine.understandIntent(text, context);
-      if (result?.ok) {
-        modelResult = result.data;
-      }
-    }
+    // Fast health gate (Phase 6): skip the model classification when the
+    // provider is unavailable so an unreachable gateway can't stall intent
+    // parsing for 30s before the deterministic classifier runs. A provider with
+    // no healthCheck (Mock/scripted) is treated as healthy.
+    // The model has already been consulted above.  Do not make a second model
+    // call after deterministic fallback handling: that both adds latency and
+    // makes routing order impossible to audit.
 
     // Build final intent, using model result if available, else deterministic
     const intent = {
@@ -195,6 +337,43 @@ export class IntentEngine {
     }
 
     return intent;
+  }
+
+  // Build an operation-driven intent from a model-CHOSEN known operation. The
+  // planner maps `operation` 1:1 to a deterministic task graph (OPERATION_PLANS),
+  // so the LLM's choice — not a keyword matcher — selects the workflow while the
+  // execution path stays typed and bounded. The model's entities/goal/criteria are
+  // carried through; workspacePath is always guaranteed for domain validation.
+  _buildOperationIntent(intentId, text, operation, modelResult, context) {
+    const entities = {
+      workspacePath: context.workspacePath ?? process.cwd(),
+      ...(modelResult?.entities && typeof modelResult.entities === "object" ? modelResult.entities : {})
+    };
+    return {
+      intentId,
+      rawText: text,
+      normalizedGoal: (typeof modelResult?.normalizedGoal === "string" && modelResult.normalizedGoal.trim())
+        ? modelResult.normalizedGoal
+        : operation,
+      category: (typeof modelResult?.category === "string" && modelResult.category.trim())
+        ? modelResult.category
+        : "SYSTEM",
+      operation,
+      entities,
+      constraints: Array.isArray(modelResult?.constraints) ? modelResult.constraints : [],
+      preferences: Array.isArray(modelResult?.preferences) ? modelResult.preferences : [],
+      assumptions: Array.isArray(modelResult?.assumptions) ? modelResult.assumptions : [],
+      unknowns: Array.isArray(modelResult?.unknowns) ? modelResult.unknowns : [],
+      successCriteria: Array.isArray(modelResult?.successCriteria) && modelResult.successCriteria.length
+        ? modelResult.successCriteria
+        : ["Operation completed and verified"],
+      requiredContext: Array.isArray(modelResult?.requiredContext) ? modelResult.requiredContext : [],
+      requiredCapabilities: [operation],
+      confidence: Number.isFinite(modelResult?.confidence) ? modelResult.confidence : 0.9,
+      ambiguity: false,
+      clarificationQuestions: [],
+      sensitivityFlags: Array.isArray(modelResult?.sensitivityFlags) ? modelResult.sensitivityFlags : []
+    };
   }
 
   getCategory(lower) {
@@ -302,6 +481,136 @@ export class IntentEngine {
     }
     const idMatch = raw.match(/install\s+([\w.-]+)/i);
     return idMatch?.[1] ?? "VideoLAN.VLC";
+  }
+
+  extractInstalledPackageId(lower) {
+    if (!/\binstalled\b/.test(lower)) return null;
+    const known = {
+      vlc: "VideoLAN.VLC",
+      git: "Git.Git",
+      node: "OpenJS.NodeJS.LTS",
+      python: "Python.Python.3.12",
+      docker: "Docker.DockerDesktop",
+      spotify: "Spotify.Spotify"
+    };
+    for (const [name, id] of Object.entries(known)) {
+      if (lower.includes(name)) return id;
+    }
+    return null;
+  }
+
+  extractKnownInstallTarget(lower) {
+    const known = {
+      vlc: "VideoLAN.VLC", git: "Git.Git", node: "OpenJS.NodeJS.LTS",
+      python: "Python.Python.3.12", docker: "Docker.DockerDesktop", spotify: "Spotify.Spotify"
+    };
+    return Object.entries(known).find(([name]) => lower.includes(name))?.[1] ?? null;
+  }
+
+  // Deterministically detect a direct Spotify track request and classify it as
+  // either PLAYBACK (play/listen) or OPEN (open/search results). Runs entirely
+  // before any model call so common desktop commands skip LLM planning latency.
+  // Returns { query, operation } or null.
+  extractSpotifyTrackRequest(lower, rawText) {
+    // Do not make a typo force a slow model round trip for a safe, named app.
+    // The fuzzy match is deliberately tight (one known app name, edit distance
+    // <= 2); it never produces a command or executable from arbitrary text.
+    if (!this.hasApproximateWord(lower, "spotify")) return null;
+    const normalizedRaw = this.replaceApproximateWord(rawText, "spotify", "Spotify");
+    const normalizedLower = normalizedRaw.toLowerCase();
+    const wantsPlay = /\b(play|listen to)\b/.test(normalizedLower);
+    const wantsOpen = /\b(open|search)\b/.test(normalizedLower);
+    if (!wantsPlay && !wantsOpen) return null;
+    // Pull the track name out of the common phrasings, e.g.
+    //   "open spotify and play "Cry For Me""
+    //   "play Cry For Me by The Weeknd on Spotify"
+    //   "listen to Blinding Lights on spotify"
+    const patterns = [
+      /\b(?:play|listen to)\s+["“]?(.+?)["”]?(?:\s+by\s+.+?)?(?:\s+on\s+spotify)?\s*$/i,
+      /\bspotify\b.*?\b(?:play|listen to|search|open)\s+["“]?(.+?)["”]?\s*$/i,
+      /\b(?:search|open)\s+spotify\s+(?:for\s+)?["“]?(.+?)["”]?\s*$/i
+    ];
+    let query = "";
+    for (const re of patterns) {
+      const m = normalizedRaw.match(re);
+      if (m && m[1]) { query = m[1].trim().replace(/^["“]+|["”]+$/g, "").trim(); break; }
+    }
+    // Trim a trailing "by <artist>" so the search query is the track name; the
+    // artist stays useful context but the desktop search matches on the track.
+    query = query.replace(/\s+by\s+.+$/i, "").trim();
+    if (query.length < 2 || query.length > 160) return null;
+    return { query, operation: wantsPlay ? "spotify.track.play" : "spotify.track.open" };
+  }
+
+  // A deliberately small, allow-listed fast-command vocabulary. This is not a
+  // generic shell launcher: unknown applications continue through normal
+  // capability selection/planning, preserving the typed execution boundary.
+  extractDirectDesktopAction(lower, rawText) {
+    const volume = lower.match(/\b(increase|raise|turn up|up|lower|decrease|turn down|down)\b.*\bvolume\b|\bvolume\b.*\b(increase|raise|turn up|up|lower|decrease|turn down|down)\b/);
+    if (volume) {
+      const verb = `${volume[1] ?? ""} ${volume[2] ?? ""}`.trim();
+      const direction = /lower|decrease|turn down/.test(verb) ? "down" : "up";
+      const steps = /\b(a lot|much|significantly)\b/.test(lower) ? 5 : /\b(slightly|a little)\b/.test(lower) ? 1 : 2;
+      return {
+        operation: "system.volume.adjust",
+        entities: { direction, steps },
+        normalizedGoal: `${direction === "up" ? "Increase" : "Decrease"} system volume`,
+        successCriteria: [`A system volume ${direction} command is sent`]
+      };
+    }
+
+    const launch = String(rawText).match(/^\s*(?:please\s+)?(?:open|launch|start)\s+(?:the\s+)?([\w.-]+)\s*[.!?]*\s*$/i);
+    if (launch) {
+      const requested = launch[1].toLowerCase();
+      const application = ["notepad", "calculator", "calc", "spotify"]
+        .find((name) => this.editDistance(requested, name) <= 2);
+      if (!application) return null;
+      return {
+        operation: "application.launch",
+        entities: { application },
+        normalizedGoal: `Open ${application}`,
+        successCriteria: [`${application} is launched`]
+      };
+    }
+
+    const search = String(rawText).match(/^\s*(?:please\s+)?(?:search(?:\s+(?:the\s+)?(?:web|internet|browser|bing|google))?\s+(?:for\s+)?)?(.+?)\s+(?:online|on\s+(?:the\s+)?(?:web|internet|bing|google))\s*[.!?]*\s*$/i)
+      ?? String(rawText).match(/^\s*(?:please\s+)?search(?:\s+(?:the\s+)?(?:web|internet|browser|bing|google))?\s+for\s+(.+?)\s*[.!?]*\s*$/i);
+    const query = search?.[1]?.trim();
+    if (query && query.length >= 2 && query.length <= 200) {
+      return {
+        operation: "browser.search",
+        entities: { query },
+        normalizedGoal: `Search the web for ${query}`,
+        successCriteria: [`Browser search for ${query} is opened`]
+      };
+    }
+    return null;
+  }
+
+  hasApproximateWord(text, target) {
+    return String(text).toLowerCase().split(/[^a-z0-9]+/).some((word) =>
+      word.length >= 4 && this.editDistance(word, target) <= 2
+    );
+  }
+
+  replaceApproximateWord(text, target, replacement) {
+    return String(text).replace(/[a-z0-9]+/gi, (word) =>
+      this.editDistance(word.toLowerCase(), target) <= 2 ? replacement : word
+    );
+  }
+
+  editDistance(a, b) {
+    const source = String(a); const target = String(b);
+    const row = Array.from({ length: target.length + 1 }, (_, index) => index);
+    for (let i = 1; i <= source.length; i += 1) {
+      let diagonal = row[0]; row[0] = i;
+      for (let j = 1; j <= target.length; j += 1) {
+        const previous = row[j];
+        row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (source[i - 1] === target[j - 1] ? 0 : 1));
+        diagonal = previous;
+      }
+    }
+    return row[target.length];
   }
 
   guessPythonPath() {

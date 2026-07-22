@@ -10,7 +10,7 @@
   "scripts": {
     "mvp:demo": "node apps/cli/src/index.js set-env",
     "mvp:status": "node apps/daemon/src/index.js sessions",
-    "mvp:ui": "node apps/daemon/src/server.js",
+    "mvp:ui": "node --use-system-ca apps/daemon/src/server.js",
     "desktop:dev": "electron apps/desktop-shell/src/main.js",
     "test": "node --test tests/**/*.test.js",
     "capabilities:validate": "node --test tests/unit/capability-framework.test.js"

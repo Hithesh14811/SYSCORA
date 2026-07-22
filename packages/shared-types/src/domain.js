@@ -45,6 +45,198 @@ export const PolicyEffect = Object.freeze({
   DENY: "DENY"
 });
 
+// The full control ladder a policy decision may require before an action runs.
+// Ordered weakest -> strongest; a policy may only ever move UP this ladder as
+// risk rises, never down. Each level has explicit semantics enforced by the
+// PolicyEngine + PermissionBroker (see policy-engine/src/index.js):
+//   NONE           - safe, runs with no extra interaction.
+//   AUDIT          - runs automatically but MUST emit the declared audit evidence.
+//   CONFIRM        - requires explicit, informed, operation-scoped user approval.
+//   REAUTHENTICATE - requires fresh proof of user presence/identity.
+//   ELEVATE        - requires privileged execution through the bounded helper.
+//   SANDBOX        - requires isolated execution.
+//   DENY           - must not execute.
+export const ConfirmationLevel = Object.freeze({
+  NONE: "NONE",
+  AUDIT: "AUDIT",
+  CONFIRM: "CONFIRM",
+  REAUTHENTICATE: "REAUTHENTICATE",
+  ELEVATE: "ELEVATE",
+  SANDBOX: "SANDBOX",
+  DENY: "DENY"
+});
+
+// Monotonic strength ordering for ConfirmationLevel. Used to take the STRONGEST
+// required control across independent rules and to assert (in tests and at
+// runtime) that a decision never weakens a required control. DENY is the
+// strongest terminal control; SANDBOX/ELEVATE/REAUTH sit above CONFIRM because
+// each demands a mechanism CONFIRM cannot substitute for.
+export const CONFIRMATION_LEVEL_ORDER = Object.freeze({
+  NONE: 0,
+  AUDIT: 1,
+  CONFIRM: 2,
+  REAUTHENTICATE: 3,
+  ELEVATE: 4,
+  SANDBOX: 5,
+  DENY: 6
+});
+
+// A policy decision's terminal disposition. Distinct from ConfirmationLevel so
+// we can express "a control is required but the mechanism to satisfy it does
+// not exist" WITHOUT silently downgrading to a weaker control.
+//   PROCEED                     - the required control can be satisfied; continue.
+//   BLOCKED                     - policy hard-denies (DENY level).
+//   REQUIRED_CONTROL_UNAVAILABLE- the required control (SANDBOX/REAUTH/ELEVATE)
+//                                 has no available mechanism; fail closed.
+export const PolicyOutcome = Object.freeze({
+  PROCEED: "PROCEED",
+  BLOCKED: "BLOCKED",
+  REQUIRED_CONTROL_UNAVAILABLE: "REQUIRED_CONTROL_UNAVAILABLE"
+});
+
+// Map a ConfirmationLevel onto the legacy PolicyEffect triad so existing callers
+// (PermissionBroker.evaluate, runtime DENY gate, older tests) keep working while
+// the richer ConfirmationLevel drives behavior. NONE/AUDIT need no interactive
+// approval (ALLOW); DENY maps to DENY; everything in between requires approval
+// of some kind (CONFIRM).
+export function confirmationLevelToEffect(level) {
+  if (level === ConfirmationLevel.DENY) return PolicyEffect.DENY;
+  if (level === ConfirmationLevel.NONE || level === ConfirmationLevel.AUDIT) return PolicyEffect.ALLOW;
+  return PolicyEffect.CONFIRM;
+}
+
+// Return the stronger of two confirmation levels (never the weaker). This is the
+// only sanctioned way to combine control requirements, guaranteeing controls
+// escalate monotonically.
+export function maxConfirmationLevel(a, b) {
+  const av = CONFIRMATION_LEVEL_ORDER[a] ?? -1;
+  const bv = CONFIRMATION_LEVEL_ORDER[b] ?? -1;
+  return av >= bv ? a : b;
+}
+
+// ---------------------------------------------------------------------------
+// Structured, multi-dimensional risk taxonomy.
+//
+// Each dimension is an ORDERED scale (index = severity). Deterministic scoring
+// (risk-engine) maps a dimension value to its index; the capability contract
+// declares a BASELINE per dimension that runtime evidence may only raise. No
+// enum here is optional-by-omission: an unset dimension resolves to UNKNOWN,
+// which scores conservatively (never as "safe").
+// ---------------------------------------------------------------------------
+
+export const RiskDimension = Object.freeze({
+  REVERSIBILITY: "reversibility",
+  BLAST_RADIUS: "blastRadius",
+  PRIVILEGE: "privilege",
+  DATA_SENSITIVITY: "dataSensitivity",
+  MUTATION_IMPACT: "mutationImpact",
+  EXECUTION_RISK: "executionRisk",
+  EXTERNAL_EFFECT: "externalEffect",
+  PERSISTENCE: "persistence",
+  RECOVERY_CONFIDENCE: "recoveryConfidence",
+  INPUT_TRUST: "inputTrust",
+  STATE_CERTAINTY: "stateCertainty"
+});
+
+// Ordered scales. Index within the array IS the severity rank (0 = least risk).
+// UNKNOWN, where present, is deliberately placed at a HIGH rank so uncertainty
+// is treated as dangerous, per the "fail conservatively" rule.
+export const RiskScale = Object.freeze({
+  reversibility: ["FULLY_REVERSIBLE", "PARTIALLY_REVERSIBLE", "IRREVERSIBLE", "UNKNOWN"],
+  blastRadius: ["SINGLE_RESOURCE", "PROJECT", "USER_ACCOUNT", "SYSTEM_WIDE", "EXTERNAL_SYSTEM"],
+  privilege: ["STANDARD_USER", "ELEVATED", "ADMINISTRATOR"],
+  dataSensitivity: ["PUBLIC", "USER_DATA", "CONFIDENTIAL", "CREDENTIAL", "SECURITY_CRITICAL"],
+  mutationImpact: ["READ_ONLY", "TEMPORARY", "PERSISTENT", "DESTRUCTIVE"],
+  executionRisk: ["NO_EXECUTION", "TRUSTED_EXECUTABLE", "PACKAGE_INSTALL", "SCRIPT_EXECUTION", "UNTRUSTED_EXECUTION"],
+  externalEffect: ["LOCAL_ONLY", "NETWORK_READ", "EXTERNAL_MUTATION", "COMMUNICATION", "FINANCIAL_OR_SECURITY"],
+  persistence: ["EPHEMERAL", "SESSION", "USER_PERSISTENT", "SYSTEM_PERSISTENT"],
+  recoveryConfidence: ["VERIFIED_ROLLBACK", "BEST_EFFORT_ROLLBACK", "NO_ROLLBACK", "UNKNOWN"],
+  inputTrust: ["INTERNAL", "VALIDATED_USER_INPUT", "MODEL_DERIVED", "EXTERNAL_UNTRUSTED"],
+  stateCertainty: ["FRESH_VERIFIED", "STALE", "INCOMPLETE", "CONFLICTING"]
+});
+
+// The conservative default for every dimension when a capability/context does
+// not declare it. Chosen so an undeclared dimension is treated as risky, never
+// safe. Recovery/state/input default to their UNKNOWN-equivalent worst rank.
+export const RISK_DIMENSION_DEFAULT = Object.freeze({
+  reversibility: "UNKNOWN",
+  blastRadius: "SINGLE_RESOURCE",
+  privilege: "STANDARD_USER",
+  dataSensitivity: "USER_DATA",
+  mutationImpact: "READ_ONLY",
+  executionRisk: "NO_EXECUTION",
+  externalEffect: "LOCAL_ONLY",
+  persistence: "EPHEMERAL",
+  recoveryConfidence: "UNKNOWN",
+  inputTrust: "INTERNAL",
+  stateCertainty: "FRESH_VERIFIED"
+});
+
+// Severity rank (0-based index) of a dimension value on its scale. An
+// unrecognized value resolves to the TOP of the scale (max severity) so a
+// bogus/forged value can never score as safe.
+export function riskDimensionRank(dimension, value) {
+  const scale = RiskScale[dimension];
+  if (!scale) return 0;
+  const idx = scale.indexOf(value);
+  return idx === -1 ? scale.length - 1 : idx;
+}
+
+// Normalize a dimension rank to [0,1] for aggregation.
+export function riskDimensionSeverity(dimension, value) {
+  const scale = RiskScale[dimension];
+  if (!scale || scale.length <= 1) return 0;
+  return riskDimensionRank(dimension, value) / (scale.length - 1);
+}
+
+// Take the RISKIER (higher-rank) of two values on the same dimension. This is
+// the only sanctioned combinator, guaranteeing risk escalates monotonically
+// when capability baseline and runtime evidence are merged.
+export function maxRiskValue(dimension, a, b) {
+  if (a === undefined || a === null) return b;
+  if (b === undefined || b === null) return a;
+  return riskDimensionRank(dimension, a) >= riskDimensionRank(dimension, b) ? a : b;
+}
+
+// Build a fully-populated dimensions object, filling any unset dimension with
+// its conservative default.
+export function completeRiskDimensions(partial = {}) {
+  const out = {};
+  for (const dimension of Object.values(RiskDimension)) {
+    out[dimension] = partial[dimension] ?? RISK_DIMENSION_DEFAULT[dimension];
+  }
+  return out;
+}
+
+// Validate a structured RiskAssessment shape (used by tests and audit). Ensures
+// every dimension value is on its scale and overallRisk is a valid RiskLevel.
+export function validateRiskAssessment(assessment) {
+  if (!assessment || typeof assessment !== "object") {
+    throw new ValidationError("riskAssessment must be an object");
+  }
+  assertEnum(assessment.overallRisk, RiskLevel, "riskAssessment.overallRisk");
+  if (typeof assessment.score !== "number" || assessment.score < 0 || assessment.score > 1) {
+    throw new ValidationError("riskAssessment.score must be a number in [0,1]");
+  }
+  if (!assessment.dimensions || typeof assessment.dimensions !== "object") {
+    throw new ValidationError("riskAssessment.dimensions must be an object");
+  }
+  for (const [dimension, value] of Object.entries(assessment.dimensions)) {
+    const scale = RiskScale[dimension];
+    if (!scale) {
+      throw new ValidationError(`riskAssessment.dimensions has unknown dimension ${dimension}`);
+    }
+    if (!scale.includes(value)) {
+      throw new ValidationError(`riskAssessment.dimensions.${dimension} value ${value} is not on its scale`);
+    }
+  }
+  if (!Array.isArray(assessment.reasons)) throw new ValidationError("riskAssessment.reasons must be an array");
+  if (typeof assessment.uncertainty !== "number" || assessment.uncertainty < 0 || assessment.uncertainty > 1) {
+    throw new ValidationError("riskAssessment.uncertainty must be a number in [0,1]");
+  }
+  return assessment;
+}
+
 export const ActionType = Object.freeze({
   FILE_READ: "FileReadAction",
   ENVIRONMENT_VARIABLE_SET: "EnvironmentVariableSetAction",

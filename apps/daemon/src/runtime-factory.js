@@ -24,6 +24,8 @@ import { WindowsSecretBroker } from "../../../packages/secrets/src/index.js";
 import { ReasoningEngine } from "../../../packages/reasoning-engine/src/index.js";
 import { createModelProviderChain } from "../../../packages/model-providers/src/index.js";
 import { PrivilegedOperationHelper } from "../../../packages/privileged-helpers/src/index.js";
+import { InstallationKeyStore } from "../../../packages/permission-broker/src/installation-key.js";
+import { loadModelConfig } from "./model-config.js";
 
 export function createRuntime(basePath = process.cwd()) {
   const stateDirectory = path.join(basePath, ".syscora");
@@ -38,10 +40,19 @@ export function createRuntime(basePath = process.cwd()) {
   // approval-token issuance) and the privileged helper (single-use token
   // consumption), so a token issued via /api/privileged/approve is the exact
   // token the privileged capability consumes during execution.
+  // Per-installation key for cryptographic approval commitments (HMAC over
+  // secret input values). Created once, 0600; enables commitment stability
+  // across restart without persisting any plaintext secret.
+  const installationKey = new InstallationKeyStore(path.join(stateDirectory, "permission-broker")).loadSync();
+  // resolveCapabilityVersion binds the EXACT approved capability version into the
+  // approval manifest, so a capability upgraded under the same name invalidates
+  // a prior approval. Constructed after the registry below via a late setter.
   const permissionBroker = new PermissionBroker({
     approvalTokenStore,
     auditRepository,
-    capabilityGrantStore
+    capabilityGrantStore,
+    installationKey,
+    resolveCapabilityVersion: (name) => capabilityRegistry?.get?.(name)?.version ?? null
   });
   // The privileged helper is the bounded, allow-listed execution boundary used by
   // the privileged capabilities. It shares the runtime's broker and adapter so
@@ -53,24 +64,29 @@ export function createRuntime(basePath = process.cwd()) {
   const troubleshootingEngine = new TroubleshootingEngine();
   const secretBroker = new WindowsSecretBroker(path.join(stateDirectory, "secrets"));
 
-  // Provider selection is configuration-driven (env: SYSCORA_MODEL_PROVIDER,
-  // and provider-specific API keys). Falls back to the deterministic Mock
-  // provider when no credentials are present. The ReasoningEngine wraps it as
+  // Provider selection is configuration-driven via loadModelConfig: env vars,
+  // then a gitignored .syscora/config.json, then Mock. Default MVP setup points
+  // `provider: "agentrouter"` at the AgentRouter gateway (one key, many models:
+  // claude-opus-4-8 / gpt-5.5 / glm-5.2) — SYSCORA is not tied to any vendor.
+  // Falls back to the deterministic Mock provider when no credentials are
+  // present. The ReasoningEngine wraps it as
   // the single model boundary; every subsystem keeps a deterministic fallback.
-  const modelProvider = createModelProviderChain({
-    provider: process.env.SYSCORA_MODEL_PROVIDER,
-    apiKey: process.env.SYSCORA_MODEL_API_KEY,
-    model: process.env.SYSCORA_MODEL_NAME,
-    fallbackProviders: process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS
-  });
+  const modelProvider = createModelProviderChain(loadModelConfig(basePath));
   const reasoningEngine = new ReasoningEngine({ modelProvider, capabilityRegistry });
 
   const runtime = new AgentRuntime({
     sessionStore,
     auditRepository,
     capabilityRegistry,
-    riskEngine: new RiskEngine(),
-    policyEngine: new PolicyEngine(),
+    // The RiskEngine reads the authoritative per-capability risk floor from the
+    // registry; runtime context may only raise those dimensions.
+    riskEngine: new RiskEngine({ capabilityRegistry }),
+    // ELEVATE is a wired control here because the privileged helper + approval
+    // token flow exists. Without a helper it would stay unavailable and any
+    // privileged operation would fail closed (never silently downgraded).
+    policyEngine: new PolicyEngine({
+      controlAvailability: { ELEVATE: Boolean(privilegedHelper) }
+    }),
     permissionBroker,
     recoveryEngine,
     troubleshootingEngine,

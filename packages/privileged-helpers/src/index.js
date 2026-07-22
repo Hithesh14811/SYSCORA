@@ -104,6 +104,14 @@ export class PrivilegedOperationHelper {
     return Object.prototype.hasOwnProperty.call(OPERATIONS, operation);
   }
 
+  // The bounded operation ids this helper can route + execute. The registry
+  // uses this to build its live privileged-operation allow-list, so elevation
+  // availability is operation-specific (helper supporting service.restart does
+  // NOT imply it supports arbitrary.plugin.adminAction).
+  supportedOperations() {
+    return Object.keys(OPERATIONS);
+  }
+
   async issueApprovalToken(operation, scope, options = {}) {
     return this.permissionBroker.issuePrivilegeToken({
       sessionId: options.sessionId,

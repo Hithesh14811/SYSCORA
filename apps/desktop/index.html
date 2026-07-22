@@ -12,6 +12,23 @@
       <p>System Cognitive Reasoning Architecture</p>
     </header>
 
+    <!-- Connect panel. Shown only when no API token is available (browser-only
+         launch). The Electron shell supplies the token in-process via preload,
+         so this stays hidden there. The token is never embedded in served HTML;
+         it is entered here and kept in tab-scoped sessionStorage. -->
+    <section id="connectPanel" class="panel connect-panel" hidden>
+      <h2>Connect to daemon</h2>
+      <p class="muted">Paste the API token printed in the daemon console (<code>SYSCORA API token: ...</code>).</p>
+      <form id="connectForm">
+        <label>
+          API Token
+          <input id="connectToken" type="password" autocomplete="off" required />
+        </label>
+        <p id="connectError" class="muted" hidden></p>
+        <button type="submit">Connect</button>
+      </form>
+    </section>
+
     <main class="layout">
       <section class="panel">
         <h2>Intent</h2>
@@ -179,9 +196,6 @@
       </section>
     </main>
 
-    <script>
-      window.__SYSCORA_API_TOKEN__ = "__SYSCORA_API_TOKEN__";
-    </script>
     <script src="/app.js" type="module"></script>
   </body>
 </html>

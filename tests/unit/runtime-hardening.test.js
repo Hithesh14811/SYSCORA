@@ -5,6 +5,9 @@ import { RollbackManager } from "../../packages/agent-runtime/src/rollback-manag
 import { GeneralPlanner, PlanValidator } from "../../packages/planner/src/index.js";
 import { WorkspaceContextProvider } from "../../packages/context-engine/src/index.js";
 import { OpenAIModelProvider } from "../../packages/model-providers/src/index.js";
+import { IntentEngine } from "../../packages/intent-engine/src/index.js";
+import { RiskEngine } from "../../packages/risk-engine/src/index.js";
+import { PolicyEngine } from "../../packages/policy-engine/src/index.js";
 
 function rollbackCapability(name, calls) {
   return {
@@ -47,6 +50,54 @@ test("operation planner emits a validator-accepted WinGet install graph", async 
   }, []);
   assert.equal(plan.taskGraph.tasks[0].timeout, 600000);
   assert.deepEqual(new PlanValidator(registry).validatePlan(plan.taskGraph), { valid: true, errors: [] });
+});
+
+test("installed-package question maps to one read-only WinGet status check", async () => {
+  const intent = await new IntentEngine(null).classify("Is Spotify installed on this device?");
+  assert.equal(intent.operation, "package.winget.inspect");
+  assert.equal(intent.entities.id, "Spotify.Spotify");
+
+  const registry = createDefaultCapabilityRegistry({ wingetList: async () => ({ exitCode: 0, stdout: "Spotify.Spotify" }) });
+  const planner = new GeneralPlanner(null, registry);
+  const plan = await planner.generatePlan(intent, []);
+  assert.equal(plan.plannerSource, "DIRECT_OPERATION");
+  assert.deepEqual(plan.taskGraph.tasks.map((task) => task.capability), ["package.winget.inspect"]);
+  assert.deepEqual(new PlanValidator(registry).validatePlan(plan.taskGraph), { valid: true, errors: [] });
+});
+
+test("known package install and system-info requests use direct operations", async () => {
+  const engine = new IntentEngine(null);
+  const install = await engine.classify("Install Spotify");
+  const system = await engine.classify("Show me my system specs");
+  assert.equal(install.operation, "package.winget.install");
+  assert.equal(install.entities.id, "Spotify.Spotify");
+  assert.equal(system.operation, "system.inspect");
+});
+
+test("Spotify play phrasing bypasses model planning and plays the requested track", async () => {
+  const intent = await new IntentEngine(null).classify('Open Spotify and play "Cry For Me"');
+  assert.equal(intent.operation, "spotify.track.play");
+  assert.equal(intent.entities.query, "Cry For Me");
+  const registry = createDefaultCapabilityRegistry({
+    playSpotifyTrack: async () => ({ available: true, playback: { playing: true } }),
+    readSpotifyPlayback: async () => ({ playing: true, title: "The Weeknd - Cry For Me" })
+  });
+  const plan = await new GeneralPlanner(null, registry).generatePlan(intent, []);
+  assert.equal(plan.plannerSource, "DIRECT_OPERATION");
+  assert.deepEqual(plan.taskGraph.tasks.map((task) => task.capability), ["spotify.track.play"]);
+});
+
+test("launching an installed app and opening a search is a low-risk interaction", () => {
+  const registry = createDefaultCapabilityRegistry({});
+  const plan = { taskGraph: { tasks: [
+    { capability: "package.winget.inspect" },
+    { capability: "application.launch" },
+    { capability: "browser.search" }
+  ] } };
+  const assessment = new RiskEngine({ capabilityRegistry: registry }).assess(plan, {});
+  const decision = new PolicyEngine().decide(assessment, plan);
+  assert.equal(assessment.overallRisk, "LOW");
+  assert.equal(decision.effect, "ALLOW");
 });
 
 test("workspace context awaits the developer intelligence contract", async () => {

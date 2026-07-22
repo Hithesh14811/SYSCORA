@@ -30,6 +30,13 @@ SYSCORA executes requests through one canonical runtime path:
 ## Explicit Non-Goals
 
 - unrestricted shell access
-- browser, Windows UI, Office, or registry automation
+- unrestricted browser, Office, or registry automation
+- **general-purpose** Windows UI automation (arbitrary apps / blind coordinate clicking).
+  A single, bounded, window-scoped UI Automation capability now exists —
+  `spotify.track.play` drives the installed Spotify desktop client (launch → wait →
+  search → select → activate play) via native Windows UI Automation and verifies
+  playback independently from the live window title. It is LOW risk, scoped to the
+  Spotify window/process, uses only bounded waits, and reports partial/failed
+  honestly. This does not open the door to unscoped UI automation of other apps.
 - autonomous privilege escalation
 - untyped tool execution

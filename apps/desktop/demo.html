@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SYSCORA</title>
+    <link rel="stylesheet" href="/demo.css" />
+  </head>
+  <body>
+    <header class="demo-topbar">
+      <div class="brand">
+        <span class="logo">◆</span>
+        <div>
+          <h1>SYSCORA</h1>
+          <p>Tell your computer what you want done.</p>
+        </div>
+      </div>
+      <label class="debug-toggle">
+        <input id="debugToggle" type="checkbox" />
+        Developer mode
+      </label>
+    </header>
+
+    <!-- Connect panel: shown only for browser-only launch (no injected token). -->
+    <section id="connectPanel" class="connect-panel" hidden>
+      <div class="connect-card">
+        <h2>Connect to SYSCORA</h2>
+        <p class="muted">Paste the API token printed in the daemon console
+          (<code>SYSCORA API token: ...</code>).</p>
+        <form id="connectForm">
+          <input id="connectToken" type="password" autocomplete="off" placeholder="API token" required />
+          <p id="connectError" class="error" hidden></p>
+          <button type="submit">Connect</button>
+        </form>
+      </div>
+    </section>
+
+    <main class="demo-layout">
+      <section id="feed" class="feed" aria-live="polite">
+        <div class="welcome">
+          <h2>What would you like SYSCORA to do?</h2>
+          <p class="muted">Ask in plain English. SYSCORA inspects your machine, plans the work,
+            asks before anything risky, does it, and verifies the result.</p>
+          <div class="suggestions" id="suggestions">
+            <button class="suggestion" data-text="Tell me about this computer and what development tools are installed.">Tell me about this computer</button>
+            <button class="suggestion" data-text="What's using port 3000?">What's using port 3000?</button>
+            <button class="suggestion" data-text="Create a folder called Investor Demo on my Desktop and put a readme.txt inside it.">Create a folder on my Desktop</button>
+            <button class="suggestion" data-text="Check if Git is installed.">Check if Git is installed</button>
+            <button class="suggestion" data-text="Search WinGet for VLC.">Search for VLC</button>
+            <button class="suggestion" data-text="Inspect this project and tell me what I need to run it.">Inspect this project</button>
+          </div>
+        </div>
+      </section>
+
+      <form id="chatForm" class="chat-bar">
+        <textarea id="chatInput" rows="1" placeholder="Ask SYSCORA to do something..." required></textarea>
+        <label class="auto-approve" title="Skip approval prompts (demo only — off by default)">
+          <input id="autoApprove" type="checkbox" />
+          Auto-approve
+        </label>
+        <button id="sendButton" type="submit">Send</button>
+      </form>
+    </main>
+
+    <script src="/demo.js"></script>
+  </body>
+</html>

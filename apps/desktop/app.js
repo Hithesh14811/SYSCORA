@@ -19,7 +19,83 @@ const sessionIdControl = document.getElementById("sessionIdControl");
 const pauseSession = document.getElementById("pauseSession");
 const resumeSession = document.getElementById("resumeSession");
 const cancelSession = document.getElementById("cancelSession");
-const apiToken = window.__SYSCORA_API_TOKEN__;
+
+// API token bootstrap. The token is NEVER embedded in the served HTML (that page
+// is unauthenticated and any local process could scrape it). It is obtained
+// out-of-band, in priority order:
+//   1. Electron shell — injected in-process via a contextBridge preload.
+//   2. sessionStorage — a token the user entered earlier this tab session.
+//   3. The Connect panel — the user pastes the token from the daemon console.
+// `apiToken` is mutable so a fresh connect (or a 401-triggered re-prompt) updates
+// every call site, which all read it at request time.
+const TOKEN_STORAGE_KEY = "syscora_token";
+let apiToken = (window.syscora && window.syscora.apiToken)
+  || sessionStorage.getItem(TOKEN_STORAGE_KEY)
+  || null;
+
+const connectPanel = document.getElementById("connectPanel");
+const connectForm = document.getElementById("connectForm");
+const connectToken = document.getElementById("connectToken");
+const connectError = document.getElementById("connectError");
+
+function showConnectPanel(message) {
+  if (message) {
+    connectError.textContent = message;
+    connectError.hidden = false;
+  } else {
+    connectError.hidden = true;
+  }
+  connectPanel.hidden = false;
+  connectToken.focus();
+}
+
+function hideConnectPanel() {
+  connectPanel.hidden = true;
+  connectError.hidden = true;
+}
+
+// Called by any fetch that gets a 401: the stored token is stale or wrong, so
+// drop it and re-prompt rather than silently failing.
+function handleUnauthorized() {
+  apiToken = null;
+  sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+  showConnectPanel("Token was rejected. Paste the current token from the daemon console.");
+}
+
+if (connectForm) {
+  connectForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = connectToken.value.trim();
+    if (!value) return;
+    apiToken = value;
+    sessionStorage.setItem(TOKEN_STORAGE_KEY, value);
+    connectToken.value = "";
+    hideConnectPanel();
+  });
+}
+
+// If no token is available at load (browser-only launch), prompt immediately.
+if (!apiToken) {
+  showConnectPanel();
+}
+
+// Centralize auth on top of fetch: every same-origin /api/ request carries the
+// current token, and a 401 anywhere re-opens the Connect panel. This means the
+// individual call sites below don't each need to re-check auth, and a rejected
+// token is handled in one place instead of failing silently per call.
+const nativeFetch = window.fetch.bind(window);
+window.fetch = async (input, init = {}) => {
+  const url = typeof input === "string" ? input : (input?.url ?? "");
+  const isApi = url.startsWith("/api/") || url.includes("://127.0.0.1");
+  if (isApi && apiToken) {
+    init = { ...init, headers: { ...(init.headers || {}), "x-syscora-token": apiToken } };
+  }
+  const response = await nativeFetch(input, init);
+  if (isApi && response.status === 401) {
+    handleUnauthorized();
+  }
+  return response;
+};
 
 const workspacePathInput = document.getElementById("workspacePath");
 workspacePathInput.value = ".";

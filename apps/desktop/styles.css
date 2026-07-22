@@ -126,3 +126,13 @@ pre {
   overflow: auto;
   white-space: pre-wrap;
 }
+
+.connect-panel {
+  margin: 16px;
+  max-width: 520px;
+  border: 1px solid #d29922;
+}
+
+.connect-panel[hidden] {
+  display: none;
+}

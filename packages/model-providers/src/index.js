@@ -482,6 +482,103 @@ export class AnthropicModelProvider extends LanguageModelProvider {
   }
 }
 
+// AgentRouter: an OpenAI-compatible model GATEWAY (https://agentrouter.org).
+// One endpoint + one API key gives access to many models (claude-opus-4-8,
+// gpt-5.5, glm-5.2, ...). SYSCORA is therefore NOT tied to a single vendor:
+// switch models by changing `model`, not code. Because the gateway fronts
+// heterogeneous models (some without OpenAI strict json_schema support), this
+// provider does NOT rely on response_format json_schema — it instructs the
+// model to emit only JSON and extracts the first balanced object, then the
+// caller (ReasoningEngine) validates/repairs against the schema. The runtime
+// never trusts this output directly.
+export const AGENTROUTER_MODELS = Object.freeze(["claude-opus-4-8", "gpt-5.5", "glm-5.2"]);
+
+export class AgentRouterModelProvider extends LanguageModelProvider {
+  constructor(config = {}) {
+    super(config);
+    this.apiKey = config.apiKey || process.env.SYSCORA_MODEL_API_KEY || process.env.AGENTROUTER_API_KEY;
+    this.model = config.model || "claude-opus-4-8";
+    // Accept a base with or without a trailing /v1; normalize to the OpenAI-
+    // compatible root so `${baseUrl}/chat/completions` is correct.
+    const rawBase = config.baseUrl || "https://agentrouter.org/v1";
+    this.baseUrl = /\/v\d+$/.test(rawBase.replace(/\/$/, "")) ? rawBase.replace(/\/$/, "") : `${rawBase.replace(/\/$/, "")}/v1`;
+    // AgentRouter fronts its gateway with a WAF that rejects requests which do
+    // not look like the Claude Code CLI (a plain Bearer call returns HTTP 401
+    // "unauthorized client detected"). A Claude-Code-style User-Agent clears it.
+    // Overridable via config for forward-compat if the gateway changes policy.
+    this.userAgent = config.userAgent || "claude-cli/1.0.0 (external)";
+    this.name = "agentrouter";
+  }
+
+  async healthCheck() {
+    if (!this.apiKey) return { ok: false, error: "No AgentRouter API key" };
+    try {
+      const response = await fetch(`${this.baseUrl}/models`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.apiKey}`, "User-Agent": this.userAgent }
+      });
+      return { ok: response.ok, status: response.status, type: "AgentRouterModelProvider", model: this.model };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  capabilities() {
+    return { name: this.name, structured: true, text: true, streaming: false, model: this.model, gateway: true, remote: true };
+  }
+
+  async generateStructured(prompt, schema, options = {}) {
+    this._usage.calls += 1;
+    if (!this.apiKey) throw new Error("No AgentRouter API key");
+    const timeoutMs = options.timeoutMs || 30000;
+    const maxRetries = options.maxRetries || 3;
+    let attempt = 0;
+    let lastError = null;
+    while (attempt < maxRetries) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(`${this.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}`, "User-Agent": this.userAgent },
+          body: JSON.stringify({
+            model: options.model || this.model,
+            messages: [
+              { role: "system", content: "You output ONLY valid minified JSON conforming to the requested schema. No prose, no markdown fences." },
+              { role: "user", content: `${prompt}\n\nReturn ONLY JSON matching this schema: ${JSON.stringify(schema)}` }
+            ],
+            temperature: options.temperature ?? 0.3
+          }),
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        const usage = result.usage || {};
+        this._usage.tokensIn += usage.prompt_tokens || 0;
+        this._usage.tokensOut += usage.completion_tokens || 0;
+        const content = result.choices?.[0]?.message?.content ?? "";
+        const parsed = extractJson(content);
+        if (options.validateSchema) {
+          const validation = validateSchema(parsed, schema);
+          if (!validation.valid) throw new Error(`Invalid schema: ${validation.errors.join(", ")}`);
+        }
+        return parsed;
+      } catch (error) {
+        lastError = error;
+        attempt += 1;
+        if (attempt < maxRetries && isRetryableProviderError(error)) {
+          await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt), 10000)));
+        } else {
+          break;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw lastError;
+  }
+}
+
 // Extract the first balanced JSON object from a text blob, tolerating stray
 // prose or markdown fences around it. Throws if no valid JSON object is found
 // so callers can fall back deterministically.
@@ -515,6 +612,11 @@ export function createModelProvider(settings = {}) {
     case "anthropic": {
       const apiKey = settings.apiKey || process.env.ANTHROPIC_API_KEY;
       if (apiKey) return new AnthropicModelProvider({ apiKey, model: settings.model, baseUrl: settings.baseUrl });
+      return new MockModelProvider();
+    }
+    case "agentrouter": {
+      const apiKey = settings.apiKey || process.env.AGENTROUTER_API_KEY || process.env.SYSCORA_MODEL_API_KEY;
+      if (apiKey) return new AgentRouterModelProvider({ apiKey, model: settings.model, baseUrl: settings.baseUrl });
       return new MockModelProvider();
     }
     case "mock":

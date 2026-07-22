@@ -1,4 +1,10 @@
-import { RiskLevel } from "../../shared-types/src/domain.js";
+import {
+  RiskLevel,
+  RiskDimension,
+  RiskScale,
+  maxRiskValue,
+  completeRiskDimensions
+} from "../../shared-types/src/domain.js";
 
 export const CAPABILITY_CONTRACT_VERSION = "2.0.0";
 export const CAPABILITY_RUNTIME_VERSION = "0.1.0";
@@ -131,13 +137,29 @@ function builtinDeclarations(name, capability) {
   const isRegistry = /^environment\.user/.test(name ?? "");
   const isNetwork = /^browser\./.test(name ?? "");
   const isExternalProcess = /^(process|package|application|git|docker|developer|system\.services)/.test(name ?? "");
+  // Starting an already-installed user application is an ephemeral, local
+  // interaction. It is not equivalent to executing an arbitrary script.
+  const isInteractiveLaunch = name === "application.launch";
+  // A read-only capability merely QUERIES state (inspect/list/search/detect/
+  // analyze/read). Even when it shells out to a bounded external command
+  // (winget search, git status, docker ps), it mutates nothing — so it must NOT
+  // inherit the "CONTROLLED external process" surface that derives a mutating,
+  // SCRIPT_EXECUTION (HIGH) profile and forces an unnecessary confirmation. The
+  // name-based signal is authoritative for the built-in catalog; genuinely
+  // mutating verbs (install/set/add/restart/delete/close/launch) are excluded.
+  const isReadOnlyVerb = /\.(inspect|list|search|detect|analyze|read)$/.test(name ?? "")
+    || /\b(inspect|list|search|detect|analyze)\b/.test(name ?? "");
+  const isMutatingVerb = /(install|\.set|\.add|restart|delete|remove|dedupe|launch|close|write|createDirectory)/i.test(name ?? "");
+  const readOnlyExternal = isInteractiveLaunch || (isExternalProcess && isReadOnlyVerb && !isMutatingVerb);
   const mutates = capability?.riskMetadata?.level === RiskLevel.MEDIUM || capability?.reversibility === "ROLLBACK_SUPPORTED";
   return {
     permissions: [
       ...(isFilesystem ? [mutates ? "filesystem.write" : "filesystem.read"] : []),
       ...(isRegistry ? [mutates ? "environment.write" : "environment.read"] : []),
       ...(isNetwork ? ["network.access"] : []),
-      ...(isExternalProcess ? ["process.execute"] : [])
+      // Read-only external queries get a read permission, not process.execute,
+      // so they never derive an execution-risk / mutating floor.
+      ...(isExternalProcess ? [readOnlyExternal ? "process.read" : "process.execute"] : [])
     ],
     security: {
       filesystem: isFilesystem ? (mutates ? "WRITE" : "READ") : "NONE",
@@ -146,7 +168,8 @@ function builtinDeclarations(name, capability) {
       browser: isNetwork ? "LAUNCH" : "NONE",
       clipboard: "NONE",
       windowAutomation: "NONE",
-      externalProcesses: isExternalProcess ? "CONTROLLED" : "NONE"
+      // Read-only external queries declare NO external-process mutation surface.
+      externalProcesses: (isExternalProcess && !readOnlyExternal) ? "CONTROLLED" : "NONE"
     },
     stateMutations: mutates ? [name] : [],
     semanticUpdates: [{ type: "observation", entityType: name?.split(".")[0] ?? "system" }],
@@ -154,6 +177,164 @@ function builtinDeclarations(name, capability) {
     documentation: { examples: [`Use ${name} through a validated task graph.`] },
     packaging: { migration: { from: "legacy-registry", version: "1.0.0" }, versionHistory: [capability?.version ?? "0.0.0"] }
   };
+}
+
+// Derive an authoritative, conservative structured risk profile (per-dimension
+// baseline) from what a capability already declares: its coarse risk level, the
+// security surface, elevation requirement, scope, mutation profile, and rollback
+// support. This is the ENFORCED FLOOR. A capability may declare an explicit
+// `riskProfile` to raise any dimension, but never to lower one below what its
+// declared surface implies — plugins cannot self-certify as safer than their
+// enforceable minimums (M2 Phase 3/12). The RiskEngine layers runtime evidence
+// on top, again raise-only.
+export function deriveRiskProfile(name, capability, security, permissionModel) {
+  const level = capability?.risk?.level ?? capability?.riskMetadata?.level ?? RiskLevel.MEDIUM;
+  const elevated = permissionModel?.requiresElevation
+    ?? ((capability?.requirements?.elevation ?? capability?.requiredElevation ?? "NONE") !== "NONE");
+  const rollback = capability?.rollbackSupport ?? capability?.reversibility ?? "NOT_REQUIRED";
+  const scopes = new Set(permissionModel?.scope ?? []);
+  const type = permissionModel?.type ?? "READ";
+  const isDestructive = /rollback|delete|remove|uninstall|reset|restart|dedupe/i.test(name ?? "");
+
+  const fs = security?.filesystem ?? "NONE";
+  const registry = security?.registry ?? "NONE";
+  const network = security?.network ?? "NONE";
+  const browser = security?.browser ?? "NONE";
+  const externalProcesses = security?.externalProcesses ?? "NONE";
+
+  // Mutation is inferred from the CONCRETE security surface and permission
+  // declarations, never from the self-declared coarse risk level. A capability
+  // cannot dodge the "mutates" classification (and thus a benign profile) by
+  // declaring LOW risk while still declaring a WRITE surface or a write/execute
+  // permission — closing the plugin self-certification hole (M2 Phase 3/12).
+  const declaredPerms = (permissionModel?.declaredPermissions
+    ?? capability?.requirements?.permissions ?? capability?.permissions ?? []).map((p) => String(p).toLowerCase());
+  const permImpliesMutation = declaredPerms.some((p) => /write|install|execute|set|add|delete|remove|restart|:service:|:package:/.test(p));
+  // A browser search is network *reading*, not a remote mutation. `NETWORK`
+  // is still its permission type so the broker can constrain it, but it must
+  // not by itself turn a URL navigation into a persistent write.
+  const isReadOnlyQueryVerb = /(\.(inspect|list|search|detect|analyze|read)$|\b(inspect|list|search|detect|analyze)\b)/.test(name ?? "");
+  const isReadOnlyNetworkQuery = isReadOnlyQueryVerb
+    && (network === "OUTBOUND" || browser !== "NONE")
+    && !permImpliesMutation;
+  const mutates =
+    type === "WRITE" || type === "EXECUTE" || (type === "NETWORK" && !isReadOnlyNetworkQuery) ||
+    fs === "WRITE" || registry === "WRITE" ||
+    externalProcesses !== "NONE" || permImpliesMutation;
+  const isPackage = /^package\./.test(name ?? "") || externalProcesses === "PACKAGE";
+  const isService = /service/.test(name ?? "");
+
+  // --- privilege ---
+  const privilege = elevated ? (isService || /system/.test(name ?? "") ? "ADMINISTRATOR" : "ELEVATED") : "STANDARD_USER";
+
+  // --- blast radius ---
+  let blastRadius = "SINGLE_RESOURCE";
+  if (scopes.has("PROJECT") || scopes.has("WORKSPACE")) blastRadius = "PROJECT";
+  if (scopes.has("USER")) blastRadius = "USER_ACCOUNT";
+  if (scopes.has("SYSTEM") || elevated || isService) blastRadius = "SYSTEM_WIDE";
+  if (network !== "NONE" || browser !== "NONE" || scopes.has("NETWORK")) blastRadius = maxRiskValue(RiskDimension.BLAST_RADIUS, blastRadius, "EXTERNAL_SYSTEM");
+
+  // --- data sensitivity --- (name-driven; refined further by RiskEngine at runtime)
+  let dataSensitivity = "USER_DATA";
+  if (!mutates && /inspect|list|read|detect|search|analyze/.test(name ?? "")) dataSensitivity = "PUBLIC";
+  if (/secret|credential|token|password|key/i.test(name ?? "")) dataSensitivity = "CREDENTIAL";
+
+  // --- mutation impact ---
+  let mutationImpact = "READ_ONLY";
+  if (mutates) {
+    mutationImpact = "PERSISTENT";
+    if (isDestructive) mutationImpact = "DESTRUCTIVE";
+  }
+
+  // --- execution risk ---
+  let executionRisk = "NO_EXECUTION";
+  if (isPackage) executionRisk = "PACKAGE_INSTALL";
+  else if (externalProcesses !== "NONE" || type === "EXECUTE") executionRisk = "SCRIPT_EXECUTION";
+
+  // --- external effect ---
+  let externalEffect = "LOCAL_ONLY";
+  if (network === "OUTBOUND" || browser !== "NONE") externalEffect = "NETWORK_READ";
+  if (isPackage) externalEffect = "EXTERNAL_MUTATION"; // supply-chain fetch
+
+  // --- persistence ---
+  let persistence = "EPHEMERAL";
+  if (mutates) {
+    if (scopes.has("SYSTEM") || elevated || isService) persistence = "SYSTEM_PERSISTENT";
+    else if (scopes.has("USER")) persistence = "USER_PERSISTENT";
+    else persistence = "SESSION";
+    if (fs === "WRITE" || registry === "WRITE") persistence = maxRiskValue(RiskDimension.PERSISTENCE, persistence, scopes.has("USER") ? "USER_PERSISTENT" : "SESSION");
+  }
+
+  // --- reversibility / recovery confidence ---
+  let reversibility;
+  let recoveryConfidence;
+  if (rollback === "ROLLBACK_SUPPORTED") {
+    reversibility = "PARTIALLY_REVERSIBLE";
+    recoveryConfidence = "BEST_EFFORT_ROLLBACK";
+  } else if (!mutates) {
+    reversibility = "FULLY_REVERSIBLE";
+    recoveryConfidence = "VERIFIED_ROLLBACK";
+  } else {
+    // A persistent/destructive mutation with no declared rollback support is,
+    // absent runtime evidence to the contrary, treated as irreversible.
+    reversibility = isDestructive ? "IRREVERSIBLE" : "UNKNOWN";
+    recoveryConfidence = "NO_ROLLBACK";
+  }
+
+  // READ-ONLY QUERY CLAMP. A genuinely non-mutating capability with a read-only
+  // verb (inspect/list/search/detect/analyze/read) changes NOTHING, even when it
+  // shells out to a bounded query (winget search, git status, netstat). Its
+  // execution/external/blast dimensions must reflect that a read has no blast
+  // radius and installs nothing — otherwise a name prefix like `package.` or a
+  // SYSTEM scope forces a spurious PACKAGE_INSTALL / SYSTEM_WIDE (HIGH) floor and
+  // an unnecessary confirmation. This only ever LOWERS a read's own derived
+  // surface; it cannot apply to a mutating capability (guarded by !mutates), so
+  // it does not weaken the anti-self-certification guarantee for writes/plugins.
+  const isReadOnlyQuery = !mutates
+    && /(\.(inspect|list|search|detect|analyze|read)$|\b(inspect|list|search|detect|analyze)\b)/.test(name ?? "");
+  if (isReadOnlyQuery) {
+    executionRisk = "NO_EXECUTION";
+    externalEffect = network === "OUTBOUND" || browser !== "NONE" ? "NETWORK_READ" : "LOCAL_ONLY";
+    // A pure read's blast radius is the data it reads, not the machine: cap at
+    // PROJECT (LOW) so read-only inspection is ALLOW, never CONFIRM.
+    blastRadius = maxRiskValue(RiskDimension.BLAST_RADIUS, "SINGLE_RESOURCE",
+      scopes.has("PROJECT") || scopes.has("WORKSPACE") ? "PROJECT" : "SINGLE_RESOURCE");
+  }
+
+  // Coarse level acts as a further floor for the aggregate-sensitive dimensions
+  // so a capability declaring HIGH/CRITICAL can never derive a benign profile.
+  // (Skipped for read-only queries: a read cannot mutate, so a coarse HIGH label
+  // must not fabricate a PERSISTENT mutation floor on it.)
+  if (!isReadOnlyQuery && (level === RiskLevel.HIGH || level === RiskLevel.CRITICAL)) {
+    mutationImpact = maxRiskValue(RiskDimension.MUTATION_IMPACT, mutationImpact, "PERSISTENT");
+    blastRadius = maxRiskValue(RiskDimension.BLAST_RADIUS, blastRadius, "USER_ACCOUNT");
+  }
+
+  const derived = {
+    [RiskDimension.REVERSIBILITY]: reversibility,
+    [RiskDimension.BLAST_RADIUS]: blastRadius,
+    [RiskDimension.PRIVILEGE]: privilege,
+    [RiskDimension.DATA_SENSITIVITY]: dataSensitivity,
+    [RiskDimension.MUTATION_IMPACT]: mutationImpact,
+    [RiskDimension.EXECUTION_RISK]: executionRisk,
+    [RiskDimension.EXTERNAL_EFFECT]: externalEffect,
+    [RiskDimension.PERSISTENCE]: persistence,
+    [RiskDimension.RECOVERY_CONFIDENCE]: recoveryConfidence,
+    [RiskDimension.INPUT_TRUST]: "INTERNAL",
+    [RiskDimension.STATE_CERTAINTY]: "FRESH_VERIFIED"
+  };
+
+  // An explicit capability-declared riskProfile may only RAISE a dimension.
+  // maxRiskValue guarantees a declared value below the derived floor is ignored,
+  // so a plugin/capability cannot self-certify as safer than its surface implies.
+  const declared = capability?.riskProfile ?? {};
+  const enforced = {};
+  for (const dimension of Object.values(RiskDimension)) {
+    const scale = RiskScale[dimension];
+    const declaredValue = scale?.includes(declared[dimension]) ? declared[dimension] : undefined;
+    enforced[dimension] = maxRiskValue(dimension, derived[dimension], declaredValue);
+  }
+  return completeRiskDimensions(enforced);
 }
 
 // Legacy built-ins retain their execution behavior. This adapter supplies the
@@ -165,6 +346,29 @@ export function normalizeCapability(capability, options = {}) {
   const source = options.source ?? capability?.packaging?.source ?? "builtin";
   const builtin = source === "builtin" ? builtinDeclarations(name, capability) : {};
   const security = capability?.security ?? {};
+  const resolvedSecurity = {
+    filesystem: security.filesystem ?? builtin.security?.filesystem ?? "NONE",
+    registry: security.registry ?? builtin.security?.registry ?? "NONE",
+    network: security.network ?? builtin.security?.network ?? "NONE",
+    browser: security.browser ?? builtin.security?.browser ?? "NONE",
+    clipboard: security.clipboard ?? builtin.security?.clipboard ?? "NONE",
+    windowAutomation: security.windowAutomation ?? builtin.security?.windowAutomation ?? "NONE",
+    externalProcesses: security.externalProcesses ?? builtin.security?.externalProcesses ?? "NONE",
+    ...security
+  };
+  const resolvedPermissionModel = derivePermissionModel(
+    name,
+    list(capability?.requirements?.permissions ?? capability?.permissions ?? builtin.permissions),
+    capability?.security ?? builtin.security ?? {},
+    capability?.riskMetadata?.level === RiskLevel.MEDIUM ||
+      capability?.riskMetadata?.level === RiskLevel.HIGH ||
+      capability?.riskMetadata?.level === RiskLevel.CRITICAL ||
+      capability?.reversibility === "ROLLBACK_SUPPORTED",
+    capability
+  );
+  // Authoritative structured risk floor for this capability. Runtime evidence
+  // (RiskEngine) may only raise these dimensions, never lower them.
+  const riskProfile = deriveRiskProfile(name, capability, resolvedSecurity, resolvedPermissionModel);
   return {
     ...capability,
     name,
@@ -202,26 +406,11 @@ export function normalizeCapability(capability, options = {}) {
       policyRequirements: list(capability?.risk?.policyRequirements ?? capability?.policyRequirements),
       ...capability?.risk
     },
-    security: {
-      filesystem: security.filesystem ?? builtin.security?.filesystem ?? "NONE",
-      registry: security.registry ?? builtin.security?.registry ?? "NONE",
-      network: security.network ?? builtin.security?.network ?? "NONE",
-      browser: security.browser ?? builtin.security?.browser ?? "NONE",
-      clipboard: security.clipboard ?? builtin.security?.clipboard ?? "NONE",
-      windowAutomation: security.windowAutomation ?? builtin.security?.windowAutomation ?? "NONE",
-      externalProcesses: security.externalProcesses ?? builtin.security?.externalProcesses ?? "NONE",
-      ...security
-    },
-    permissionModel: derivePermissionModel(
-      name,
-      list(capability?.requirements?.permissions ?? capability?.permissions ?? builtin.permissions),
-      capability?.security ?? builtin.security ?? {},
-      capability?.riskMetadata?.level === RiskLevel.MEDIUM ||
-        capability?.riskMetadata?.level === RiskLevel.HIGH ||
-        capability?.riskMetadata?.level === RiskLevel.CRITICAL ||
-        capability?.reversibility === "ROLLBACK_SUPPORTED",
-      capability
-    ),
+    // Structured, enforced-minimum risk profile (M2). Runtime evidence may
+    // raise these dimensions; nothing may lower them below this floor.
+    riskProfile,
+    security: resolvedSecurity,
+    permissionModel: resolvedPermissionModel,
     stateMutations: list(capability?.stateMutations ?? capability?.mutations ?? builtin.stateMutations),
     failureClassifications: list(capability?.failureClassifications),
     recoveryHints: list(capability?.recoveryHints),

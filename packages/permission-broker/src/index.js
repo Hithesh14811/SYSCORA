@@ -1,13 +1,41 @@
+import crypto from "node:crypto";
 import { PolicyEffect } from "../../shared-types/src/domain.js";
+import { buildApprovalManifest, APPROVAL_MANIFEST_VERSION } from "./approval-manifest.js";
 
 export class PermissionBroker {
-  constructor({ approvalTokenStore = null, auditRepository = null, capabilityGrantStore = null } = {}) {
+  // installationKey (Buffer) authenticates secret commitments in the approval
+  // manifest. The production runtime wires it from the InstallationKeyStore; a
+  // broker constructed without one falls back to a process-ephemeral key so
+  // unit/direct-call paths still function (commitments are then only stable
+  // within the process, which is fine because no persistence spans processes
+  // there). resolveCapabilityVersion binds the exact approved capability version.
+  constructor({ approvalTokenStore = null, auditRepository = null, capabilityGrantStore = null, installationKey = null, resolveCapabilityVersion = null } = {}) {
     this.approvalTokenStore = approvalTokenStore;
     this.auditRepository = auditRepository;
     this.capabilityGrantStore = capabilityGrantStore;
+    this._installationKey = installationKey ?? PermissionBroker._ephemeralKey();
+    this.resolveCapabilityVersion = resolveCapabilityVersion;
   }
 
-  evaluate({ policyDecision, autoApprove = false }) {
+  static _ephemeralKey() {
+    // Lazily created once per process. Stable within a process so a
+    // build-then-verify in the same process matches; never persisted.
+    if (!PermissionBroker.__ephemeralKey) {
+      PermissionBroker.__ephemeralKey = crypto.randomBytes(32);
+    }
+    return PermissionBroker.__ephemeralKey;
+  }
+
+  // Evaluate whether a policy decision can proceed without further interaction.
+  //   policyDecision   - the PolicyEngine decision (carries effect +
+  //                      confirmationLevel).
+  //   autoApprove      - caller-supplied blanket approval.
+  //   approvalCommitment- the cryptographic commitment (SHA-256 over the
+  //                      canonical ApprovalManifest) the approval is bound to.
+  //                      Echoed back on the decision so the runtime records
+  //                      exactly what was approved and can detect a later plan
+  //                      whose commitment differs.
+  evaluate({ policyDecision, autoApprove = false, approvalCommitment = null }) {
     if (!policyDecision || !policyDecision.effect) {
       return {
         required: true,
@@ -16,10 +44,13 @@ export class PermissionBroker {
       };
     }
 
+    const confirmationLevel = policyDecision.confirmationLevel ?? null;
+
     if (policyDecision.effect === PolicyEffect.DENY) {
       return {
         required: false,
         approved: false,
+        confirmationLevel,
         reason: policyDecision.reason
       };
     }
@@ -28,6 +59,7 @@ export class PermissionBroker {
       return {
         required: false,
         approved: true,
+        confirmationLevel,
         reason: "No additional approval required by policy."
       };
     }
@@ -35,10 +67,35 @@ export class PermissionBroker {
     return {
       required: true,
       approved: autoApprove === true,
+      confirmationLevel,
+      // The approval, if granted, is bound to THIS commitment. A later resume
+      // whose recomputed commitment differs must not reuse this approval.
+      approvalCommitment,
       reason: autoApprove === true
         ? "Approval granted by caller."
         : "Approval required for this action."
     };
+  }
+
+  // Build the cryptographic approval manifest + commitment for a plan, bound to
+  // this broker's installation key. This is the authoritative, security-material
+  // commitment an approval is granted against (see approval-manifest.js). A
+  // change to ANY security-material field — capability, version, dependencies,
+  // ordering, permissions, elevation, rollback requirement, non-secret input, or
+  // a secret VALUE (via keyed HMAC, no plaintext) — changes the commitment.
+  //   priorManifest lets a legitimate redacted secret round-trip on resume.
+  buildApprovalCommitment(plan, { priorManifest = null } = {}) {
+    return buildApprovalManifest(plan, {
+      key: this._installationKey,
+      resolveVersion: this.resolveCapabilityVersion,
+      priorManifest
+    });
+  }
+
+  // Back-compat convenience: the bare commitment string for a plan. Prefer
+  // buildApprovalCommitment (returns the full manifest for persistence).
+  approvalCommitment(plan, options = {}) {
+    return this.buildApprovalCommitment(plan, options).commitment;
   }
 
   // Authoritative capability permission enforcement. Deny-by-default: a

@@ -10,8 +10,33 @@ export class CapabilityLifecyclePipeline {
     const capability = this.registry.get(task.capability);
     if (!capability) throw new Error(`Unknown capability ${task.capability}`);
     if (!isCapabilityHealthy(capability, context)) throw new Error(`Capability ${task.capability} is not healthy`);
-    if (capability.requirements.elevation !== "NONE" && !context.privilegeApproved) {
-      throw new Error(`Capability ${task.capability} requires elevation`);
+    // ELEVATION ROUTING INVARIANT (M2.1 Part E/F). Elevation is NOT a boolean the
+    // caller can assert to run an arbitrary execute(). An elevated capability may
+    // only be prepared when (a) policy approved elevation AND (b) it binds to a
+    // bounded privileged operation that is actually routable in THIS runtime
+    // (i.e. a helper is wired and the operation is in the live allow-list). This
+    // is what guarantees the privileged mutation is executed exclusively through
+    // the bounded trust boundary, not via a self-supplied handler.
+    const requiresElevation = (capability.requirements?.elevation ?? "NONE") !== "NONE";
+    if (requiresElevation) {
+      if (!context.privilegeApproved) {
+        throw new Error(`Capability ${task.capability} requires elevation`);
+      }
+      const op = capability.privilegedOperation;
+      const routable = this.registry.privilegedOperations instanceof Set
+        && op
+        && this.registry.privilegedOperations.has(op);
+      if (!routable) {
+        throw new Error(
+          `Capability ${task.capability} requires elevation but has no bounded privileged route ` +
+          `(operation: ${op ?? "none"}). Refusing to execute an elevated capability outside the helper boundary.`
+        );
+      }
+      await this.emit("CAPABILITY_ELEVATION_ROUTED", {
+        taskId: task.taskId,
+        capability: capability.name,
+        privilegedOperation: op
+      });
     }
     if (typeof context.authorize === "function") {
       const decision = await context.authorize(capability);

@@ -82,6 +82,86 @@ test("audit chain detects a deleted (reordered) entry", async () => {
   }
 });
 
+test("audit chain detects tail truncation via the authenticated anchor", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-audit-"));
+  try {
+    const auditDir = path.join(root, "audit");
+    const repo = new AuditRepository(auditDir);
+    for (let i = 0; i < 5; i += 1) {
+      await repo.append("session_t", "TEST_EVENT", { index: i });
+    }
+    // Healthy baseline: full chain + anchor agree.
+    assert.equal((await repo.verifyChain()).valid, true);
+
+    // Truncate the TAIL. The remaining 3-row prefix is itself a valid chain, so
+    // the hash walk alone cannot detect this — only the anchor (still at seq 5) can.
+    const db = new DatabaseSync(path.join(auditDir, "audit.sqlite"));
+    try {
+      db.prepare(`DELETE FROM audit_events WHERE seq IN (4, 5)`).run();
+    } finally {
+      db.close();
+    }
+
+    const verification = await repo.verifyChain();
+    assert.equal(verification.valid, false);
+    assert.match(verification.error, /Truncation detected/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("audit chain detects anchor tampering (forged high-water mark)", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-audit-"));
+  try {
+    const auditDir = path.join(root, "audit");
+    const repo = new AuditRepository(auditDir);
+    for (let i = 0; i < 3; i += 1) {
+      await repo.append("session_anchor", "TEST_EVENT", { index: i });
+    }
+    assert.equal((await repo.verifyChain()).valid, true);
+
+    // Rewrite the anchor file to lower the high-water mark without the HMAC key —
+    // an attacker's attempt to make a future truncation look legitimate. The HMAC
+    // no longer verifies, so the anchor itself is flagged as tampered.
+    const anchorPath = path.join(auditDir, "audit.anchor");
+    await fs.writeFile(anchorPath, JSON.stringify({ maxSeq: 1, entryHash: "0".repeat(64), hmac: "deadbeef" }));
+
+    const verification = await repo.verifyChain();
+    assert.equal(verification.valid, false);
+    assert.match(verification.error, /anchor tampered/i);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("audit chain rejects a stray unsequenced row inserted after migration", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-audit-"));
+  try {
+    const auditDir = path.join(root, "audit");
+    const repo = new AuditRepository(auditDir);
+    await repo.append("session_u", "A", {});
+    await repo.append("session_u", "B", {});
+
+    // Insert a row with NULL seq directly — the classic evasion the old
+    // `WHERE seq IS NOT NULL` filter allowed to slip past verification.
+    const db = new DatabaseSync(path.join(auditDir, "audit.sqlite"));
+    try {
+      db.prepare(
+        `INSERT INTO audit_events (event_id, session_id, event_type, event_timestamp, protocol_version, payload_json)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run("stray-1", "session_u", "INJECTED", "2020-01-01T00:00:00.000Z", "1.0", JSON.stringify({ evil: true }));
+    } finally {
+      db.close();
+    }
+
+    const verification = await repo.verifyChain();
+    assert.equal(verification.valid, false);
+    assert.match(verification.error, /unsequenced/i);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy rows (seq NULL) are backfilled into the chain and then verified", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-audit-"));
   try {

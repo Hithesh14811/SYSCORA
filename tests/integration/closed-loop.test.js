@@ -190,6 +190,43 @@ describe("Closed-Loop Intelligence", () => {
     assert.ok(attempts >= 2, "capability should have run again after replan");
   });
 
+  it("does not replan a failed mutating task", async () => {
+    let plans = 0;
+    const { runtime } = await buildRuntime({
+      capabilities: [{
+        name: "test.mutating-timeout",
+        version: "1.0.0",
+        description: "mutation whose postcondition cannot be verified",
+        inputSchema: { type: "object", properties: {}, required: [] },
+        riskMetadata: { level: "MEDIUM" },
+        reversibility: "PARTIAL",
+        preconditions: () => true,
+        execute: async () => ({ changed: true }),
+        observe: okObserve("test.mutating-timeout"),
+        verify: async () => ({ status: "FAILED", message: "state is uncertain", confidence: 1 }),
+        rollback: null,
+        timeout: 5000,
+        retryPolicy: { maxAttempts: 1 }
+      }],
+      planFor: () => {
+        plans += 1;
+        return [task("test.mutating-timeout")];
+      }
+    });
+
+    const session = await runtime.submitIntent("perform the timed mutation", {
+      autoApprove: true,
+      operation: "test.mutating-timeout",
+      category: "SYSTEM",
+      normalizedGoal: "Perform the timed mutation"
+    });
+
+    assert.equal(session.finalResponse.status, "FAILED", JSON.stringify(session.finalResponse));
+    assert.equal(plans, 1, "a failed mutation must not be replanned or retried");
+    assert.ok(session.events.some((event) => event.eventType === "RECOVERY_DECIDED" && event.details.action === "abort"));
+    assert.ok(!session.events.some((event) => event.eventType === "STARTING_REPLANNING"));
+  });
+
   it("exhausts recovery budget and stops (never loops forever)", async () => {
     let runs = 0;
     const { runtime } = await buildRuntime({

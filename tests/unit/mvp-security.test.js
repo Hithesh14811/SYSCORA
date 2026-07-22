@@ -124,6 +124,10 @@ test("runtime can resume in-flight approval session after restart", async () => 
     await fs.mkdir(workspace, { recursive: true });
 
     const runtimeBeforeRestart = createRuntime(workspace);
+    // Editing an EXISTING file is one of the three actions that still require
+    // approval under the autonomous-execution policy; pre-create .env so the env
+    // set parks in AWAITING_APPROVAL (creating a new .env would be autonomous).
+    await fs.writeFile(path.join(workspace, ".env"), "SEED=1\n", "utf8");
     const awaiting = await runtimeBeforeRestart.runSetProjectEnvVariable(
       {
         rawText: "Set FEATURE_FLAG for the current project",
@@ -148,6 +152,40 @@ test("runtime can resume in-flight approval session after restart", async () => 
   }
 });
 
+test("resume voids a prior approval if the plan changed after approval was requested", async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-mutate-"));
+  try {
+    const workspace = path.join(tempRoot, "workspace");
+    await fs.mkdir(workspace, { recursive: true });
+
+    const runtime = createRuntime(workspace);
+    // Editing an existing file still requires approval — pre-create .env so the set parks.
+    await fs.writeFile(path.join(workspace, ".env"), "SEED=1\n", "utf8");
+    const awaiting = await runtime.runSetProjectEnvVariable(
+      {
+        rawText: "Set FEATURE_FLAG for the current project",
+        entities: { workspacePath: workspace, key: "FEATURE_FLAG", value: "true" }
+      },
+      { autoApprove: false }
+    );
+    assert.equal(awaiting.finalResponse.status, "AWAITING_APPROVAL");
+    assert.ok(awaiting.approvalCommitment, "approval must be bound to a cryptographic commitment");
+
+    // Tamper with the suspended session's plan (different target key) before
+    // resuming. The approval was shown for FEATURE_FLAG, not HIJACKED_KEY.
+    const session = await runtime.sessionStore.get(awaiting.sessionId);
+    session.plan.taskGraph.tasks[0].inputs.key = "HIJACKED_KEY";
+    await runtime.sessionStore.save(session);
+
+    const resumed = await runtime.resumeSessionById(awaiting.sessionId, { autoApprove: true });
+    // The mutated plan must NOT auto-run on the stale approval; it re-gates.
+    assert.equal(resumed.finalResponse.status, "AWAITING_APPROVAL");
+    assert.notEqual(resumed.currentState, "COMPLETED");
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("runtime supports explicit pause and cancel controls", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-control-"));
   try {
@@ -155,6 +193,8 @@ test("runtime supports explicit pause and cancel controls", async () => {
     await fs.mkdir(workspace, { recursive: true });
 
     const runtime = createRuntime(workspace);
+    // Editing an existing file still requires approval — pre-create .env so the sets park.
+    await fs.writeFile(path.join(workspace, ".env"), "SEED=1\n", "utf8");
     const awaiting = await runtime.runSetProjectEnvVariable(
       {
         rawText: "Set CONTROL_TEST for the current project",

@@ -38,7 +38,9 @@ async function readJsonBody(request) {
 
 function parseStaticPath(urlPathname) {
   if (urlPathname === "/") {
-    return path.join(desktopDirectory, "index.html");
+    // The demo chat is the default face of the MVP. The developer console
+    // remains available at /console.html for debugging.
+    return path.join(desktopDirectory, "demo.html");
   }
   const safePath = path.normalize(urlPathname).replace(/^(\.\.[/\\])+/, "");
   return path.join(desktopDirectory, safePath);
@@ -107,6 +109,24 @@ export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
         sendJson(response, 200, {
           envelope: buildEnvelope("intent_response", legacy, parsed.requestId),
           ...legacy
+        });
+        return;
+      }
+
+      if (request.method === "POST" && requestUrl.pathname === "/api/intents/acknowledge") {
+        const acknowledgementStartedAt = performance.now();
+        const body = await readJsonBody(request);
+        const parsed = parseRequestBodyWithEnvelope(body, "intent_acknowledgement_request");
+        const payload = parsed.payload;
+        if (!payload.text) {
+          sendJson(response, 400, { error: "text is required." });
+          return;
+        }
+        const acknowledgement = await runtime.acknowledgeIntent(payload.text);
+        acknowledgement.latencyMs = Math.round(performance.now() - acknowledgementStartedAt);
+        sendJson(response, 200, {
+          envelope: buildEnvelope("intent_acknowledgement_response", acknowledgement, parsed.requestId),
+          acknowledgement
         });
         return;
       }
@@ -483,10 +503,13 @@ export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
         return;
       }
 
-      let file = await fs.readFile(staticPath, "utf8");
-      if (requestUrl.pathname === "/" || requestUrl.pathname === "/index.html") {
-        file = file.replace("__SYSCORA_API_TOKEN__", apiToken);
-      }
+      // Static assets are served WITHOUT the API token. The token is never
+      // embedded in served HTML/JS because GET / is unauthenticated — any local
+      // process or reachable browser context could otherwise scrape it and then
+      // drive the mutating API. Clients obtain the token out-of-band: the Electron
+      // shell injects it in-process via a contextBridge preload; a plain browser
+      // reads it from the daemon stdout banner and enters it in the Connect panel.
+      const file = await fs.readFile(staticPath, "utf8");
       response.writeHead(200, { "content-type": inferContentType(staticPath) });
       response.end(file);
     } catch (error) {

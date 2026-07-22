@@ -1,4 +1,6 @@
 import crypto from "crypto";
+import os from "node:os";
+import path from "node:path";
 const createId = () => crypto.randomBytes(16).toString("hex");
 import { validateSchema } from "../../model-providers/src/index.js";
 
@@ -28,6 +30,17 @@ export function buildTask(capability, inputs = {}, overrides = {}) {
     idempotency: overrides.idempotency ?? true,
     rollbackRequired: overrides.rollbackRequired ?? false
   };
+}
+
+// Model providers legitimately use different entity names for a song. Normalize
+// them at the capability boundary so a valid model intent can never become an
+// empty Spotify precondition. Add the artist when supplied to disambiguate the
+// search without making it a separate Spotify-specific LLM prompt.
+function spotifyQuery(entities = {}) {
+  const title = entities.query ?? entities.trackQuery ?? entities.track ?? entities.trackTitle ?? entities.song ?? entities.songTitle ?? entities.title;
+  const artist = typeof entities.artist === "string" ? entities.artist.trim() : "";
+  if (typeof title !== "string" || !title.trim()) return undefined;
+  return artist && !title.toLowerCase().includes(artist.toLowerCase()) ? `${title.trim()} ${artist}` : title.trim();
 }
 
 // Operation-driven deterministic plans. Each entry maps a named operation to a
@@ -132,6 +145,14 @@ export const OPERATION_PLANS = {
       timeout: 30000
     })
   ],
+  "package.winget.inspect": (e) => [
+    buildTask("package.winget.inspect", { id: e.id }, {
+      goal: `Check whether ${e.id} is installed`,
+      description: "Check installed-package status via WinGet",
+      completionCriteria: [`Reported whether ${e.id} is installed`],
+      timeout: 30000
+    })
+  ],
   "package.winget.install": (e) => [
     buildTask("package.winget.install", { id: e.id ?? e.key }, {
       goal: "Install package",
@@ -222,6 +243,45 @@ export const OPERATION_PLANS = {
       description: "Open the default browser to a search results page",
       completionCriteria: ["Browser launched"],
       timeout: 15000
+    })
+  ],
+  "application.launch": (e) => [
+    buildTask("application.launch", { application: e.application }, {
+      goal: `Open ${e.application}`,
+      description: "Launch the requested allow-listed desktop application",
+      completionCriteria: [`${e.application} launched`], timeout: 15000, retryBudget: 0
+    })
+  ],
+  "system.volume.adjust": (e) => [
+    buildTask("system.volume.adjust", { direction: e.direction, steps: e.steps }, {
+      goal: `${e.direction === "down" ? "Decrease" : "Increase"} system volume`,
+      description: "Send bounded Windows media-volume key commands",
+      completionCriteria: [`Volume ${e.direction} command sent`], timeout: 5000, retryBudget: 0
+    })
+  ],
+  "spotify.track.open": (e) => [
+    buildTask("spotify.track.open", { query: spotifyQuery(e) }, {
+      goal: `Open Spotify results for ${spotifyQuery(e)}`,
+      description: "Hand the requested track search directly to Spotify",
+      completionCriteria: [`Spotify results opened for ${spotifyQuery(e)}`],
+      timeout: 5000
+    })
+  ],
+  // Direct desktop playback. A single typed task drives launch -> wait -> search
+  // -> select -> activate play -> verify inside the capability (which shares one
+  // live UI-automation session and verifies playback from the window title). No
+  // WinGet check or process-list scan is composed — Spotify is launched through
+  // the known route inside the capability itself. Bounded timeout + retryBudget 0
+  // (plus the capability's ABORT_ON_FAILURE) prevent any replan loop.
+  "spotify.track.play": (e) => [
+    buildTask("spotify.track.play", { query: spotifyQuery(e) }, {
+      goal: `Play ${spotifyQuery(e)} in Spotify`,
+      description: "Launch/focus Spotify, search, select the track, and start playback",
+      riskHints: "LOW",
+      completionCriteria: [`${spotifyQuery(e)} is playing in Spotify`],
+      verificationCriteria: [`Spotify is playing ${spotifyQuery(e)}`],
+      timeout: 28000,
+      retryBudget: 0
     })
   ],
   // Developer workflow. The caller resolves ordered steps from the project
@@ -363,20 +423,35 @@ export class GeneralPlanner {
     previousExecutionState = null
   ) {
     let plan = null;
+    // Planner source marker (Phase 6): the runtime/audit distinguishes a plan the
+    // MODEL produced from one the DETERMINISTIC fallback produced. Never claim
+    // model reasoning occurred when it did not.
+    let plannerSource = "DETERMINISTIC_FALLBACK";
 
     // LLM planning goes through the ReasoningEngine, which validates output,
     // performs bounded repair, and rejects hallucinated capabilities. It returns
     // { ok, data } and NEVER throws — so any failure (no model, bad JSON,
     // timeout, hallucination) falls through to the deterministic planner below.
-    if (this.reasoningEngine && this.reasoningEngine.hasModel()) {
-      const result = await this.reasoningEngine.composeTaskGraph(userIntent, {
-        context: resolvedContext,
-        semanticState: relevantSemanticState,
-        memory: relevantMemory,
-        previousExecutionState
-      });
-      if (result.ok && this._isStructurallyPlan(result.data)) {
-        plan = result.data;
+    // A fast, cached health gate means an UNAVAILABLE provider is skipped in
+    // ~1s instead of burning 30-45s of retries before the fallback (Phase 6).
+    // Explicit operations are already typed, bounded requests. Calling a model
+    // to rediscover their one-to-one plan adds latency without adding judgment.
+    if (userIntent.operation && OPERATION_PLANS[userIntent.operation]) {
+      plan = this.fallbackPlan(userIntent, resolvedContext);
+      plannerSource = "DIRECT_OPERATION";
+    } else if (this.reasoningEngine && this.reasoningEngine.hasModel()) {
+      const healthy = await this.reasoningEngine.isModelHealthy();
+      if (healthy) {
+        const result = await this.reasoningEngine.composeTaskGraph(userIntent, {
+          context: resolvedContext,
+          semanticState: relevantSemanticState,
+          memory: relevantMemory,
+          previousExecutionState
+        });
+        if (result.ok && this._isStructurallyPlan(result.data)) {
+          plan = result.data;
+          plannerSource = "MODEL_REASONING";
+        }
       }
     }
 
@@ -384,6 +459,7 @@ export class GeneralPlanner {
     // or the model output was rejected. The runtime always has a valid plan.
     if (!this._isStructurallyPlan(plan)) {
       plan = this.fallbackPlan(userIntent, resolvedContext);
+      plannerSource = "DETERMINISTIC_FALLBACK";
     }
 
     // An LLM plan is a proposal only. Normalize it against the capability
@@ -392,6 +468,7 @@ export class GeneralPlanner {
     plan = this._normalizePlan(plan);
     if (!new PlanValidator(this.capabilityRegistry).validatePlan(plan.taskGraph).valid) {
       plan = this._normalizePlan(this.fallbackPlan(userIntent, resolvedContext));
+      plannerSource = "DETERMINISTIC_FALLBACK";
     }
 
     // Ensure all required fields exist
@@ -400,6 +477,8 @@ export class GeneralPlanner {
     plan.parentPlanId = plan.parentPlanId ?? null;
     plan.finalSuccessCriteria = plan.finalSuccessCriteria ?? ["Task completed"];
     plan.taskGraph.graphId = plan.taskGraph.graphId ?? createId();
+    // Record which planner produced this plan so the runtime can audit it.
+    plan.plannerSource = plannerSource;
     return plan;
   }
 
@@ -485,66 +564,193 @@ export class GeneralPlanner {
     };
   }
 
+  // Deterministic fallback matcher for the supported MVP demo workflows. This is
+  // the safety net when no model is configured / the model failed — it is NOT a
+  // second LLM. It recognizes the FIVE controlled workflow families by robust
+  // keyword/entity signals (not one exact sentence) and composes REAL registered
+  // capabilities into REAL TaskGraphs that pass through the same canonical
+  // runtime (validate -> risk -> policy -> scheduler -> observe -> verify). It
+  // never fabricates capabilities, never bypasses the runtime, and only builds
+  // BOUNDED-safe filesystem targets. Order matters: the most specific families
+  // (port, filesystem, winget) are matched before the broad system/dev family.
   _keywordTasks(userIntent) {
-    const tasks = [];
-    const category = userIntent.category;
-    const lower = userIntent.rawText.toLowerCase();
+    const lower = String(userIntent.rawText ?? "").toLowerCase();
     const entities = userIntent.entities || {};
+    const workspacePath = entities.workspacePath ?? process.cwd();
 
-    if (category === "SYSTEM" && lower.includes("system")) {
-      tasks.push(buildTask("system.inspect", {}, {
+    // --- WORKFLOW B: port troubleshooting (read-only inspection) --------------
+    // A port number in the text/entities is a strong, unambiguous signal.
+    const port = entities.port ?? this._extractPort(lower);
+    if (port && /\bport\b/.test(lower)) {
+      return [buildTask("process.port.inspect", { port: Number(port) }, {
+        goal: `Inspect port ${port}`,
+        description: `Find which process is using port ${port}`,
+        riskHints: "LOW",
+        completionCriteria: [`Identified what is using port ${port}`],
+        timeout: 10000
+      })];
+    }
+
+    // --- WORKFLOW D: WinGet software discovery (search only) ------------------
+    const wantsSearch = /\b(winget|package manager)\b/.test(lower)
+      || (/\b(find|search|look up|discover)\b/.test(lower) && /\b(package|app|application|software|install)\b/.test(lower));
+    if (wantsSearch) {
+      const query = entities.query ?? this._extractSearchTerm(lower);
+      if (query) {
+        return [buildTask("package.winget.search", { query }, {
+          goal: `Search WinGet for ${query}`,
+          description: `Search Windows Package Manager for "${query}"`,
+          riskHints: "LOW",
+          completionCriteria: [`WinGet search for ${query} complete`],
+          timeout: 30000
+        })];
+      }
+    }
+
+    // --- WORKFLOW C: file/folder creation (bounded, multi-step) ---------------
+    // Only compose filesystem mutations when the request clearly asks to create
+    // a folder/file. The target is a BOUNDED demo directory under the system temp
+    // dir — never an arbitrary caller-supplied path through this fallback.
+    const wantsFolder = /\b(folder|directory|workspace)\b/.test(lower) && /\b(create|make|new|set up|setup)\b/.test(lower);
+    const wantsFile = /\b(file|config|readme|\.txt|\.json)\b/.test(lower) && /\b(create|make|new|write|add|put)\b/.test(lower);
+    if (wantsFolder || wantsFile) {
+      const dir = this._safeDemoDir(entities);
+      const fileName = this._safeFileName(entities) ?? "config.json";
+      const filePath = path.join(dir, fileName);
+      const content = typeof entities.content === "string" ? entities.content : "{\n  \"createdBy\": \"SYSCORA\"\n}\n";
+      const mkdir = buildTask("filesystem.createDirectory", { directoryPath: dir }, {
+        goal: "Create folder",
+        description: `Create the folder ${dir}`,
+        riskHints: "MEDIUM",
+        expectedStateChanges: ["directory"],
+        completionCriteria: ["Directory exists"],
+        rollbackRequired: false,
+        timeout: 10000
+      });
+      const write = buildTask("filesystem.write", { filePath, content }, {
+        goal: "Create config file",
+        description: `Write ${filePath}`,
+        riskHints: "MEDIUM",
+        dependencies: [mkdir.taskId],
+        expectedStateChanges: ["file"],
+        completionCriteria: ["File written and verified"],
+        rollbackRequired: true,
+        timeout: 10000
+      });
+      const read = buildTask("filesystem.read", { filePath }, {
+        goal: "Verify config file",
+        description: `Read back ${filePath} to confirm it exists`,
+        riskHints: "LOW",
+        dependencies: [write.taskId],
+        completionCriteria: ["File contents confirmed"],
+        timeout: 10000
+      });
+      return [mkdir, write, read];
+    }
+
+    // --- WORKFLOW E: project inspection (read-only) ---------------------------
+    const wantsProject = /\b(project|repo|repository|codebase|this code)\b/.test(lower)
+      && /\b(inspect|analyz|run|start|set up|setup|need|require|depend|stack|how do i)\b/.test(lower);
+    if (wantsProject) {
+      const tasks = [buildTask("environment.project.inspect", { workspacePath }, {
+        goal: "Inspect project",
+        description: "Inspect the project workspace for type, tooling, and setup",
+        riskHints: "LOW",
+        completionCriteria: ["Project inspected"],
+        timeout: 15000
+      })];
+      // Enrich read-only signals: git + package manager, independent tasks.
+      tasks.push(buildTask("git.repository.inspect", { workspacePath }, {
+        goal: "Inspect git repository",
+        description: "Inspect the git repository state",
+        riskHints: "LOW",
+        completionCriteria: ["Git repository inspected"],
+        timeout: 10000
+      }));
+      tasks.push(buildTask("package.manager.inspect", { workspacePath }, {
+        goal: "Inspect package manager",
+        description: "Detect the project's package manager",
+        riskHints: "LOW",
+        completionCriteria: ["Package manager detected"],
+        timeout: 15000
+      }));
+      return tasks;
+    }
+
+    // --- WORKFLOW A: system + developer intelligence (read-only) --------------
+    // Broadest family: "tell me about this computer", "what dev tools are
+    // installed", "inspect my PC", "what's installed for development". Composes a
+    // read-only snapshot: system info + developer tooling (git/docker/pkg-mgr).
+    const wantsSystem = /\b(system|computer|machine|pc|this box|hardware|spec)\b/.test(lower);
+    const wantsDevTools = /\b(dev|develop|development|tool|tooling|git|node|docker|python|installed|environment)\b/.test(lower);
+    if (wantsSystem || wantsDevTools) {
+      const tasks = [buildTask("system.inspect", {}, {
         goal: "Inspect system",
-        description: "Retrieve system summary",
+        description: "Retrieve system summary (OS, hardware, environment)",
         riskHints: "LOW",
         completionCriteria: ["Got system info"],
         timeout: 10000
-      }));
+      })];
+      if (wantsDevTools) {
+        tasks.push(buildTask("git.repository.inspect", { workspacePath }, {
+          goal: "Check Git",
+          description: "Inspect Git availability / repository",
+          riskHints: "LOW",
+          completionCriteria: ["Git checked"],
+          timeout: 10000
+        }));
+        tasks.push(buildTask("docker.environment.inspect", { workspacePath }, {
+          goal: "Check Docker",
+          description: "Inspect Docker environment availability",
+          riskHints: "LOW",
+          completionCriteria: ["Docker checked"],
+          timeout: 15000
+        }));
+        tasks.push(buildTask("package.manager.inspect", { workspacePath }, {
+          goal: "Check package managers",
+          description: "Detect available package managers",
+          riskHints: "LOW",
+          completionCriteria: ["Package managers checked"],
+          timeout: 15000
+        }));
+      } else if (/\bprocess\b/.test(lower)) {
+        tasks.push(buildTask("processes.list", {}, {
+          goal: "List processes",
+          description: "List running processes",
+          riskHints: "LOW",
+          completionCriteria: ["Got process list"],
+          timeout: 15000
+        }));
+      }
+      return tasks;
     }
-    if (category === "SYSTEM" && lower.includes("process")) {
-      tasks.push(buildTask("processes.list", {}, {
-        goal: "List processes",
-        description: "List running processes",
-        riskHints: "LOW",
-        completionCriteria: ["Got process list"],
-        timeout: 15000
-      }));
-    }
-    if (category === "SYSTEM" && entities.port) {
-      tasks.push(buildTask("process.port.inspect", { port: entities.port }, {
-        goal: "Inspect port",
-        description: "Find process on port",
-        riskHints: "LOW",
-        completionCriteria: ["Got port info"],
-        timeout: 10000
-      }));
-    }
-    if (category === "ENVIRONMENT" && lower.includes("path")) {
-      tasks.push(buildTask("environment.user.inspect", {}, {
+
+    // --- Legacy narrow matches preserved for explicit env/notepad requests ----
+    if (userIntent.category === "ENVIRONMENT" && lower.includes("path")) {
+      return [buildTask("environment.user.inspect", {}, {
         goal: "Inspect environment",
         description: "Get user environment",
         riskHints: "LOW",
         completionCriteria: ["Got env info"],
         timeout: 5000
-      }));
+      })];
     }
-    if (category === "PROJECT" && entities.key && entities.value) {
-      tasks.push(buildTask("environment.project.set", {
-        workspacePath: entities.workspacePath ?? process.cwd(),
-        key: entities.key,
-        value: entities.value
+    if (userIntent.category === "PROJECT" && entities.key && entities.value) {
+      return [buildTask("environment.project.set", {
+        workspacePath, key: entities.key, value: entities.value
       }, {
         goal: "Set env var",
         description: "Set project environment variable",
         riskHints: "MEDIUM",
         expectedStateChanges: ["env.file"],
         completionCriteria: ["Env var is set and verified"],
+        rollbackRequired: true,
         timeout: 10000
-      }));
+      })];
     }
-    if (category === "APPLICATION" && entities.content && entities.filename) {
-      tasks.push(buildTask("application.notepad.launch", {
-        content: entities.content,
-        filename: entities.filename
+    if (userIntent.category === "APPLICATION" && entities.content && entities.filename) {
+      return [buildTask("application.notepad.launch", {
+        content: entities.content, filename: entities.filename
       }, {
         goal: "Notepad task",
         description: "Open Notepad and save",
@@ -553,8 +759,49 @@ export class GeneralPlanner {
         completionCriteria: ["File saved"],
         timeout: 45000,
         idempotency: false
-      }));
+      })];
     }
-    return tasks;
+    return [];
+  }
+
+  _extractPort(lower) {
+    const m = lower.match(/\bport\s+(\d{2,5})\b/) || lower.match(/\b(\d{2,5})\b/);
+    const n = m ? Number(m[1]) : NaN;
+    return Number.isFinite(n) && n > 0 && n <= 65535 ? n : null;
+  }
+
+  // Pull a package/app search term out of common phrasings. Falls back to null
+  // (the caller then declines to build a search task) rather than guessing.
+  _extractSearchTerm(lower) {
+    const patterns = [
+      /(?:search|find|look up|discover)(?:\s+winget\s+for|\s+for)?\s+([a-z0-9.+\- ]{2,40}?)(?:\s+(?:using|with|via|on|in)\b|[.?!]|$)/,
+      /winget\s+(?:for\s+)?([a-z0-9.+\- ]{2,40})/,
+      /package\s+(?:for\s+)?([a-z0-9.+\- ]{2,40})/
+    ];
+    for (const re of patterns) {
+      const m = lower.match(re);
+      if (m && m[1]) {
+        const term = m[1].trim().replace(/\b(package|app|application|software)\b/g, "").trim();
+        if (term) return term;
+      }
+    }
+    return null;
+  }
+
+  // A bounded, safe demo directory. The deterministic fallback NEVER writes to an
+  // arbitrary caller path — it uses a fixed folder under the OS temp dir so a
+  // broad NL request can't target sensitive locations. A model-driven plan can
+  // still request other (policy-gated) paths; this constraint is fallback-only.
+  _safeDemoDir(entities) {
+    const raw = typeof entities.folderName === "string" ? entities.folderName : "SYSCORA Demo";
+    const safe = raw.replace(/[^a-z0-9 _.-]/gi, "").trim().slice(0, 64) || "SYSCORA Demo";
+    return path.join(os.tmpdir(), "syscora-demo", safe);
+  }
+
+  _safeFileName(entities) {
+    const raw = typeof entities.filename === "string" ? entities.filename : null;
+    if (!raw) return null;
+    const safe = raw.replace(/[^a-z0-9 _.-]/gi, "").trim().slice(0, 64);
+    return safe || null;
   }
 }

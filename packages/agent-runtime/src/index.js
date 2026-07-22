@@ -2,6 +2,8 @@ import path from "node:path";
 import {
   PolicyEffect,
   RuntimeState,
+  RiskDimension,
+  ConfirmationLevel,
   createId,
   validateExecutionSession,
   validateIntent
@@ -128,6 +130,7 @@ export class AgentRuntime {
     const session = {
       sessionId: createId("session"),
       createdAt: new Date().toISOString(),
+      receivedAtMs: Date.now(),
       currentState: RuntimeState.RECEIVE_INTENT,
       intent: null,
       context: null,
@@ -140,8 +143,17 @@ export class AgentRuntime {
       verifications: [],
       diagnoses: [],
       recoveryBudget: createRecoveryBudget(),
+      // Replan attempts are session state, not request-local state. A session
+      // may pause for approval between replans, so this counter must survive
+      // resume instead of resetting and reopening the recovery loop.
+      replanAttempts: 0,
       finalResponse: null,
-      events: []
+      events: [],
+      // The caller's standing authorization for this session. Recorded so a
+      // replan re-enters the SAME authorization gate with the same standing
+      // (an autoApprove caller does not have to re-confirm an equivalent plan,
+      // but a materially riskier replan is still re-gated — see _authorizePlan).
+      autoApprove: options.autoApprove === true
     };
 
     await this.addSessionEvent(session, "INTENT_RECEIVED", { rawText });
@@ -154,14 +166,59 @@ export class AgentRuntime {
       await this.addSessionEvent(session, "INTENT_CLASSIFIED", session.intent);
       await this.persistSession(session);
 
-      if (session.intent.ambiguity) {
-        session.currentState = RuntimeState.AMBIGUOUS_INTENT;
-        session.finalResponse = { status: "NEEDS_CLARIFICATION", questions: session.intent.clarificationQuestions };
-        await this.persistSession(session);
-        return session;
+      // Direct commands do not wait for a model plan, but they do not bypass the
+      // LLM. Start a non-authoritative interpretation in parallel with the typed
+      // execution lane. Its result is audited for context/diagnostics; it can
+      // never replace the already-validated capability or widen its scope.
+      if (session.intent.operation) this._startParallelIntentInterpretation(session, rawText);
+
+      // 1b. CONVERSATIONAL FAST PATH (offline fallback only). When a REAL model is
+      // healthy, every message goes through the LLM-first classifier + planner and
+      // a greeting simply produces an empty plan → the model `converse` path below
+      // answers it, so no keyword heuristic pre-empts the model. This regex
+      // shortcut therefore runs ONLY when the model is unavailable/unhealthy: it
+      // keeps a greeting from triggering a bogus deterministic plan offline while
+      // never overriding the model when one is present. It performs NO actions and
+      // mutates NO state.
+      const modelHealthyForConversational = this.reasoningEngine?.hasModel?.()
+        ? await this._isModelHealthy()
+        : false;
+      if (!modelHealthyForConversational && this._looksConversational(rawText)) {
+        let conversational = null;
+        try {
+          const catalog = (this.capabilityRegistry?.getCatalog?.() ?? []).map((c) => c.name);
+          const c = await this.reasoningEngine?.converse?.(rawText, { capabilities: catalog });
+          if (c?.ok) conversational = c.text;
+        } catch { /* best-effort; fall through to clarification below */ }
+        if (conversational) {
+          session.currentState = RuntimeState.COMPLETED;
+          session.finalResponse = { status: "ANSWERED", message: conversational, rawText, conversational: true };
+          await this.addSessionEvent(session, "CONVERSATIONAL_REPLY", { rawText });
+          session.plan = null;
+          await this.persistSession(session);
+          return session;
+        }
       }
 
-      // 2. Collect context (including semantic state and memory)
+      // 2. Collect context (including semantic state and memory). A known
+      // read-only operation — or a direct, self-contained desktop action like a
+      // Spotify play — already has its exact typed scope, so skip the expensive
+      // advisory context/perception work; policy and capability verification
+      // still run unchanged below.
+      const fastReadOnlyOperation = new Set([
+        "package.winget.inspect",
+        "package.winget.search",
+        "system.inspect",
+        "system.summary",
+        "processes.list",
+        "process.port.inspect",
+        "environment.user.inspect",
+        "application.launch",
+        "browser.search",
+        "system.volume.adjust",
+        "spotify.track.open",
+        "spotify.track.play"
+      ]).has(session.intent.operation);
       const requiredContext = session.intent.requiredContext || [];
       const baseContext = await this.contextEngine.collectContext(requiredContext, session.intent.entities);
       let semanticContext = [];
@@ -170,7 +227,7 @@ export class AgentRuntime {
       // Perception populates the world model from live Windows state (via its
       // read-only providers), then the planner receives only a relevant, budgeted
       // subgraph — never the whole graph.
-      if (this.perception) {
+      if (this.perception && !fastReadOnlyOperation) {
         try {
           await this.perception.perceive({
             workspacePath: session.intent.entities?.workspacePath,
@@ -183,7 +240,7 @@ export class AgentRuntime {
         session.semanticSubgraph = subgraph;
       }
 
-      if (this.memory) {
+      if (this.memory && !fastReadOnlyOperation) {
         relevantMemory = await this.memory.retrieveRelevant(session.intent);
       }
 
@@ -200,8 +257,8 @@ export class AgentRuntime {
 
       await this.addSessionEvent(session, "CONTEXT_COLLECTED", {
         types: requiredContext,
-        includesSemantic: !!this.semanticState,
-        includesMemory: !!this.memory,
+        includesSemantic: !fastReadOnlyOperation && !!this.semanticState,
+        includesMemory: !fastReadOnlyOperation && !!this.memory,
         estimatedTokens: planningContext.estimatedTokens,
         tokenBudget: planningContext.tokenBudget
       });
@@ -231,53 +288,65 @@ export class AgentRuntime {
         { priorProcedures, priorFailures }
       );
       originalPlan = session.plan;
-      await this.addSessionEvent(session, "PLAN_GENERATED", session.plan);
-      await this.persistSession(session);
 
-      // 4. Validate plan
-      session.currentState = RuntimeState.VALIDATE_PLAN;
-      const planValidation = this.planValidator.validatePlan(session.plan.taskGraph);
-      await this.addSessionEvent(session, "PLAN_VALIDATED", planValidation);
-      if (!planValidation.valid) {
-        session.currentState = RuntimeState.PLAN_REJECTED;
-        session.finalResponse = { status: "PLAN_REJECTED", errors: planValidation.errors };
-        await this.persistSession(session);
-        return session;
-      }
-      await this.persistSession(session);
+      // Graceful no-plan path (MVP). When neither a model nor the deterministic
+      // planner could map the request to any capability, the task graph is empty.
+      // Persisting/validating that would throw ("taskGraph.tasks must contain at
+      // least one task"), so instead we return a friendly NEEDS_CLARIFICATION
+      // response that the UI can show — never a protocol crash on a request the
+      // system simply doesn't know how to handle yet.
+      const plannedTasks = session.plan?.taskGraph?.tasks ?? [];
+      if (plannedTasks.length === 0) {
+        // The request did not map to any capability. Before giving up, try a
+        // pure conversational answer via the model (greetings, "what model are
+        // you", capability questions). This performs NO actions and mutates NO
+        // state — it only replies with text. If the model is unavailable or
+        // declines, fall back to the honest clarification message.
+        let conversational = null;
+        try {
+          const catalog = (this.capabilityRegistry?.getCatalog?.() ?? []).map((c) => c.name);
+          const c = await this.reasoningEngine?.converse?.(rawText, { capabilities: catalog });
+          if (c?.ok) conversational = c.text;
+        } catch { /* conversational is best-effort; fall through to clarification */ }
 
-      // 5. Assess risk
-      session.currentState = RuntimeState.ASSESS_RISK;
-      session.riskAssessment = this.riskEngine.assess(session.plan, session.context);
-      await this.addSessionEvent(session, "RISK_ASSESSED", session.riskAssessment);
-      await this.persistSession(session);
-
-      // 6. Apply policy
-      session.currentState = RuntimeState.APPLY_POLICY;
-      session.policyDecision = this.policyEngine.decide(session.riskAssessment, session.plan);
-      await this.addSessionEvent(session, "POLICY_DECIDED", session.policyDecision);
-      await this.persistSession(session);
-
-      if (session.policyDecision.effect === PolicyEffect.DENY) {
         session.currentState = RuntimeState.FAILED;
-        session.finalResponse = { status: "DENIED", reason: session.policyDecision.reason };
+        session.finalResponse = conversational
+          ? { status: "ANSWERED", message: conversational, rawText, conversational: true }
+          : {
+              status: "NEEDS_CLARIFICATION",
+              message:
+                "I couldn't map that request to something I know how to do yet. Try rephrasing, " +
+                "or ask for one of my supported actions (inspect the system, list processes, " +
+                "check a port, read/write files, inspect a project, search or install a package).",
+              rawText
+            };
+        await this.addSessionEvent(session, conversational ? "CONVERSATIONAL_REPLY" : "PLAN_EMPTY_NEEDS_CLARIFICATION", { rawText });
+        // Persist WITHOUT the full plan object (empty graph fails validation).
+        session.plan = null;
         await this.persistSession(session);
         return session;
       }
 
-      // 7. Check approval
-      session.currentState = RuntimeState.REQUEST_CONFIRMATION_IF_REQUIRED;
-      const permissionDecision = this.permissionBroker.evaluate({
-        policyDecision: session.policyDecision,
+      await this.addSessionEvent(session, "PLAN_GENERATED", session.plan);
+      // Distinguish, in the audit, whether the MODEL or the DETERMINISTIC
+      // fallback produced this plan — never let a fallback look like reasoning.
+      await this.addSessionEvent(session, "PLANNER_SOURCE", { source: session.plan?.plannerSource ?? "DETERMINISTIC_FALLBACK" });
+      await this.persistSession(session);
+
+      // 4-7. Validate -> assess risk -> apply policy -> evaluate approval, all
+      // through the ONE canonical plan authorization gate. Initial plans and
+      // replans call the identical gate, so a plan can never reach execution
+      // without a fresh risk assessment, policy decision, and approval bound to
+      // its exact cryptographic commitment.
+      const gate = await this._authorizePlan(session, session.plan, {
+        phase: "INITIAL",
         autoApprove: options.autoApprove === true
       });
-      await this.addSessionEvent(session, "APPROVAL_EVALUATED", permissionDecision);
-      if (!permissionDecision.approved) {
-        session.finalResponse = { status: "AWAITING_APPROVAL", reason: permissionDecision.reason };
-        await this.persistSession(session);
+      if (!gate.authorized) {
+        // The gate set session.currentState + finalResponse (PLAN_REJECTED /
+        // DENIED / AWAITING_APPROVAL) and persisted the session.
         return session;
       }
-      await this.persistSession(session);
 
       // 8. Execute tasks with TaskGraphScheduler (single canonical pipeline).
       session.currentState = RuntimeState.EXECUTING;
@@ -297,6 +366,307 @@ export class AgentRuntime {
       await this.persistSession(session);
       return session;
     }
+  }
+
+  _startParallelIntentInterpretation(session, rawText) {
+    if (!this.reasoningEngine?.hasModel?.()) return;
+    void this.reasoningEngine.understandIntent(rawText, { parallel: true })
+      .then(async (result) => {
+        await this.addSessionEvent(session, "LLM_PARALLEL_INTERPRETATION", {
+          status: result?.ok ? "COMPLETED" : "UNAVAILABLE",
+          normalizedGoal: result?.ok ? result.data?.normalizedGoal ?? null : null,
+          confidence: result?.ok ? result.data?.confidence ?? null : null,
+          authoritativeOperation: session.intent?.operation ?? null
+        });
+      })
+      .catch(() => {});
+  }
+
+  // Used by the chat surface as a separate, parallel request. The LLM generates
+  // its OWN natural, first-person acknowledgement ("Sure, playing 'Cry For Me'
+  // now.") — never a hardcoded/templated string — while submitIntent begins the
+  // safe typed work concurrently. Falls back to a minimal deterministic line only
+  // when no model is available so the user always sees an acknowledgement.
+  async acknowledgeIntent(rawText) {
+    if (!this.reasoningEngine?.acknowledgeAction) {
+      return { message: null, source: "unavailable" };
+    }
+    try {
+      const result = await this.reasoningEngine.acknowledgeAction(rawText);
+      const message = result?.ok && typeof result.text === "string" && result.text.trim()
+        ? result.text.trim()
+        : null;
+      return { message, source: message ? (result?.source ?? "model") : "unavailable" };
+    } catch {
+      return { message: null, source: "unavailable" };
+    }
+  }
+
+  // Autonomous-execution approval classifier. Returns { requiresApproval, reasons }
+  // for a candidate plan. Approval is required ONLY for the three risky action
+  // classes; everything else is autonomous:
+  //   1. DELETE — a task that deletes a file or uninstalls/removes an app.
+  //   2. EDIT-EXISTING-FILE — a write-class task whose target FILE already exists
+  //      (creating a new file is autonomous; overwriting an existing one is an edit).
+  //   3. NON-WINGET INSTALL — installing software sourced from a browser/external
+  //      site (WinGet installs from the signed community source are exempt).
+  // Existence is probed via the adapter (cheap, read-only). If existence cannot be
+  // determined for a write, we fail SAFE (require approval) rather than silently
+  // editing an existing file. Deterministic and side-effect free.
+  async _classifyPlanApproval(plan) {
+    const tasks = plan?.taskGraph?.tasks ?? [];
+    const reasons = [];
+
+    for (const task of tasks) {
+      const name = task?.capability ?? task?.selectedCapability;
+      if (!name) continue;
+      const inputs = task?.inputs ?? {};
+      const capability = this.capabilityRegistry?.get?.(name) ?? null;
+
+      // (1) DELETE — file deletion or app uninstall/removal.
+      if (name === "filesystem.delete" || name === "application.uninstall" || name === "package.uninstall") {
+        reasons.push(`${name} deletes from the system and requires approval.`);
+        continue;
+      }
+
+      // Generic UI interaction can change a third-party account, submit a form,
+      // or purchase something. Inspection is read-only; click/type requires an
+      // explicit approval bound to the exact selector and text in the plan.
+      if (name === "gui.interact") {
+        reasons.push("gui.interact can alter a third-party application and requires approval.");
+        continue;
+      }
+
+      // (3) NON-WINGET / BROWSER-SOURCED INSTALL. WinGet installs (signed community
+      // source) are explicitly autonomous; a capability flagged as an external /
+      // browser-sourced install requires approval. Forward-looking: no such
+      // capability ships today, so this is driven by an explicit capability flag
+      // rather than by guessing from a name.
+      const installSource = capability?.installSource ?? capability?.security?.installSource ?? null;
+      const isWinget = name.startsWith("package.winget.") || installSource === "winget";
+      const isExternalInstall = (installSource && installSource !== "winget")
+        || capability?.requiresBrowserDownload === true;
+      if (isExternalInstall && !isWinget) {
+        reasons.push(`${name} installs software from a non-WinGet/browser source and requires approval.`);
+        continue;
+      }
+
+      // (2) EDIT AN EXISTING FILE. Only write-class tasks can edit a file; a new
+      // file is autonomous, an existing one is an edit.
+      if (name === "filesystem.write" || name === "environment.project.set" || name === "application.notepad.launch") {
+        const existing = await this._writeTargetExists(name, inputs);
+        if (existing === true) {
+          reasons.push(`${name} edits an existing file and requires approval.`);
+        } else if (existing === null) {
+          // Undetermined — fail safe.
+          reasons.push(`${name} may edit an existing file (existence undetermined); requiring approval.`);
+        }
+        continue;
+      }
+    }
+
+    return { requiresApproval: reasons.length > 0, reasons };
+  }
+
+  // Best-effort existence probe for a write-class task's target file. Returns
+  // true (exists → edit), false (absent → new file), or null (undetermined). Uses
+  // only read-only adapter methods and never throws.
+  async _writeTargetExists(capabilityName, inputs) {
+    try {
+      if (capabilityName === "filesystem.write") {
+        if (!inputs?.filePath) return null;
+        try {
+          await this.adapter.readTextFile(inputs.filePath);
+          return true;
+        } catch (error) {
+          return error?.code === "ENOENT" ? false : null;
+        }
+      }
+      if (capabilityName === "environment.project.set") {
+        if (!inputs?.workspacePath || typeof this.adapter.inspectProjectEnvironment !== "function") return null;
+        const info = await this.adapter.inspectProjectEnvironment(inputs.workspacePath);
+        return Boolean(info?.exists);
+      }
+      if (capabilityName === "application.notepad.launch") {
+        // Notepad saves under the Documents folder using the provided filename.
+        if (!inputs?.filename || typeof this.adapter.getDocumentsPath !== "function") return null;
+        const target = path.join(this.adapter.getDocumentsPath(), inputs.filename);
+        try {
+          await this.adapter.readTextFile(target);
+          return true;
+        } catch (error) {
+          return error?.code === "ENOENT" ? false : null;
+        }
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  // THE canonical plan authorization gate. Both the initial plan and every
+  // replan pass a candidate plan through this ONE function, so a plan can never
+  // reach execution without: (4) validation, (5) a FRESH risk assessment at an
+  // explicit evaluation time, (6) a FRESH policy decision, and (7) an approval
+  // bound to the plan's exact cryptographic commitment. This is the structural
+  // fix for the replan-escalation gap: replanning is a NEW security decision,
+  // never an inheritance of the original approval.
+  //
+  // On success it records session.plan/riskAssessment/policyDecision/
+  // approvalManifest/approvalCommitment and returns { authorized: true }. On any
+  // block it sets session.currentState + finalResponse, persists, and returns
+  // { authorized: false, reason }. Grants are NEVER minted here — only after a
+  // caller sees authorized:true (see _executeTaskGraph / replan continue path).
+  //
+  //   phase        - "INITIAL" | "REPLAN" (drives event names + the delta audit).
+  //   autoApprove  - the caller's standing authorization for THIS session.
+  //   priorManifest- the previously-approved manifest, so a legitimate redacted
+  //                  secret round-trips without forcing re-entry of the secret.
+  async _authorizePlan(session, plan, { phase = "INITIAL", autoApprove = false, priorManifest = null } = {}) {
+    const isReplan = phase === "REPLAN";
+    const ev = (initial, replan) => (isReplan ? replan : initial);
+
+    // 4. Validate.
+    session.currentState = RuntimeState.VALIDATE_PLAN;
+    const planValidation = this.planValidator.validatePlan(plan.taskGraph);
+    await this.addSessionEvent(session, ev("PLAN_VALIDATED", "REPLAN_VALIDATED"), planValidation);
+    if (!planValidation.valid) {
+      session.currentState = RuntimeState.PLAN_REJECTED;
+      session.finalResponse = { status: "PLAN_REJECTED", errors: planValidation.errors };
+      await this.persistSession(session);
+      return { authorized: false, reason: "PLAN_REJECTED" };
+    }
+
+    // The candidate plan becomes the session's authoritative plan from here on:
+    // risk, policy, commitment, persistence, and (if it parks in
+    // AWAITING_APPROVAL) resume all operate on THIS plan. On the initial path
+    // session.plan is already this same object, so this is a no-op there.
+    session.plan = plan;
+
+    // 5. Fresh risk assessment at an EXPLICIT evaluation time (deterministic,
+    // auditable — never a hidden Date.now() inside the engine).
+    session.currentState = RuntimeState.ASSESS_RISK;
+    const evaluatedAt = new Date().toISOString();
+    const riskAssessment = this.riskEngine.assess(plan, session.context, { evaluatedAt });
+    session.riskAssessment = riskAssessment;
+    await this.addSessionEvent(session, ev("RISK_ASSESSED", "REPLAN_RISK_ASSESSED"), riskAssessment);
+
+    // 6. Fresh policy decision using the plan's authoritative capability
+    // profiles (privilege/execution/policy requirements). ELEVATE availability
+    // is OPERATION-SPECIFIC: it is true only when EVERY elevated capability in
+    // this plan binds to a privileged operation the registry can actually route
+    // through the bounded helper. A plan whose elevated capability has no live
+    // route fails closed (REQUIRED_CONTROL_UNAVAILABLE) rather than proceeding.
+    session.currentState = RuntimeState.APPLY_POLICY;
+    const planCapabilities = this._planCapabilities(plan);
+    const elevateAvailable = this._elevateAvailableForPlan(planCapabilities);
+    const policyDecision = this.policyEngine.decide(riskAssessment, plan, {
+      capabilities: planCapabilities,
+      controlAvailability: { ELEVATE: elevateAvailable },
+      context: session.context
+    });
+    session.policyDecision = policyDecision;
+    await this.addSessionEvent(session, ev("POLICY_DECIDED", "REPLAN_POLICY_DECIDED"), policyDecision);
+
+    if (policyDecision.effect === PolicyEffect.DENY) {
+      session.currentState = RuntimeState.FAILED;
+      session.finalResponse = { status: "DENIED", reason: policyDecision.reason };
+      await this.persistSession(session);
+      return { authorized: false, reason: "DENIED" };
+    }
+
+    // 7. Bind approval to the plan's EXACT cryptographic commitment (SHA-256 over
+    // the canonical ApprovalManifest; secret values committed via keyed HMAC).
+    session.currentState = RuntimeState.REQUEST_CONFIRMATION_IF_REQUIRED;
+    const built = this.permissionBroker.buildApprovalCommitment(plan, { priorManifest });
+    session.approvalManifest = built.manifest;
+    session.approvalCommitment = built.commitment;
+
+    // A replan whose commitment differs from the previously-approved one is, by
+    // definition, a different authorization; record the delta for the audit.
+    if (isReplan) {
+      await this.addSessionEvent(session, "REPLAN_COMMITMENT_COMPUTED", {
+        newCommitment: built.commitment,
+        priorCommitment: session.priorApprovalCommitment ?? null,
+        changed: built.commitment !== (session.priorApprovalCommitment ?? null)
+      });
+    }
+
+    // AUTONOMOUS-EXECUTION APPROVAL SCOPE. Per the autonomous-controller policy,
+    // explicit user approval is required ONLY for the three risky action classes:
+    //   (1) deleting files/apps, (2) editing an EXISTING file, and
+    //   (3) installing software sourced from a browser (non-WinGet).
+    // Every other action proceeds autonomously. We compute that classification for
+    // THIS plan and, when it is not risky, grant the CONFIRM-level approval on the
+    // caller's behalf (fold into autoApprove). A policy DENY still fails closed
+    // above/inside evaluate(); a plan classified risky still parks in
+    // AWAITING_APPROVAL unless the caller supplied standing autoApprove. The
+    // cryptographic commitment binding and replan re-gate are unchanged — this only
+    // narrows WHEN the human is asked, never what is bound or audited.
+    const approvalClass = await this._classifyPlanApproval(plan);
+    // SAFETY FLOOR (never relaxed). The autonomous narrowing may only grant
+    // approval on the caller's behalf for genuinely benign, standard-user
+    // mutations. It must NEVER auto-approve:
+    //   - a destructive or irreversible mutation (the generalized form of the
+    //     "delete from the system" risky class), or
+    //   - a privileged/elevated operation (ELEVATE) — those keep their own
+    //     token-gated approval and re-gate on replan.
+    // This preserves the M2.1 replan-escalation guarantee: a LOW plan that replans
+    // into a HIGH/destructive/elevated task still PARKS for fresh approval.
+    const dims = riskAssessment?.dimensions ?? {};
+    const destructiveOrIrreversible =
+      dims[RiskDimension.MUTATION_IMPACT] === "DESTRUCTIVE" ||
+      dims[RiskDimension.REVERSIBILITY] === "IRREVERSIBLE";
+    const needsElevation = policyDecision.confirmationLevel === ConfirmationLevel.ELEVATE;
+    const canRelax = approvalClass.requiresApproval === false
+      && !destructiveOrIrreversible
+      && !needsElevation;
+    await this.addSessionEvent(session, ev("APPROVAL_SCOPE_CLASSIFIED", "REPLAN_APPROVAL_SCOPE_CLASSIFIED"), {
+      requiresApproval: approvalClass.requiresApproval,
+      reasons: approvalClass.reasons,
+      autonomouslyRelaxed: canRelax,
+      destructiveOrIrreversible,
+      needsElevation
+    });
+    const effectiveAutoApprove = autoApprove === true || canRelax;
+
+    const permissionDecision = this.permissionBroker.evaluate({
+      policyDecision,
+      autoApprove: effectiveAutoApprove,
+      approvalCommitment: built.commitment
+    });
+    await this.addSessionEvent(session, "APPROVAL_EVALUATED", {
+      required: permissionDecision.required,
+      approved: permissionDecision.approved,
+      confirmationLevel: permissionDecision.confirmationLevel ?? null,
+      approvalCommitment: built.commitment,
+      autonomousApproval: effectiveAutoApprove && autoApprove !== true,
+      reason: permissionDecision.reason
+    });
+
+    if (!permissionDecision.approved) {
+      session.currentState = RuntimeState.REQUEST_CONFIRMATION_IF_REQUIRED;
+      session.finalResponse = {
+        status: "AWAITING_APPROVAL",
+        reason: permissionDecision.reason,
+        confirmationLevel: policyDecision.confirmationLevel ?? null,
+        informedApproval: policyDecision.informedApproval ?? null,
+        approvalCommitment: built.commitment
+      };
+      if (isReplan) {
+        await this.addSessionEvent(session, "REPLAN_APPROVAL_REQUIRED", { approvalCommitment: built.commitment });
+      }
+      await this.persistSession(session);
+      return { authorized: false, reason: "AWAITING_APPROVAL" };
+    }
+
+    const commitmentChanged = built.commitment !== (session.priorApprovalCommitment ?? null);
+    session.priorApprovalCommitment = built.commitment;
+    if (isReplan) {
+      await this.addSessionEvent(session, "REPLAN_APPROVED", { approvalCommitment: built.commitment });
+    }
+    await this.persistSession(session);
+    return { authorized: true, commitmentChanged };
   }
 
   // Issue capability grants for a plan's task graph. One grant is issued per task
@@ -319,12 +689,48 @@ export class AgentRuntime {
   }
 
   // The single canonical execution pipeline. Runs the plan's task graph through
+  // Resolve the normalized capabilities named by a plan's tasks. These carry
+  // the authoritative structured risk profile and explicit policy requirements
+  // the PolicyEngine needs to route confirmation levels. Unknown names are
+  // skipped (PlanValidator already rejected them upstream).
+  _planCapabilities(plan) {
+    const tasks = plan?.taskGraph?.tasks ?? [];
+    const out = [];
+    for (const task of tasks) {
+      const name = task?.capability ?? task?.selectedCapability;
+      if (!name || !this.capabilityRegistry?.get) continue;
+      try {
+        const cap = this.capabilityRegistry.get(name);
+        if (cap) out.push(cap);
+      } catch {
+        // ignore — validator handles unknown capabilities
+      }
+    }
+    return out;
+  }
+
+  // ELEVATE is available for a plan ONLY when every capability that requires
+  // elevation is backed by a LIVE bounded privileged route (its declared
+  // privilegedOperation is in the registry's live privilegedOperations set,
+  // which is populated only when a privileged helper is wired). If any elevated
+  // capability lacks a live route, ELEVATE is unavailable and the policy gate
+  // fails closed (REQUIRED_CONTROL_UNAVAILABLE) rather than pretending the
+  // control exists. This makes availability operation-specific, not a global
+  // "a helper object exists" boolean.
+  _elevateAvailableForPlan(capabilities) {
+    const live = this.capabilityRegistry?.privilegedOperations;
+    const elevated = capabilities.filter((c) => (c?.requirements?.elevation ?? "NONE") !== "NONE");
+    if (elevated.length === 0) return false; // no elevated caps -> ELEVATE not needed
+    if (!live || live.size === 0) return false;
+    return elevated.every((c) => c?.privilegedOperation && live.has(c.privilegedOperation));
+  }
+
   // the TaskGraphScheduler: checkpoint -> execute -> observe -> verify, with
   // bounded replanning on verification failure. Both fresh intents
   // (submitIntent) and resumed/approved sessions use this exact loop, so there
   // is exactly one execution path in the runtime.
   async _executeTaskGraph(session, options = {}) {
-    let replanAttempts = options.replanAttempts ?? 0;
+    let replanAttempts = session.replanAttempts ?? options.replanAttempts ?? 0;
     const MAX_REPLAN_ATTEMPTS = options.MAX_REPLAN_ATTEMPTS ?? 2;
     const originalPlan = options.originalPlan ?? session.plan;
 
@@ -363,7 +769,8 @@ export class AgentRuntime {
 
         await this.addSessionEvent(session, "TASK_STARTING", {
           taskId: task.taskId,
-          capability: task.capability
+          capability: task.capability,
+          latencyMs: Date.now() - session.receivedAtMs
         });
         await this.persistSession(session);
 
@@ -498,6 +905,40 @@ export class AgentRuntime {
         }
       }
     }
+  }
+
+  // Cached model-health probe used to gate keyword fallbacks (conversational
+  // shortcut) behind "no real model available". Delegates to the ReasoningEngine's
+  // own bounded, cached isModelHealthy so it never adds latency and never throws.
+  // A provider with no health check is treated as healthy (Mock/scripted).
+  async _isModelHealthy() {
+    try {
+      if (typeof this.reasoningEngine?.isModelHealthy === "function") {
+        return await this.reasoningEngine.isModelHealthy();
+      }
+    } catch { /* fall through to unhealthy */ }
+    return false;
+  }
+
+  // Heuristic: is this input conversational (a greeting, a meta-question about
+  // SYSCORA, small talk) rather than a concrete Windows automation task? Used to
+  // answer directly with text BEFORE planning, so a greeting never triggers
+  // system inspection or a slow plan/compose round-trip. Deliberately narrow:
+  // anything that names or implies an action (verbs/targets) is NOT treated as
+  // conversational and flows to the normal planner.
+  _looksConversational(rawText) {
+    const text = String(rawText ?? "").trim().toLowerCase();
+    if (!text) return false;
+    // Any action-shaped word means it's a task, not small talk — let it plan.
+    const actionish = /\b(inspect|list|check|find|search|install|create|make|open|launch|close|run|read|write|delete|remove|set|add|kill|stop|start|restart|show|tell me about|what'?s using|port|folder|file|path|package|winget|process|service|project|docker|git|node|python|environment|env)\b/;
+    if (actionish.test(text)) return false;
+    // Greetings / thanks / meta-questions about the assistant itself.
+    const greeting = /^(hi|hii+|hey|hello|yo|sup|howdy|greetings|good (morning|afternoon|evening)|thanks|thank you|ok|okay|cool|nice)\b/;
+    const metaQuestion = /\b(what|which) (model|llm|ai) (are|r) (you|u)\b|\bwho are you\b|\byour name\b|\bwhat can you do\b|\bwhat do you do\b|\bhow do you work\b|\bare you (an? )?(ai|bot|model)\b|\bhelp\b/;
+    if (greeting.test(text) || metaQuestion.test(text)) return true;
+    // Very short, question-like, no action word → treat as conversational.
+    if (text.length <= 40 && /\?$/.test(text)) return true;
+    return false;
   }
 
   async addSessionEvent(session, eventType, details) {
@@ -684,6 +1125,15 @@ export class AgentRuntime {
       executionSummary = null;
     }
 
+    // For a single read-only question, the verified result is the answer the
+    // user asked for. Prefer it over a generic "run completed" summary.
+    const directAnswer = session.taskResults.length === 1
+      ? session.verifications.at(-1)?.message
+      : null;
+    if (directAnswer) {
+      executionSummary = { ...(executionSummary ?? {}), summary: directAnswer };
+    }
+
     session.finalResponse = {
       status: finalVerification.status,
       message: finalVerification.message,
@@ -727,6 +1177,25 @@ export class AgentRuntime {
         })
       : { category: "unexpected", rootCause: "No diagnosis engine", confidence: 0.1, suggestedRecovery: "abort" };
     await this.addSessionEvent(session, "FAILURE_DIAGNOSED", diagnosis);
+
+    // A failed mutation is uncertain: the OS process may have changed state
+    // even when execution or verification reports failure. Re-running or
+    // replanning it can duplicate installs/writes, so terminate safely and let
+    // the user inspect the state before explicitly starting a new request.
+    const capability = this.capabilityRegistry.get(task.capability);
+    const mutatesState = capability?.reversibility && capability.reversibility !== "NOT_REQUIRED";
+    const abortOnFailure = Array.isArray(capability?.recoveryHints) && capability.recoveryHints.includes("ABORT_ON_FAILURE");
+    if (mutatesState || abortOnFailure) {
+      await this.addSessionEvent(session, "RECOVERY_DECIDED", {
+        action: "abort",
+        reason: mutatesState
+          ? "Mutating task failed with uncertain system state; automatic retry is unsafe."
+          : "This capability does not support automatic retry; ending the request with its verification result.",
+        budgetSpent: session.recoveryBudget.spent,
+        budgetTotal: session.recoveryBudget.total
+      });
+      return this._handleFailureWithoutReplan(session, task, verification, diagnosis);
+    }
 
     // Model reasoning is advisory and auditable. The deterministic diagnosis
     // and RecoveryEngine still decide what the runtime may execute.
@@ -840,19 +1309,65 @@ export class AgentRuntime {
           remainingRecoveryBudget: session.recoveryBudget.total - session.recoveryBudget.spent
         }
       );
+      newPlan.planVersion = (session.plan.planVersion || 1) + 1;
+      newPlan.parentPlanId = session.plan.planId;
+      await this.addSessionEvent(session, "REPLAN_GENERATED", {
+        planId: newPlan.planId,
+        planVersion: newPlan.planVersion,
+        parentPlanId: newPlan.parentPlanId,
+        preservedTaskIds: completedTaskIds
+      });
 
-      session.currentState = RuntimeState.VALIDATE_PLAN;
-      const planValidation = this.planValidator.validatePlan(newPlan.taskGraph);
-      await this.addSessionEvent(session, "PLAN_VALIDATED", planValidation);
-      if (!planValidation.valid) {
-        await this.addSessionEvent(session, "REPLAN_FAILED", { reason: "Plan validation failed", errors: planValidation.errors });
+      // A replan is a NEW security decision. Route the candidate through the
+      // SAME canonical authorization gate the initial plan used: fresh
+      // validation, fresh risk assessment, fresh policy decision, and an
+      // approval bound to the candidate's exact cryptographic commitment. The
+      // original approval NEVER carries over — a replan that escalates
+      // privilege/risk or introduces new/changed tasks must be re-authorized
+      // (and, if it needs CONFIRM/ELEVATE without standing authorization, the
+      // session parks in AWAITING_APPROVAL rather than executing).
+      //
+      // priorManifest lets a legitimately-unchanged, already-redacted secret
+      // round-trip; a changed secret value still changes the commitment.
+      const priorManifest = session.approvalManifest ?? null;
+      session.priorApprovalCommitment = session.approvalCommitment ?? null;
+      // Persist this BEFORE authorization. A high-risk replan normally parks
+      // at the approval gate, and putting the increment after that gate would
+      // reset the limit every time the user approves the suspended session.
+      session.replanAttempts = replanAttempts + 1;
+      const gate = await this._authorizePlan(session, newPlan, {
+        phase: "REPLAN",
+        autoApprove: session.autoApprove === true,
+        priorManifest
+      });
+      if (!gate.authorized) {
+        // The gate set a terminal/among-approval state + finalResponse and
+        // persisted. Do NOT continue scheduling protected work.
+        if (gate.reason === "AWAITING_APPROVAL") {
+          return { shouldContinue: false };
+        }
+        await this.addSessionEvent(session, "REPLAN_FAILED", { reason: gate.reason });
         return this._handleFailureWithoutReplan(session, task, verification, diagnosis);
       }
 
-      newPlan.planVersion = (session.plan.planVersion || 1) + 1;
-      newPlan.parentPlanId = session.plan.planId;
-      session.plan = newPlan;
-      await this.addSessionEvent(session, "PLAN_UPDATED", { planId: newPlan.planId, planVersion: newPlan.planVersion, preservedTaskIds: completedTaskIds });
+      // Material replan (commitment changed) => the old plan's grants no longer
+      // describe the authorized work. Revoke every pending session grant so the
+      // re-mint in _executeTaskGraph issues fresh grants bound to the NEW plan;
+      // a session-reusable grant for a capability dropped from the new plan can
+      // never be reused. (Completed VERIFIED tasks already consumed their grants,
+      // so revoking here only affects not-yet-run work.)
+      if (gate.commitmentChanged
+          && typeof this.permissionBroker?.revokeSessionCapabilities === "function") {
+        await this.permissionBroker.revokeSessionCapabilities(
+          session.sessionId,
+          "Material replan: prior-plan grants invalidated pending re-authorization."
+        );
+        await this.addSessionEvent(session, "REPLAN_GRANTS_INVALIDATED", {
+          priorCommitment: session.priorApprovalCommitment ?? null,
+          newCommitment: session.approvalCommitment
+        });
+      }
+
       session.currentState = RuntimeState.EXECUTING;
       // Preserve completed VERIFIED tasks so they never re-run.
       return { shouldContinue: true, replanAttempts: replanAttempts + 1, preserveStates: completedStates };
@@ -1157,9 +1672,42 @@ export class AgentRuntime {
     }
 
     if (session.currentState === RuntimeState.REQUEST_CONFIRMATION_IF_REQUIRED) {
+      // An approval is bound to the plan's EXACT cryptographic commitment. If the
+      // plan changed since the session was suspended (different capability,
+      // version, dependencies, ordering, permissions, elevation, rollback, a
+      // non-secret input, or a secret VALUE), the recomputed commitment differs
+      // and the approval must NOT be reused — the operation is re-gated. This
+      // closes the "approve op X, resume into a mutated op Y" downgrade path.
+      //
+      // The stored manifest is passed as priorManifest so a legitimately
+      // unchanged, already-redacted secret round-trips to the same commitment;
+      // any tampering that replaces a redacted secret with a different string is
+      // hashed fresh and no longer matches.
+      const built = this.permissionBroker.buildApprovalCommitment(session.plan, {
+        priorManifest: session.approvalManifest ?? null
+      });
+      const currentCommitment = built.commitment;
+      if (session.approvalCommitment && currentCommitment !== session.approvalCommitment) {
+        await this.auditRepository.append(session.sessionId, "APPROVAL_INVALIDATED", {
+          reason: "Plan changed after approval was requested; prior approval is void.",
+          expected: session.approvalCommitment,
+          actual: currentCommitment
+        });
+        session.approvalCommitment = currentCommitment;
+        session.approvalManifest = built.manifest;
+        session.finalResponse = {
+          status: "AWAITING_APPROVAL",
+          reason: "The plan changed since approval was requested; re-approval is required.",
+          approvalCommitment: currentCommitment
+        };
+        await this.persistSession(session);
+        return session;
+      }
+
       const permissionDecision = this.permissionBroker.evaluate({
         policyDecision: session.policyDecision,
-        autoApprove: options.autoApprove === true
+        autoApprove: options.autoApprove === true,
+        approvalCommitment: currentCommitment
       });
       await this.auditRepository.append(session.sessionId, "APPROVAL_EVALUATED", {
         required: permissionDecision.required,
@@ -1169,7 +1717,9 @@ export class AgentRuntime {
       if (!permissionDecision.approved) {
         session.finalResponse = {
           status: "AWAITING_APPROVAL",
-          reason: permissionDecision.reason
+          reason: permissionDecision.reason,
+          confirmationLevel: session.policyDecision?.confirmationLevel ?? null,
+          informedApproval: session.policyDecision?.informedApproval ?? null
         };
         await this.persistSession(session);
         return session;
@@ -1180,41 +1730,63 @@ export class AgentRuntime {
     return session;
   }
 
-  async pauseSessionById(sessionId, reason = "Paused by user request.") {
+  // Canonical control-intent lane for lifecycle halts (pause / cancel). Like the
+  // rollback convergence, this stops these transitions bypassing the runtime's
+  // guarantees — but a halt does not plan, assess risk, perceive, or schedule, so
+  // forcing it through submitIntent()'s reasoning pipeline would be dishonest
+  // (fabricating a plan/risk for a no-op) and wasteful. Instead the lane shares
+  // the guarantees that DO apply to a control action:
+  //   1. Session validation.
+  //   2. Deterministic policy AUTHORIZATION (is this transition legal from the
+  //      current state?) via policyEngine.decideControl — not risk/planning.
+  //   3. A chained, tamper-evident audit record of the authorization decision
+  //      (CONTROL_INTENT_EVALUATED) AND the resulting transition.
+  //   4. Persisted state transition.
+  // Returns the (possibly unchanged) session, preserving the historical no-op
+  // contract when the transition is denied.
+  async submitControlIntent(command, sessionId, { reason } = {}) {
     const session = await this.sessionStore.get(sessionId);
     validateExecutionSession(session);
-    if ([RuntimeState.COMPLETED, RuntimeState.FAILED, RuntimeState.ROLLED_BACK, RuntimeState.CANCELLED].includes(session.currentState)) {
+
+    const decision = this.policyEngine.decideControl(command, session);
+    await this.auditRepository.append(session.sessionId, "CONTROL_INTENT_EVALUATED", {
+      command,
+      fromState: session.currentState,
+      effect: decision.effect,
+      reason: decision.reason
+    });
+
+    // Denied transitions (terminal session, illegal command) are a no-op beyond
+    // the audit record — mirrors the prior guard that returned the session as-is.
+    if (decision.effect === PolicyEffect.DENY) {
       return session;
     }
-    session.suspension = {
-      suspendedFromState: session.currentState,
-      reason,
-      pausedAt: new Date().toISOString()
-    };
-    session.currentState = RuntimeState.PAUSED;
-    session.finalResponse = {
-      status: "PAUSED",
-      reason
-    };
-    await this.auditRepository.append(session.sessionId, "SESSION_PAUSED", { reason });
+
+    if (command === "pause") {
+      session.suspension = {
+        suspendedFromState: session.currentState,
+        reason,
+        pausedAt: new Date().toISOString()
+      };
+      session.currentState = RuntimeState.PAUSED;
+      session.finalResponse = { status: "PAUSED", reason };
+      await this.auditRepository.append(session.sessionId, "SESSION_PAUSED", { reason });
+    } else if (command === "cancel") {
+      session.currentState = RuntimeState.CANCELLED;
+      session.finalResponse = { status: "CANCELLED", reason };
+      await this.auditRepository.append(session.sessionId, "SESSION_CANCELLED", { reason });
+    }
+
     await this.persistSession(session);
     return session;
   }
 
+  async pauseSessionById(sessionId, reason = "Paused by user request.") {
+    return this.submitControlIntent("pause", sessionId, { reason });
+  }
+
   async cancelSessionById(sessionId, reason = "Cancelled by user request.") {
-    const session = await this.sessionStore.get(sessionId);
-    validateExecutionSession(session);
-    if ([RuntimeState.COMPLETED, RuntimeState.FAILED, RuntimeState.ROLLED_BACK, RuntimeState.CANCELLED].includes(session.currentState)) {
-      return session;
-    }
-    session.currentState = RuntimeState.CANCELLED;
-    session.finalResponse = {
-      status: "CANCELLED",
-      reason
-    };
-    await this.auditRepository.append(session.sessionId, "SESSION_CANCELLED", { reason });
-    await this.persistSession(session);
-    return session;
+    return this.submitControlIntent("cancel", sessionId, { reason });
   }
 
   async rollbackLatestSession() {

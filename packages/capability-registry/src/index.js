@@ -1,5 +1,6 @@
 import { RiskLevel } from "../../shared-types/src/domain.js";
 import { redactSensitiveData } from "../../shared-types/src/redaction.js";
+import { PRIVILEGED_OPERATIONS } from "../../privileged-helpers/src/index.js";
 import crypto from "crypto";
 import {
   CAPABILITY_CONTRACT_VERSION,
@@ -23,6 +24,48 @@ export { createCapabilityTemplate } from "./template.js";
 export { validateCapabilityPackage, validatePluginCapabilityDefinition, validatePluginManifest } from "./quality.js";
 const createId = () => crypto.randomBytes(16).toString("hex");
 
+// Loose match between a requested track query and the live "now playing" title.
+// Tokenizes both, drops short/common filler words, and returns true when a
+// meaningful share of the query's significant tokens appear in the title. This is
+// what lets spotify.track.play confirm it played the REQUESTED track (not merely
+// "something is playing"). Deterministic and side-effect free.
+const TRACK_STOPWORDS = new Set([
+  "the", "a", "an", "by", "for", "on", "in", "of", "and", "to", "feat", "ft", "with",
+  "song", "track", "play", "spotify", "version", "remaster", "remastered"
+]);
+function trackTokens(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 2 && !TRACK_STOPWORDS.has(t));
+}
+function tokenDistance(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diagonal = row[0]; row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const prior = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = prior;
+    }
+  }
+  return row[b.length];
+}
+export function matchesTrackQuery(title, query) {
+  const q = trackTokens(query);
+  if (q.length === 0) return false;
+  const titleTokens = new Set(trackTokens(title));
+  if (titleTokens.size === 0) return false;
+  const hits = q.filter((tok) => [...titleTokens].some((candidate) =>
+    candidate === tok || (tok.length >= 2 && candidate.length >= 2 && tokenDistance(candidate, tok) <= 1)
+  )).length;
+  // Playback verification is deliberately stricter than search ranking: every
+  // meaningful requested track token must appear in the live title. A partial
+  // match could otherwise claim the wrong song was playing.
+  return hits === q.length;
+}
+
 export const LifecycleStatus = {
   IMPLEMENTED: "IMPLEMENTED",
   VERIFIED: "VERIFIED",
@@ -31,12 +74,17 @@ export const LifecycleStatus = {
 };
 
 export class CapabilityRegistry {
-  constructor(capabilities = [], { runtimeVersion, onEvent } = {}) {
+  constructor(capabilities = [], { runtimeVersion, onEvent, privilegedOperations = [] } = {}) {
     this.capabilities = new Map();
     this.runtimeVersion = runtimeVersion ?? "0.1.0";
     this.listeners = new Set();
     if (onEvent) this.listeners.add(onEvent);
     this.pipeline = new CapabilityLifecyclePipeline({ registry: this, onEvent: (event) => this.emit(event.type, event) });
+    // The set of privileged-operation ids that a bounded helper can actually
+    // route+execute. An elevated capability MUST bind to one of these (see
+    // register()); this is what makes ELEVATE an execution-routing guarantee
+    // rather than a self-declared boolean. Empty when no helper is wired.
+    this.privilegedOperations = new Set(privilegedOperations);
     // Late-bound rollback manager. The session.rollback capability's execute()
     // invokes it, but the manager needs a reference back to this registry to
     // look up per-capability rollback handlers — a construction cycle. It is
@@ -70,12 +118,51 @@ export class CapabilityRegistry {
 
   register(capability, options = {}) {
     const normalized = normalizeCapability(capability, options);
+
+    // ELEVATION ROUTING INVARIANT (M2.1 Part E/F), enforced FIRST — before the
+    // contract validator — so a capability attempting to self-grant privilege is
+    // rejected for THAT reason, not a generic contract gap. A capability that
+    // requires elevation must be a TRUSTED, built-in capability bound to a
+    // registered bounded privileged operation. This structurally prevents:
+    //   - a signed PLUGIN from declaring elevation + an arbitrary execute() and
+    //     thereby gaining administrator authority (provenance != privilege), and
+    //   - any elevated capability whose privilegedOperation is not a real,
+    //     helper-routable operation.
+    // Signature/provenance is checked elsewhere; this gate ensures elevation can
+    // only ever route through the bounded helper allow-list.
+    const requiresElevation = (normalized.requirements?.elevation ?? "NONE") !== "NONE";
+    if (requiresElevation) {
+      const source = normalized.packaging?.source ?? "builtin";
+      if (source !== "builtin") {
+        throw new Error(
+          `Capability ${normalized.name} requires elevation but is sourced from '${source}'. ` +
+          `Plugins cannot self-grant privileged execution; map to a registered bounded operation instead.`
+        );
+      }
+      // The capability MUST declare a privilegedOperation that names a real,
+      // bounded operation in the STATIC helper catalog. This is a registration-
+      // time correctness check on the binding itself (independent of whether a
+      // helper is wired in THIS runtime). Whether the operation can actually run
+      // — i.e. a helper is live — is a runtime AVAILABILITY concern enforced at
+      // pipeline.prepare time via this.privilegedOperations. Separating the two
+      // preserves the "registers as UNAVAILABLE when no helper" contract while
+      // still rejecting a bogus/absent binding outright.
+      const op = normalized.privilegedOperation;
+      if (!op || !PRIVILEGED_OPERATIONS[op]) {
+        throw new Error(
+          `Elevated capability ${normalized.name} must bind privilegedOperation to a known bounded ` +
+          `operation (declared: ${op ?? "none"}; known: ${Object.keys(PRIVILEGED_OPERATIONS).join(", ") || "none"}).`
+        );
+      }
+    }
+
     const validation = validateCapabilityContract(normalized, { strict: options.strict === true });
     if (!validation.valid) throw new Error(`Invalid capability ${normalized.name ?? "unknown"}: ${validation.errors.join("; ")}`);
     if (!satisfiesVersion(this.runtimeVersion, normalized.packaging.runtimeVersion)) {
       throw new Error(`Capability ${normalized.name} requires runtime ${normalized.packaging.runtimeVersion}`);
     }
     if (this.capabilities.has(normalized.name)) throw new Error(`Duplicate capability registration: ${normalized.name}`);
+
     this.capabilities.set(normalized.name, normalized);
     this.emit("CAPABILITY_REGISTERED", { capability: normalized.name, source: normalized.packaging.source, version: normalized.version });
     return normalized;
@@ -179,6 +266,16 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
   // wiring), the privileged capabilities are still registered but marked
   // UNAVAILABLE so the planner/validator will not select them.
   const privilegedHelper = options.privilegedHelper ?? null;
+  // Register the bounded privileged-operation ids the helper can actually route
+  // and execute. This is the authoritative set an elevated capability must bind
+  // to (registry.register enforces it). When no helper is wired the set stays
+  // empty, so no elevated capability can register as executable — elevation has
+  // no bounded route to run through.
+  if (privilegedHelper) {
+    const ops = privilegedHelper.supportedOperations?.()
+      ?? Object.keys(PRIVILEGED_OPERATIONS);
+    registry.privilegedOperations = new Set(ops);
+  }
 
   // system.inspect
   registry.register({
@@ -193,6 +290,9 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     outputSchema: { type: "object" },
     requiredContext: [],
     riskMetadata: { level: RiskLevel.LOW },
+    // This is a user-initiated, ephemeral interaction with one installed app;
+    // it must not inherit the SYSTEM scope used for process inspection.
+    permissionModel: { scope: ["SESSION"], type: "READ" },
     reversibility: "NOT_REQUIRED",
     preconditions: () => true,
     execute: async () => {
@@ -409,7 +509,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     },
     outputSchema: { type: "object" },
     requiredContext: [],
-    riskMetadata: { level: RiskLevel.MEDIUM },
+    riskMetadata: { level: RiskLevel.LOW },
     reversibility: "ROLLBACK_SUPPORTED",
     preconditions: (args) => !!args.workspacePath && !!args.key,
     execute: async (args) => {
@@ -533,6 +633,40 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     rollback: null,
     timeout: 30000,
     retryPolicy: { maxAttempts: 2, backoffMs: 2000 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // package.winget.inspect - read-only installed-package status
+  registry.register({
+    name: "package.winget.inspect",
+    version: "1.0.0",
+    description: "Check whether a package is installed via WinGet",
+    inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissions: ["system:read"],
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => !!args.id,
+    execute: async (args) => adapter.wingetList(args.id),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "package.winget.inspect", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId, detectedChanges: [], confidence: 1, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    // Both installed and not-installed are successful answers to this query.
+    verify: async (observation, args) => {
+      const result = observation.structuredState ?? {};
+      const installed = result.exitCode === 0 && (result.stdout ?? "").toLowerCase().includes(String(args.id).toLowerCase());
+      return {
+        status: "VERIFIED",
+        message: installed ? `${args.id} is installed.` : `${args.id} is not installed.`,
+        evidence: result,
+        confidence: result.timedOut ? 0.5 : 1
+      };
+    },
+    rollback: null,
+    timeout: 30000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
@@ -674,6 +808,437 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     },
     timeout: 10000,
     retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // filesystem.createDirectory (real) - create a directory (recursive). Verified
+  // by an independent stat. Rollback removes a directory THIS op created.
+  registry.register({
+    name: "filesystem.createDirectory",
+    version: "1.0.0",
+    description: "Create a directory (including parents)",
+    inputSchema: {
+      type: "object",
+      properties: { directoryPath: { type: "string" } },
+      required: ["directoryPath"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.MEDIUM },
+    reversibility: "ROLLBACK_SUPPORTED",
+    preconditions: (args) => typeof args?.directoryPath === "string" && args.directoryPath.trim() !== "",
+    execute: async (args) => adapter.createDirectory(args.directoryPath),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "filesystem.createDirectory",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: ["directory"],
+      confidence: 1,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation, args) => {
+      const target = observation?.structuredState?.directoryPath ?? args.directoryPath;
+      const verify = await adapter.verifyDirectoryExists(target);
+      return {
+        status: verify.exists ? "VERIFIED" : "FAILED",
+        message: verify.exists ? "Directory exists" : "Directory was not created",
+        evidence: verify,
+        confidence: verify.exists ? 1 : 0
+      };
+    },
+    // Only remove the directory if it did not exist before we created it.
+    rollback: async (args, checkpoint) => {
+      if (checkpoint?.existedBefore) return { skipped: true, reason: "Directory pre-existed; not removed." };
+      return adapter.removeDirectory(checkpoint?.directoryPath ?? args.directoryPath);
+    },
+    createCheckpoint: async (args) => {
+      const existing = await adapter.verifyDirectoryExists(args.directoryPath);
+      return { existedBefore: existing.exists, directoryPath: args.directoryPath };
+    },
+    timeout: 10000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 500 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // filesystem.search (real, read-only) - find files under a root by glob.
+  registry.register({
+    name: "filesystem.search",
+    version: "1.0.0",
+    description: "Search for files under a directory by name pattern",
+    inputSchema: {
+      type: "object",
+      properties: {
+        rootDirectory: { type: "string" },
+        pattern: { type: "string" },
+        maxResults: { type: "number" }
+      },
+      required: ["pattern"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.pattern === "string" && args.pattern.trim() !== "",
+    execute: async (args) => adapter.searchFiles(args.rootDirectory, args.pattern, args.maxResults ?? 50),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "filesystem.search",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: [],
+      confidence: 1,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      return {
+        status: Array.isArray(result.files) ? "VERIFIED" : "FAILED",
+        message: Array.isArray(result.files) ? `Found ${result.files.length} file(s)` : "Search failed",
+        evidence: { count: result.files?.length ?? 0 },
+        confidence: Array.isArray(result.files) ? 1 : 0
+      };
+    },
+    timeout: 30000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // filesystem.delete (real, MUTATING) - delete a file. MEDIUM risk so policy
+  // routes it through CONFIRM. Rollback restores the captured contents.
+  registry.register({
+    name: "filesystem.delete",
+    version: "1.0.0",
+    description: "Delete a file",
+    inputSchema: {
+      type: "object",
+      properties: { filePath: { type: "string" } },
+      required: ["filePath"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.MEDIUM },
+    reversibility: "ROLLBACK_SUPPORTED",
+    preconditions: (args) => typeof args?.filePath === "string" && args.filePath.trim() !== "",
+    execute: async (args) => adapter.removeTextFile(args.filePath),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "filesystem.delete",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: ["file"],
+      confidence: 1,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation, args) => {
+      const target = args.filePath;
+      let stillExists = true;
+      try {
+        await adapter.readTextFile(target);
+      } catch (error) {
+        if (error?.code === "ENOENT") stillExists = false;
+      }
+      return {
+        status: stillExists ? "FAILED" : "VERIFIED",
+        message: stillExists ? "File still exists" : "File deleted",
+        confidence: stillExists ? 0 : 1
+      };
+    },
+    rollback: async (args, checkpoint) => {
+      if (checkpoint?.exists) return adapter.writeTextFile(args.filePath, checkpoint.contents);
+      return { skipped: true, reason: "File did not exist before delete." };
+    },
+    createCheckpoint: async (args) => {
+      try {
+        const file = await adapter.readTextFile(args.filePath);
+        return { exists: true, contents: file.contents };
+      } catch (error) {
+        if (error?.code === "ENOENT") return { exists: false, contents: null };
+        throw error;
+      }
+    },
+    timeout: 10000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // application.launch (real) - launch an application/executable and confirm a
+  // window/process appeared.
+  registry.register({
+    name: "application.launch",
+    version: "1.0.0",
+    description: "Launch an application and confirm it started",
+    inputSchema: {
+      type: "object",
+      properties: { application: { type: "string" } },
+      required: ["application"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["SESSION"], type: "READ" },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.application === "string" && args.application.trim() !== "",
+    execute: async (args) => adapter.launchApplication(args.application),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "application.launch",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: ["process"],
+      confidence: result?.window ? 1 : 0.5,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      const started = Boolean(result.window) || result?.launch?.started === true || result?.launchResult?.exitCode === 0;
+      return {
+        status: started ? "VERIFIED" : "FAILED",
+        message: started ? `Launched ${result.application}` : `Could not confirm ${result.application} started`,
+        evidence: { window: result.window ?? null },
+        confidence: started ? (result.window ? 1 : 0.6) : 0
+      };
+    },
+    timeout: 15000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    recoveryHints: ["ABORT_ON_FAILURE"],
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  registry.register({
+    name: "system.volume.adjust",
+    version: "1.0.0",
+    description: "Adjust Windows master volume by a bounded number of media-key steps",
+    inputSchema: {
+      type: "object",
+      properties: { direction: { type: "string", enum: ["up", "down"] }, steps: { type: "number" } },
+      required: ["direction"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["SESSION"], type: "READ" },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => ["up", "down"].includes(args?.direction),
+    execute: async (args) => adapter.adjustSystemVolume(args.direction, args.steps),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "system.volume.adjust", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId, detectedChanges: [],
+      confidence: result?.dispatched ? 0.8 : 0, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      return {
+        status: result.dispatched ? "VERIFIED" : "FAILED",
+        message: result.dispatched
+          ? `Sent ${result.steps} volume-${result.direction} command(s).`
+          : "Windows did not confirm dispatch of the volume command.",
+        evidence: result, confidence: result.dispatched ? 0.8 : 0
+      };
+    },
+    rollback: null,
+    timeout: 5000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    recoveryHints: ["ABORT_ON_FAILURE"],
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // application.close (real, MUTATING) - stop a process by name. MEDIUM risk.
+  registry.register({
+    name: "application.close",
+    version: "1.0.0",
+    description: "Close a running application/process by name",
+    inputSchema: {
+      type: "object",
+      properties: { processName: { type: "string" } },
+      required: ["processName"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.MEDIUM },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.processName === "string" && args.processName.trim() !== "",
+    execute: async (args) => adapter.closeApplication(args.processName),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "application.close",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: ["process"],
+      confidence: 1,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation, args) => {
+      const name = (args.processName ?? "").toLowerCase().replace(".exe", "");
+      const processes = await adapter.listProcesses();
+      const list = Array.isArray(processes?.processes) ? processes.processes : (Array.isArray(processes) ? processes : []);
+      const stillRunning = list.some((p) => String(p?.ProcessName ?? p?.name ?? "").toLowerCase() === name);
+      return {
+        status: stillRunning ? "FAILED" : "VERIFIED",
+        message: stillRunning ? `${name} is still running` : `${name} was closed`,
+        confidence: stillRunning ? 0 : 1
+      };
+    },
+    timeout: 10000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // gui.inspect is the reusable perception primitive for a desktop agent. It
+  // exposes accessible controls as structured evidence; it never clicks/types.
+  registry.register({
+    name: "gui.inspect",
+    version: "1.0.0",
+    description: "Inspect accessible controls in a visible desktop application",
+    inputSchema: { type: "object", properties: { application: { type: "string" }, maxElements: { type: "number" } }, required: [] },
+    outputSchema: { type: "object" }, requiredContext: [], riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["SESSION"], type: "READ" }, reversibility: "NOT_REQUIRED",
+    execute: async (args) => adapter.inspectUi(args ?? {}),
+    observe: async (result, args) => ({ observationId: createId(), source: "gui.inspect", timestamp: new Date().toISOString(), structuredState: result, relatedActionId: args?.actionId, detectedChanges: [], confidence: 0.9, trustLevel: "SYSTEM_TRUSTED" }),
+    verify: async (observation) => ({ status: "VERIFIED", message: `Inspected ${(observation?.structuredState?.elements ?? []).length} accessible controls.`, confidence: 0.9 }),
+    timeout: 15000, retryPolicy: { maxAttempts: 1, backoffMs: 0 }, lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // gui.interact is intentionally generic, but never coordinate based. Every
+  // action is bound to an app window plus an accessible selector. The runtime
+  // asks for approval before it can alter a third-party UI.
+  registry.register({
+    name: "gui.interact",
+    version: "1.0.0",
+    description: "Click or type into an accessible control in a visible desktop application",
+    inputSchema: { type: "object", properties: { application: { type: "string" }, target: { type: "object" }, action: { type: "string" }, text: { type: "string" } }, required: ["application", "target", "action"] },
+    outputSchema: { type: "object" }, requiredContext: ["application"], riskMetadata: { level: RiskLevel.MEDIUM },
+    permissionModel: { scope: ["SESSION"], type: "WRITE" }, reversibility: "PARTIALLY_REVERSIBLE",
+    execute: async (args) => adapter.interactUi(args),
+    observe: async (result, args) => ({ observationId: createId(), source: "gui.interact", timestamp: new Date().toISOString(), structuredState: result, relatedActionId: args?.actionId, detectedChanges: result?.performed ? ["application.ui"] : [], confidence: result?.performed ? 0.8 : 0.4, trustLevel: "SYSTEM_TRUSTED" }),
+    verify: async (observation) => observation?.structuredState?.performed
+      ? { status: "VERIFIED", message: "Accessible UI action completed.", confidence: 0.8 }
+      : { status: "FAILED", message: observation?.structuredState?.reason ?? "UI action did not complete.", confidence: 1 },
+    timeout: 20000, retryPolicy: { maxAttempts: 0, backoffMs: 0 }, recoveryHints: ["ABORT_ON_FAILURE"], lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // spotify.track.open (real) - hand a specific song request to the installed
+  // Spotify desktop client. This deliberately opens Spotify's result, rather
+  // than claiming it can control account playback without OAuth authorization.
+  registry.register({
+    name: "spotify.track.open",
+    version: "1.0.0",
+    description: "Open a track search in the Spotify desktop client",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["SESSION"], type: "READ" },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.query === "string" && args.query.trim() !== "",
+    execute: async (args) => adapter.openSpotifySearch(args.query),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "spotify.track.open", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId, detectedChanges: ["application"],
+      confidence: result?.launch?.opened ? 1 : 0.5, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      const opened = result?.launch?.opened === true || result?.launchResult?.exitCode === 0;
+      return {
+        status: opened ? "VERIFIED" : "FAILED",
+        message: opened
+          ? `Opened Spotify results for ${result.query}.`
+          : `Could not open Spotify results for ${result.query ?? "the requested track"}.`,
+        evidence: { uri: result.uri ?? null }, confidence: opened ? 0.9 : 0
+      };
+    },
+    timeout: 5000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    recoveryHints: ["ABORT_ON_FAILURE"],
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // spotify.track.play (real) - drive the installed Spotify desktop client to
+  // ACTUALLY play a requested track via bounded, window-scoped UI Automation.
+  // Unlike spotify.track.open (which only opens results), this attempts real
+  // playback and then VERIFIES it independently from the live Spotify window
+  // title — so it reports success ONLY when a track is genuinely playing, and
+  // honestly reports partial/failed otherwise (never "launched == done").
+  //
+  // Normal launch/search/focus/play is a LOW-risk, ephemeral interaction with one
+  // already-installed app (no account/OAuth/financial mutation), so — like
+  // application.launch and spotify.track.open — it is ALLOW without confirmation.
+  // ABORT_ON_FAILURE + a single bounded retry keep a failed UI interaction from
+  // looping/replanning forever.
+  registry.register({
+    name: "spotify.track.play",
+    version: "1.0.0",
+    description: "Play a track in the Spotify desktop client via bounded UI automation",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" }, options: { type: "object" } },
+      required: ["query"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    // Scoped to a single interactive session with one app, exactly like
+    // spotify.track.open / application.launch. Not a system or account write.
+    permissionModel: { scope: ["SESSION"], type: "READ" },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.query === "string" && args.query.trim() !== "",
+    execute: async (args) => adapter.playSpotifyTrack(args.query, args.options ?? {}),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "spotify.track.play", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId,
+      detectedChanges: result?.playback?.playing ? ["application.playback"] : [],
+      confidence: result?.playback?.playing ? 1 : 0.5, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    // INDEPENDENT verification: re-read the LIVE Spotify window title rather than
+    // trusting execute()'s own return value. A track is confirmed VERIFIED only
+    // when playback is live AND the title matches the requested query.
+    verify: async (observation, args) => {
+      const result = observation?.structuredState ?? {};
+      const query = String(args?.query ?? result.query ?? "").trim();
+      if (result.available === false) {
+        return {
+          status: "FAILED",
+          message: "Spotify does not appear to be installed, so the track could not be played.",
+          evidence: result, confidence: 1
+        };
+      }
+      const live = typeof adapter.readSpotifyPlayback === "function"
+        ? await adapter.readSpotifyPlayback()
+        : (result.playback ?? {});
+      const matched = matchesTrackQuery(live.title ?? live.nowPlaying, query);
+      if (live.playing && matched) {
+        return {
+          status: "VERIFIED",
+          message: `Playing "${live.nowPlaying}" in Spotify.`,
+          evidence: { title: live.title }, confidence: 0.9
+        };
+      }
+      if (live.playing && !matched) {
+        return {
+          status: "FAILED",
+          message: `Spotify is playing "${live.nowPlaying}", not the requested "${query}".`,
+          evidence: { title: live.title }, confidence: 1
+        };
+      }
+      return {
+        status: "FAILED",
+        message: `I opened Spotify and searched for "${query}", but couldn't confirm the track started playing. You may need to press Play.`,
+        evidence: { title: live.title ?? null }, confidence: 1
+      };
+    },
+    timeout: 30000,
+    retryPolicy: { maxAttempts: 2, backoffMs: 0 },
+    recoveryHints: ["ABORT_ON_FAILURE"],
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
@@ -1326,7 +1891,8 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     outputSchema: { type: "object" },
     requiredContext: [],
     riskMetadata: { level: RiskLevel.LOW },
-    permissions: ["browser:launch"],
+    // Opening a search result is read-only navigation, not an external write.
+    permissions: ["browser:read"],
     reversibility: "NOT_REQUIRED",
     preconditions: (args) => !!args.query,
     execute: async (args) => {
@@ -1500,6 +2066,12 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     riskMetadata: { level: RiskLevel.MEDIUM },
     permissions: ["system:service:restart"],
     requirements: { elevation: "ADMIN", permissions: ["system:service:restart"] },
+    // Structural binding: an elevated capability MUST name the bounded privileged
+    // operation it routes through. The registry rejects any elevated capability
+    // whose privilegedOperation is not a real helper operation, and execution is
+    // routed through the helper (never an arbitrary execute()). This is what makes
+    // ELEVATE an execution-ROUTING guarantee rather than a boolean.
+    privilegedOperation: "service.restart",
     reversibility: "NOT_REQUIRED",
     preconditions: (args) => typeof args?.scope === "string" && args.scope.trim() !== "" && typeof args?.token === "string" && args.token !== "",
     execute: async (args) => runPrivileged("service.restart", args.scope, args),
@@ -1549,6 +2121,11 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     riskMetadata: { level: RiskLevel.MEDIUM },
     permissions: ["system:package:install"],
     requirements: { elevation: "ADMIN", permissions: ["system:package:install"] },
+    // Explicit binding to a bounded privileged-helper operation. This is what
+    // makes ELEVATE an execution-ROUTING guarantee: the registry only accepts an
+    // elevated capability whose privilegedOperation names a real helper op, and
+    // the pipeline refuses to run an elevated capability that lacks this binding.
+    privilegedOperation: "package.install",
     reversibility: "NOT_REQUIRED",
     preconditions: (args) => typeof args?.scope === "string" && args.scope.trim() !== "" && typeof args?.token === "string" && args.token !== "",
     execute: async (args) => runPrivileged("package.install", args.scope, args),
