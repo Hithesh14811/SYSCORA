@@ -19,6 +19,14 @@
 
 import { validateSchema } from "../../model-providers/src/index.js";
 import { redactSensitiveData } from "../../shared-types/src/redaction.js";
+import {
+  classifyExternalContext,
+  ExternalAIDataCategory
+} from "../../shared-types/src/external-context.js";
+import {
+  InteractiveDecisionKind,
+  normalizeInteractiveDecision
+} from "../../shared-types/src/interactive-decision.js";
 
 // ---- Strict schemas (Phase 4) -------------------------------------------
 
@@ -101,6 +109,40 @@ export const SUMMARY_SCHEMA = {
   }
 };
 
+const INTERACTIVE_ACTION_SCHEMA = {
+  type: "object",
+  required: ["capability", "inputs"],
+  properties: {
+    capability: { type: "string" },
+    inputs: { type: "object" },
+    subgoal: { type: "string" },
+    expectedEffect: { type: "string" },
+    verification: { type: "object" },
+    bindOutput: { type: "object" },
+    completesGoal: { type: "boolean" },
+    completionResult: { type: "object" }
+  }
+};
+
+export const INTERACTIVE_DECISION_SCHEMA = {
+  type: "object",
+  required: ["kind"],
+  properties: {
+    kind: { type: "string" },
+    subgoal: { type: "string" },
+    reason: { type: "string" },
+    result: { type: "object" },
+    question: { type: "string" },
+    requestedPerception: { type: "array", items: { type: "string" } },
+    strategy: { type: "string" },
+    expectedEffect: { type: "string" },
+    verification: { type: "object" },
+    action: INTERACTIVE_ACTION_SCHEMA,
+    localSteps: { type: "array", items: INTERACTIVE_ACTION_SCHEMA },
+    fallback: { type: "array", items: INTERACTIVE_ACTION_SCHEMA }
+  }
+};
+
 // Recovery actions the runtime's deterministic layer understands. A model
 // proposal outside this set is rejected.
 const ALLOWED_RECOVERY_ACTIONS = new Set([
@@ -111,7 +153,7 @@ const ALLOWED_RECOVERY_ACTIONS = new Set([
 export class ReasoningEngine {
   // modelProvider: any LanguageModelProvider (may be Mock). capabilityRegistry:
   // used to reject hallucinated capabilities. repairAttempts: bounded repair.
-  constructor({ modelProvider = null, capabilityRegistry = null, repairAttempts = 1, defaultTimeoutMs = 60000 } = {}) {
+  constructor({ modelProvider = null, capabilityRegistry = null, repairAttempts = 1, defaultTimeoutMs = 15000 } = {}) {
     this.modelProvider = modelProvider;
     this.capabilityRegistry = capabilityRegistry;
     this.repairAttempts = Math.max(0, repairAttempts);
@@ -176,6 +218,9 @@ export class ReasoningEngine {
     const safePrompt = typeof prompt === "string" ? prompt : String(prompt ?? "");
     const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
     const extraValidate = typeof options.validate === "function" ? options.validate : null;
+    const normalize = typeof options.normalize === "function"
+      ? options.normalize
+      : (value) => ({ ok: true, data: value, errors: [] });
 
     let currentPrompt = safePrompt;
     const maxTries = 1 + this.repairAttempts;
@@ -185,7 +230,16 @@ export class ReasoningEngine {
       let raw;
       try {
         // validateSchema:false — we validate here so we can drive repair.
-        raw = await this.modelProvider.generateStructured(currentPrompt, schema, { timeoutMs });
+        raw = await this.modelProvider.generateStructured(currentPrompt, schema, {
+          timeoutMs,
+          // Interactive control must have one transport attempt. Structural
+          // repair remains separately bounded by repairAttempts.
+          maxRetries: options.maxRetries ?? 1,
+          strictSchema: options.strictSchema,
+          externalAI: {
+            dataCategories: options.dataCategories ?? [ExternalAIDataCategory.SANITIZED_TASK_TEXT]
+          }
+        });
       } catch (error) {
         lastError = error?.message || String(error);
         // Malformed JSON / network / timeout / rate limit all land here. Repair
@@ -193,10 +247,16 @@ export class ReasoningEngine {
         break;
       }
 
-      const validation = validateSchema(raw, schema);
-      const extra = extraValidate ? extraValidate(raw) : { valid: true, errors: [] };
+      const normalized = normalize(raw);
+      const candidate = normalized?.data;
+      const validation = normalized?.ok === false
+        ? { valid: false, errors: normalized.errors ?? ["normalization failed"] }
+        : validateSchema(candidate, schema);
+      const extra = validation.valid && extraValidate
+        ? extraValidate(candidate)
+        : { valid: true, errors: [] };
       if (validation.valid && extra.valid) {
-        return { ok: true, data: raw };
+        return { ok: true, data: candidate };
       }
 
       lastError = [...(validation.errors || []), ...(extra.errors || [])].join(", ");
@@ -243,7 +303,14 @@ Return JSON with:
 - confidence: number from 0 to 1
 - ambiguity: boolean (true if the request is unclear)
 - clarificationQuestions: array of strings if ambiguous`.trim();
-    return this._reasonStructured(this._redact(prompt), INTENT_SCHEMA);
+    return this._reasonStructured(this._redact(prompt), INTENT_SCHEMA, {
+      timeoutMs: 12000,
+      maxRetries: 1,
+      dataCategories: [
+        ExternalAIDataCategory.SANITIZED_TASK_TEXT,
+        ExternalAIDataCategory.CAPABILITY_METADATA
+      ]
+    });
   }
 
   async extractEntities(rawText, context = {}) {
@@ -277,6 +344,140 @@ Return JSON with:
       : { ok: true, data: requested };
   }
 
+  async decideInteractiveAction(context = {}) {
+    if (!this.capabilityRegistry) return { ok: false, error: "no-capability-registry" };
+    const catalog = Array.isArray(context.availableCapabilities)
+      ? context.availableCapabilities
+      : this.capabilityRegistry.getCatalog();
+    const known = new Set(catalog.map((capability) => capability.name));
+    const { availableCapabilities: trustedCatalog = [], ...machineContext } = context;
+    const classified = classifyExternalContext(machineContext);
+    const safeContext = {
+      contextClassification: classified.classification,
+      machineContext: classified.data,
+      availableCapabilities: trustedCatalog
+    };
+    const prompt = `
+You are selecting the next safe action for a general Windows agent.
+Use only the supplied registered capabilities. Never return executable code,
+shell text, invented coordinates, invented window ids, or invented UI targets.
+A UI or visual action must consume a target actually returned by a prior
+perception/find action. Prefer INTERNAL/OS_API/CLI, then BROWSER_DOM, then UIA,
+then local vision when equally effective.
+
+Choose one unresolved subgoal. Return exactly one canonical decision kind:
+ACT, OBSERVE, RECOVER, COMPLETE, FAIL, or CLARIFY.
+Prefer returning the complete deterministic
+happy-path strategy as action + localSteps so one reasoning call can execute
+many mechanical operations. Stop the local sequence before genuine ambiguity.
+Every action is:
+{ "capability": "registered.name", "inputs": {}, "modality": "..." }.
+Within localSteps, consume the immediately preceding action's output with a
+"$last.output.<field>" reference (for example "$last.output.target"). Do not
+invent values that a prior action has not returned.
+To retain a scalar across later steps, add
+"bindOutput":{"name":"descriptiveName","path":"output.text","normalize":"trim|version"}
+to its producing action, then consume it as "$binding.descriptiveName". Use
+this for browser-to-desktop data transfer. Bindings carry local provenance and
+are resolved and reauthorized by the runtime; never copy known values by asking
+the model again.
+When the last local step is a read-only verification that proves every success
+criterion, mark it "completesGoal":true and include
+"completionResult":{"summary":"..."}. The controller completes only if that
+step is locally VERIFIED; a proposed completion flag never bypasses execution.
+Fallbacks use the same shape. ACT requires action. Do not include an action for
+COMPLETE, FAIL, or CLARIFY.
+
+Return COMPLETE only after every original success criterion is supported by
+fresh observed or verified evidence. COMPLETE requires:
+{
+  "result": { "summary": "what is now true" },
+  "verification": {
+    "allCriteriaSatisfied": true,
+    "satisfiedCriteria": [
+      { "criterion": "original criterion", "evidence": "specific observed fact" }
+    ]
+  }
+}
+Do not treat successful clicks or task execution alone as goal completion.
+
+Canonical examples:
+{"kind":"ACT","action":{"capability":"ui.inspect","inputs":{"application":"Example"}}}
+{"kind":"OBSERVE","reason":"Window state needs refreshing","requestedPerception":["windows","controls"]}
+{"kind":"RECOVER","strategy":"refresh-window","reason":"The prior target was stale"}
+{"kind":"COMPLETE","result":{"summary":"..."}, "verification":{"allCriteriaSatisfied":true,"satisfiedCriteria":[]}}
+{"kind":"FAIL","reason":"No safe action remains"}
+{"kind":"CLARIFY","question":"Which window did you mean?"}
+Compact sanitized state:
+${JSON.stringify(safeContext)}
+
+Return only JSON matching the decision schema.`.trim();
+    const validateAction = (action, errors, label) => {
+      if (!action || typeof action !== "object") {
+        errors.push(`${label} is missing`);
+        return;
+      }
+      if (!known.has(action.capability)) errors.push(`${label} uses unknown capability: ${action.capability}`);
+      if (!action.inputs || typeof action.inputs !== "object" || Array.isArray(action.inputs)) {
+        errors.push(`${label}.inputs must be an object`);
+      }
+    };
+    const validate = (data) => {
+      const errors = [];
+      const kind = data?.kind;
+      if (!Object.values(InteractiveDecisionKind).includes(kind)) {
+        errors.push("decision kind is invalid");
+      }
+      if (kind === InteractiveDecisionKind.ACT) validateAction(data.action, errors, "action");
+      if (kind === InteractiveDecisionKind.COMPLETE) {
+        const requiredCriteria = Array.isArray(context.initialContext?.successCriteria)
+          ? context.initialContext.successCriteria.filter(Boolean)
+          : [];
+        if (!data.result || typeof data.result !== "object") errors.push("COMPLETE requires result");
+        if (data.verification?.allCriteriaSatisfied !== true) {
+          errors.push("COMPLETE requires verification.allCriteriaSatisfied=true");
+        }
+        const satisfied = data.verification?.satisfiedCriteria;
+        if (!Array.isArray(satisfied) || satisfied.length < requiredCriteria.length) {
+          errors.push(`COMPLETE requires evidence for all ${requiredCriteria.length} success criteria`);
+        } else {
+          for (const [index, item] of satisfied.entries()) {
+            if (!item || typeof item.criterion !== "string" || typeof item.evidence !== "string" || !item.evidence.trim()) {
+              errors.push(`verification.satisfiedCriteria[${index}] requires criterion and evidence`);
+            }
+          }
+        }
+      }
+      for (const [index, action] of (data?.localSteps ?? []).entries()) {
+        validateAction(action, errors, `localSteps[${index}]`);
+      }
+      for (const [index, action] of (data?.fallback ?? []).entries()) {
+        validateAction(action, errors, `fallback[${index}]`);
+      }
+      return { valid: errors.length === 0, errors };
+    };
+    return this._reasonStructured(prompt, INTERACTIVE_DECISION_SCHEMA, {
+      normalize: normalizeInteractiveDecision,
+      validate,
+      strictSchema: false,
+      timeoutMs: context.reasoningPhase === "INITIAL_STRATEGY" ? 30000 : 10000,
+      maxRetries: 1,
+      dataCategories: [
+        ExternalAIDataCategory.SANITIZED_TASK_TEXT,
+        ExternalAIDataCategory.STRUCTURED_SEMANTIC_CONTEXT,
+        ExternalAIDataCategory.CAPABILITY_METADATA,
+        ExternalAIDataCategory.STRUCTURED_UIA_METADATA,
+        ExternalAIDataCategory.ACTION_VERIFICATION_STATE,
+        ...(machineContext.currentState?.browser != null ||
+            machineContext.recentObservations?.some?.((item) =>
+              item?.browser != null || /\b(?:BROWSER_DOM|DOM)\b/i.test(String(item?.source ?? ""))
+            )
+          ? [ExternalAIDataCategory.SANITIZED_BROWSER_DOM]
+          : [])
+      ]
+    });
+  }
+
   async clarifyIntent(rawText, context = {}) {
     const prompt = `
 The following request may be ambiguous. Decide whether clarification is needed.
@@ -304,6 +505,14 @@ Execution-priority guidance:
 - Choose a GUI-automation capability ONLY when no command/API capability covers that sub-step.
 - For a hybrid goal, order the tasks so the command/API task runs first and the GUI task
   depends on it (command-then-GUI), so there is no idle wait between the two phases.
+- Select modality independently for every subgoal using each capability's execution metadata.
+- Never invent a UI target, window id, coordinates, or OCR result. First use
+  ui.resolveTarget (or ui.find when visual fallback is inappropriate), then pass
+  its real result using a runtime reference such as
+  "$task.<finderTaskId>.output.target".
+- Prefer UI Automation targets. Use vision.locate and pointer.click only after structured
+  lookup is unavailable or a bounded recovery requires visual grounding.
+- Every GUI mutation should include an observable postcondition when one can be described.
 
 Intent: ${JSON.stringify(this._safeIntent(intent))}
 Capabilities: ${JSON.stringify(catalog)}
@@ -358,7 +567,16 @@ Return JSON:
       return { valid: errors.length === 0, errors };
     };
 
-    return this._reasonStructured(prompt, TASKGRAPH_SCHEMA, { validate, timeoutMs: planningContext.timeoutMs ?? 90000 });
+    return this._reasonStructured(prompt, TASKGRAPH_SCHEMA, {
+      validate,
+      timeoutMs: planningContext.timeoutMs ?? 30000,
+      maxRetries: 1,
+      dataCategories: [
+        ExternalAIDataCategory.SANITIZED_TASK_TEXT,
+        ExternalAIDataCategory.STRUCTURED_SEMANTIC_CONTEXT,
+        ExternalAIDataCategory.CAPABILITY_METADATA
+      ]
+    });
   }
 
   // Alias — decomposition and composition share one structured call here.

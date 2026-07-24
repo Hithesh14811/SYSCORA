@@ -3,12 +3,115 @@ import os from "node:os";
 import path from "node:path";
 const createId = () => crypto.randomBytes(16).toString("hex");
 import { validateSchema } from "../../model-providers/src/index.js";
+import {
+  assessGoalContractPlanCoverage
+} from "../../shared-types/src/goal-contract.js";
 
 export const TASK_LIMITS = Object.freeze({
   minTimeoutMs: 1000,
   maxTimeoutMs: 600000,
   maxRetryBudget: 10
 });
+
+const SEMANTIC_STOP_WORDS = new Set([
+  "a", "about", "an", "and", "are", "as", "at", "be", "by", "can", "could", "current",
+  "do", "for", "from", "get", "give", "i", "in", "into", "is", "it", "leave",
+  "its", "me", "my", "of", "on", "only", "or", "out", "please", "put", "read", "show", "something", "tell",
+  "that", "the", "then", "this", "to", "use", "using", "via", "what", "with",
+  "quick", "request", "processed", "success", "successful", "successfully", "whats",
+  "task", "complete", "completed", "completion", "done", "verify", "verified"
+]);
+
+const SEMANTIC_ALIASES = new Map([
+  ["box", "system"], ["computer", "system"], ["machine", "system"], ["pc", "system"],
+  ["developer", "environment"], ["development", "environment"],
+  ["tool", "environment"], ["tools", "environment"], ["tooling", "environment"],
+  ["installed", "environment"],
+  ["application", "app"], ["applications", "app"],
+  ["directories", "directory"], ["folder", "directory"], ["folders", "directory"],
+  ["repository", "repo"], ["repositories", "repo"],
+  ["processes", "process"], ["running", "process"], ["packages", "package"],
+  ["browsing", "browser"], ["webpage", "browser"], ["website", "browser"]
+]);
+
+function semanticTokens(value) {
+  const raw = String(value ?? "").toLowerCase().match(/[a-z0-9]+(?:[+-][a-z0-9]+)*/g) ?? [];
+  return new Set(raw
+    .map((token) => SEMANTIC_ALIASES.get(token) ?? token)
+    .map((token) => token.length > 5 && token.endsWith("ing") ? token.slice(0, -3) : token)
+    .map((token) => token.length > 4 && token.endsWith("ed") ? token.slice(0, -2) : token)
+    .filter((token) => token.length > 1 && !SEMANTIC_STOP_WORDS.has(token)));
+}
+
+/**
+ * Fail-closed semantic coverage check for an untyped deterministic fallback.
+ * Plan goal/summary are deliberately excluded because they merely echo the
+ * request. Coverage must come from concrete tasks, capability contracts, and
+ * bounded inputs that would actually execute.
+ */
+export function assessPlanGoalCoverage(intent = {}, taskGraph = {}, capabilityRegistry = null) {
+  const goalContract = intent.goalContract ?? null;
+  if (goalContract?.enforceable && goalContract?.criteria?.length > 0) {
+    const contractCoverage = assessGoalContractPlanCoverage(goalContract, taskGraph, capabilityRegistry);
+    return {
+      covered: contractCoverage.covered,
+      score: contractCoverage.totalCriteria > 0
+        ? contractCoverage.coveredCount / contractCoverage.totalCriteria
+        : 0,
+      matchedTerms: contractCoverage.criteria
+        .filter((criterion) => criterion.covered)
+        .map((criterion) => criterion.description),
+      missingTerms: contractCoverage.missingCriteria,
+      reason: contractCoverage.covered
+        ? "all-goal-contract-criteria-covered"
+        : "goal-contract-criteria-missing",
+      goalContractCoverage: contractCoverage
+    };
+  }
+  // rawText is the original authority. Model-produced normalizedGoal and
+  // successCriteria are useful only when no original text exists; a malformed
+  // interpretation must not make an otherwise correct deterministic route fail
+  // (or make an irrelevant one pass).
+  const requestSource = String(intent.rawText ?? "").trim() || [
+    intent.normalizedGoal,
+    ...(intent.successCriteria ?? [])
+  ].filter(Boolean).join(" ");
+  const requestTokens = semanticTokens(requestSource);
+  const tasks = Array.isArray(taskGraph?.tasks) ? taskGraph.tasks : [];
+  if (requestTokens.size === 0) {
+    return { covered: true, score: 1, matchedTerms: [], missingTerms: [], reason: "no-informative-goal-terms" };
+  }
+  if (tasks.length === 0) {
+    return { covered: false, score: 0, matchedTerms: [], missingTerms: [...requestTokens], reason: "empty-task-graph" };
+  }
+
+  const evidenceParts = [];
+  for (const task of tasks) {
+    const contract = capabilityRegistry?.get?.(task.capability);
+    evidenceParts.push(
+      task.capability,
+      task.goal,
+      task.description,
+      JSON.stringify(task.inputs ?? {}),
+      ...(task.completionCriteria ?? []),
+      ...(task.verificationCriteria ?? []),
+      contract?.description
+    );
+  }
+  const evidenceTokens = semanticTokens(evidenceParts.filter(Boolean).join(" "));
+  const matchedTerms = [...requestTokens].filter((token) => evidenceTokens.has(token));
+  const missingTerms = [...requestTokens].filter((token) => !evidenceTokens.has(token));
+  const denominator = Math.min(requestTokens.size, 6);
+  const score = denominator > 0 ? matchedTerms.length / denominator : 1;
+  const covered = matchedTerms.length >= Math.min(2, requestTokens.size) && score >= 0.34;
+  return {
+    covered,
+    score,
+    matchedTerms,
+    missingTerms,
+    reason: covered ? "task-evidence-covers-goal" : "task-evidence-does-not-cover-goal"
+  };
+}
 
 // Build a canonical scheduler task. Centralizes the task shape so every planner
 // path (operation-driven and keyword-driven) produces identical structure.
@@ -251,6 +354,33 @@ export const OPERATION_PLANS = {
       description: "Launch the requested allow-listed desktop application",
       completionCriteria: [`${e.application} launched`], timeout: 15000, retryBudget: 0
     })
+  ],
+  "window.enumerate": () => [
+    buildTask("window.enumerate", {}, { goal: "Enumerate windows", completionCriteria: ["Visible windows observed"], timeout: 8000, retryBudget: 0 })
+  ],
+  "window.wait": (e) => [
+    buildTask("window.wait", { windowId: e.windowId, application: e.application, timeoutMs: e.timeoutMs }, { goal: "Wait for application window", completionCriteria: ["Expected window appeared"], timeout: 20000, retryBudget: 0 })
+  ],
+  "process.launch": (e, ws) => [
+    buildTask("process.launch", { executable: e.executable, args: e.args ?? [], workingDirectory: e.workingDirectory ?? ws }, { goal: "Launch process", riskHints: "MEDIUM", completionCriteria: ["Process started"], timeout: 15000, retryBudget: 0 })
+  ],
+  "window.activate": (e) => [
+    buildTask("window.activate", { windowId: e.windowId, application: e.application }, { goal: "Activate window", completionCriteria: ["Window is foreground"], timeout: 8000, retryBudget: 0 })
+  ],
+  "ui.find": (e) => [
+    buildTask("ui.find", { application: e.application, windowId: e.windowId, selector: e.selector ?? { nameContains: e.targetName ?? e.query } }, { goal: "Find UI target", completionCriteria: ["Live UI target resolved"], timeout: 10000, retryBudget: 0 })
+  ],
+  "ui.resolveTarget": (e) => [
+    buildTask("ui.resolveTarget", { application: e.application, windowId: e.windowId, selector: e.selector ?? { nameContains: e.targetName ?? e.query }, visualQuery: e.visualQuery ?? e.targetName ?? e.query }, { goal: "Resolve live interaction target", completionCriteria: ["Target resolved from current state"], timeout: 20000, retryBudget: 0 })
+  ],
+  "ui.action": (e) => [
+    buildTask("ui.action", { application: e.application, windowId: e.windowId, target: e.target, action: e.action, text: e.text, expectedAfter: e.expectedAfter }, { goal: "Interact with UI target", riskHints: "MEDIUM", completionCriteria: ["UI effect observed"], timeout: 15000, retryBudget: 0 })
+  ],
+  "screen.capture": (e) => [
+    buildTask("screen.capture", { application: e.application, windowId: e.windowId, region: e.region }, { goal: "Capture relevant screen state", completionCriteria: ["Screenshot captured locally"], timeout: 12000, retryBudget: 0 })
+  ],
+  "vision.locate": (e) => [
+    buildTask("vision.locate", { application: e.application, windowId: e.windowId, query: e.query }, { goal: "Locate visible target", completionCriteria: ["Visual target grounded"], timeout: 20000, retryBudget: 0 })
   ],
   "system.volume.adjust": (e) => [
     buildTask("system.volume.adjust", { direction: e.direction, steps: e.steps }, {
@@ -578,6 +708,9 @@ export class GeneralPlanner {
     const entities = userIntent.entities || {};
     const workspacePath = entities.workspacePath ?? process.cwd();
 
+    const explicitFilesystemTasks = this._explicitFilesystemTasks(userIntent, workspacePath);
+    if (explicitFilesystemTasks.length > 0) return explicitFilesystemTasks;
+
     // --- WORKFLOW B: port troubleshooting (read-only inspection) --------------
     // A port number in the text/entities is a strong, unambiguous signal.
     const port = entities.port ?? this._extractPort(lower);
@@ -803,5 +936,77 @@ export class GeneralPlanner {
     if (!raw) return null;
     const safe = raw.replace(/[^a-z0-9 _.-]/gi, "").trim().slice(0, 64);
     return safe || null;
+  }
+
+  // Compile explicit, bounded file-state requests into ordinary filesystem
+  // capabilities. This is deliberately grammar-based rather than prompt-based:
+  // every named file operation is retained in order, including successive
+  // writes to the same file, and final reads independently verify each output.
+  _explicitFilesystemTasks(userIntent, workspacePath) {
+    const raw = String(userIntent.rawText ?? "");
+    if (!/\b(?:create|write|modify|update)\b/i.test(raw) || !/\.[a-z0-9]{1,8}\b/i.test(raw)) return [];
+
+    const requestedDirectory = raw.match(/\b(?:directory|folder)\s+(?:named|called)\s+["'`]?([^"',.;]+?)["'`]?(?=\s*[,.;]|\s+(?:containing|with)\b|$)/i)?.[1]?.trim();
+    const safeDirectory = requestedDirectory
+      ? requestedDirectory.replace(/[^a-z0-9 _.-]/gi, "").trim().slice(0, 64)
+      : "";
+    const root = path.resolve(workspacePath);
+    const directoryPath = safeDirectory ? path.resolve(root, safeDirectory) : root;
+    if (directoryPath !== root && !directoryPath.startsWith(`${root}${path.sep}`)) return [];
+
+    const operations = [];
+    const operationPattern = /\b(create|write|modify|update)\s+(?:the\s+)?["'`]?([a-z0-9][a-z0-9 _-]*\.[a-z0-9]{1,8})["'`]?\s+(?:with\s+exact\s+(?:final\s+)?content|so\s+(?:that\s+)?its?\s+exact\s+(?:final\s+)?content\s+is|to\s+contain(?:s)?(?:\s+exactly)?)\s+["'`]?([^,"'`;]+?)["'`]?(?=\s*,|\s+then\b|[.;]|$)/gi;
+    for (const match of raw.matchAll(operationPattern)) {
+      const fileName = match[2].replace(/[^a-z0-9 _.-]/gi, "").trim().slice(0, 64);
+      const content = match[3].trim();
+      if (!fileName || !content || path.basename(fileName) !== fileName) return [];
+      operations.push({ operation: match[1].toLowerCase(), fileName, content });
+    }
+    if (operations.length === 0) return [];
+
+    const tasks = [];
+    let dependency = null;
+    if (safeDirectory) {
+      const mkdir = buildTask("filesystem.createDirectory", { directoryPath }, {
+        goal: `Create directory ${safeDirectory}`,
+        description: `Create requested directory ${directoryPath}`,
+        riskHints: "MEDIUM",
+        expectedStateChanges: ["directory"],
+        completionCriteria: [`Directory ${safeDirectory} exists`],
+        timeout: 10000
+      });
+      tasks.push(mkdir);
+      dependency = mkdir.taskId;
+    }
+
+    const lastWriteByFile = new Map();
+    for (const operation of operations) {
+      const filePath = path.join(directoryPath, operation.fileName);
+      const write = buildTask("filesystem.write", { filePath, content: operation.content }, {
+        goal: `${operation.operation} ${operation.fileName} with exact content ${operation.content}`,
+        description: `${operation.operation} ${filePath} with exact content ${operation.content}`,
+        dependencies: dependency ? [dependency] : [],
+        riskHints: "MEDIUM",
+        expectedStateChanges: ["file"],
+        completionCriteria: [`${operation.fileName} contains exactly ${operation.content}`],
+        rollbackRequired: true,
+        timeout: 10000
+      });
+      tasks.push(write);
+      dependency = write.taskId;
+      lastWriteByFile.set(operation.fileName.toLowerCase(), write);
+    }
+
+    for (const write of lastWriteByFile.values()) {
+      tasks.push(buildTask("filesystem.read", { filePath: write.inputs.filePath }, {
+        goal: `Verify exact final content of ${path.basename(write.inputs.filePath)}`,
+        description: `Read ${write.inputs.filePath} and verify exact final content ${write.inputs.content}`,
+        dependencies: [write.taskId],
+        completionCriteria: [`Exact final content is ${write.inputs.content}`],
+        verificationCriteria: [`Read-back equals ${write.inputs.content}`],
+        timeout: 10000
+      }));
+    }
+    return tasks;
   }
 }

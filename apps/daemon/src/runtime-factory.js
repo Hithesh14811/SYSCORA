@@ -22,7 +22,7 @@ import { SemanticState } from "../../../packages/semantic-state/src/index.js";
 import { Memory } from "../../../packages/memory/src/index.js";
 import { WindowsSecretBroker } from "../../../packages/secrets/src/index.js";
 import { ReasoningEngine } from "../../../packages/reasoning-engine/src/index.js";
-import { createModelProviderChain } from "../../../packages/model-providers/src/index.js";
+import { ConsentAwareModelProvider, createModelProviderChain } from "../../../packages/model-providers/src/index.js";
 import { PrivilegedOperationHelper } from "../../../packages/privileged-helpers/src/index.js";
 import { InstallationKeyStore } from "../../../packages/permission-broker/src/installation-key.js";
 import { loadModelConfig } from "./model-config.js";
@@ -71,7 +71,14 @@ export function createRuntime(basePath = process.cwd()) {
   // Falls back to the deterministic Mock provider when no credentials are
   // present. The ReasoningEngine wraps it as
   // the single model boundary; every subsystem keeps a deterministic fallback.
-  const modelProvider = createModelProviderChain(loadModelConfig(basePath));
+  const modelConfig = loadModelConfig(basePath);
+  const modelProvider = new ConsentAwareModelProvider({
+    provider: createModelProviderChain(modelConfig),
+    consentScopes: modelConfig.externalAIConsent.scopes,
+    onProvenance: (record) => {
+      auditRepository.append("external-ai", "EXTERNAL_AI_REQUEST", record).catch(() => {});
+    }
+  });
   const reasoningEngine = new ReasoningEngine({ modelProvider, capabilityRegistry });
 
   const runtime = new AgentRuntime({

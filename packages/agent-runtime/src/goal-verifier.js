@@ -16,6 +16,9 @@
 // It returns one of:
 //   COMPLETED, COMPLETED_WITH_WARNINGS, PARTIALLY_COMPLETED, FAILED, INCONCLUSIVE
 
+import { assessPlanGoalCoverage } from "../../planner/src/index.js";
+import { assessGoalContractEvidence } from "../../shared-types/src/goal-contract.js";
+
 export const GoalStatus = Object.freeze({
   COMPLETED: "COMPLETED",
   COMPLETED_WITH_WARNINGS: "COMPLETED_WITH_WARNINGS",
@@ -25,12 +28,17 @@ export const GoalStatus = Object.freeze({
 });
 
 export class GoalVerifier {
+  constructor(capabilityRegistry = null) {
+    this.capabilityRegistry = capabilityRegistry;
+  }
+
   // input: { intent, plan, taskGraph, schedulerStatus, verifications, observations, semanticState }
   // schedulerStatus: { status: COMPLETED | FAILED | UNCERTAIN | PARTIALLY_COMPLETED } | null
   verify(input = {}) {
     const {
       intent = {},
       taskGraph = null,
+      taskResults = [],
       verifications = [],
       schedulerStatus = null,
       observations = [],
@@ -66,6 +74,30 @@ export class GoalVerifier {
     // 3. Success criteria.
     const successCriteria = Array.isArray(intent.successCriteria) ? intent.successCriteria : [];
     evidence.push({ kind: "success_criteria", criteria: successCriteria });
+    // A structured operation is already bound to an explicit caller-selected
+    // capability contract. Semantic text overlap is for untyped natural
+    // language plans; applying it to operation ids would reject valid custom
+    // capabilities whose human wording differs from their registered name.
+    const semanticCoverage = intent.operationProvenance === "EXPLICIT_CONTEXT"
+      ? {
+          covered: true,
+          score: 1,
+          matchedTerms: [intent.operation],
+          missingTerms: [],
+          reason: "structured-operation-bound-to-capability"
+        }
+      : assessPlanGoalCoverage(intent, taskGraph, this.capabilityRegistry);
+    evidence.push({ kind: "semantic_goal_coverage", ...semanticCoverage });
+    const goalContract = input.goalContract ?? intent.goalContract ?? null;
+    const contractEvidence = goalContract?.enforceable
+      ? assessGoalContractEvidence(goalContract, {
+          taskGraph,
+          taskResults,
+          verifications,
+          observations
+        }, this.capabilityRegistry)
+      : null;
+    if (contractEvidence) evidence.push({ kind: "goal_contract_evidence", ...contractEvidence });
 
     // 4. Mutation evidence: expected vs unexpected. Every task may declare
     //    expectedStateChanges; observations report detectedChanges. Changes that
@@ -142,6 +174,25 @@ export class GoalVerifier {
           GoalStatus.PARTIALLY_COMPLETED,
           `Scheduler reported COMPLETED, but only ${verified}/${total} tasks corroborate as verified.`,
           0.6
+        );
+      }
+
+      if (!semanticCoverage.covered) {
+        return build(
+          GoalStatus.INCONCLUSIVE,
+          `Tasks completed, but their evidence does not establish the original goal. Missing goal terms: ${semanticCoverage.missingTerms.join(", ") || "unknown"}.`,
+          0.85
+        );
+      }
+
+      if (contractEvidence && !contractEvidence.satisfied) {
+        const status = contractEvidence.satisfiedCount > 0
+          ? GoalStatus.PARTIALLY_COMPLETED
+          : GoalStatus.INCONCLUSIVE;
+        return build(
+          status,
+          `Tasks completed, but independent evidence satisfies only ${contractEvidence.satisfiedCount}/${contractEvidence.totalCriteria} original goal criteria. Missing: ${contractEvidence.unsatisfiedCriteria.join("; ") || "unspecified criteria"}.`,
+          0.9
         );
       }
 

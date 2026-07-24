@@ -5,6 +5,7 @@ import {
   maxRiskValue,
   completeRiskDimensions
 } from "../../shared-types/src/domain.js";
+import { ExecutionModality, modalityProfile } from "../../shared-types/src/execution.js";
 
 export const CAPABILITY_CONTRACT_VERSION = "2.0.0";
 export const CAPABILITY_RUNTIME_VERSION = "0.1.0";
@@ -384,6 +385,11 @@ export function normalizeCapability(capability, options = {}) {
     verify: capability?.verify ?? (async () => ({ status: "FAILED", message: `Capability ${name} has no verification handler` })),
     contractVersion: capability?.contractVersion ?? CAPABILITY_CONTRACT_VERSION,
     category: capability?.category ?? name?.split(".")[0] ?? "general",
+    execution: capability?.execution ?? {
+      modalities: [modalityProfile(ExecutionModality.INTERNAL)],
+      preferredModality: ExecutionModality.INTERNAL,
+      resources: []
+    },
     owner: capability?.owner ?? "SYSCORA",
     lifecycle: capability?.lifecycle ?? {
       status: lifecycleStatus,

@@ -1,6 +1,30 @@
 import { redactSensitiveData } from "../../shared-types/src/redaction.js";
+import {
+  authorizeExternalAITransfer,
+  sanitizeExternalContext
+} from "../../shared-types/src/external-context.js";
 import crypto from "crypto";
+import tls from "node:tls";
 const createId = () => crypto.randomBytes(16).toString("hex");
+
+let systemCaEnabled = false;
+
+function enableSystemCaTrust() {
+  if (systemCaEnabled) return;
+  if (typeof tls.getCACertificates !== "function" || typeof tls.setDefaultCACertificates !== "function") return;
+  try {
+    const certificates = [
+      ...tls.getCACertificates("bundled"),
+      ...tls.getCACertificates("system"),
+      ...tls.getCACertificates("extra")
+    ];
+    tls.setDefaultCACertificates([...new Set(certificates)]);
+    systemCaEnabled = true;
+  } catch {
+    // Older runtimes or restricted certificate stores keep their launch-time
+    // trust configuration; the provider health check will report availability.
+  }
+}
 
 export function validateSchema(data, schema) {
   if (!data) return { valid: false, errors: ["No data provided"] };
@@ -15,6 +39,12 @@ export function validateSchema(data, schema) {
   for (const key in properties) {
     if (key in data && data[key] !== null && data[key] !== undefined) {
       const expectedType = properties[key].type;
+      // M4 runtime references are intentionally validated after their producing
+      // task completes. The planner may name a reference, never its resolved
+      // value. AgentRuntime resolves and revalidates it immediately before use.
+      if (typeof data[key] === "string" && /^\$(task|observation|entity)\.[^.]+(?:\..+)?$/.test(data[key])) {
+        continue;
+      }
       let actualType = typeof data[key];
       
       // Special case for arrays and null
@@ -261,12 +291,21 @@ export class FailoverModelProvider extends LanguageModelProvider {
     const errors = [];
     for (const provider of this.providers) {
       const startedAt = performance.now();
+      const identity = getProviderIdentity(provider);
+      const attempt = options.onExternalAttempt?.(identity);
       try {
         const result = await provider.generateStructured(prompt, schema, options);
         this._record(provider.name, startedAt, false);
+        options.onExternalAttemptResult?.(attempt, { ok: true, latencyMs: performance.now() - startedAt });
+        this.lastRequestProvider = provider;
         return result;
       } catch (error) {
         this._record(provider.name, startedAt, true);
+        options.onExternalAttemptResult?.(attempt, {
+          ok: false,
+          latencyMs: performance.now() - startedAt,
+          error: error instanceof Error ? error.message : String(error)
+        });
         errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
@@ -306,9 +345,108 @@ export class FailoverModelProvider extends LanguageModelProvider {
   }
 }
 
+export function getProviderIdentity(provider) {
+  const endpoint = typeof provider?.baseUrl === "string"
+    ? provider.baseUrl.replace(/[?#].*$/, "")
+    : null;
+  return {
+    provider: String(provider?.name ?? "unknown"),
+    model: provider?.model ?? provider?.capabilities?.()?.model ?? null,
+    endpoint
+  };
+}
+
+export class ConsentAwareModelProvider extends LanguageModelProvider {
+  constructor({ provider, consentScopes = [], onProvenance = null } = {}) {
+    super();
+    this.provider = provider;
+    this.name = provider?.name ?? "consent-aware";
+    this.consentScopes = [...new Set(consentScopes)];
+    this.onProvenance = onProvenance;
+    this.provenance = [];
+  }
+
+  async generateStructured(prompt, schema, options = {}) {
+    const candidates = this.provider instanceof FailoverModelProvider
+      ? this.provider.providers
+      : [this.provider];
+    const hasRemoteProvider = candidates.some((candidate) => candidate?.capabilities?.()?.remote === true);
+    if (!hasRemoteProvider) {
+      return this.provider.generateStructured(prompt, schema, options);
+    }
+    const dataCategories = [...new Set(options.externalAI?.dataCategories ?? [])];
+    const authorization = authorizeExternalAITransfer({
+      scopes: this.consentScopes,
+      dataCategories
+    });
+    if (!authorization.allowed) {
+      throw new Error(`external-ai-consent-denied:${authorization.missingScopes.join(",")}`);
+    }
+    // Structured machine fields are clipped aggressively before prompt
+    // construction, but clipping the final prompt to 1.2 KB discards the goal
+    // and grounded state appended near the end. Preserve a bounded complete
+    // reasoning prompt while applying the same redaction rules.
+    const classified = sanitizeExternalContext(String(prompt ?? ""), { maxStringLength: 32000 });
+    const records = [];
+    const recordAttempt = (identity) => {
+      const record = {
+        requestId: createId(),
+        timestamp: new Date().toISOString(),
+        ...identity,
+        dataCategories,
+        consentScopes: authorization.scopes,
+        sanitizationApplied: true,
+        redactionApplied: classified !== String(prompt ?? ""),
+        credentialsRecorded: false,
+        status: "ATTEMPTED"
+      };
+      this.provenance.push(record);
+      records.push(record);
+      this.onProvenance?.({ ...record });
+      return record;
+    };
+    const finishAttempt = (record, result) => {
+      if (!record) return;
+      Object.assign(record, {
+        status: result.ok ? "SUCCEEDED" : "FAILED",
+        latencyMs: Math.round(result.latencyMs ?? 0),
+        ...(result.ok ? {} : { error: String(result.error ?? "provider-failed").slice(0, 300) })
+      });
+      this.onProvenance?.({ ...record });
+    };
+    const isFailover = this.provider instanceof FailoverModelProvider;
+    const directRecord = isFailover ? null : recordAttempt(getProviderIdentity(this.provider));
+    const startedAt = performance.now();
+    try {
+      const result = await this.provider.generateStructured(classified, schema, {
+        ...options,
+        onExternalAttempt: recordAttempt,
+        onExternalAttemptResult: finishAttempt
+      });
+      if (directRecord) finishAttempt(directRecord, { ok: true, latencyMs: performance.now() - startedAt });
+      return result;
+    } catch (error) {
+      if (directRecord) finishAttempt(directRecord, { ok: false, latencyMs: performance.now() - startedAt, error: error?.message });
+      throw error;
+    }
+  }
+
+  async healthCheck() { return this.provider?.healthCheck?.() ?? { ok: false }; }
+  async health() { return this.healthCheck(); }
+  usage() { return this.provider?.usage?.() ?? super.usage(); }
+  getUsage() { return this.provider?.getUsage?.() ?? this.usage(); }
+  telemetry() { return this.provider?.telemetry?.() ?? super.telemetry(); }
+  capabilities() { return { ...(this.provider?.capabilities?.() ?? {}), consentScopes: this.consentScopes }; }
+  getExternalRequestProvenance() { return this.provenance.map((record) => ({ ...record })); }
+}
+
 export class OpenAIModelProvider extends LanguageModelProvider {
   constructor(config = {}) {
     super(config);
+    // OpenAI-compatible gateways on managed Windows machines may use a local
+    // TLS inspection root. Use the same OS trust union as the gateway adapter;
+    // provider selection must not change whether the machine CA store works.
+    enableSystemCaTrust();
     this.apiKey = config.apiKey || process.env.OPENAI_API_KEY;
     this.model = config.model || "gpt-4o-mini";
     this.baseUrl = config.baseUrl || "https://api.openai.com/v1";
@@ -349,7 +487,9 @@ export class OpenAIModelProvider extends LanguageModelProvider {
           body: JSON.stringify({
             model: this.model,
             messages: [{ role: "user", content: prompt }],
-            response_format: { type: "json_schema", json_schema: { name: "schema", schema, strict: true } },
+            response_format: options.strictSchema === false
+              ? { type: "json_object" }
+              : { type: "json_schema", json_schema: { name: "schema", schema, strict: true } },
             temperature: options.temperature || 0.3
           }),
           signal: controller.signal
@@ -496,6 +636,11 @@ export const AGENTROUTER_MODELS = Object.freeze(["claude-opus-4-8", "gpt-5.5", "
 export class AgentRouterModelProvider extends LanguageModelProvider {
   constructor(config = {}) {
     super(config);
+    // AgentRouter is commonly reached through an enterprise TLS inspection
+    // chain on Windows. Node's bundled roots alone do not include that machine
+    // trust anchor. Merge the OS certificate store at the provider boundary so
+    // every production entry point works without requiring a special node flag.
+    enableSystemCaTrust();
     this.apiKey = config.apiKey || process.env.SYSCORA_MODEL_API_KEY || process.env.AGENTROUTER_API_KEY;
     this.model = config.model || "claude-opus-4-8";
     // Accept a base with or without a trailing /v1; normalize to the OpenAI-
@@ -507,19 +652,24 @@ export class AgentRouterModelProvider extends LanguageModelProvider {
     // "unauthorized client detected"). A Claude-Code-style User-Agent clears it.
     // Overridable via config for forward-compat if the gateway changes policy.
     this.userAgent = config.userAgent || "claude-cli/1.0.0 (external)";
-    this.name = "agentrouter";
+    this.name = config.providerName || "agentrouter";
   }
 
   async healthCheck() {
     if (!this.apiKey) return { ok: false, error: "No AgentRouter API key" };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
     try {
       const response = await fetch(`${this.baseUrl}/models`, {
         method: "GET",
-        headers: { Authorization: `Bearer ${this.apiKey}`, "User-Agent": this.userAgent }
+        headers: { Authorization: `Bearer ${this.apiKey}`, "User-Agent": this.userAgent },
+        signal: controller.signal
       });
       return { ok: response.ok, status: response.status, type: "AgentRouterModelProvider", model: this.model };
     } catch (e) {
       return { ok: false, error: e.message };
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -617,6 +767,19 @@ export function createModelProvider(settings = {}) {
     case "agentrouter": {
       const apiKey = settings.apiKey || process.env.AGENTROUTER_API_KEY || process.env.SYSCORA_MODEL_API_KEY;
       if (apiKey) return new AgentRouterModelProvider({ apiKey, model: settings.model, baseUrl: settings.baseUrl });
+      return new MockModelProvider();
+    }
+    case "deepseek": {
+      // DeepSeek is OpenAI transport-compatible, but the configured models do
+      // not necessarily accept strict `response_format: json_schema`. Reuse
+      // the existing prompt-schema + local-validation provider abstraction.
+      const apiKey = settings.apiKey || process.env.SYSCORA_MODEL_API_KEY;
+      if (apiKey) return new AgentRouterModelProvider({
+        apiKey,
+        model: settings.model,
+        baseUrl: settings.baseUrl,
+        providerName: "deepseek"
+      });
       return new MockModelProvider();
     }
     case "mock":

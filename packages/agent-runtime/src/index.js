@@ -10,14 +10,25 @@ import {
 } from "../../shared-types/src/domain.js";
 import { IntentEngine } from "../../intent-engine/src/index.js";
 import { ContextEngine, SystemContextProvider, ProcessContextProvider, PortContextProvider, EnvironmentContextProvider, WorkspaceContextProvider } from "../../context-engine/src/index.js";
-import { GeneralPlanner, PlanValidator } from "../../planner/src/index.js";
-import { MockModelProvider } from "../../model-providers/src/index.js";
+import { GeneralPlanner, PlanValidator, assessPlanGoalCoverage } from "../../planner/src/index.js";
+import { MockModelProvider, validateSchema } from "../../model-providers/src/index.js";
 import { TaskGraphScheduler } from "../../task-graph-scheduler/src/index.js";
 import { PerceptionEngine } from "../../perception/src/index.js";
 import { ReasoningEngine } from "../../reasoning-engine/src/index.js";
 import { GoalVerifier } from "./goal-verifier.js";
 import { RollbackManager } from "./rollback-manager.js";
 import { createRecoveryBudget } from "../../recovery-engine/src/index.js";
+import { resolveTaskInputs } from "./input-bindings.js";
+import {
+  InteractiveAgentController,
+  buildBrowserCompositionStrategy,
+  buildCrossModalTransferStrategy,
+  buildInternalToGuiTransferStrategy,
+  buildExplicitApplicationLaunchStrategy
+} from "./interactive-agent-controller.js";
+import { createGoalContract } from "../../shared-types/src/goal-contract.js";
+
+export { InteractiveAgentController, sanitizeInteractiveState, classifyInteractiveContext, INTERACTIVE_AGENT_DEFAULT_BUDGETS } from "./interactive-agent-controller.js";
 
 export class AgentRuntime {
   constructor({
@@ -68,7 +79,7 @@ export class AgentRuntime {
     ]);
     this.generalPlanner = new GeneralPlanner(this.reasoningEngine, this.capabilityRegistry);
     this.planValidator = new PlanValidator(this.capabilityRegistry);
-    this.goalVerifier = new GoalVerifier();
+    this.goalVerifier = new GoalVerifier(this.capabilityRegistry);
     this.semanticState = semanticState;
     this.memory = memory;
     // Perception is the ONLY subsystem that writes to SemanticState. The runtime
@@ -133,6 +144,7 @@ export class AgentRuntime {
       receivedAtMs: Date.now(),
       currentState: RuntimeState.RECEIVE_INTENT,
       intent: null,
+      goalContract: null,
       context: null,
       plan: null,
       riskAssessment: null,
@@ -163,7 +175,17 @@ export class AgentRuntime {
       // 1. Understand intent
       session.currentState = RuntimeState.BUILD_CONTEXT;
       session.intent = await this.intentEngine.classify(rawText, { workspacePath: process.cwd(), ...options });
+      session.intent.operationProvenance = options.operation
+        ? "EXPLICIT_CONTEXT"
+        : (session.intent.operation ? "NATURAL_LANGUAGE_ROUTED" : null);
+      session.goalContract = session.intent.operationProvenance === "EXPLICIT_CONTEXT"
+        ? null
+        : createGoalContract(session.intent);
+      session.intent.goalContract = session.goalContract;
       await this.addSessionEvent(session, "INTENT_CLASSIFIED", session.intent);
+      if (session.goalContract) {
+        await this.addSessionEvent(session, "GOAL_CONTRACT_CREATED", session.goalContract);
+      }
       await this.persistSession(session);
 
       // Direct commands do not wait for a model plan, but they do not bypass the
@@ -219,6 +241,10 @@ export class AgentRuntime {
         "spotify.track.open",
         "spotify.track.play"
       ]).has(session.intent.operation);
+      // When the model is unavailable, semantic/memory collection cannot improve
+      // the deterministic fallback plan but can add several seconds of Windows
+      // inspection. Keep required base context, skip only this advisory layer.
+      const skipAdvisoryPlanningState = fastReadOnlyOperation || !modelHealthyForConversational;
       const requiredContext = session.intent.requiredContext || [];
       const baseContext = await this.contextEngine.collectContext(requiredContext, session.intent.entities);
       let semanticContext = [];
@@ -227,7 +253,7 @@ export class AgentRuntime {
       // Perception populates the world model from live Windows state (via its
       // read-only providers), then the planner receives only a relevant, budgeted
       // subgraph — never the whole graph.
-      if (this.perception && !fastReadOnlyOperation) {
+      if (this.perception && !skipAdvisoryPlanningState) {
         try {
           await this.perception.perceive({
             workspacePath: session.intent.entities?.workspacePath,
@@ -240,7 +266,7 @@ export class AgentRuntime {
         session.semanticSubgraph = subgraph;
       }
 
-      if (this.memory && !fastReadOnlyOperation) {
+      if (this.memory && !skipAdvisoryPlanningState) {
         relevantMemory = await this.memory.retrieveRelevant(session.intent);
       }
 
@@ -257,8 +283,8 @@ export class AgentRuntime {
 
       await this.addSessionEvent(session, "CONTEXT_COLLECTED", {
         types: requiredContext,
-        includesSemantic: !fastReadOnlyOperation && !!this.semanticState,
-        includesMemory: !fastReadOnlyOperation && !!this.memory,
+        includesSemantic: !skipAdvisoryPlanningState && !!this.semanticState,
+        includesMemory: !skipAdvisoryPlanningState && !!this.memory,
         estimatedTokens: planningContext.estimatedTokens,
         tokenBudget: planningContext.tokenBudget
       });
@@ -276,6 +302,49 @@ export class AgentRuntime {
           failurePatterns: priorFailures.length,
           topSummaries: relevantMemory.slice(0, 3).map((m) => m.summary)
         });
+      }
+
+      // Clearly interactive free-text goals should enter the closed-loop
+      // controller before paying for a one-shot task-graph composition. This is
+      // a modality-level routing rule, not an application workflow: typed
+      // operations keep their static fast path, while generic open/select/type/
+      // navigate goals require live perception and adaptation.
+      const hasLocalInteractiveStrategy = Boolean(
+        buildBrowserCompositionStrategy(rawText) ??
+        buildCrossModalTransferStrategy(rawText) ??
+        buildInternalToGuiTransferStrategy(rawText) ??
+        buildExplicitApplicationLaunchStrategy(rawText)
+      );
+      const earlyInteractiveGoal =
+        (!session.intent.operation || hasLocalInteractiveStrategy) &&
+        (
+          ["APPLICATION", "BROWSER"].includes(String(session.intent.category ?? "").toUpperCase()) ||
+          /\b(open|launch|select|choose|click|type|enter|put|navigate|browser|website)\b/i.test(rawText) ||
+          /\bread\b[\s\S]{0,120}\b(?:into|in)\b/i.test(rawText)
+        );
+      if (
+        options.interactive !== false &&
+        earlyInteractiveGoal &&
+        typeof this.reasoningEngine?.decideInteractiveAction === "function" &&
+        (hasLocalInteractiveStrategy || await this._isModelHealthy())
+      ) {
+        const interactive = await this._runInteractiveController(session, rawText, options);
+        if (interactive.status === "COMPLETE" || interactive.status === "NEEDS_USER") return session;
+        session.currentState = RuntimeState.FAILED;
+        session.finalResponse = {
+          status: "FAILED",
+          message: `Adaptive reasoning could not complete the request safely: ${interactive.reason ?? "reasoning unavailable"}.`,
+          reason: interactive.reason ?? "INTERACTIVE_REASONING_FAILED",
+          interactive: true,
+          metrics: interactive.metrics
+        };
+        await this.addSessionEvent(session, "INTERACTIVE_REASONING_FAILED", {
+          reason: interactive.reason,
+          metrics: interactive.metrics
+        });
+        session.plan = null;
+        await this.persistSession(session);
+        return session;
       }
 
       // 3. Generate plan (memory + semantic state passed as planning inputs)
@@ -297,6 +366,31 @@ export class AgentRuntime {
       // system simply doesn't know how to handle yet.
       const plannedTasks = session.plan?.taskGraph?.tasks ?? [];
       if (plannedTasks.length === 0) {
+        const canTryInteractive = options.interactive !== false &&
+          !this._looksConversational(rawText) &&
+          typeof this.reasoningEngine?.decideInteractiveAction === "function" &&
+          await this._isModelHealthy();
+        if (canTryInteractive) {
+          const interactive = await this._runInteractiveController(session, rawText, options);
+          if (interactive.status === "COMPLETE" || interactive.status === "NEEDS_USER") {
+            return session;
+          }
+          session.currentState = RuntimeState.FAILED;
+          session.finalResponse = {
+            status: "FAILED",
+            message: `Adaptive reasoning could not complete the request safely: ${interactive.reason ?? "reasoning unavailable"}.`,
+            reason: interactive.reason ?? "INTERACTIVE_REASONING_FAILED",
+            interactive: true,
+            metrics: interactive.metrics
+          };
+          await this.addSessionEvent(session, "INTERACTIVE_REASONING_FAILED", {
+            reason: interactive.reason,
+            metrics: interactive.metrics
+          });
+          session.plan = null;
+          await this.persistSession(session);
+          return session;
+        }
         // The request did not map to any capability. Before giving up, try a
         // pure conversational answer via the model (greetings, "what model are
         // you", capability questions). This performs NO actions and mutates NO
@@ -325,6 +419,61 @@ export class AgentRuntime {
         session.plan = null;
         await this.persistSession(session);
         return session;
+      }
+
+      // Untyped application/browser work needs closed-loop perception rather
+      // than a one-shot graph. Route it through the adaptive controller whether
+      // the candidate came from the model or deterministic planning. Typed
+      // operations and non-interactive system/data plans keep the fast path.
+      const plannedCapabilities = plannedTasks.map((task) => String(task.capability ?? ""));
+      const inferredRouteCoverage = session.intent.operationProvenance !== "EXPLICIT_CONTEXT"
+        ? assessPlanGoalCoverage(session.intent, session.plan.taskGraph, this.capabilityRegistry)
+        : { covered: true };
+      const needsClosedLoopInteraction =
+        ["APPLICATION", "BROWSER"].includes(String(session.intent.category ?? "").toUpperCase()) ||
+        plannedCapabilities.some((name) => /^(ui|window|pointer|keyboard|browser)\./.test(name));
+      if (
+        options.interactive !== false &&
+        (!session.intent.operation || !inferredRouteCoverage.covered) &&
+        needsClosedLoopInteraction &&
+        typeof this.reasoningEngine?.decideInteractiveAction === "function" &&
+        await this._isModelHealthy()
+      ) {
+        const candidatePlan = session.plan;
+        const interactive = await this._runInteractiveController(session, rawText, options);
+        if (interactive.status === "COMPLETE" || interactive.status === "NEEDS_USER") return session;
+        session.plan = candidatePlan;
+        session.currentState = RuntimeState.GENERATE_PLAN;
+        session.finalResponse = null;
+        await this.addSessionEvent(session, "INTERACTIVE_CONTROLLER_RESTORED_STATIC_PLAN", {
+          reason: interactive.reason ?? "interactive-controller-did-not-complete"
+        });
+      }
+
+      // An untyped keyword plan is permitted only when its concrete tasks
+      // semantically cover the original user goal. This is the fail-closed
+      // boundary that prevents a novel cross-modal request from degenerating
+      // into an unrelated but internally successful developer/system workflow.
+      const inferredNonModelPlan =
+        session.intent.operationProvenance !== "EXPLICIT_CONTEXT" &&
+        ["DIRECT_OPERATION", "DETERMINISTIC_FALLBACK"].includes(session.plan?.plannerSource);
+      if (inferredNonModelPlan) {
+        const coverage = assessPlanGoalCoverage(session.intent, session.plan.taskGraph, this.capabilityRegistry);
+        await this.addSessionEvent(session, "DETERMINISTIC_PLAN_COVERAGE_CHECKED", coverage);
+        if (!coverage.covered) {
+          session.currentState = RuntimeState.FAILED;
+          session.finalResponse = {
+            status: "FAILED",
+            message:
+              "The language-model route is unavailable or could not produce a safe plan, and the deterministic fallback does not cover the requested goal. No unrelated actions were run.",
+            reason: "IRRELEVANT_DETERMINISTIC_FALLBACK",
+            coverage
+          };
+          await this.addSessionEvent(session, "IRRELEVANT_DETERMINISTIC_FALLBACK_REJECTED", coverage);
+          session.plan = null;
+          await this.persistSession(session);
+          return session;
+        }
       }
 
       await this.addSessionEvent(session, "PLAN_GENERATED", session.plan);
@@ -380,6 +529,190 @@ export class AgentRuntime {
         });
       })
       .catch(() => {});
+  }
+
+  async _runInteractiveController(session, rawText, options = {}) {
+    const controller = new InteractiveAgentController({
+      reasoningEngine: this.reasoningEngine,
+      capabilityRegistry: this.capabilityRegistry,
+      budgets: options.interactiveBudgets,
+      perceive: async (controllerState = {}) => {
+        const windows = await this.adapter.listWindows().catch(() => []);
+        const rawForeground = windows.find((window) => window.Foreground ?? window.foreground) ?? null;
+        const goalTokens = new Set(
+          String(controllerState.goal ?? rawText)
+            .toLowerCase()
+            .match(/[a-z0-9]{3,}/g)
+            ?.filter((token) => !["and", "the", "with", "from", "tell", "whether", "open"].includes(token)) ?? []
+        );
+        const matchesGoal = (window) => {
+          const identity = `${window?.ProcessName ?? window?.processName ?? ""} ${window?.MainWindowTitle ?? window?.title ?? ""}`.toLowerCase();
+          return [...goalTokens].some((token) => identity.includes(token));
+        };
+        const visibleWindows = windows.filter((window) => {
+          const bounds = window.Bounds ?? window.bounds ?? {};
+          const titled = String(window.MainWindowTitle ?? window.title ?? "").trim();
+          return titled && Number(bounds.width ?? 0) > 10 && Number(bounds.height ?? 0) > 10;
+        });
+        const relevantWindows = visibleWindows.filter(matchesGoal).slice(0, 12);
+        const foreground = rawForeground && matchesGoal(rawForeground) ? rawForeground : null;
+        const groundedWindow = foreground ?? relevantWindows[0] ?? null;
+        let ui = null;
+        if (groundedWindow) {
+          try {
+            ui = await this.adapter.inspectUi({
+              application: groundedWindow.ProcessName ?? groundedWindow.processName,
+              windowId: String(groundedWindow.WindowHandle ?? groundedWindow.windowId),
+              maxElements: 100
+            });
+          } catch { /* UIA is an optional perception source */ }
+        }
+        let browser = null;
+        try {
+          if (this.adapter.browserAutomation?.connection) {
+            browser = await this.adapter.browserDomAction("currentState", {});
+          }
+        } catch { /* browser may not be active */ }
+        const rawControls = (ui?.elements ?? ui?.targets ?? []);
+        const compactControls = rawControls.map((control) => ({
+          targetId: control.targetId,
+          source: control.source,
+          windowId: control.windowId,
+          automationId: control.automationId,
+          name: control.name,
+          controlType: control.controlType,
+          boundingRect: control.boundingRect,
+          enabled: control.enabled,
+          focused: control.focused,
+          supportedPatterns: control.supportedPatterns,
+          toggleState: control.toggleState,
+          expandCollapseState: control.expandCollapseState,
+          confidence: control.confidence,
+          observedAt: control.observedAt
+        }));
+        const scoredControls = compactControls
+          .map((control, index) => {
+            const semantics = `${control.name ?? ""} ${control.automationId ?? ""} ${control.controlType ?? ""}`.toLowerCase();
+            const score = [...goalTokens].reduce((total, token) => total + (semantics.includes(token) ? 3 : 0), 0) +
+              (control.supportedPatterns?.length ? 1 : 0) +
+              (control.focused ? 1 : 0);
+            return { control, score, index };
+          })
+          .sort((left, right) => right.score - left.score || left.index - right.index)
+          .slice(0, 24)
+          .map(({ control }) => control);
+        return {
+          foregroundWindow: foreground,
+          groundedWindow,
+          windows: relevantWindows,
+          relevantControls: scoredControls,
+          browser
+        };
+      },
+      executeAction: async (action, controllerContext) =>
+        this._executeInteractiveAction(session, action, controllerContext),
+      onEvent: async (event) => this.addSessionEvent(session, event.type, event)
+    });
+    const result = await controller.run(rawText, {
+      normalizedGoal: session.intent?.normalizedGoal,
+      successCriteria: session.intent?.successCriteria,
+      constraints: session.intent?.constraints,
+      entities: session.intent?.entities,
+      requiredCapabilities: session.intent?.requiredCapabilities,
+      intentCategory: session.intent?.category,
+      goalContract: session.goalContract
+    });
+    session.interactiveController = result;
+    if (result.status === "COMPLETE") {
+      session.currentState = RuntimeState.COMPLETED;
+      session.finalResponse = {
+        status: "COMPLETED",
+        message: typeof result.result === "string"
+          ? result.result
+          : (result.result?.summary ?? "The requested goal was completed and verified."),
+        interactive: true,
+        result: result.result,
+        verification: result.completionVerification,
+        metrics: result.metrics,
+        observability: result.observability
+      };
+      await this.addSessionEvent(session, "INTERACTIVE_GOAL_VERIFIED", {
+        result: result.result,
+        verification: result.completionVerification,
+        metrics: result.metrics
+      });
+    } else if (result.status === "NEEDS_USER") {
+      if (session.finalResponse?.status !== "AWAITING_APPROVAL") {
+        session.finalResponse = { status: "NEEDS_CLARIFICATION", message: result.reason, interactive: true };
+      }
+    }
+    await this.persistSession(session);
+    return result;
+  }
+
+  async _executeInteractiveAction(session, action, controllerContext = {}) {
+    const taskId = createId("interactive_task");
+    const capability = this.capabilityRegistry.get(action.capability);
+    const plan = {
+      planId: createId("interactive_plan"),
+      planVersion: 1,
+      parentPlanId: session.plan?.planId ?? null,
+      goal: session.intent?.normalizedGoal ?? controllerContext.goal,
+      summary: `Adaptive step: ${action.subgoal ?? action.capability}`,
+      finalSuccessCriteria: session.intent?.successCriteria ?? [],
+      taskGraph: {
+        graphId: createId("interactive_graph"),
+        tasks: [{
+          taskId,
+          goal: action.subgoal ?? action.capability,
+          description: action.expectedEffect ?? `Execute ${action.capability}`,
+          dependencies: [],
+          capability: action.capability,
+          inputs: action.inputs ?? {},
+          expectedStateChanges: [],
+          affectedEntities: [],
+          riskHints: "LOW",
+          verificationCriteria: action.verification
+            ? [JSON.stringify(action.verification)]
+            : [`${action.capability} must return capability-level verified evidence`],
+          completionCriteria: [
+            action.expectedEffect ?? `${action.capability} completes its declared subgoal`
+          ],
+          rollbackRequired: capability?.reversibility === "ROLLBACK_SUPPORTED",
+          timeout: Math.min(30000, Number(capability?.timeout ?? 30000)),
+          retryBudget: 0,
+          idempotency: false
+        }]
+      }
+    };
+    const validation = this.planValidator.validatePlan(plan.taskGraph);
+    if (!validation.valid) throw new Error(`Interactive action plan is invalid: ${validation.errors.join("; ")}`);
+    const priorManifest = session.approvalManifest ?? null;
+    session.plan = plan;
+    const gate = await this._authorizePlan(session, plan, {
+      phase: "REPLAN",
+      autoApprove: session.autoApprove === true,
+      priorManifest
+    });
+    if (!gate.authorized) {
+      return {
+        paused: true,
+        reason: session.finalResponse?.message ?? "This action requires approval",
+        verification: { status: "FAILED", message: "Action was not authorized", confidence: 1 }
+      };
+    }
+    session.currentState = RuntimeState.EXECUTING;
+    await this._executeTaskGraph(session, {
+      replanAttempts: 0,
+      MAX_REPLAN_ATTEMPTS: 0,
+      originalPlan: plan
+    });
+    const taskResult = [...session.taskResults].reverse().find((item) => item.taskId === taskId);
+    const observation = [...session.observations].reverse().find((item) => item?.relatedActionId === taskId)
+      ?? session.observations.at(-1);
+    const verification = session.verifications.at(-1)
+      ?? { status: "FAILED", message: "No verification was produced", confidence: 1 };
+    return { executionResult: taskResult?.executionResult, observation, verification };
   }
 
   // Used by the chat surface as a separate, parallel request. The LLM generates
@@ -746,6 +1079,56 @@ export class AgentRuntime {
       const readyTasks = this.taskGraphScheduler.getReadyTasks();
 
       for (const task of readyTasks) {
+        const referencedInputs = task.inputs;
+        const resolved = resolveTaskInputs(referencedInputs, {
+          taskResults: this.taskGraphScheduler.taskResults,
+          observations: this.taskGraphScheduler.observations
+        });
+        if (resolved.provenance.length > 0) {
+          const capability = this.capabilityRegistry.get(task.capability);
+          const validation = validateSchema(resolved.inputs, capability?.inputSchema ?? { type: "object" });
+          if (!validation.valid) {
+            throw new Error(`Resolved inputs for ${task.taskId} are invalid: ${validation.errors.join(", ")}`);
+          }
+          task.inputs = resolved.inputs;
+          await this.addSessionEvent(session, "TASK_INPUTS_RESOLVED", {
+            taskId: task.taskId,
+            capability: task.capability,
+            provenance: resolved.provenance
+          });
+          // A model approved only the REFERENCE, not the value discovered at
+          // runtime. Read-only consumers may proceed after schema validation.
+          // Any write/execute consumer is a materially resolved plan and must
+          // re-enter the canonical risk/policy/approval gate before use.
+          if (capability?.permissionModel?.type !== "READ") {
+            const priorManifest = session.approvalManifest ?? null;
+            const gate = await this._authorizePlan(session, session.plan, {
+              phase: "REPLAN",
+              autoApprove: session.autoApprove === true,
+              priorManifest
+            });
+            if (!gate.authorized) return { terminated: true };
+            if (typeof this.permissionBroker?.revokeSessionCapabilities === "function") {
+              await this.permissionBroker.revokeSessionCapabilities(
+                session.sessionId,
+                "Runtime binding resolved; grants reissued against the resolved plan."
+              );
+            }
+            const remainingTasks = session.plan.taskGraph.tasks.filter((candidate) =>
+              this.taskGraphScheduler.getTaskState(candidate.taskId) !== "VERIFIED"
+            );
+            await this._issuePlanGrants(session, {
+              ...session.plan,
+              taskGraph: { ...session.plan.taskGraph, tasks: remainingTasks }
+            });
+            session.currentState = RuntimeState.EXECUTING;
+            await this.addSessionEvent(session, "RUNTIME_BINDING_REAUTHORIZED", {
+              taskId: task.taskId,
+              capability: task.capability,
+              approvalCommitment: session.approvalCommitment
+            });
+          }
+        }
         let cap;
         try {
           cap = await this.capabilityRegistry.pipeline.prepare(task, {
@@ -989,6 +1372,7 @@ export class AgentRuntime {
       : session.verifications;
     const finalVerification = this.goalVerifier.verify({
       intent: session.intent,
+      goalContract: session.goalContract,
       taskGraph: session.plan?.taskGraph,
       schedulerStatus: finalStatus,
       verifications: reconciledVerifications,

@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { getWindowsAutomationHost } from "../../windows-host/src/client.js";
+import { CdpBrowserAdapter } from "../../browser/src/cdp-browser-adapter.js";
 
 function parseEnvContents(rawContents) {
   const pairs = new Map();
@@ -28,6 +30,19 @@ function escapePowerShellSingleQuoted(value) {
   return String(value).replace(/'/g, "''");
 }
 
+function expandWindowsEnvironmentPath(value) {
+  const environment = new Map(
+    Object.entries(process.env).map(([key, item]) => [key.toUpperCase(), item])
+  );
+  environment.set("USERPROFILE", process.env.USERPROFILE || os.homedir());
+  environment.set("TEMP", process.env.TEMP || os.tmpdir());
+  environment.set("TMP", process.env.TMP || os.tmpdir());
+  return String(value ?? "").replace(/%([^%]+)%/g, (match, key) => {
+    const replacement = environment.get(String(key).toUpperCase());
+    return replacement == null ? match : replacement;
+  });
+}
+
 // Coerce a caller-supplied duration into a bounded integer. UI-automation waits
 // are interpolated (unquoted) into PowerShell, so they MUST be integer literals
 // derived from a clamped number, never free-form caller text.
@@ -42,7 +57,76 @@ function spotifyQueryTokens(value) {
   return [...new Set(String(value ?? "").toLowerCase().match(/[a-z0-9]{2,}/g)?.filter((token) => !ignored.has(token)) ?? [])].slice(0, 8);
 }
 
+function identityTokens(value) {
+  return new Set(
+    String(value ?? "").toLowerCase().match(/[a-z0-9]+/g)?.filter((token) => token.length > 1) ?? []
+  );
+}
+
+function tokenSimilarity(left, right) {
+  const a = identityTokens(left);
+  const b = identityTokens(right);
+  if (!a.size || !b.size) return 0;
+  const overlap = [...a].filter((token) => b.has(token)).length;
+  return overlap / Math.max(1, Math.min(a.size, b.size));
+}
+
+export function correlateLaunchWindow({
+  application,
+  beforeWindows = [],
+  afterWindows = [],
+  launch = null
+} = {}) {
+  const beforeIds = new Set(beforeWindows.map((window) => String(window.WindowHandle ?? window.windowId)));
+  const beforeForeground = beforeWindows.find((window) => window.Foreground ?? window.foreground);
+  const launchedPid = Number(launch?.processId);
+  const compactApplication = String(application ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const candidates = afterWindows.map((window) => {
+    const windowId = String(window.WindowHandle ?? window.windowId);
+    const processId = Number(window.Id ?? window.processId);
+    const processName = String(window.ProcessName ?? window.processName ?? "");
+    const title = String(window.MainWindowTitle ?? window.title ?? "");
+    const foreground = Boolean(window.Foreground ?? window.foreground);
+    const signals = [];
+    let score = 0;
+    if (Number.isFinite(launchedPid) && processId === launchedPid) { score += 70; signals.push("launched-pid"); }
+    if (!beforeIds.has(windowId)) { score += 45; signals.push("new-hwnd"); }
+    const compactProcess = processName.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (compactApplication && compactProcess &&
+        (compactApplication.includes(compactProcess) || compactProcess.includes(compactApplication))) {
+      score += 35; signals.push("process-identity");
+    }
+    const titleSimilarity = tokenSimilarity(application, title);
+    if (titleSimilarity >= 0.5) { score += 30; signals.push("title-similarity"); }
+    if (foreground && String(beforeForeground?.WindowHandle ?? beforeForeground?.windowId) !== windowId) {
+      score += 15; signals.push("foreground-transition");
+    }
+    return { window, score, signals, titleSimilarity };
+  }).sort((left, right) => right.score - left.score);
+  const best = candidates[0];
+  if (!best || best.score < 45) {
+    return { grounded: false, window: null, confidence: 0, candidates: candidates.slice(0, 5) };
+  }
+  return {
+    grounded: true,
+    window: best.window,
+    confidence: Math.min(0.99, 0.45 + best.score / 150),
+    signals: best.signals,
+    candidates: candidates.slice(0, 5)
+  };
+}
+
 export class WindowsAdapter {
+  constructor({ automationHost = null, browserAutomation = null } = {}) {
+    this.automationHost = automationHost ?? (process.platform === "win32" ? getWindowsAutomationHost() : null);
+    this.browserAutomation = browserAutomation ?? new CdpBrowserAdapter();
+  }
+
+  async hostRequest(operation, params = {}, options = {}) {
+    if (!this.automationHost) throw new Error("Windows automation host is unavailable");
+    return this.automationHost.request(operation, params, options);
+  }
+
   async executeCommand(workingDirectory, command, args = [], options = {}) {
     return new Promise((resolve) => {
       const child = spawn(command, args, {
@@ -549,22 +633,23 @@ export class WindowsAdapter {
   }
 
   async createDirectory(directoryPath) {
-    const target = path.resolve(directoryPath);
+    const target = path.resolve(expandWindowsEnvironmentPath(directoryPath));
     await fs.mkdir(target, { recursive: true });
     return { directoryPath: target, created: true };
   }
 
   async verifyDirectoryExists(directoryPath) {
+    const target = path.resolve(expandWindowsEnvironmentPath(directoryPath));
     try {
-      const stat = await fs.stat(directoryPath);
-      return { exists: stat.isDirectory(), directoryPath };
+      const stat = await fs.stat(target);
+      return { exists: stat.isDirectory(), directoryPath: target };
     } catch {
-      return { exists: false, directoryPath };
+      return { exists: false, directoryPath: target };
     }
   }
 
   async writeTextFile(filePath, contents) {
-    const target = path.resolve(filePath);
+    const target = path.resolve(expandWindowsEnvironmentPath(filePath));
     let previousContents = null;
     let existed = false;
     try {
@@ -579,25 +664,26 @@ export class WindowsAdapter {
   }
 
   async readTextFile(filePath) {
-    const target = path.resolve(filePath);
+    const target = path.resolve(expandWindowsEnvironmentPath(filePath));
     const contents = await fs.readFile(target, "utf8");
     return { filePath: target, contents };
   }
 
   async removeTextFile(filePath) {
+    const target = path.resolve(expandWindowsEnvironmentPath(filePath));
     try {
-      await fs.unlink(path.resolve(filePath));
+      await fs.unlink(target);
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
-    return { filePath: path.resolve(filePath), removed: true };
+    return { filePath: target, removed: true };
   }
 
   // Remove a directory. Used only as the rollback of filesystem.createDirectory
   // for a directory THIS runtime created, so a non-recursive removal is correct:
   // it refuses (ENOTEMPTY) if the user put files there, which is the safe choice.
   async removeDirectory(directoryPath, { recursive = false } = {}) {
-    const target = path.resolve(directoryPath);
+    const target = path.resolve(expandWindowsEnvironmentPath(directoryPath));
     try {
       await fs.rmdir(target, { recursive });
     } catch (error) {
@@ -616,6 +702,7 @@ export class WindowsAdapter {
   }
 
   async launchApplication(application) {
+    const launchStartedAt = Date.now();
     const map = {
       notepad: "notepad.exe",
       calc: "calc.exe",
@@ -623,6 +710,7 @@ export class WindowsAdapter {
       spotify: "spotify.exe"
     };
     const exe = map[application.toLowerCase()] ?? application;
+    const beforeWindows = await this.listWindows();
     // Do not wait for a GUI application's process to exit. The previous direct
     // spawn treated a correctly-launched Spotify window as a timeout after 8s,
     // then the runtime re-planned the same action indefinitely. Prefer a Start
@@ -636,16 +724,112 @@ export class WindowsAdapter {
       `$app = Get-StartApps | Where-Object { $_.Name -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
       `if ($app) { Start-Process -FilePath 'explorer.exe' -ArgumentList ('shell:AppsFolder\\' + $app.AppID); ` +
       `[pscustomobject]@{ started = $true; method = 'start-menu'; appId = $app.AppID } | ConvertTo-Json -Compress } ` +
-      `else { $process = Start-Process -FilePath '${escapedExe}' -PassThru; ` +
-      `[pscustomobject]@{ started = $true; method = 'executable'; processId = $process.Id } | ConvertTo-Json -Compress }`,
+      `else { ` +
+      `$command = Get-Command -Name '${escapedExe}' -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
+      `$appPath = Get-ItemProperty -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\' + '${escapedExe}') -ErrorAction SilentlyContinue; ` +
+      `$roots = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms')) | Where-Object { $_ }; ` +
+      `$shortcut = $roots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue } | ` +
+      `Where-Object { $_.BaseName -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
+      `if ($command) { $process = Start-Process -FilePath $command.Source -PassThru; $method = 'command'; $target = $command.Source } ` +
+      `elseif ($appPath.'(default)') { $process = Start-Process -FilePath $appPath.'(default)' -PassThru; $method = 'app-path'; $target = $appPath.'(default)' } ` +
+      `elseif ($shortcut) { $process = Start-Process -FilePath $shortcut.FullName -PassThru; $method = 'start-menu-shortcut'; $target = $shortcut.FullName } ` +
+      `else { $process = Start-Process -FilePath '${escapedExe}' -PassThru; $method = 'literal'; $target = '${escapedExe}' } ` +
+      `[pscustomobject]@{ started = $true; method = $method; processId = $process.Id; target = $target } | ConvertTo-Json -Compress }`,
       { timeoutMs: 8000 }
     );
     let launch = null;
     try { launch = JSON.parse(result.stdout || 'null'); } catch { launch = null; }
-    await new Promise((r) => setTimeout(r, 1500));
-    const windows = await this.listWindows();
-    const match = windows.find((w) => w.ProcessName?.toLowerCase().includes(application.toLowerCase()) || w.MainWindowTitle?.toLowerCase().includes(application));
-    return { application, exe, launchResult: result, launch, window: match ?? null, windows };
+    const baseDeadline = Date.now() + 4000;
+    const hardDeadline = Date.now() + 12000;
+    let deadline = baseDeadline;
+    let progressExtended = false;
+    let windows = [];
+    let correlation = { grounded: false, window: null, confidence: 0, candidates: [] };
+    let attempts = 0;
+    while (Date.now() < deadline) {
+      attempts += 1;
+      windows = await this.listWindows();
+      correlation = correlateLaunchWindow({ application, beforeWindows, afterWindows: windows, launch });
+      if (correlation.grounded) break;
+      const processProgress = Boolean(launch?.processId || launch?.appId);
+      const windowProgress = (correlation.candidates ?? []).some((candidate) =>
+        (candidate.signals ?? []).some((signal) => ["launched-pid", "new-hwnd", "title-similarity"].includes(signal))
+      );
+      if (!progressExtended && (processProgress || windowProgress)) {
+        deadline = hardDeadline;
+        progressExtended = true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(500, 100 + attempts * 50)));
+    }
+    const window = correlation.window ?? null;
+    const windowIdentity = window ? {
+      windowId: String(window.WindowHandle ?? window.windowId),
+      processId: Number(window.Id ?? window.processId),
+      processName: window.ProcessName ?? window.processName ?? null,
+      title: window.MainWindowTitle ?? window.title ?? "",
+      className: window.ClassName ?? window.className ?? null,
+      bounds: window.Bounds ?? window.bounds ?? null,
+      confidence: correlation.confidence,
+      correlationSignals: correlation.signals ?? [],
+      observedAt: new Date().toISOString()
+    } : null;
+    return {
+      application,
+      exe,
+      launchResult: result,
+      launch,
+      window,
+      windowIdentity,
+      grounding: {
+        grounded: Boolean(window),
+        attempts,
+        elapsedMs: Date.now() - launchStartedAt,
+        progressExtended,
+        readinessState: window
+          ? "APPLICATION_READY"
+          : launch?.processId || launch?.appId
+            ? "PROCESS_WITHOUT_WINDOW"
+            : correlation.candidates?.length
+              ? "WINDOW_WITHOUT_UIA"
+              : "NO_PROCESS",
+        confidence: correlation.confidence,
+        signals: correlation.signals ?? [],
+        candidates: correlation.candidates?.map((candidate) => ({
+          windowId: String(candidate.window?.WindowHandle ?? candidate.window?.windowId ?? ""),
+          processId: candidate.window?.Id ?? candidate.window?.processId ?? null,
+          processName: candidate.window?.ProcessName ?? candidate.window?.processName ?? null,
+          title: candidate.window?.MainWindowTitle ?? candidate.window?.title ?? "",
+          score: candidate.score,
+          signals: candidate.signals
+        })) ?? []
+      },
+      before: {
+        windowIds: beforeWindows.map((candidate) => String(candidate.WindowHandle ?? candidate.windowId)),
+        foregroundWindowId: String(beforeWindows.find((candidate) => candidate.Foreground ?? candidate.foreground)?.WindowHandle ?? "")
+      },
+      windows
+    };
+  }
+
+  async launchProcess(executable, args = [], workingDirectory = process.cwd()) {
+    const command = String(executable ?? "").trim();
+    if (!command) throw new Error("Executable is required");
+    const boundedArgs = Array.isArray(args) ? args.map(String).slice(0, 64) : [];
+    return new Promise((resolve) => {
+      const child = spawn(command, boundedArgs, {
+        cwd: path.resolve(workingDirectory),
+        detached: true,
+        shell: false,
+        stdio: "ignore",
+        windowsHide: false
+      });
+      child.once("error", (error) => resolve({ started: false, executable: command, args: boundedArgs, error: error.message }));
+      child.once("spawn", () => {
+        const pid = child.pid;
+        child.unref();
+        resolve({ started: true, executable: command, args: boundedArgs, processId: pid });
+      });
+    });
   }
 
   async openSpotifySearch(query) {
@@ -909,7 +1093,27 @@ export class WindowsAdapter {
   // control types and bounding rectangles are stable targets for an agent and
   // avoid unsafe coordinate guessing.  The caller may scope to one application
   // (recommended) or inspect the foreground-visible windows.
-  async inspectUi({ application = null, maxElements = 120 } = {}) {
+  async inspectUi({ application = null, windowId = null, maxElements = 120 } = {}) {
+    if (this.automationHost) {
+      try {
+        const inspected = await this.hostRequest("ui.inspect", { application, windowId, maxElements }, { timeoutMs: 12000 });
+        return {
+          application,
+          windows: inspected.window ? [{
+            Id: inspected.window.processId,
+            ProcessName: inspected.window.processName,
+            MainWindowTitle: inspected.window.title,
+            WindowHandle: Number(inspected.window.windowId)
+          }] : [],
+          elements: inspected.targets ?? [],
+          targets: inspected.targets ?? [],
+          host: "persistent"
+        };
+      } catch {
+        // Compatibility fallback below keeps the frozen MVP operational if the
+        // companion host cannot start in the current Windows session.
+      }
+    }
     const limit = clampInt(maxElements, 1, 500, 120);
     const windows = await this.listWindows();
     const needle = application ? String(application).toLowerCase() : null;
@@ -956,6 +1160,26 @@ export class WindowsAdapter {
     const app = String(application ?? "").trim();
     const verb = String(action ?? "").toLowerCase();
     if (!app || !target || !["click", "type", "key"].includes(verb)) throw new Error("application, target and a supported UI action are required");
+    if (this.automationHost) {
+      try {
+        const mappedAction = verb === "key" ? "type" : verb;
+        return {
+          application: app,
+          action: verb,
+          ...(await this.hostRequest("ui.action", {
+            application: app,
+            target,
+            selector: target.selector ?? target,
+            action: mappedAction,
+            text,
+            allowFirst: target.occurrence != null
+          }, { timeoutMs: 12000 })),
+          host: "persistent"
+        };
+      } catch {
+        // Fall through to the original process-isolated implementation.
+      }
+    }
     const windows = await this.listWindows();
     const needle = app.toLowerCase();
     const window = windows.find((w) => String(w.ProcessName ?? "").toLowerCase().includes(needle) || String(w.MainWindowTitle ?? "").toLowerCase().includes(needle));
@@ -996,6 +1220,22 @@ export class WindowsAdapter {
   }
 
   async listWindows() {
+    if (this.automationHost) {
+      try {
+        const result = await this.hostRequest("window.enumerate", {}, { timeoutMs: 5000 });
+        return (result.windows ?? []).map((window) => ({
+          Id: window.processId,
+          ProcessName: window.processName,
+          MainWindowTitle: window.title,
+          WindowHandle: Number(window.windowId),
+          ClassName: window.className,
+          Bounds: window.bounds,
+          Foreground: window.foreground
+        }));
+      } catch {
+        // Fall through to the original bounded PowerShell implementation.
+      }
+    }
     const ps = await this.runPowerShell(
       `if (-not ("SyscoraWindowEnumerator" -as [type])) {
         Add-Type -TypeDefinition @'
@@ -1022,6 +1262,7 @@ public static class SyscoraWindowEnumerator {
     }, IntPtr.Zero);
     return windows;
   }
+
 }
 '@
       }
@@ -1038,6 +1279,94 @@ public static class SyscoraWindowEnumerator {
       parsed = [];
     }
     return Array.isArray(parsed) ? parsed : [parsed].filter(Boolean);
+  }
+
+  async findUiTarget({ application = null, windowId = null, selector = {} } = {}) {
+    return this.hostRequest("ui.find", { application, windowId, selector }, { timeoutMs: 8000 });
+  }
+
+  async performUiAction({ application = null, windowId = null, target, action, text = "", allowFirst = false } = {}) {
+    const params = {
+      application, windowId: windowId ?? target?.windowId, target, selector: target?.selector ?? target,
+      action, text, allowFirst
+    };
+    const first = await this.hostRequest("ui.action", params, { timeoutMs: 10000 });
+    if (first?.performed !== false || !["stale-target", "target-not-found", "window-not-found", "foreground-not-acquired"].includes(first?.reason)) {
+      return first;
+    }
+    const stableSelector = {
+      ...(target?.automationId ? { automationId: target.automationId } : {}),
+      ...(target?.name ? { name: target.name } : {}),
+      ...(target?.controlType ? { controlType: target.controlType } : {})
+    };
+    if (Object.keys(stableSelector).length === 0) return first;
+    const refreshed = await this.hostRequest("ui.find", {
+      application,
+      windowId: windowId ?? target?.windowId,
+      selector: stableSelector
+    }, { timeoutMs: 8000 });
+    if (!refreshed?.found || !refreshed.target) {
+      return {
+        ...first,
+        deterministicRecovery: {
+          attempted: true,
+          strategy: "refresh-stable-uia-identity",
+          succeeded: false,
+          reason: refreshed?.reason ?? "target-refresh-failed"
+        }
+      };
+    }
+    const retried = await this.hostRequest("ui.action", {
+      ...params,
+      windowId: refreshed.target.windowId,
+      target: refreshed.target,
+      selector: stableSelector
+    }, { timeoutMs: 10000 });
+    return {
+      ...retried,
+      deterministicRecovery: {
+        attempted: true,
+        strategy: "refresh-stable-uia-identity",
+        succeeded: retried?.performed === true,
+        priorReason: first.reason,
+        refreshedTargetId: refreshed.target.targetId
+      }
+    };
+  }
+
+  async manageWindow(operation, params = {}) {
+    return this.hostRequest(`window.${operation}`, params, { timeoutMs: 8000 });
+  }
+
+  async pointerAction(operation, params = {}) {
+    return this.hostRequest(`pointer.${operation}`, params, { timeoutMs: 5000 });
+  }
+
+  async keyboardAction(operation, params = {}) {
+    return this.hostRequest(`keyboard.${operation}`, params, { timeoutMs: 5000 });
+  }
+
+  async clipboardAction(operation, params = {}) {
+    return this.hostRequest(`clipboard.${operation}`, params, { timeoutMs: 5000 });
+  }
+
+  async captureScreen(params = {}) {
+    const defaultPath = path.join(os.tmpdir(), "syscora-m4", `capture-${Date.now()}.png`);
+    return this.hostRequest("screen.capture", { ...params, path: params.path ?? defaultPath }, { timeoutMs: 10000 });
+  }
+
+  async readOcr(params = {}) {
+    return this.hostRequest("ocr.read", params, { timeoutMs: 15000 });
+  }
+
+  async locateVisualTarget(params = {}) {
+    return this.hostRequest("vision.locate", params, { timeoutMs: 20000 });
+  }
+
+  async browserDomAction(operation, params = {}) {
+    const method = this.browserAutomation?.[operation];
+    if (typeof method !== "function") throw new Error(`Unsupported browser DOM operation: ${operation}`);
+    return method.call(this.browserAutomation, params);
   }
 
   async notepadTypeAndSave({ content, filename }) {

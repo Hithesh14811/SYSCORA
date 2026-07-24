@@ -1,4 +1,5 @@
 import { RiskLevel } from "../../shared-types/src/domain.js";
+import { ExecutionModality, modalityProfile, validateInteractionTarget } from "../../shared-types/src/execution.js";
 import { redactSensitiveData } from "../../shared-types/src/redaction.js";
 import { PRIVILEGED_OPERATIONS } from "../../privileged-helpers/src/index.js";
 import crypto from "crypto";
@@ -237,6 +238,7 @@ export class CapabilityRegistry {
       version: cap.version,
       category: cap.category,
       description: cap.description,
+      execution: cap.execution,
       owner: cap.owner,
       inputSchema: cap.inputSchema,
       outputSchema: cap.outputSchema,
@@ -995,15 +997,15 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     }),
     verify: async (observation) => {
       const result = observation?.structuredState ?? {};
-      const started = Boolean(result.window) || result?.launch?.started === true || result?.launchResult?.exitCode === 0;
+      const started = Boolean(result.windowIdentity ?? result.window);
       return {
         status: started ? "VERIFIED" : "FAILED",
-        message: started ? `Launched ${result.application}` : `Could not confirm ${result.application} started`,
-        evidence: { window: result.window ?? null },
-        confidence: started ? (result.window ? 1 : 0.6) : 0
+        message: started ? `Launched and grounded ${result.application}` : `Could not ground a window for ${result.application}`,
+        evidence: { window: result.window ?? null, windowIdentity: result.windowIdentity ?? null, grounding: result.grounding ?? null },
+        confidence: started ? (result.windowIdentity?.confidence ?? 0.9) : 0
       };
     },
-    timeout: 15000,
+    timeout: 24000,
     retryPolicy: { maxAttempts: 1, backoffMs: 0 },
     recoveryHints: ["ABORT_ON_FAILURE"],
     lifecycleStatus: LifecycleStatus.VERIFIED
@@ -1087,6 +1089,780 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     timeout: 10000,
     retryPolicy: { maxAttempts: 1, backoffMs: 0 },
     lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  const registerM4Primitive = ({
+    name, description, inputSchema, execute, modality = ExecutionModality.OS_API, modalities = null,
+    risk = RiskLevel.LOW, permissionType = "READ", verify = null,
+    resources = [], detectedChanges = []
+  }) => registry.register({
+    name,
+    version: "1.0.0",
+    description,
+    inputSchema,
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: risk },
+    permissionModel: { scope: ["SESSION"], type: permissionType },
+    execution: {
+      modalities: (modalities ?? [modality]).map((value) => modalityProfile(value)),
+      preferredModality: modality,
+      resources
+    },
+    security: {
+      filesystem: name === "screen.capture" ? "WRITE" : "NONE",
+      registry: "NONE", network: "NONE", browser: "NONE",
+      clipboard: name.startsWith("clipboard.") ? (permissionType === "WRITE" ? "WRITE" : "READ") : "NONE",
+      windowAutomation: ["ui.", "window.", "pointer.", "keyboard.", "screen."].some((prefix) => name.startsWith(prefix))
+        ? (permissionType === "WRITE" ? "CONTROLLED" : "READ")
+        : "NONE",
+      externalProcesses: "NONE"
+    },
+    reversibility: "NOT_REQUIRED",
+    preconditions: () => true,
+    execute,
+    observe: async (result, args) => ({
+      observationId: createId(), source: name, timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId,
+      detectedChanges: result?.performed === false ? [] : detectedChanges,
+      confidence: result?.performed === false || result?.found === false ? 0.4 : 0.95,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: verify ?? (async (observation) => {
+      const result = observation?.structuredState ?? {};
+      const failed = result.performed === false || result.found === false || result.captured === false;
+      return {
+        status: failed ? "FAILED" : "VERIFIED",
+        message: failed ? (result.reason ?? `${name} did not complete`) : `${name} completed`,
+        evidence: result,
+        confidence: failed ? 1 : 0.9
+      };
+    }),
+    timeout: 15000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    recoveryHints: ["REFRESH_STATE", "ABORT_ON_FAILURE"],
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  const refreshVisualTarget = async (target) => {
+    const validation = validateInteractionTarget(target);
+    if (!validation.valid) throw new Error(`Unsafe visual target: ${validation.errors.join(", ")}`);
+    const age = Date.now() - Date.parse(target.observedAt);
+    if (!Number.isFinite(age) || age > 5000) throw new Error("Unsafe visual target: evidence is stale");
+    if (!target.relativeCoordinates || target.windowId === "screen") return target;
+    const windows = await adapter.listWindows();
+    let window = windows.find((candidate) =>
+      String(candidate.WindowHandle ?? candidate.windowId) === String(target.windowId)
+    );
+    if (!window && target.windowIdentity) {
+      const identity = target.windowIdentity;
+      window = windows
+        .map((candidate) => {
+          let score = 0;
+          if (identity.processId && Number(candidate.Id ?? candidate.processId) === Number(identity.processId)) score += 4;
+          if (identity.processName && String(candidate.ProcessName ?? candidate.processName).toLowerCase() === String(identity.processName).toLowerCase()) score += 3;
+          if (identity.className && String(candidate.ClassName ?? candidate.className) === String(identity.className)) score += 2;
+          if (identity.title && String(candidate.MainWindowTitle ?? candidate.title) === String(identity.title)) score += 3;
+          return { candidate, score };
+        })
+        .sort((left, right) => right.score - left.score)[0];
+      window = window?.score >= 5 ? window.candidate : null;
+    }
+    if (!window) throw new Error("Unsafe visual target: source window no longer exists");
+    const bounds = window.Bounds ?? window.bounds;
+    if (!bounds) return target;
+    return {
+      ...target,
+      windowId: String(window.WindowHandle ?? window.windowId),
+      boundingRect: {
+        x: Number(bounds.x) + Number(target.relativeCoordinates.x),
+        y: Number(bounds.y) + Number(target.relativeCoordinates.y),
+        width: target.boundingRect.width,
+        height: target.boundingRect.height
+      },
+      observedAt: new Date().toISOString(),
+      reGrounded: true
+    };
+  };
+
+  registerM4Primitive({
+    name: "window.enumerate",
+    description: "Enumerate visible top-level Windows with stable ids and bounds",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    execute: async () => ({ windows: await adapter.listWindows() }),
+    resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "window.resolve",
+    description: "Resolve a top-level window from stable and fallback identity signals",
+    inputSchema: {
+      type: "object",
+      properties: {
+        windowId: { type: "string" }, processId: { type: "number" }, processName: { type: "string" },
+        executable: { type: "string" }, className: { type: "string" }, title: { type: "string" },
+        titleContains: { type: "string" }, application: { type: "string" }
+      },
+      required: []
+    },
+    execute: async (args) => adapter.manageWindow("resolve", args),
+    resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "window.wait",
+    description: "Wait boundedly for a matching application window to appear",
+    inputSchema: { type: "object", properties: { windowId: { type: "string" }, application: { type: "string" }, timeoutMs: { type: "number" } }, required: [] },
+    execute: async (args) => adapter.manageWindow("wait", { ...args, timeoutMs: args.timeoutMs ?? 8000 }),
+    modality: ExecutionModality.UI_AUTOMATION, resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "window.activate",
+    description: "Restore and activate a visible Windows application window",
+    inputSchema: { type: "object", properties: { windowId: { type: "string" }, application: { type: "string" } }, required: [] },
+    execute: async (args) => adapter.manageWindow("activate", args),
+    modality: ExecutionModality.UI_AUTOMATION, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["window.foreground"]
+  });
+  registerM4Primitive({
+    name: "window.moveResize",
+    description: "Move and resize one identified window",
+    inputSchema: { type: "object", properties: { windowId: { type: "string" }, application: { type: "string" }, x: { type: "number" }, y: { type: "number" }, width: { type: "number" }, height: { type: "number" } }, required: ["x", "y", "width", "height"] },
+    execute: async (args) => adapter.manageWindow("moveResize", args),
+    permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["window.bounds"]
+  });
+  registerM4Primitive({
+    name: "ui.inspect",
+    description: "Inspect one grounded application window and return compact accessible controls",
+    inputSchema: {
+      type: "object",
+      properties: {
+        application: { type: "string" },
+        windowId: { type: "string" },
+        maxElements: { type: "number" }
+      },
+      required: []
+    },
+    execute: async (args) => adapter.inspectUi(args),
+    modality: ExecutionModality.UI_AUTOMATION,
+    resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "ui.find",
+    description: "Find a live accessible control and return a unified interaction target",
+    inputSchema: { type: "object", properties: { application: { type: "string" }, windowId: { type: "string" }, selector: { type: "object" } }, required: ["selector"] },
+    execute: async (args) => adapter.findUiTarget(args),
+    modality: ExecutionModality.UI_AUTOMATION, resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "ui.extract",
+    description: "Extract one typed value from a grounded accessible GUI using goal-relevant semantics; fail on unresolved ambiguity",
+    inputSchema: {
+      type: "object",
+      properties: {
+        application: { type: "string" },
+        windowId: { type: "string" },
+        query: { type: "string" },
+        selector: { type: "object" },
+        maxElements: { type: "number" }
+      },
+      required: ["query"]
+    },
+    execute: async (args) => {
+      const inspected = await adapter.inspectUi({
+        application: args.application,
+        windowId: args.windowId,
+        maxElements: args.maxElements ?? 240
+      });
+      const controls = inspected?.targets ?? inspected?.elements ?? [];
+      const query = String(args.query ?? "").toLowerCase();
+      const ignored = new Set([
+        "read", "obtain", "get", "extract", "exact", "current", "currently",
+        "visible", "shown", "displayed", "main", "section", "control", "from",
+        "application", "window", "the", "and", "its", "one"
+      ]);
+      const tokens = query.match(/[a-z0-9]{2,}/g)?.filter((token) => !ignored.has(token)) ?? [];
+      const wantsLabel = /\b(label|caption|heading|title|text)\b/.test(query);
+      const wantsToggle = /\b(toggle|checked|enabled|disabled|on|off|state)\b/.test(query);
+      const wantsSelection = /\b(selected|selection|chosen|choice)\b/.test(query);
+      const selector = args.selector ?? {};
+      const candidates = controls.map((control) => {
+        const name = String(control?.name ?? "").trim();
+        const explicitValue = control?.value;
+        const selectedValue = control?.selected ?? control?.selection;
+        const value = explicitValue != null && String(explicitValue).trim() !== ""
+          ? explicitValue
+          : control?.toggleState != null ? control.toggleState
+            : selectedValue != null && String(selectedValue).trim() !== "" ? selectedValue
+              : name;
+        if (value == null || String(value).trim() === "") return null;
+        const semantics = `${name} ${control?.automationId ?? ""} ${control?.controlType ?? ""} ${control?.className ?? ""}`.toLowerCase();
+        const matchedTokens = tokens.filter((token) => semantics.includes(token));
+        let score = matchedTokens.length * 20;
+        if (selector.name && name.toLowerCase() === String(selector.name).toLowerCase()) score += 100;
+        if (selector.nameContains && name.toLowerCase().includes(String(selector.nameContains).toLowerCase())) score += 60;
+        if (selector.automationId && String(control?.automationId) === String(selector.automationId)) score += 100;
+        if (selector.controlType && semantics.includes(String(selector.controlType).toLowerCase())) score += 30;
+        const staticText = /(?:static|text|label)/i.test(`${control?.className ?? ""} ${control?.controlType ?? ""}`);
+        const interactive = /(?:button|edit|combo|check|radio|listitem|menuitem|tabitem)/i.test(`${control?.className ?? ""} ${control?.controlType ?? ""}`);
+        if (wantsLabel && staticText) score += 14;
+        if (wantsLabel && !interactive && name.length <= 100) score += 5;
+        if (wantsLabel && /[:：]\s*$/.test(name)) score += 4;
+        if (wantsLabel && name.length > 160) score -= 12;
+        if (wantsToggle && control?.toggleState != null) score += 25;
+        if (wantsSelection && selectedValue != null) score += 25;
+        if (explicitValue != null && String(explicitValue).trim() !== "") score += 8;
+        return {
+          control,
+          value,
+          valueType: typeof value,
+          valueSource: explicitValue != null ? "ValuePattern"
+            : control?.toggleState != null ? "TogglePattern"
+              : selectedValue != null ? "Selection" : "AccessibleName",
+          matchedTokens,
+          score
+        };
+      }).filter(Boolean).sort((left, right) => right.score - left.score);
+      const top = candidates[0];
+      const tied = top && candidates[1] && candidates[1].score === top.score;
+      const semanticallyGrounded = top && (
+        top.matchedTokens.length > 0
+        || (wantsLabel && /(?:static|text|label)/i.test(`${top.control?.className ?? ""} ${top.control?.controlType ?? ""}`))
+        || (wantsToggle && top.control?.toggleState != null)
+        || (wantsSelection && top.valueSource === "Selection")
+        || Object.keys(selector).length > 0
+      );
+      if (!top || tied || !semanticallyGrounded) {
+        return {
+          found: false,
+          reason: tied ? "ambiguous-value" : "no-semantically-grounded-value",
+          query: args.query,
+          candidates: candidates.slice(0, 6).map((candidate) => ({
+            value: candidate.value,
+            valueSource: candidate.valueSource,
+            score: candidate.score,
+            control: candidate.control
+          }))
+        };
+      }
+      return {
+        found: true,
+        value: top.value,
+        valueType: top.valueType,
+        valueSource: top.valueSource,
+        query: args.query,
+        control: top.control,
+        target: top.control,
+        window: inspected?.windows?.[0] ?? null,
+        matchedTokens: top.matchedTokens,
+        candidatesConsidered: candidates.length
+      };
+    },
+    modality: ExecutionModality.UI_AUTOMATION,
+    resources: ["desktop"],
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      const valid = result.found === true && result.value != null && String(result.value) !== "";
+      return {
+        status: valid ? "VERIFIED" : "FAILED",
+        message: valid
+          ? `Extracted a typed GUI value through ${result.valueSource}.`
+          : result.reason ?? "GUI value extraction failed",
+        evidence: result,
+        confidence: valid ? 0.95 : 1
+      };
+    }
+  });
+  registerM4Primitive({
+    name: "ui.navigateSection",
+    description: "Navigate boundedly among generic tab/section views and stop only when accessible UI evidence uniquely matches the requested section",
+    inputSchema: {
+      type: "object",
+      properties: {
+        application: { type: "string" },
+        windowId: { type: "string" },
+        query: { type: "string" },
+        maxTransitions: { type: "number" }
+      },
+      required: ["query"]
+    },
+    execute: async (args) => {
+      const ignored = new Set(["open", "select", "section", "tab", "view", "the", "and"]);
+      const tokens = String(args.query).toLowerCase().match(/[a-z0-9]{3,}/g)
+        ?.filter((token) => !ignored.has(token)) ?? [];
+      if (!tokens.length) return { performed: false, reason: "section-query-has-no-semantic-tokens" };
+      const attempts = [];
+      const limit = Math.max(1, Math.min(12, Number(args.maxTransitions) || 8));
+      for (let index = 0; index <= limit; index += 1) {
+        const inspected = await adapter.inspectUi({
+          application: args.application,
+          windowId: args.windowId,
+          maxElements: 240
+        });
+        const controls = inspected?.targets ?? inspected?.elements ?? [];
+        const accessibleTab = controls.find((control) =>
+          /TabControl/i.test(String(control?.className ?? ""))
+          && Array.isArray(control?.accessibleChildren)
+        );
+        const accessibleMatches = (accessibleTab?.accessibleChildren ?? []).map((name) => {
+          const semantics = String(name).toLowerCase();
+          return {
+            name,
+            score: tokens.reduce((total, token) => total + (semantics.includes(token) ? 1 : 0), 0)
+          };
+        }).filter((entry) => entry.score > 0).sort((left, right) => right.score - left.score);
+        if (accessibleMatches[0]
+          && (!accessibleMatches[1] || accessibleMatches[0].score > accessibleMatches[1].score
+            || accessibleMatches[0].score === tokens.length)) {
+          const selected = await adapter.performUiAction({
+            application: args.application,
+            windowId: args.windowId,
+            target: accessibleTab,
+            action: "selectAccessibleChild",
+            text: accessibleMatches[0].name
+          });
+          if (!selected?.performed) {
+            return {
+              performed: false,
+              reason: selected?.reason ?? "accessible-section-selection-failed",
+              accessibleTab,
+              attempts
+            };
+          }
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          const after = await adapter.inspectUi({
+            application: args.application,
+            windowId: args.windowId,
+            maxElements: 240
+          });
+          const afterControls = after?.targets ?? after?.elements ?? [];
+          const postMatches = afterControls.filter((control) => {
+            const semantics = `${control?.name ?? ""} ${control?.automationId ?? ""}`.toLowerCase();
+            return tokens.some((token) => semantics.includes(token));
+          });
+          if (!postMatches.length) {
+            return {
+              performed: false,
+              reason: "section-selection-postcondition-not-observed",
+              query: args.query,
+              accessibleSelection: accessibleMatches[0].name,
+              controls: afterControls,
+              attempts
+            };
+          }
+          return {
+            performed: true,
+            query: args.query,
+            matched: { name: accessibleMatches[0].name, source: "MSAA", windowId: args.windowId },
+            matchedTokens: tokens.filter((token) => accessibleMatches[0].name.toLowerCase().includes(token)),
+            controls: afterControls,
+            transitions: index,
+            method: "MSAA-accSelect",
+            attempts
+          };
+        }
+        const matches = controls.map((control) => {
+          const semantics = `${control?.name ?? ""} ${control?.automationId ?? ""}`.toLowerCase();
+          return {
+            control,
+            score: tokens.reduce((total, token) => total + (semantics.includes(token) ? 1 : 0), 0)
+          };
+        }).filter((entry) => entry.score > 0).sort((left, right) => right.score - left.score);
+        attempts.push({
+          transition: index,
+          topMatch: matches[0]?.control?.name ?? null,
+          score: matches[0]?.score ?? 0
+        });
+        if (matches[0] && (!matches[1] || matches[0].score > matches[1].score || matches[0].score === tokens.length)) {
+          return {
+            performed: true,
+            query: args.query,
+            matched: matches[0].control,
+            matchedTokens: tokens.filter((token) =>
+              `${matches[0].control?.name ?? ""} ${matches[0].control?.automationId ?? ""}`.toLowerCase().includes(token)
+            ),
+            controls,
+            transitions: index,
+            attempts
+          };
+        }
+        if (index < limit) {
+          const nativeContainer = controls.find((control) =>
+            /TabControl/i.test(String(control?.className ?? ""))
+          );
+          const pressed = nativeContainer
+            ? await adapter.performUiAction({
+                application: args.application,
+                windowId: args.windowId,
+                target: nativeContainer,
+                action: "nextSection"
+              })
+            : await adapter.keyboardAction("press", {
+                application: args.application,
+                windowId: args.windowId,
+                keys: "^{TAB}"
+              });
+          if (!pressed?.performed) {
+            return {
+              performed: false,
+              reason: pressed?.reason ?? "section-navigation-failed",
+              nativeContainer: nativeContainer ?? null,
+              navigationResult: pressed,
+              attempts
+            };
+          }
+          await new Promise((resolve) => setTimeout(resolve, 150));
+        }
+      }
+      return { performed: false, reason: "section-not-found-within-bounded-navigation", attempts };
+    },
+    modality: ExecutionModality.UI_AUTOMATION,
+    permissionType: "WRITE",
+    resources: ["desktop"],
+    detectedChanges: ["application.navigation"],
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      return {
+        status: result.performed && result.matched ? "VERIFIED" : "FAILED",
+        message: result.performed
+          ? `Section ${result.query} was selected and matched accessible evidence ${result.matched?.name ?? ""}.`
+          : result.reason ?? "Section navigation failed",
+        evidence: result,
+        confidence: result.performed ? 0.95 : 1
+      };
+    }
+  });
+  registerM4Primitive({
+    name: "ui.verifyValue",
+    description: "Re-read one grounded accessible control and verify its exact current value",
+    inputSchema: {
+      type: "object",
+      properties: {
+        application: { type: "string" },
+        windowId: { type: "string" },
+        selector: { type: "object" },
+        expected: { type: "string" }
+      },
+      required: ["selector", "expected"]
+    },
+    execute: async (args) => {
+      const found = await adapter.findUiTarget(args);
+      const actual = found?.target?.value ?? found?.target?.name ?? null;
+      const normalizeControlValue = (value) => String(value ?? "")
+        .replace(/\r\n?/g, "\n")
+        .replace(/\n$/, "");
+      return {
+        ...found,
+        expected: args.expected,
+        actual,
+        normalizedActual: normalizeControlValue(actual),
+        normalizedExpected: normalizeControlValue(args.expected),
+        matches: found?.found === true && normalizeControlValue(actual) === normalizeControlValue(args.expected)
+      };
+    },
+    modality: ExecutionModality.UI_AUTOMATION,
+    resources: ["desktop"],
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      return {
+        status: result.matches ? "VERIFIED" : "FAILED",
+        message: result.matches ? "The control value exactly matches the expected value." : "The control value does not match the expected value.",
+        evidence: { expected: result.expected, actual: result.actual, target: result.target ?? null },
+        confidence: 1
+      };
+    }
+  });
+  registerM4Primitive({
+    name: "ui.resolveTarget",
+    description: "Resolve a UI target progressively through UI Automation then screenshot/OCR",
+    inputSchema: { type: "object", properties: { application: { type: "string" }, windowId: { type: "string" }, selector: { type: "object" }, visualQuery: { type: "string" } }, required: ["selector"] },
+    execute: async (args) => {
+      const structured = await adapter.findUiTarget(args);
+      if (structured?.found) {
+        return { ...structured, modality: ExecutionModality.UI_AUTOMATION, fallbacks: [] };
+      }
+      const query = args.visualQuery ?? args.selector?.name ?? args.selector?.nameContains;
+      if (!query) return { found: false, reason: structured?.reason ?? "target-not-found", structured, fallbacks: [] };
+      const visual = await adapter.locateVisualTarget({
+        application: args.application, windowId: args.windowId, query
+      });
+      return {
+        ...visual,
+        modality: ExecutionModality.VISION_GUI,
+        fallbacks: [{
+          from: ExecutionModality.UI_AUTOMATION,
+          to: ExecutionModality.VISION_GUI,
+          reason: structured?.reason ?? "accessible-target-unavailable"
+        }],
+        structuredAttempt: structured
+      };
+    },
+    modality: ExecutionModality.UI_AUTOMATION,
+    modalities: [ExecutionModality.UI_AUTOMATION, ExecutionModality.VISION_GUI],
+    resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "ui.action",
+    description: "Perform a bounded action against a runtime-observed unified UI target",
+    inputSchema: { type: "object", properties: { application: { type: "string" }, windowId: { type: "string" }, target: { type: "object" }, action: { type: "string", enum: ["invoke", "click", "focus", "setValue", "type", "select", "expand", "collapse", "toggle", "scrollIntoView", "nextSection", "selectAccessibleChild"] }, text: { type: "string" }, expectedAfter: { type: "object" } }, required: ["target", "action"] },
+    execute: async (args) => {
+      if (args.target?.source === "UIA") return adapter.performUiAction(args);
+      const target = await refreshVisualTarget(args.target);
+      if (!["click", "type"].includes(args.action)) throw new Error(`Visual fallback does not support ${args.action}`);
+      const rect = target.boundingRect;
+      const click = await adapter.pointerAction("click", {
+        windowId: target.windowId,
+        x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2), button: "left"
+      });
+      if (args.action === "type" && args.text) {
+        const typed = await adapter.keyboardAction("type", { text: args.text, windowId: target.windowId });
+        return { performed: click.performed && typed.performed, method: "vision-pointer+keyboard", target, click, typed };
+      }
+      return { ...click, method: "vision-pointer", target };
+    },
+    modality: ExecutionModality.UI_AUTOMATION, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"],
+    verify: async (observation, args) => {
+      const result = observation?.structuredState ?? {};
+      if (!result.performed) return { status: "FAILED", message: result.reason ?? "UI action failed", evidence: result, confidence: 1 };
+      if (args.expectedAfter) {
+        const next = await adapter.findUiTarget({
+          application: args.application,
+          windowId: args.windowId ?? args.target?.windowId,
+          selector: args.expectedAfter
+        });
+        return {
+          status: next.found ? "VERIFIED" : "FAILED",
+          message: next.found ? "Expected post-action UI state appeared." : "Action ran but expected UI state was not observed.",
+          evidence: { action: result, postcondition: next }, confidence: 0.95
+        };
+      }
+      return { status: "PARTIALLY_VERIFIED", message: "UI action completed; no explicit postcondition was supplied.", evidence: result, confidence: 0.7 };
+    }
+  });
+  registerM4Primitive({
+    name: "screen.capture",
+    description: "Capture a bounded screen, window, or region to a local PNG",
+    inputSchema: { type: "object", properties: { windowId: { type: "string" }, application: { type: "string" }, region: { type: "object" }, path: { type: "string" } }, required: [] },
+    execute: async (args) => adapter.captureScreen(args),
+    modality: ExecutionModality.VISION_GUI, resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "ocr.read",
+    description: "Read text and grounded line targets from a local screenshot using Windows OCR",
+    inputSchema: { type: "object", properties: { path: { type: "string" }, windowId: { type: "string" }, originX: { type: "number" }, originY: { type: "number" } }, required: ["path"] },
+    execute: async (args) => adapter.readOcr(args),
+    modality: ExecutionModality.VISION_GUI, resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "vision.locate",
+    description: "Capture a window and locate visible text as a confidence-scored unified target",
+    inputSchema: { type: "object", properties: { application: { type: "string" }, windowId: { type: "string" }, query: { type: "string" }, path: { type: "string" } }, required: ["query"] },
+    execute: async (args) => adapter.locateVisualTarget(args),
+    modality: ExecutionModality.VISION_GUI, resources: ["desktop"]
+  });
+  registerM4Primitive({
+    name: "pointer.click",
+    description: "Click the center of a fresh, high-confidence visual target",
+    inputSchema: { type: "object", properties: { target: { type: "object" }, button: { type: "string" } }, required: ["target"] },
+    execute: async (args) => {
+      const target = await refreshVisualTarget(args.target);
+      const rect = target.boundingRect;
+      return adapter.pointerAction("click", {
+        windowId: target.windowId,
+        x: Math.round(rect.x + rect.width / 2),
+        y: Math.round(rect.y + rect.height / 2),
+        button: args.button ?? "left"
+      });
+    },
+    modality: ExecutionModality.VISION_GUI, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"]
+  });
+  registerM4Primitive({
+    name: "pointer.wheel",
+    description: "Scroll the wheel in an identified application window",
+    inputSchema: { type: "object", properties: { delta: { type: "number" }, windowId: { type: "string" }, application: { type: "string" } }, required: ["delta"] },
+    execute: async (args) => adapter.pointerAction("wheel", args),
+    modality: ExecutionModality.VISION_GUI, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.viewport"]
+  });
+  registerM4Primitive({
+    name: "pointer.drag",
+    description: "Drag between two fresh runtime-observed targets in one window",
+    inputSchema: { type: "object", properties: { fromTarget: { type: "object" }, toTarget: { type: "object" }, windowId: { type: "string" }, application: { type: "string" } }, required: ["fromTarget", "toTarget"] },
+    execute: async (args) => {
+      const from = await refreshVisualTarget(args.fromTarget);
+      const to = await refreshVisualTarget(args.toTarget);
+      if (String(from.windowId) !== String(to.windowId)) throw new Error("Drag targets must belong to the same window");
+      return adapter.pointerAction("drag", {
+        windowId: from.windowId,
+        fromX: Math.round(from.boundingRect.x + from.boundingRect.width / 2),
+        fromY: Math.round(from.boundingRect.y + from.boundingRect.height / 2),
+        toX: Math.round(to.boundingRect.x + to.boundingRect.width / 2),
+        toY: Math.round(to.boundingRect.y + to.boundingRect.height / 2)
+      });
+    },
+    modality: ExecutionModality.VISION_GUI, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"]
+  });
+  registerM4Primitive({
+    name: "keyboard.type",
+    description: "Type bounded text into the current focused control",
+    inputSchema: { type: "object", properties: { text: { type: "string" }, windowId: { type: "string" }, application: { type: "string" } }, required: ["text"] },
+    execute: async (args) => adapter.keyboardAction("type", args),
+    modality: ExecutionModality.UI_AUTOMATION, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"]
+  });
+  registerM4Primitive({
+    name: "keyboard.press",
+    description: "Send a bounded key or hotkey sequence to the foreground application",
+    inputSchema: { type: "object", properties: { keys: { type: "string" }, windowId: { type: "string" }, application: { type: "string" } }, required: ["keys"] },
+    execute: async (args) => adapter.keyboardAction("press", args),
+    modality: ExecutionModality.UI_AUTOMATION, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"]
+  });
+  registerM4Primitive({
+    name: "clipboard.read",
+    description: "Read current text clipboard content locally",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    execute: async () => adapter.clipboardAction("read"),
+    resources: ["clipboard"]
+  });
+  registerM4Primitive({
+    name: "clipboard.write",
+    description: "Write text to the clipboard and return the previous value",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+    execute: async (args) => adapter.clipboardAction("write", args),
+    permissionType: "WRITE", resources: ["clipboard"], detectedChanges: ["clipboard"]
+  });
+  registerM4Primitive({
+    name: "process.launch",
+    description: "Launch one executable with a structured argument array and no shell",
+    inputSchema: { type: "object", properties: { executable: { type: "string" }, args: { type: "array" }, workingDirectory: { type: "string" } }, required: ["executable"] },
+    execute: async (args) => adapter.launchProcess(args.executable, args.args ?? [], args.workingDirectory),
+    modality: ExecutionModality.OS_API,
+    risk: RiskLevel.MEDIUM,
+    permissionType: "EXECUTE",
+    resources: ["process"],
+    detectedChanges: ["process"]
+  });
+
+  const registerBrowserPrimitive = ({
+    name, description, inputSchema, operation, permissionType = "READ",
+    risk = RiskLevel.LOW, detectedChanges = [], filesystem = "NONE"
+  }) => registry.register({
+    name,
+    version: "1.0.0",
+    description,
+    inputSchema,
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: risk },
+    permissionModel: { scope: ["SESSION", "NETWORK"], type: permissionType },
+    execution: {
+      modalities: [modalityProfile(ExecutionModality.BROWSER_DOM)],
+      preferredModality: ExecutionModality.BROWSER_DOM,
+      resources: ["browser"]
+    },
+    security: {
+      filesystem, registry: "NONE",
+      network: ["launch", "navigate"].includes(operation) ? "OUTBOUND" : "NONE",
+      browser: permissionType === "WRITE" ? "CONTROLLED" : "READ",
+      clipboard: "NONE", windowAutomation: "NONE", externalProcesses: operation === "launch" ? "BROWSER" : "NONE"
+    },
+    reversibility: "NOT_REQUIRED",
+    preconditions: () => typeof adapter?.browserDomAction === "function",
+    execute: async (args) => adapter.browserDomAction(operation, args),
+    observe: async (result, args) => ({
+      observationId: createId(), source: name, timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId,
+      detectedChanges, confidence: result?.performed === false || result?.found === false ? 0.4 : 0.98,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      const failed = result.performed === false || result.found === false || result.matched === false;
+      return {
+        status: failed ? "FAILED" : "VERIFIED",
+        message: failed ? (result.reason ?? `${name} did not complete`) : `${name} completed`,
+        evidence: result,
+        confidence: 0.98
+      };
+    },
+    timeout: 20000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  registerBrowserPrimitive({
+    name: "browser.launch",
+    description: "Launch a Chromium browser with a private structured CDP control channel",
+    inputSchema: { type: "object", properties: { url: { type: "string" }, headless: { type: "boolean" } }, required: [] },
+    operation: "launch", permissionType: "EXECUTE", risk: RiskLevel.MEDIUM, detectedChanges: ["browser.process"]
+  });
+  registerBrowserPrimitive({
+    name: "browser.connect",
+    description: "Connect to an explicitly enabled local Chromium debugging endpoint",
+    inputSchema: { type: "object", properties: { endpoint: { type: "string" } }, required: [] },
+    operation: "connect"
+  });
+  registerBrowserPrimitive({
+    name: "browser.navigate",
+    description: "Navigate the controlled browser to one explicit HTTP(S) URL",
+    inputSchema: { type: "object", properties: { url: { type: "string" }, waitUntil: { type: "string" }, timeoutMs: { type: "number" } }, required: ["url"] },
+    operation: "navigate", detectedChanges: ["browser.location"]
+  });
+  registerBrowserPrimitive({
+    name: "browser.currentState",
+    description: "Read the controlled page URL, title, readiness, viewport, and focus",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    operation: "currentState"
+  });
+  registerBrowserPrimitive({
+    name: "browser.inspect",
+    description: "Inspect a bounded set of visible structured DOM controls and content",
+    inputSchema: { type: "object", properties: { limit: { type: "number" } }, required: [] },
+    operation: "inspect"
+  });
+  registerBrowserPrimitive({
+    name: "browser.find",
+    description: "Find a DOM element by selector, text, role, or accessible name and return a grounded target",
+    inputSchema: { type: "object", properties: { selector: { type: "string" }, text: { type: "string" }, role: { type: "string" }, name: { type: "string" } }, required: [] },
+    operation: "find"
+  });
+  for (const operation of ["click", "type", "select"]) {
+    registerBrowserPrimitive({
+      name: `browser.${operation}`,
+      description: `${operation} a runtime-observed DOM target`,
+      inputSchema: {
+        type: "object",
+        properties: { target: { type: "object" }, text: { type: "string" }, value: { type: "string" }, clear: { type: "boolean" } },
+        required: ["target"]
+      },
+      operation, permissionType: "WRITE", risk: RiskLevel.MEDIUM, detectedChanges: ["browser.document"]
+    });
+  }
+  registerBrowserPrimitive({
+    name: "browser.scroll",
+    description: "Scroll the page or bring a runtime-observed DOM target into view",
+    inputSchema: { type: "object", properties: { target: { type: "object" }, x: { type: "number" }, y: { type: "number" } }, required: [] },
+    operation: "scroll", permissionType: "WRITE", detectedChanges: ["browser.viewport"]
+  });
+  registerBrowserPrimitive({
+    name: "browser.wait",
+    description: "Wait boundedly for a DOM selector or document readiness state",
+    inputSchema: { type: "object", properties: { condition: { type: "string" }, selector: { type: "string" }, value: { type: "string" }, timeoutMs: { type: "number" } }, required: [] },
+    operation: "wait"
+  });
+  registerBrowserPrimitive({
+    name: "browser.read",
+    description: "Read text from a runtime-observed DOM target or explicit selector",
+    inputSchema: { type: "object", properties: { target: { type: "object" }, selector: { type: "string" } }, required: [] },
+    operation: "read"
+  });
+  registerBrowserPrimitive({
+    name: "browser.extract",
+    description: "Extract a typed scalar such as a version or number from structured DOM text",
+    inputSchema: { type: "object", properties: { kind: { type: "string", enum: ["version", "number", "text"] }, query: { type: "string" }, selector: { type: "string" } }, required: ["kind"] },
+    operation: "extract"
+  });
+  registerBrowserPrimitive({
+    name: "browser.download",
+    description: "Download from a runtime-observed DOM target into an explicit existing directory and verify the resulting file",
+    inputSchema: { type: "object", properties: { target: { type: "object" }, directory: { type: "string" }, timeoutMs: { type: "number" } }, required: ["target", "directory"] },
+    operation: "download", permissionType: "WRITE", risk: RiskLevel.MEDIUM,
+    filesystem: "WRITE", detectedChanges: ["filesystem"]
   });
 
   // gui.inspect is the reusable perception primitive for a desktop agent. It

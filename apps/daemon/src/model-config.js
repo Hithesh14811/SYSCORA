@@ -13,12 +13,14 @@ import path from "node:path";
 // (claude-opus-4-8 / gpt-5.5 / glm-5.2) by changing `model` alone.
 export function loadModelConfig(basePath = process.cwd()) {
   let fileConfig = {};
+  let consentConfig = {};
   const configPath = path.join(basePath, ".syscora", "config.json");
   try {
     if (fs.existsSync(configPath)) {
       const raw = fs.readFileSync(configPath, "utf8");
       const parsed = JSON.parse(raw);
       fileConfig = parsed?.model ?? parsed ?? {};
+      consentConfig = parsed?.externalAIConsent ?? fileConfig?.externalAIConsent ?? {};
     }
   } catch {
     // A malformed local config must never crash startup; fall back to env/mock.
@@ -35,6 +37,13 @@ export function loadModelConfig(basePath = process.cwd()) {
     model: process.env.SYSCORA_MODEL_NAME || fileConfig.model || undefined,
     baseUrl: process.env.SYSCORA_MODEL_BASE_URL || fileConfig.baseUrl || undefined,
     fallbackProviders:
-      process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS || fileConfig.fallbackProviders || ""
+      process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS || fileConfig.fallbackProviders || "",
+    externalAIConsent: {
+      scopes: String(
+        process.env.SYSCORA_EXTERNAL_AI_CONSENT_SCOPES ||
+        (Array.isArray(consentConfig.scopes) ? consentConfig.scopes.join(",") : consentConfig.scopes) ||
+        "EXTERNAL_AI_DISABLED"
+      ).split(",").map((scope) => scope.trim()).filter(Boolean)
+    }
   };
 }
