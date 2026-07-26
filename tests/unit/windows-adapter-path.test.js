@@ -12,7 +12,7 @@ test("WindowsAdapter - verifyUserPathEntry and rollbackUserPath", async () => {
   
   try {
     // Add a test entry that probably doesn't exist
-    const testEntry = path.join(os.tmpdir(), "syscora-test-path");
+    const testEntry = path.join(os.tmpdir(), `syscora-test-path-${process.pid}-${Date.now()}`);
     await adapter.addUserPathEntry(testEntry);
     
     // Verify it's there

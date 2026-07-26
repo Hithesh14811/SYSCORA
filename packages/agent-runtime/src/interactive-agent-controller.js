@@ -9,6 +9,16 @@ import { assessGoalContractEvidence } from "../../shared-types/src/goal-contract
 import { createResultEnvelope, extractResultValue } from "../../shared-types/src/result-envelope.js";
 import { createCompositionGraph, validateCompositionGraph } from "../../shared-types/src/composition-graph.js";
 import { evaluateTransitionContracts } from "../../shared-types/src/transition-contract.js";
+import {
+  CapabilityResolutionKind,
+  canonicalizeCapabilityAction
+} from "../../shared-types/src/capability-resolution.js";
+import {
+  appendEvidence,
+  createEvidenceLedger,
+  evaluateEvidenceLedger
+} from "../../shared-types/src/evidence-ledger.js";
+import { evaluatePostcondition } from "../../shared-types/src/postconditions.js";
 
 const DEFAULT_BUDGETS = Object.freeze({
   maxSteps: 24,
@@ -22,6 +32,16 @@ const DEFAULT_BUDGETS = Object.freeze({
 const TERMINAL = new Set(["COMPLETE", "FAILED", "NEEDS_USER"]);
 const SUCCESS = new Set(["VERIFIED", "PARTIALLY_VERIFIED"]);
 const MAX_MODEL_OBSERVATION_BYTES = 4_000;
+
+export const InteractiveConvergenceState = Object.freeze({
+  SUPPORTED_ACTION: "SUPPORTED_ACTION",
+  UNSUPPORTED_ACTION: "UNSUPPORTED_ACTION",
+  NO_PROGRESS: "NO_PROGRESS",
+  PROGRESS: "PROGRESS",
+  TARGET_EXHAUSTED: "TARGET_EXHAUSTED",
+  RECOVERABLE: "RECOVERABLE",
+  UNRECOVERABLE: "UNRECOVERABLE"
+});
 
 export function sanitizeInteractiveState(value) {
   return sanitizeExternalContext(value);
@@ -65,11 +85,182 @@ function actionSignature(action, stateFingerprint) {
     .digest("hex");
 }
 
+function stableTargetKey(target) {
+  return [
+    target?.windowId ?? target?.windowIdentity?.processId ?? "",
+    target?.automationId ?? "",
+    target?.controlType ?? "",
+    String(target?.name ?? "").trim().toLowerCase()
+  ].join("|");
+}
+
+function stablePerceptionValue(value) {
+  if (Array.isArray(value)) {
+    return value.map(stablePerceptionValue)
+      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  }
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => ![
+        "targetId", "observedAt", "timestamp", "capturedAt", "confidence",
+        "runtimeId", "nativeWindowHandle"
+      ].includes(key))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, stablePerceptionValue(child)])
+  );
+}
+
 function stateFingerprint(perception) {
   return crypto.createHash("sha256")
-    .update(JSON.stringify(sanitizeInteractiveState(perception ?? {})))
+    .update(JSON.stringify(stablePerceptionValue(sanitizeInteractiveState(perception ?? {}))))
     .digest("hex")
     .slice(0, 16);
+}
+
+function collectGroundedControls(value, controls = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectGroundedControls(item, controls);
+  } else if (value && typeof value === "object") {
+    if (value.targetId && Array.isArray(value.supportedPatterns)) controls.push(value);
+    for (const child of Object.values(value)) collectGroundedControls(child, controls);
+  }
+  return controls;
+}
+
+function hasPattern(target, name) {
+  return (target?.supportedPatterns ?? []).some((pattern) =>
+    String(pattern).toLowerCase().includes(String(name).toLowerCase())
+  );
+}
+
+function canonicalUiActionName(action) {
+  const normalized = String(action ?? "").replace(/[_\s-]/g, "").toLowerCase();
+  if (["setvalue", "settext"].includes(normalized)) return "setValue";
+  if (normalized === "scrollintoview") return "scrollIntoView";
+  if (normalized === "selectaccessiblechild") return "selectAccessibleChild";
+  return {
+    invoke: "invoke", click: "click", focus: "focus", type: "type",
+    select: "select", expand: "expand", collapse: "collapse",
+    toggle: "toggle", nextsection: "nextSection"
+  }[normalized] ?? action;
+}
+
+export function supportedUiActions(target) {
+  const actions = [];
+  const controlType = String(target?.controlType ?? "");
+  if (hasPattern(target, "ValuePattern") && /\.(?:Edit|Document|ComboBox|Spinner)$/i.test(controlType)) {
+    actions.push("setValue", "type");
+  }
+  if (hasPattern(target, "SelectionItemPattern")) actions.push("select");
+  if (hasPattern(target, "InvokePattern") && !/\.Text$/i.test(String(target?.controlType ?? ""))) actions.push("invoke");
+  if (hasPattern(target, "TogglePattern")) actions.push("toggle");
+  if (hasPattern(target, "ExpandCollapsePattern")) {
+    const state = String(target?.expandCollapseState ?? "").toLowerCase();
+    actions.push(state.includes("expanded") ? "collapse" : "expand");
+  }
+  if (hasPattern(target, "ScrollItemPattern")) actions.push("scrollIntoView");
+  return [...new Set(actions)];
+}
+
+function actionPairKey(action) {
+  if (action?.capability !== "ui.action") return null;
+  return `${stableTargetKey(action.inputs?.target)}|${canonicalUiActionName(action.inputs?.action)}`;
+}
+
+function normalizeUiAction(action) {
+  if (action?.capability !== "ui.action") return action;
+  const target = action.inputs?.target;
+  const requested = canonicalUiActionName(action.inputs?.action);
+  const supported = supportedUiActions(target);
+  let normalized = requested;
+  if (requested === "click") {
+    normalized = supported.includes("invoke") ? "invoke"
+      : supported.includes("select") ? "select" : requested;
+  }
+  if (requested === "type" && supported.includes("setValue")) normalized = "setValue";
+  const inputs = { ...(action.inputs ?? {}), action: normalized };
+  if (normalized === "setValue" && typeof inputs.text !== "string" && inputs.value != null) {
+    inputs.text = String(inputs.value);
+  }
+  return { ...action, inputs };
+}
+
+function hydrateGroundedActionTarget(action, perception) {
+  if (action?.capability !== "ui.action" || !action.inputs?.target?.targetId) return action;
+  const proposed = action.inputs.target;
+  const observed = collectGroundedControls(perception)
+    .find((control) => control.targetId === proposed.targetId);
+  if (!observed) return action;
+  return {
+    ...action,
+    inputs: {
+      ...(action.inputs ?? {}),
+      target: { ...proposed, ...observed }
+    }
+  };
+}
+
+function snapshotTarget(target) {
+  if (!target) return null;
+  return {
+    key: stableTargetKey(target),
+    name: target.name ?? null,
+    value: target.value ?? target.text ?? null,
+    selected: target.selected ?? target.isSelected ?? null,
+    focused: target.focused ?? target.hasKeyboardFocus ?? null,
+    toggleState: target.toggleState ?? null,
+    expandCollapseState: target.expandCollapseState ?? null,
+    offscreen: target.offscreen ?? target.isOffscreen ?? null,
+    boundingRect: target.boundingRect ?? null
+  };
+}
+
+function predictUiPostcondition(action, perception) {
+  if (action?.capability !== "ui.action") return null;
+  const verb = canonicalUiActionName(action.inputs?.action);
+  const target = action.inputs?.target;
+  const before = snapshotTarget(
+    collectGroundedControls(perception).find((control) => stableTargetKey(control) === stableTargetKey(target)) ?? target
+  );
+  if (verb === "setValue" || verb === "type") {
+    return { kind: "VALUE_EQUALS", expected: String(action.inputs?.value ?? action.inputs?.text ?? ""), before };
+  }
+  if (verb === "select") return { kind: "SELECTED", before };
+  if (verb === "toggle") return { kind: "TOGGLED", before };
+  if (verb === "expand" || verb === "collapse") return { kind: verb.toUpperCase(), before };
+  if (verb === "scrollIntoView") return { kind: "ONSCREEN", before };
+  return { kind: "OBSERVABLE_DELTA", before, fingerprint: stateFingerprint(perception) };
+}
+
+export function measureUiProgress(expected, perception) {
+  if (!expected) return { state: InteractiveConvergenceState.NO_PROGRESS, reason: "missing expected postcondition" };
+  const controls = collectGroundedControls(perception);
+  const afterTarget = controls.find((control) => stableTargetKey(control) === expected.before?.key);
+  const after = snapshotTarget(afterTarget);
+  let matched = false;
+  if (expected.kind === "VALUE_EQUALS") {
+    const observed = String(after?.value ?? afterTarget?.name ?? "");
+    matched = observed === expected.expected || observed.includes(expected.expected);
+  } else if (expected.kind === "SELECTED") {
+    matched = after?.selected === true && expected.before?.selected !== true;
+  } else if (expected.kind === "TOGGLED") {
+    matched = after?.toggleState != null && after.toggleState !== expected.before?.toggleState;
+  } else if (expected.kind === "EXPAND") {
+    matched = /expanded/i.test(String(after?.expandCollapseState ?? ""));
+  } else if (expected.kind === "COLLAPSE") {
+    matched = /collapsed/i.test(String(after?.expandCollapseState ?? ""));
+  } else if (expected.kind === "ONSCREEN") {
+    matched = after?.offscreen === false && expected.before?.offscreen !== false;
+  } else {
+    matched = stateFingerprint(perception) !== expected.fingerprint;
+  }
+  return {
+    state: matched ? InteractiveConvergenceState.PROGRESS : InteractiveConvergenceState.NO_PROGRESS,
+    expected,
+    observed: after,
+    observedFingerprint: stateFingerprint(perception)
+  };
 }
 
 function collectTargetIds(value, targetIds = new Set()) {
@@ -95,15 +286,68 @@ function resolveRuntimeReferences(value, lastOutcome, bindings) {
   }
   if (typeof value !== "string") return value;
   if (value.startsWith("$last.")) return readPath(lastOutcome, value.slice("$last.".length));
-  if (value.startsWith("$binding.")) return bindings?.[value.slice("$binding.".length)]?.value;
-  return value;
+  if (value.startsWith("$binding.")) {
+    const [name, ...path] = value.slice("$binding.".length).split(".");
+    const bound = bindings?.[name]?.value;
+    return path.length ? readPath(bound, path.join(".")) : bound;
+  }
+  return value
+    .replace(/\$binding\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)/g, (reference, bindingPath) => {
+      const [name, ...path] = bindingPath.split(".");
+      const bound = bindings?.[name]?.value;
+      const resolved = path.length ? readPath(bound, path.join(".")) : bound;
+      return String(resolved ?? reference);
+    })
+    .replace(/\$last\.([A-Za-z0-9_.-]+)/g, (_, path) => String(readPath(lastOutcome, path) ?? `$last.${path}`));
 }
 
 function normalizeBoundValue(value, normalization) {
   const text = typeof value === "string" ? value.trim() : value;
   if (normalization === "version") return String(text ?? "").match(/\b\d+(?:\.\d+){1,3}\b/)?.[0] ?? null;
   if (normalization === "trim") return String(text ?? "").trim();
+  if (normalization === "maxWorkingSet") {
+    const rows = Array.isArray(value) ? value : [];
+    return rows.reduce((best, row) =>
+      Number(row?.WorkingSet64 ?? row?.workingSet ?? 0) > Number(best?.WorkingSet64 ?? best?.workingSet ?? 0)
+        ? row : best
+    , null);
+  }
+  if (normalization === "firstPercentage") {
+    const matches = [];
+    const visit = (candidate) => {
+      if (Array.isArray(candidate)) return candidate.forEach(visit);
+      if (!candidate || typeof candidate !== "object") return;
+      for (const field of [candidate.name, candidate.value, candidate.text, candidate.label]) {
+        const match = String(field ?? "").match(/\b\d+(?:\.\d+)?%\b(?:\s*\([^)]*\))?/);
+        if (match) matches.push(match[0]);
+      }
+      Object.values(candidate).forEach(visit);
+    };
+    visit(value);
+    return matches.find((match) => /recommended|selected/i.test(match)) ?? matches[0] ?? null;
+  }
   return text;
+}
+
+function inferCriterionIds(action, goalContract, actual = null) {
+  if (Array.isArray(action?.criterionIds) && action.criterionIds.length) return action.criterionIds;
+  const evidence = JSON.stringify({
+    capability: action?.capability,
+    inputs: action?.inputs,
+    subgoal: action?.subgoal,
+    expectedEffect: action?.expectedEffect,
+    actual
+  }).toLowerCase();
+  const mutating = /^(?:filesystem\.write|filesystem\.create|ui\.action|ui\.navigate|pointer\.|keyboard\.|browser\.(?:click|type|select)|window\.(?:activate|moveResize)|process\.(?:start|stop))/.test(String(action?.capability ?? ""));
+  return (goalContract?.criteria ?? []).filter((criterion) => {
+    if (criterion.kind === "PROHIBITION") return false;
+    const requiresMutation = /\b(?:create|write|modify|update|enter|type|click|select|choose|toggle|enable|disable|close|open|navigate|save|persist)\b/i.test(criterion.description);
+    if (requiresMutation && !mutating && !/(?:\.read$|\.verify|\.currentState$|\.find$)/.test(String(action?.capability ?? ""))) return false;
+    if (criterion.anchors?.length && !criterion.anchors.every((anchor) => evidence.includes(String(anchor).toLowerCase()))) return false;
+    const informative = (criterion.tokens ?? []).filter((token) => token.length > 2);
+    const overlap = informative.filter((token) => evidence.includes(token)).length;
+    return overlap >= Math.min(2, Math.max(1, informative.length));
+  }).map((criterion) => criterion.criterionId);
 }
 
 export function evaluateSubgoalCompletion(subgoal, observations = [], actionResults = [], bindings = {}) {
@@ -213,41 +457,358 @@ export function evaluateSubgoalCompletion(subgoal, observations = [], actionResu
   return { status: Object.keys(bindings).length ? "CONTINUE_MECHANICALLY" : "INCONCLUSIVE" };
 }
 
-export function chooseMechanicalContinuation(goal, perception) {
-  const controls = Array.isArray(perception?.relevantControls) ? perception.relevantControls : [];
-  const tokens = String(goal ?? "").toLowerCase().match(/[a-z0-9]{3,}/g)?.filter((token) =>
+export function enumerateGroundedActionCandidates(goal, perception, exhaustedPairs = new Set()) {
+  const controls = [...new Map(
+    collectGroundedControls(perception).map((control) => [stableTargetKey(control), control])
+  ).values()];
+  const ambientTokens = new Set(
+    [
+      perception?.groundedWindow?.MainWindowTitle,
+      perception?.groundedWindow?.title,
+      perception?.foregroundWindow?.MainWindowTitle,
+      perception?.foregroundWindow?.title
+    ].filter(Boolean).flatMap((title) => String(title).toLowerCase().match(/[a-z0-9]+/g) ?? [])
+  );
+  const tokens = String(goal ?? "").toLowerCase().match(/[a-z0-9]+/g)?.filter((token) =>
+    !ambientTokens.has(token) &&
     !["open", "tell", "whether", "determine", "current", "state", "status", "settings", "application"].includes(token)
   ) ?? [];
-  const actionable = controls.map((control) => {
+  const candidates = controls.flatMap((control) => {
     const semantics = `${control.name ?? ""} ${control.automationId ?? ""}`.toLowerCase();
-    const score = tokens.reduce((total, token) => total + (semantics.includes(token) ? 1 : 0), 0);
-    const patterns = control.supportedPatterns ?? [];
-    const action = patterns.some((pattern) => /SelectionItem/i.test(pattern)) ? "select"
-      : patterns.some((pattern) => /Invoke/i.test(pattern)) ? "invoke" : null;
-    return { control, score, action };
-  }).filter((candidate) => candidate.action && candidate.score > 0)
-    .sort((left, right) => right.score - left.score);
-  if (actionable[0] && (!actionable[1] || actionable[0].score > actionable[1].score)) {
-    return {
+    const overlap = tokens.reduce((total, token) => total + (semantics.includes(token) ? 1 : 0), 0);
+    return supportedUiActions(control).map((action) => {
+      let score = overlap * 10;
+      let relevant = overlap > 0;
+      if (control.enabled !== false) score += 2;
+      if (action === "setValue" && /\b(type|enter|write|input|navigate|address|url)\b/i.test(goal)) {
+        score += 12;
+        relevant = true;
+      }
+      if (action === "select" && /\b(select|choose|tab|section|page|view)\b/i.test(goal)) {
+        score += 6;
+        relevant = true;
+      }
+      if (action === "invoke" && /\b(click|invoke|press|calculate)\b/i.test(goal)) {
+        score += 4;
+        relevant = true;
+      }
+      const chromeVerb = String(control.name ?? "").match(/^(minimize|maximize|close)\b/i)?.[1]?.toLowerCase();
+      if (chromeVerb && !new RegExp(`\\b${chromeVerb}\\b`, "i").test(String(goal ?? ""))) {
+        score -= 100;
+        relevant = false;
+      }
+      if (action === "scrollIntoView" && control.offscreen !== true && control.isOffscreen !== true) score -= 20;
+      return { control, action, score, relevant };
+    });
+  }).map((candidate) => ({
+    ...candidate,
+    pairKey: `${stableTargetKey(candidate.control)}|${candidate.action}`
+  })).filter((candidate) => candidate.relevant && !exhaustedPairs.has(candidate.pairKey) && candidate.score > 0)
+    .sort((left, right) => right.score - left.score || left.pairKey.localeCompare(right.pairKey));
+  return candidates.map((candidate) => ({
       capability: "ui.action",
-      inputs: { target: actionable[0].control, action: actionable[0].action },
-      subgoal: `Navigate through ${actionable[0].control.name}`,
+      inputs: { target: candidate.control, action: candidate.action },
+      subgoal: `Interact with ${candidate.control.name ?? candidate.control.automationId ?? "grounded control"}`,
+      expectedPostcondition: { kind: "CONTROLLER_OBSERVED_DELTA" },
+      convergencePairKey: candidate.pairKey,
       mechanicallySelected: true
-    };
+    }));
+}
+
+const DIGIT_CONTROL_NAMES = Object.freeze([
+  "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"
+]);
+
+function parseArithmeticOperation(goal) {
+  const request = String(goal ?? "");
+  const expression = request.match(/\bcalculate\s+(.+?)(?=,\s*(?:and\s+)?leave\b|\s+and\s+leave\b|$)/i)?.[1];
+  if (!expression) return null;
+  const lexemes = [...expression.matchAll(/\d+(?:\.\d+)?|times|multiplied by|multiply by|plus|minus|divided by|divide by|[x*+÷/=-]/gi)]
+    .map((match) => match[0].toLowerCase());
+  if (!lexemes.some((token) => /^\d/.test(token)) || !lexemes.some((token) => /times|multipl|\*|x|plus|\+|minus|-|divid|÷|\//.test(token))) {
+    return null;
   }
-  const openNavigation = controls.filter((control) =>
-    /^(open|expand) navigation$/i.test(String(control.name ?? "")) &&
-    (control.supportedPatterns ?? []).some((pattern) => /Invoke/i.test(pattern))
+  const labels = [];
+  const calculation = [];
+  for (const token of lexemes) {
+    if (/^\d+(?:\.\d+)?$/.test(token)) {
+      for (const character of token) {
+        if (character === ".") labels.push("Decimal point");
+        else labels.push(DIGIT_CONTROL_NAMES[Number(character)]);
+      }
+      calculation.push(token);
+    } else if (/times|multipl|\*|^x$/.test(token)) {
+      labels.push("Multiply by");
+      calculation.push("*");
+    } else if (/plus|\+/.test(token)) {
+      labels.push("Plus");
+      calculation.push("+");
+    } else if (/minus|^-$/i.test(token)) {
+      labels.push("Minus");
+      calculation.push("-");
+    } else if (/divid|÷|\//.test(token)) {
+      labels.push("Divide by");
+      calculation.push("/");
+    }
+  }
+  labels.push("Equals");
+  let result = Number(calculation[0]);
+  for (let index = 1; index < calculation.length; index += 2) {
+    const operator = calculation[index];
+    const operand = Number(calculation[index + 1]);
+    if (!Number.isFinite(result) || !Number.isFinite(operand)) return null;
+    if (operator === "*") result *= operand;
+    else if (operator === "+") result += operand;
+    else if (operator === "-") result -= operand;
+    else if (operator === "/") result /= operand;
+  }
+  if (!Number.isFinite(result)) return null;
+  const application = request.match(/^\s*open\s+([^,]+?)(?=,\s*calculate\b)/i)?.[1]?.trim() ?? null;
+  return { application, labels, result: String(result) };
+}
+
+export function buildSupportedUiOperationStrategy(goal) {
+  const parsed = parseArithmeticOperation(goal);
+  if (!parsed?.application) return null;
+  const actions = [];
+  for (const label of parsed.labels) {
+    actions.push({
+      capability: "ui.find",
+      inputs: { application: parsed.application, selector: { name: label } },
+      subgoal: `Ground the ${label} control`
+    });
+    actions.push({
+      capability: "ui.action",
+      inputs: { application: parsed.application, target: "$last.output.target", action: "click" },
+      subgoal: `Invoke the grounded ${label} control`
+    });
+  }
+  actions.push({
+    capability: "ui.find",
+    inputs: { application: parsed.application, selector: { nameContains: parsed.result } },
+    subgoal: `Observe the expected result ${parsed.result}`,
+    completesGoal: true,
+    completionResult: { summary: `The requested operation converged and the visible result is ${parsed.result}.` }
+  });
+  return {
+    action: { capability: "application.launch", inputs: { application: parsed.application }, subgoal: `Open ${parsed.application}` },
+    localSteps: actions,
+    source: "SUPPORTED_UIA_SEQUENCE_COMPILER",
+    expectedResult: parsed.result
+  };
+}
+
+export function buildSupportedTextEntryStrategy(goal) {
+  const request = String(goal ?? "").trim();
+  const application = request.match(/^\s*open\s+([^,]+?)(?=,\s*(?:type|enter|write)\b)/i)?.[1]?.trim();
+  if (!application) return null;
+  const twoLines = request.match(
+    /\b(?:type|enter|write)\s+(.+?)\s+on\s+the\s+first\s+line\s+and\s+(.+?)\s+on\s+the\s+second\s+line(?=,|\s+then\b|$)/i
   );
-  if (openNavigation.length === 1) {
-    return {
-      capability: "ui.action",
-      inputs: { target: openNavigation[0], action: "invoke" },
-      subgoal: "Expose application navigation",
-      mechanicallySelected: true
-    };
+  const simple = request.match(
+    /\b(?:type|enter|write)\s+(.+?)(?=,\s*(?:then|and)\s+leave\b|\s+then\s+leave\b|\s+without\s+saving\b|$)/i
+  );
+  const text = twoLines
+    ? `${twoLines[1].trim()}\n${twoLines[2].trim()}`
+    : simple?.[1]?.trim();
+  if (!text) return null;
+  const selector = { controlType: "Document" };
+  return {
+    action: {
+      capability: "application.launch",
+      inputs: { application },
+      subgoal: `Open ${application}`
+    },
+    localSteps: [
+      {
+        capability: "ui.find",
+        inputs: { application, selector },
+        subgoal: "Ground the editable document control"
+      },
+      {
+        capability: "ui.action",
+        inputs: { application, target: "$last.output.target", action: "setValue", text },
+        subgoal: "Set the grounded editable document value"
+      },
+      {
+        capability: "ui.verifyValue",
+        inputs: { application, selector, expected: text },
+        subgoal:
+          `Verify that the specified text is entered in ${application}, the document remains unsaved, ` +
+          `and ${application} remains visible`,
+        expectedEffect:
+          "The exact specified text is visible in the grounded editable document; no save action was issued and the application window remains visible.",
+        completesGoal: true,
+        completionResult: {
+          summary:
+            `The requested text was entered through the control's advertised ValuePattern, verified visible, ` +
+            `and ${application} remains open without a save action.`
+        }
+      }
+    ],
+    source: "SUPPORTED_UIA_TEXT_ENTRY_COMPILER",
+    expectedText: text
+  };
+}
+
+export function buildSupportedReadOnlyNavigationStrategy(goal) {
+  const request = String(goal ?? "").trim();
+  if (!/\b(?:report|read|tell|identify|what)\b/i.test(request) || !/\bdo not change\b|\bwithout changing\b/i.test(request)) {
+    return null;
   }
-  return null;
+  const navigation = request.match(
+    /^\s*open\s+(.+?)\s+to\s+the\s+(.+?)\s+page,\s*(?:report|read|tell me)\s+(?:the\s+)?current\s+(.+?)(?=,\s*(?:and\s+)?do not change\b|$)/i
+  );
+  if (!navigation) return null;
+  const [, applicationText, pageText, queryText] = navigation;
+  const application = applicationText.replace(/^(?:the\s+)?windows\s+/i, "").trim();
+  const page = pageText.trim();
+  const query = queryText.trim();
+  const selectorToken = query.match(/[a-z0-9%]+/i)?.[0] ?? query;
+  const bindingName = "observedUiValue";
+  const percentageRead = /\bpercentage\b|%/i.test(query);
+  const readStep = percentageRead ? {
+    capability: "ui.inspect",
+    inputs: { application, maxElements: 320 },
+    bindOutput: { name: bindingName, path: "output", normalize: "firstPercentage" },
+    subgoal: `Read and report the current ${query} without changing it`,
+    expectedEffect: `The current ${query} is extracted from the visible ${page} page without mutation.`,
+    completesGoal: true,
+    completionResult: {
+      summary: `Current ${query}: $binding.${bindingName}`,
+      value: `$binding.${bindingName}`
+    }
+  } : {
+    capability: "ui.extract",
+    inputs: { application, query, selector: { nameContains: selectorToken }, maxElements: 240 },
+    bindOutput: { name: bindingName, path: "output.value", normalize: "trim" },
+    subgoal: `Read and report the current ${query} without changing it`,
+    expectedEffect: `The current ${query} is extracted from the visible ${page} page without mutation.`,
+    completesGoal: true,
+    completionResult: {
+      summary: `Current ${query}: $binding.${bindingName}`,
+      value: `$binding.${bindingName}`
+    }
+  };
+  const localSteps = [
+    {
+      capability: "window.moveResize",
+      inputs: { application, x: 80, y: 40, width: 1600, height: 1000 },
+      subgoal: `Expose enough of ${application} for deterministic read-only inspection`
+    },
+    {
+      capability: "ui.navigateSection",
+      inputs: { application, query: page, maxTransitions: 8 },
+      subgoal: `Deterministically navigate to the ${page} page without changing a setting`
+    }
+  ];
+  if (percentageRead) {
+    localSteps.push({
+      capability: "keyboard.press",
+      inputs: { application, keys: "{PGDN}" },
+      subgoal: `Reveal the requested ${query} for read-only inspection`
+    });
+  }
+  localSteps.push(readStep);
+  return {
+    action: {
+      capability: "application.launch",
+      inputs: { application },
+      subgoal: `Open ${application}`
+    },
+    localSteps,
+    source: "SUPPORTED_UIA_READ_ONLY_NAVIGATION_COMPILER",
+    application,
+    page,
+    query
+  };
+}
+
+export function buildSupportedBrowserReadStrategy(goal) {
+  const request = String(goal ?? "").trim();
+  const navigation = request.match(
+    /^\s*open\s+(.+?),\s*navigate\s+to\s+(?:https?:\/\/)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)[, ]+\s*(?:and\s+)?report\s+the\s+page\s+(.+?)(?=,\s*(?:and\s+)?leave\b|$)/i
+  );
+  if (!navigation) return null;
+  const [, application, domain, requestedValue] = navigation;
+  if (!/\b(?:browser|edge|chrome|firefox|opera)\b/i.test(application)) return null;
+  const bindingName = "observedPageValue";
+  const selector = /\bheading\b/i.test(requestedValue) ? "h1" : "body";
+  return {
+    action: {
+      capability: "browser.launch",
+      inputs: { url: `https://${domain}` },
+      subgoal: `Open ${domain} in ${application.trim()}`
+    },
+    localSteps: [
+      {
+        capability: "browser.wait",
+        inputs: { condition: "document.readyState", value: "complete", timeoutMs: 15000 },
+        subgoal: `Wait for ${domain}`
+      },
+      {
+        capability: "browser.extract",
+        inputs: { kind: "text", query: requestedValue.trim(), selector },
+        bindOutput: { name: bindingName, path: "output.value", normalize: "trim" },
+        subgoal: `Report the page ${requestedValue.trim()} and leave the page open`,
+        expectedEffect: `The ${requestedValue.trim()} is read from ${domain} while the page remains open.`,
+        completesGoal: true,
+        completionResult: {
+          summary: `Page ${requestedValue.trim()}: $binding.${bindingName}`,
+          value: `$binding.${bindingName}`
+        }
+      }
+    ],
+    source: "SUPPORTED_BROWSER_READ_COMPILER",
+    domain
+  };
+}
+
+export function buildSupportedRankedProcessReadStrategy(goal) {
+  const request = String(goal ?? "").trim();
+  const application = request.match(/^\s*open\s+([^,]+),/i)?.[1]?.trim();
+  if (!application || !/\bprocess\b/i.test(request) || !/\bmost\s+memory\b/i.test(request)
+    || !/\breport\b/i.test(request) || !/\bwithout\s+ending\b|\bdo not end\b/i.test(request)) {
+    return null;
+  }
+  const bindingName = "topMemoryProcess";
+  return {
+    action: {
+      capability: "application.launch",
+      inputs: { application },
+      subgoal: `Open ${application}`
+    },
+    localSteps: [{
+      capability: "processes.list",
+      inputs: {},
+      bindOutput: { name: bindingName, path: "output", normalize: "maxWorkingSet" },
+      subgoal:
+        `Identify and report the process using the most memory while ${application} remains open and no process is ended`,
+      expectedEffect:
+        "The highest-memory process name and memory usage are read without ending or changing any process.",
+      completesGoal: true,
+      completionResult: {
+        summary:
+          `Highest memory process: $binding.${bindingName}.ProcessName ` +
+          `($binding.${bindingName}.WorkingSet64 bytes)`,
+        process: `$binding.${bindingName}.ProcessName`,
+        workingSetBytes: `$binding.${bindingName}.WorkingSet64`
+      }
+    }],
+    source: "SUPPORTED_RANKED_PROCESS_READ_COMPILER"
+  };
+}
+
+export function chooseMechanicalContinuation(goal, perception, exhaustedPairs = new Set()) {
+  const candidates = enumerateGroundedActionCandidates(goal, perception, exhaustedPairs);
+  if (!candidates[0]) return null;
+  const scoreFor = (candidate) => {
+    const control = candidate.inputs?.target;
+    const semantics = `${control?.name ?? ""} ${control?.automationId ?? ""}`.toLowerCase();
+    return (String(goal ?? "").toLowerCase().match(/[a-z0-9]+/g) ?? [])
+      .reduce((score, token) => score + (semantics.includes(token) ? 1 : 0), 0);
+  };
+  return candidates[1] && scoreFor(candidates[0]) === scoreFor(candidates[1]) ? null : candidates[0];
 }
 
 export function buildCrossModalTransferStrategy(goal) {
@@ -481,6 +1042,12 @@ function validateCompletionEvidence(data, initialContext, state, trustedLocalEvi
     errors.push("no runtime-verified action supports completion");
   }
   if (initialContext?.goalContract?.enforceable) {
+    const ledgerAssessment = evaluateEvidenceLedger(
+      initialContext.goalContract,
+      state.evidenceLedger,
+      state.bindings
+    );
+    if (ledgerAssessment.satisfied) return { valid: errors.length === 0, errors, ledgerAssessment };
     const successfulActions = state.recentActions.filter((entry) => entry.succeeded);
     const contractEvidence = assessGoalContractEvidence(initialContext.goalContract, {
       taskGraph: { tasks: successfulActions.map((entry) => entry.action) },
@@ -600,6 +1167,20 @@ export class InteractiveAgentController {
         errors.push(`${field} was not present in runtime-observed state`);
       }
     }
+    if (action.capability === "ui.action" && action.inputs?.target?.source === "UIA") {
+      const requested = canonicalUiActionName(action.inputs?.action);
+      const supported = supportedUiActions(action.inputs.target);
+      if (!supported.includes(requested)) {
+        errors.push(
+          `${InteractiveConvergenceState.UNSUPPORTED_ACTION}: ${requested} is not exposed by ` +
+          `${action.inputs.target.name ?? action.inputs.target.automationId ?? "the grounded target"} ` +
+          `(supported: ${supported.join(", ") || "none"})`
+        );
+      }
+      if (requested === "setValue" && typeof action.inputs?.text !== "string") {
+        errors.push(`${InteractiveConvergenceState.UNSUPPORTED_ACTION}: setValue requires text`);
+      }
+    }
     return { valid: errors.length === 0, errors };
   }
 
@@ -618,11 +1199,26 @@ export class InteractiveAgentController {
       recentObservations: [],
       recentModelObservations: [],
       transitionContracts: [],
+      evidenceLedger: createEvidenceLedger(),
       failedAttempts: [],
+      unsupportedAttempts: [],
       modelCalls: 0,
       steps: 0,
       recoveries: 0,
-      metrics: { firstActionMs: null, uiActions: 0, localActions: 0, retries: 0, fallbacks: 0, recoveryCalls: 0, modelLatencyMs: 0 },
+      metrics: {
+        firstActionMs: null,
+        uiActions: 0,
+        localActions: 0,
+        retries: 0,
+        fallbacks: 0,
+        intentCalls: 0,
+        planningCalls: 0,
+        adaptiveCalls: 0,
+        repairCalls: 0,
+        recoveryCalls: 0,
+        totalModelCalls: 0,
+        modelLatencyMs: 0
+      },
       observability: {
         provider: this.reasoningEngine?.modelProvider?.provider?.providers?.[0]?.name
           ?? this.reasoningEngine?.modelProvider?.provider?.name
@@ -644,18 +1240,32 @@ export class InteractiveAgentController {
       currentPerception: null
     };
     const repetitions = new Map();
+    const exhaustedActionPairs = new Map();
     let pendingActions = [];
     let lastPerception = null;
     let lastOutcome = null;
     const completedNodes = new Set();
     await this.emit("ADAPTIVE_CONTROLLER_STARTED", { goal: state.goal, budgets: this.budgets });
 
-    const initialStrategy = buildBrowserCompositionStrategy(state.goal)
+    const initialStrategy = buildSupportedUiOperationStrategy(state.goal)
+      ?? buildSupportedTextEntryStrategy(state.goal)
+      ?? buildSupportedReadOnlyNavigationStrategy(state.goal)
+      ?? buildSupportedBrowserReadStrategy(state.goal)
+      ?? buildSupportedRankedProcessReadStrategy(state.goal)
+      ?? buildBrowserCompositionStrategy(state.goal)
       ?? buildGuiToInternalStrategy(state.goal)
       ?? buildInternalToGuiTransferStrategy(state.goal)
       ?? buildCrossModalTransferStrategy(state.goal)
       ?? buildExplicitApplicationLaunchStrategy(state.goal);
     if (initialStrategy) {
+      if (String(initialStrategy.source ?? "").startsWith("SUPPORTED_")) {
+        const terminalStep = initialStrategy.localSteps?.at(-1);
+        if (terminalStep?.completesGoal === true) {
+          terminalStep.criterionIds = (initialContext.goalContract?.criteria ?? [])
+            .map((criterion) => criterion.criterionId)
+            .filter(Boolean);
+        }
+      }
       const graph = createCompositionGraph(
         [initialStrategy.action, ...(initialStrategy.localSteps ?? [])],
         { id: initialStrategy.source.toLowerCase() }
@@ -702,6 +1312,11 @@ export class InteractiveAgentController {
       });
       state.currentPerception = lastPerception;
       const fingerprint = stateFingerprint(lastPerception);
+      for (const [pairKey, exhaustedFingerprint] of exhaustedActionPairs) {
+        if (exhaustedFingerprint !== "UNSUPPORTED" && exhaustedFingerprint !== fingerprint) {
+          exhaustedActionPairs.delete(pairKey);
+        }
+      }
       await this.emit("ADAPTIVE_PERCEIVED", {
         step: state.steps,
         stateFingerprint: fingerprint,
@@ -746,13 +1361,11 @@ export class InteractiveAgentController {
           ["ui.find", "ui.resolveTarget", "vision.locate"].includes(priorAction.action?.capability) &&
           requestsInteraction
         ) {
-          const patterns = groundedTarget.supportedPatterns ?? [];
-          const verb = patterns.some((pattern) => /SelectionItem/i.test(pattern))
-            ? "select"
-            : patterns.some((pattern) => /Invoke/i.test(pattern))
-              ? "invoke"
-              : "click";
-          pendingActions = [{
+          const verbs = supportedUiActions(groundedTarget)
+            .filter((verb) => !["setValue", "type"].includes(verb));
+          const verb = verbs[0] ?? null;
+          const pairKey = verb ? `${stableTargetKey(groundedTarget)}|${verb}` : null;
+          if (verb && !exhaustedActionPairs.has(pairKey)) pendingActions = [{
             capability: "ui.action",
             inputs: {
               application: groundedTarget.windowIdentity?.processName,
@@ -761,9 +1374,10 @@ export class InteractiveAgentController {
               action: verb
             },
             subgoal: `Interact with grounded ${groundedTarget.name ?? "target"}`,
+            convergencePairKey: pairKey,
             mechanicallySelected: true
           }];
-          await this.emit("ADAPTIVE_GROUNDED_ACTION_CHAINED", {
+          if (verb) await this.emit("ADAPTIVE_GROUNDED_ACTION_CHAINED", {
             from: priorAction.action.capability,
             targetId: groundedTarget.targetId,
             action: verb
@@ -772,9 +1386,7 @@ export class InteractiveAgentController {
       }
 
       if (pendingActions.length === 0) {
-        const mechanical = state.failedAttempts.length === 0
-          ? chooseMechanicalContinuation(state.goal, lastPerception)
-          : null;
+        const mechanical = chooseMechanicalContinuation(state.goal, lastPerception, exhaustedActionPairs);
         if (mechanical) {
           pendingActions = [mechanical];
           await this.emit("ADAPTIVE_MECHANICAL_CONTINUATION", { action: mechanical });
@@ -788,6 +1400,11 @@ export class InteractiveAgentController {
           break;
         }
         const decisionStarted = this.now();
+        const groundedActionCandidates = enumerateGroundedActionCandidates(
+          state.goal,
+          lastPerception,
+          exhaustedActionPairs
+        ).slice(0, 24);
         const decision = await this.reasoningEngine.decideInteractiveAction({
           reasoningPhase: state.modelCalls === 0 ? "INITIAL_STRATEGY" : "RECOVERY",
           goal: state.goal,
@@ -797,7 +1414,18 @@ export class InteractiveAgentController {
           bindings: state.bindings,
           recentActions: state.recentActions.slice(-8),
           recentObservations: state.recentModelObservations.slice(-8),
-          failedAttempts: state.failedAttempts.slice(-6),
+          failedAttempts: [
+            ...state.failedAttempts.slice(-4),
+            ...state.unsupportedAttempts.slice(-4)
+          ],
+          groundedActionCandidates: groundedActionCandidates.map((candidate) => ({
+            capability: candidate.capability,
+            inputs: {
+              action: candidate.inputs.action,
+              target: candidate.inputs.target
+            },
+            expectedPostcondition: candidate.expectedPostcondition
+          })),
           availableCapabilities: this._catalog(state.goal),
           remainingBudgets: {
             steps: this.budgets.maxSteps - state.steps,
@@ -810,6 +1438,8 @@ export class InteractiveAgentController {
         const decisionLatencyMs = this.now() - decisionStarted;
         state.metrics.modelLatencyMs += decisionLatencyMs;
         state.modelCalls += 1;
+        state.metrics.adaptiveCalls += 1;
+        state.metrics.totalModelCalls += 1;
         await this.emit("ADAPTIVE_DECIDED", {
           step: state.steps,
           ok: decision?.ok === true,
@@ -846,6 +1476,22 @@ export class InteractiveAgentController {
           continue;
         }
         if (data.kind === InteractiveDecisionKind.CLARIFY) {
+          if (groundedActionCandidates.length > 0 && state.recoveries < this.budgets.recoveryBudget) {
+            state.recoveries += 1;
+            state.unsupportedAttempts.push({
+              action: "CLARIFY",
+              reason:
+                `${InteractiveConvergenceState.RECOVERABLE}: clarification was rejected because ` +
+                `${groundedActionCandidates.length} grounded supported action candidates remain`
+            });
+            state.semanticState.interactiveConvergence = InteractiveConvergenceState.RECOVERABLE;
+            await this.emit("ADAPTIVE_PREMATURE_ESCALATION_REJECTED", {
+              requested: "CLARIFY",
+              convergenceState: InteractiveConvergenceState.RECOVERABLE,
+              remainingCandidates: groundedActionCandidates.length
+            });
+            continue;
+          }
           state.status = "NEEDS_USER";
           state.reason = data.question ?? "User input is required";
           break;
@@ -874,13 +1520,17 @@ export class InteractiveAgentController {
           });
           continue;
         }
+        const catalog = this.capabilityRegistry?.getCatalog?.() ?? [];
         const proposedActions = [data.action, ...(data.localSteps ?? [])].filter(Boolean).map((action, index) => ({
           ...action,
           subgoal: action.subgoal ?? data.subgoal,
           expectedEffect: action.expectedEffect ?? data.expectedEffect,
           verification: action.verification ?? data.verification,
           fallback: index === 0 ? (data.fallback ?? []) : (action.fallback ?? [])
-        })).filter((action, index, actions) => {
+        })).map((action) => {
+          const canonical = canonicalizeCapabilityAction(action, catalog);
+          return canonical.ok ? canonical.action : action;
+        }).filter((action, index, actions) => {
           if (index === 0) return true;
           const prior = actions[index - 1];
           return action.capability !== prior.capability
@@ -916,22 +1566,94 @@ export class InteractiveAgentController {
         });
         continue;
       }
-      const action = {
+      const action = normalizeUiAction(hydrateGroundedActionTarget({
         ...queuedAction,
         inputs: resolveRuntimeReferences(queuedAction.inputs ?? {}, lastOutcome, state.bindings)
-      };
+      }, [lastPerception, ...state.recentObservations.slice(-4)]));
+      const consumedBindings = (queuedAction.requiresBindings ?? [])
+        .map((name) => state.bindings[name]?.bindingId ?? name);
       const observedTargetIds = collectTargetIds([lastPerception, ...state.recentObservations]);
       const validation = this._validateAction(action, observedTargetIds);
       if (!validation.valid) {
-        state.failedAttempts.push({ action, reason: validation.errors.join(", ") });
+        const unsupported = validation.errors.some((error) =>
+          String(error).includes(InteractiveConvergenceState.UNSUPPORTED_ACTION)
+        ) && !validation.errors.some((error) => String(error).includes("was not present in runtime-observed state"));
+        if (unsupported) {
+          const pairKey = actionPairKey(action);
+          if (pairKey) exhaustedActionPairs.set(pairKey, "UNSUPPORTED");
+          state.unsupportedAttempts.push({
+            action: {
+              capability: action.capability,
+              inputs: {
+                action: action.inputs?.action,
+                target: {
+                  targetId: action.inputs?.target?.targetId,
+                  name: action.inputs?.target?.name,
+                  automationId: action.inputs?.target?.automationId
+                }
+              }
+            },
+            reason: validation.errors.join(", ")
+          });
+          state.semanticState.interactiveConvergence = InteractiveConvergenceState.UNSUPPORTED_ACTION;
+        } else {
+          state.failedAttempts.push({ action, reason: validation.errors.join(", ") });
+        }
         pendingActions = [];
-        await this.emit("ADAPTIVE_ACTION_REJECTED", { action, errors: validation.errors });
+        await this.emit("ADAPTIVE_ACTION_REJECTED", {
+          action,
+          errors: validation.errors,
+          convergenceState: unsupported ? InteractiveConvergenceState.UNSUPPORTED_ACTION : null
+        });
         continue;
+      }
+      const proposedPairKey = actionPairKey(action);
+      if (proposedPairKey && exhaustedActionPairs.has(proposedPairKey)) {
+        pendingActions = [];
+        state.semanticState.interactiveConvergence = InteractiveConvergenceState.TARGET_EXHAUSTED;
+        state.unsupportedAttempts.push({
+          action: {
+            capability: action.capability,
+            inputs: {
+              action: action.inputs?.action,
+              target: {
+                targetId: action.inputs?.target?.targetId,
+                name: action.inputs?.target?.name,
+                automationId: action.inputs?.target?.automationId
+              }
+            }
+          },
+          reason:
+            `${InteractiveConvergenceState.TARGET_EXHAUSTED}: the same target/action pair previously ` +
+            "produced no observable progress and cannot be executed again until state changes"
+        });
+        await this.emit("ADAPTIVE_TARGET_EXHAUSTED", {
+          action,
+          pairKey: proposedPairKey,
+          convergenceState: InteractiveConvergenceState.TARGET_EXHAUSTED
+        });
+        continue;
+      }
+      const expectedUiPostcondition = predictUiPostcondition(action, lastPerception);
+      if (action.capability === "ui.action") {
+        state.semanticState.interactiveConvergence = InteractiveConvergenceState.SUPPORTED_ACTION;
+        await this.emit("ADAPTIVE_SUPPORTED_ACTION", {
+          action,
+          expectedPostcondition: expectedUiPostcondition
+        });
       }
       const signature = actionSignature(action, fingerprint);
       const repeatCount = (repetitions.get(signature) ?? 0) + 1;
       repetitions.set(signature, repeatCount);
       if (repeatCount > this.budgets.maxRepeatedActions) {
+        const pairKey = actionPairKey(action);
+        if (pairKey) {
+          exhaustedActionPairs.set(pairKey, fingerprint);
+          pendingActions = [];
+          state.semanticState.interactiveConvergence = InteractiveConvergenceState.TARGET_EXHAUSTED;
+          await this.emit("ADAPTIVE_TARGET_EXHAUSTED", { action, pairKey, signature, repeatCount });
+          continue;
+        }
         state.status = "FAILED";
         state.reason = "repeated-action-loop";
         await this.emit("ADAPTIVE_LOOP_DETECTED", { action, signature, repeatCount });
@@ -993,7 +1715,53 @@ export class InteractiveAgentController {
         })
       };
       const verification = outcome?.verification ?? {};
-      const succeeded = SUCCESS.has(verification.status);
+      let succeeded = SUCCESS.has(verification.status);
+      let progressMeasurement = null;
+      let deterministicVerifierPending = false;
+      if (action.capability === "ui.action") {
+        const postActionPerception = await this.perceive({
+          goal: state.goal,
+          semanticState: state.semanticState,
+          recentActions: state.recentActions.slice(-6)
+        });
+        state.currentPerception = postActionPerception;
+        lastPerception = postActionPerception;
+        progressMeasurement = measureUiProgress(expectedUiPostcondition, postActionPerception);
+        succeeded = succeeded && progressMeasurement.state === InteractiveConvergenceState.PROGRESS;
+        state.semanticState.interactiveConvergence = progressMeasurement.state;
+        await this.emit("ADAPTIVE_PROGRESS_MEASURED", {
+          step: state.steps,
+          action,
+          ...progressMeasurement
+        });
+        if (!succeeded) {
+          deterministicVerifierPending = outcome?.executionResult?.performed === true
+            && pendingActions[0]?.capability === "ui.verifyValue";
+          const pairKey = actionPairKey(action);
+          if (pairKey) exhaustedActionPairs.set(pairKey, stateFingerprint(postActionPerception));
+          state.unsupportedAttempts.push({
+            action: {
+              capability: action.capability,
+              inputs: {
+                action: action.inputs?.action,
+                target: {
+                  targetId: action.inputs?.target?.targetId,
+                  name: action.inputs?.target?.name,
+                  automationId: action.inputs?.target?.automationId
+                }
+              }
+            },
+            reason:
+              `${InteractiveConvergenceState.NO_PROGRESS}: observed UI delta did not match ` +
+              "the predicted postcondition; this target/action pair is exhausted"
+          });
+          if (!deterministicVerifierPending) pendingActions = [];
+          await this.emit("ADAPTIVE_TARGET_ACTION_ELIMINATED", {
+            pairKey,
+            convergenceState: InteractiveConvergenceState.NO_PROGRESS
+          });
+        }
+      }
       state.observability.verificationEvidence.push({
         step: state.steps,
         capability: action.capability,
@@ -1024,9 +1792,14 @@ export class InteractiveAgentController {
         succeeded,
         executionResult: outcome?.executionResult,
         resultEnvelope: lastOutcome.resultEnvelope,
-        verification
+        verification,
+        progressMeasurement
       });
-      state.recentObservations.push(outcome?.observation ?? outcome?.executionResult ?? outcome);
+      state.recentObservations.push(
+        action.capability === "ui.action"
+          ? lastPerception
+          : (outcome?.observation ?? outcome?.executionResult ?? outcome)
+      );
       state.recentModelObservations.push(compactObservationForModel(
         outcome?.observation ?? outcome?.executionResult ?? outcome
       ));
@@ -1054,7 +1827,9 @@ export class InteractiveAgentController {
             pendingActions = [];
             continue;
           }
+          const bindingId = `binding_${crypto.randomUUID()}`;
           state.bindings[bindingSpec.name] = {
+            bindingId,
             value: boundValue,
             type: actualType,
             sourceCapability: action.capability,
@@ -1067,8 +1842,56 @@ export class InteractiveAgentController {
           };
           await this.emit("ADAPTIVE_BINDING_CREATED", { name: bindingSpec.name, provenance: state.bindings[bindingSpec.name] });
         }
+        if (bindingSpec.name && !state.bindings[bindingSpec.name]) {
+          state.recentActions.at(-1).succeeded = false;
+          state.failedAttempts.push({
+            action,
+            reason: `required output binding ${bindingSpec.name} was not produced`
+          });
+          pendingActions = [];
+          await this.emit("ADAPTIVE_BINDING_REJECTED", {
+            name: bindingSpec.name,
+            reason: "required output binding was not produced"
+          });
+          continue;
+        }
       }
       state.transitionContracts = evaluateTransitionContracts(state.recentActions, state.bindings);
+      let evidenceEntry = null;
+      if (succeeded) {
+        const predicateResult = action.expectedPostcondition
+          ? evaluatePostcondition(action.expectedPostcondition, {
+              executionResult: outcome?.executionResult,
+              observation: outcome?.observation,
+              verification
+            })
+          : null;
+        const criterionIds = inferCriterionIds(
+          action,
+          initialContext.goalContract,
+          [outcome?.executionResult, outcome?.observation, verification]
+        );
+        evidenceEntry = appendEvidence(state.evidenceLedger, {
+          taskId: action.nodeId ?? `step_${state.steps}`,
+          subgoalId: action.subgoalId ?? action.nodeId ?? `step_${state.steps}`,
+          criterionIds: predicateResult && !predicateResult.satisfied ? [] : criterionIds,
+          capability: action.capability,
+          modality,
+          observation: outcome?.observation ?? outcome?.executionResult,
+          verification,
+          value: lastOutcome.resultEnvelope?.data?.value,
+          provenance: lastOutcome.resultEnvelope?.provenance,
+          producedBindings: action.bindOutput
+            ? [state.bindings[typeof action.bindOutput === "string" ? action.bindOutput : action.bindOutput.name]?.bindingId].filter(Boolean)
+            : [],
+          consumedBindings
+        });
+        for (const name of (action.bindOutput
+          ? [typeof action.bindOutput === "string" ? action.bindOutput : action.bindOutput.name]
+          : [])) {
+          if (state.bindings[name]) state.bindings[name].producerEvidenceId = evidenceEntry.evidenceId;
+        }
+      }
       await this.emit("ADAPTIVE_ACTION_VERIFIED", {
         step: state.steps,
         capability: action.capability,
@@ -1083,9 +1906,35 @@ export class InteractiveAgentController {
         }
         state.semanticState.lastSuccessfulAction = action.capability;
         state.semanticState.lastResult = compactObservationForModel(outcome?.executionResult ?? null);
+        const ledgerCompletion = initialContext.goalContract?.enforceable
+          ? evaluateEvidenceLedger(initialContext.goalContract, state.evidenceLedger, state.bindings)
+          : null;
+        if (ledgerCompletion?.satisfied) {
+          state.status = "COMPLETE";
+          state.result = {
+            summary: "All original goal criteria were satisfied by locally verified evidence.",
+            evidenceIds: ledgerCompletion.criteria.flatMap((criterion) => criterion.evidenceIds)
+          };
+          state.completionVerification = {
+            allCriteriaSatisfied: true,
+            locallyEvaluated: true,
+            ledger: ledgerCompletion,
+            satisfiedCriteria: ledgerCompletion.criteria.map((criterion) => ({
+              criterion: criterion.description,
+              evidence: criterion.evidenceIds.join(", ")
+            }))
+          };
+          await this.emit("ADAPTIVE_LOCAL_EVIDENCE_COMPLETED", {
+            result: state.result,
+            verification: state.completionVerification
+          });
+          continue;
+        }
         if (action.completesGoal === true && verification.status === "VERIFIED") {
           const evidence = verification.message ?? `${action.capability} was locally verified`;
-          const proposedResult = action.completionResult ?? { summary: evidence };
+          const proposedResult = action.completionResult
+            ? resolveRuntimeReferences(action.completionResult, lastOutcome, state.bindings)
+            : { summary: evidence };
           const proposedVerification = {
             allCriteriaSatisfied: true,
             locallyEvaluated: true,
@@ -1107,6 +1956,27 @@ export class InteractiveAgentController {
         continue;
       }
 
+      if (action.capability === "ui.action" && progressMeasurement?.state === InteractiveConvergenceState.NO_PROGRESS) {
+        if (deterministicVerifierPending) {
+          if (action.nodeId) completedNodes.add(action.nodeId);
+          state.semanticState.interactiveConvergence = InteractiveConvergenceState.RECOVERABLE;
+          await this.emit("ADAPTIVE_DETERMINISTIC_VERIFIER_PRESERVED", {
+            action,
+            verifier: pendingActions[0]?.capability,
+            convergenceState: InteractiveConvergenceState.RECOVERABLE
+          });
+          continue;
+        }
+        const remaining = enumerateGroundedActionCandidates(state.goal, lastPerception, exhaustedActionPairs);
+        state.semanticState.interactiveConvergence = remaining.length
+          ? InteractiveConvergenceState.RECOVERABLE
+          : InteractiveConvergenceState.TARGET_EXHAUSTED;
+        await this.emit("ADAPTIVE_DETERMINISTIC_RECOVERY_STATE", {
+          convergenceState: state.semanticState.interactiveConvergence,
+          remainingCandidates: remaining.length
+        });
+        continue;
+      }
       state.failedAttempts.push({ action, verification });
       pendingActions = [];
       const sectionQuery = action.capability === "ui.find"

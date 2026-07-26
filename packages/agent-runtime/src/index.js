@@ -22,13 +22,37 @@ import { resolveTaskInputs } from "./input-bindings.js";
 import {
   InteractiveAgentController,
   buildBrowserCompositionStrategy,
+  buildSupportedUiOperationStrategy,
+  buildSupportedTextEntryStrategy,
+  buildSupportedReadOnlyNavigationStrategy,
+  buildSupportedBrowserReadStrategy,
+  buildSupportedRankedProcessReadStrategy,
+  InteractiveConvergenceState,
+  enumerateGroundedActionCandidates,
+  supportedUiActions,
+  measureUiProgress,
   buildCrossModalTransferStrategy,
   buildInternalToGuiTransferStrategy,
   buildExplicitApplicationLaunchStrategy
 } from "./interactive-agent-controller.js";
 import { createGoalContract } from "../../shared-types/src/goal-contract.js";
+import { summarizeReadOnlyResults } from "./read-result-summary.js";
 
-export { InteractiveAgentController, sanitizeInteractiveState, classifyInteractiveContext, INTERACTIVE_AGENT_DEFAULT_BUDGETS } from "./interactive-agent-controller.js";
+export {
+  InteractiveAgentController,
+  InteractiveConvergenceState,
+  enumerateGroundedActionCandidates,
+  supportedUiActions,
+  measureUiProgress,
+  buildSupportedUiOperationStrategy,
+  buildSupportedTextEntryStrategy,
+  buildSupportedReadOnlyNavigationStrategy,
+  buildSupportedBrowserReadStrategy,
+  buildSupportedRankedProcessReadStrategy,
+  sanitizeInteractiveState,
+  classifyInteractiveContext,
+  INTERACTIVE_AGENT_DEFAULT_BUDGETS
+} from "./interactive-agent-controller.js";
 
 export class AgentRuntime {
   constructor({
@@ -1509,11 +1533,11 @@ export class AgentRuntime {
       executionSummary = null;
     }
 
-    // For a single read-only question, the verified result is the answer the
-    // user asked for. Prefer it over a generic "run completed" summary.
-    const directAnswer = session.taskResults.length === 1
-      ? session.verifications.at(-1)?.message
-      : null;
+    // A verified read is useful only when its observed value reaches the user.
+    // This also covers aggregate reads (for example a system snapshot made of
+    // several independent tasks), without exposing raw command output.
+    const directAnswer = summarizeReadOnlyResults(session.taskResults, this.capabilityRegistry)
+      ?? (session.taskResults.length === 1 ? session.verifications.at(-1)?.message : null);
     if (directAnswer) {
       executionSummary = { ...(executionSummary ?? {}), summary: directAnswer };
     }

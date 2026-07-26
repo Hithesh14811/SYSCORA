@@ -1,6 +1,25 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { InteractiveAgentController, sanitizeInteractiveState, classifyInteractiveContext, compactObservationForModel, evaluateSubgoalCompletion, chooseMechanicalContinuation, buildCrossModalTransferStrategy, buildInternalToGuiTransferStrategy, buildExplicitApplicationLaunchStrategy } from "../../packages/agent-runtime/src/interactive-agent-controller.js";
+import {
+  InteractiveAgentController,
+  InteractiveConvergenceState,
+  sanitizeInteractiveState,
+  classifyInteractiveContext,
+  compactObservationForModel,
+  evaluateSubgoalCompletion,
+  chooseMechanicalContinuation,
+  enumerateGroundedActionCandidates,
+  supportedUiActions,
+  measureUiProgress,
+  buildSupportedUiOperationStrategy,
+  buildSupportedTextEntryStrategy,
+  buildSupportedReadOnlyNavigationStrategy,
+  buildSupportedBrowserReadStrategy,
+  buildSupportedRankedProcessReadStrategy,
+  buildCrossModalTransferStrategy,
+  buildInternalToGuiTransferStrategy,
+  buildExplicitApplicationLaunchStrategy
+} from "../../packages/agent-runtime/src/interactive-agent-controller.js";
 import { CapabilityRegistry } from "../../packages/capability-registry/src/index.js";
 
 function capability(name, inputSchema = { type: "object", properties: {}, required: [] }) {
@@ -228,6 +247,152 @@ test("a uniquely matching grounded navigation control is selected mechanically",
   assert.equal(action.inputs.action, "select");
 });
 
+test("UI action vocabulary is derived only from advertised UIA patterns", () => {
+  const display = {
+    targetId: "volatile-1",
+    source: "UIA",
+    windowId: "42",
+    name: "Display is 0",
+    controlType: "ControlType.Text",
+    supportedPatterns: ["InvokePatternIdentifiers.Pattern", "ScrollItemPatternIdentifiers.Pattern"]
+  };
+  const edit = {
+    targetId: "edit-1",
+    source: "UIA",
+    windowId: "42",
+    name: "Address and search bar",
+    controlType: "ControlType.Edit",
+    supportedPatterns: ["ValuePatternIdentifiers.Pattern", "ExpandCollapsePatternIdentifiers.Pattern"]
+  };
+  assert.deepEqual(supportedUiActions(display), ["scrollIntoView"]);
+  assert.deepEqual(supportedUiActions(edit), ["setValue", "type", "expand"]);
+});
+
+test("exhausted target/action pairs survive volatile target id refreshes", () => {
+  const control = {
+    targetId: "first-id",
+    source: "UIA",
+    windowId: "42",
+    automationId: "Display",
+    name: "Display",
+    controlType: "ControlType.Button",
+    supportedPatterns: ["InvokePatternIdentifiers.Pattern"]
+  };
+  const first = enumerateGroundedActionCandidates("click Display", { relevantControls: [control] });
+  assert.equal(first.length, 1);
+  const exhausted = new Set([first[0].convergencePairKey]);
+  const refreshed = enumerateGroundedActionCandidates(
+    "click Display",
+    { relevantControls: [{ ...control, targetId: "second-id" }] },
+    exhausted
+  );
+  assert.equal(refreshed.length, 0);
+});
+
+test("progress requires the predicted observable postcondition", () => {
+  const expected = {
+    kind: "VALUE_EQUALS",
+    expected: "example.com",
+    before: { key: "42|address|ControlType.Edit|address and search bar", value: "" }
+  };
+  const unchanged = measureUiProgress(expected, {
+    relevantControls: [{
+      targetId: "new-id",
+      source: "UIA",
+      windowId: "42",
+      automationId: "address",
+      name: "Address and search bar",
+      controlType: "ControlType.Edit",
+      value: "",
+      supportedPatterns: ["ValuePatternIdentifiers.Pattern"]
+    }]
+  });
+  assert.equal(unchanged.state, InteractiveConvergenceState.NO_PROGRESS);
+  const changed = measureUiProgress(expected, {
+    relevantControls: [{
+      targetId: "newer-id",
+      source: "UIA",
+      windowId: "42",
+      automationId: "address",
+      name: "Address and search bar",
+      controlType: "ControlType.Edit",
+      value: "example.com",
+      supportedPatterns: ["ValuePatternIdentifiers.Pattern"]
+    }]
+  });
+  assert.equal(changed.state, InteractiveConvergenceState.PROGRESS);
+});
+
+test("model target references are rehydrated before action canonicalization", async () => {
+  const registry = new CapabilityRegistry([capability("ui.action", {
+    type: "object",
+    properties: {
+      target: { type: "object" },
+      action: { type: "string", enum: ["invoke", "click"] }
+    },
+    required: ["target", "action"]
+  })]);
+  const target = {
+    targetId: "observed-button",
+    source: "UIA",
+    windowId: "42",
+    automationId: "submit",
+    name: "Submit",
+    controlType: "ControlType.Button",
+    supportedPatterns: ["InvokePatternIdentifiers.Pattern"]
+  };
+  const otherTarget = {
+    ...target,
+    targetId: "observed-other-button",
+    automationId: "other",
+    name: "Other"
+  };
+  let clicked = false;
+  let executedAction = null;
+  let calls = 0;
+  const controller = new InteractiveAgentController({
+    capabilityRegistry: registry,
+    reasoningEngine: { async decideInteractiveAction() {
+      calls += 1;
+      if (calls > 1) return {
+        ok: true,
+        data: {
+          goalStatus: "COMPLETE",
+          result: { summary: "Submitted" },
+          verification: {
+            allCriteriaSatisfied: true,
+            satisfiedCriteria: [{ criterion: "click submit", evidence: "Submit changed the observed UI." }]
+          }
+        }
+      };
+      return {
+        ok: true,
+        data: {
+          goalStatus: "IN_PROGRESS",
+          action: {
+            capability: "ui.action",
+            inputs: { target: { targetId: target.targetId, source: "UIA", windowId: "42" }, action: "click" }
+          }
+        }
+      };
+    } },
+    perceive: async () => ({
+      relevantControls: [target, otherTarget],
+      statusText: clicked ? "Submitted" : "Ready"
+    }),
+    executeAction: async (action) => {
+      executedAction = action;
+      clicked = true;
+      return { executionResult: { performed: true }, verification: { status: "PARTIALLY_VERIFIED" } };
+    },
+    budgets: { maxModelCalls: 3, maxSteps: 3 }
+  });
+  const result = await controller.run("click a button");
+  assert.equal(executedAction.inputs.action, "invoke");
+  assert.deepEqual(executedAction.inputs.target.supportedPatterns, target.supportedPatterns);
+  assert.equal(result.status, "COMPLETE");
+});
+
 test("cross-modal value transfers compile into one bound mechanical strategy", () => {
   const strategy = buildCrossModalTransferStrategy(
     "Using a browser, read the current release version from example.org, then put only that version into Calculator and leave it visible."
@@ -237,6 +402,63 @@ test("cross-modal value transfers compile into one bound mechanical strategy", (
   assert.ok(strategy.localSteps.some((step) => step.capability === "browser.extract" && step.bindOutput?.name === "transferredValue"));
   assert.ok(strategy.localSteps.some((step) => step.capability === "keyboard.type" && step.inputs.text === "$binding.transferredValue"));
   assert.equal(strategy.localSteps.at(-1).completesGoal, true);
+});
+
+test("ordered textual keypad operations compile through grounded supported actions", () => {
+  const strategy = buildSupportedUiOperationStrategy(
+    "Open a numeric keypad, calculate (47 times 19) plus 6, and leave the result visible."
+  );
+  assert.equal(strategy.expectedResult, "899");
+  assert.equal(strategy.action.capability, "application.launch");
+  const uiActions = strategy.localSteps.filter((step) => step.capability === "ui.action");
+  assert.deepEqual(
+    uiActions.map((step) => step.inputs.action),
+    Array(uiActions.length).fill("click")
+  );
+  assert.ok(uiActions.every((step) => step.inputs.target === "$last.output.target"));
+  assert.equal(strategy.localSteps.at(-1).inputs.selector.nameContains, "899");
+});
+
+test("multiline text entry compiles to ValuePattern action and exact verification", () => {
+  const strategy = buildSupportedTextEntryStrategy(
+    "Open an editor, type first value on the first line and second value on the second line, then leave it visible without saving."
+  );
+  assert.equal(strategy.expectedText, "first value\nsecond value");
+  assert.equal(strategy.localSteps[1].inputs.action, "setValue");
+  assert.equal(strategy.localSteps[1].inputs.target, "$last.output.target");
+  assert.equal(strategy.localSteps.at(-1).capability, "ui.verifyValue");
+  assert.equal(strategy.localSteps.at(-1).inputs.expected, "first value\nsecond value");
+});
+
+test("read-only page navigation compiles to grounded action and typed extraction", () => {
+  const strategy = buildSupportedReadOnlyNavigationStrategy(
+    "Open system preferences to the Display page, report the current scale percentage, and do not change any setting."
+  );
+  assert.equal(strategy.page, "Display");
+  assert.equal(strategy.localSteps[0].capability, "window.moveResize");
+  assert.equal(strategy.localSteps[1].capability, "ui.navigateSection");
+  assert.equal(strategy.localSteps[2].capability, "keyboard.press");
+  assert.equal(strategy.localSteps[3].capability, "ui.inspect");
+  assert.equal(strategy.localSteps[3].bindOutput.normalize, "firstPercentage");
+  assert.equal(strategy.localSteps[3].completesGoal, true);
+});
+
+test("browser heading reads compile without unsupported address-bar verbs", () => {
+  const strategy = buildSupportedBrowserReadStrategy(
+    "Open a browser, navigate to example.com, report the page heading, and leave the page open."
+  );
+  assert.equal(strategy.action.capability, "browser.launch");
+  assert.equal(strategy.localSteps.at(-1).inputs.selector, "h1");
+  assert.ok(!strategy.localSteps.some((step) => step.capability === "ui.action"));
+});
+
+test("highest-memory reads compile without a process mutation", () => {
+  const strategy = buildSupportedRankedProcessReadStrategy(
+    "Open Task Manager, identify the process currently using the most memory, and report its name and memory usage without ending anything."
+  );
+  assert.equal(strategy.localSteps[0].capability, "processes.list");
+  assert.equal(strategy.localSteps[0].bindOutput.normalize, "maxWorkingSet");
+  assert.ok(!strategy.localSteps.some((step) => /stop|end|kill/i.test(step.capability)));
 });
 
 test("generic internal-to-GUI composition binds file output and verifies the target value", () => {

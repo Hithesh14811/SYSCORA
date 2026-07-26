@@ -266,10 +266,7 @@ test("provider outage plus a novel goal fails truthfully without executing an ir
     );
 
     assert.equal(session.finalResponse.status, "FAILED");
-    assert.match(
-      session.finalResponse.reason,
-      /provider-unhealthy|IRRELEVANT_DETERMINISTIC_FALLBACK/
-    );
+    assert.equal(session.finalResponse.reason, "invalid-composition-graph");
     assert.equal(executions, 0);
     assert.equal(session.taskResults.length, 0);
     assert.ok(session.events.some((event) =>

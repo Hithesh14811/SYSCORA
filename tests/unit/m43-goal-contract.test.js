@@ -6,7 +6,7 @@ import {
   assessGoalContractPlanCoverage,
   assessGoalContractEvidence
 } from "../../packages/shared-types/src/goal-contract.js";
-import { GeneralPlanner } from "../../packages/planner/src/index.js";
+import { GeneralPlanner, OPERATION_PLANS } from "../../packages/planner/src/index.js";
 
 function task(capability, inputs, completionCriteria = []) {
   return {
@@ -70,6 +70,39 @@ test("GoalContract rejects a mutating plan for a do-not-modify criterion", () =>
     ]
   };
   assert.equal(assessGoalContractPlanCoverage(contract, graph).covered, false);
+});
+
+test("read-only routed system summaries satisfy mixed inspect-without-changing requests", () => {
+  const intent = {
+    rawText: "Summarize this PC's Windows version, CPU, and installed memory without changing anything.",
+    successCriteria: [
+      "Windows version is retrieved",
+      "CPU details are retrieved",
+      "Installed memory amount is retrieved"
+    ],
+    constraints: ["Do not change anything on the system"]
+  };
+  const contract = createGoalContract(intent);
+  const graph = { tasks: OPERATION_PLANS["system.summary"]({}) };
+  const registry = {
+    get(name) {
+      return {
+        name,
+        description: name === "system.inspect"
+          ? "Inspect Windows system state summary"
+          : "Read Windows system state",
+        permissionModel: { type: "READ" }
+      };
+    }
+  };
+
+  assert.equal(
+    contract.criteria.some((criterion) =>
+      criterion.description.startsWith("Summarize this PC") && criterion.kind === "PROHIBITION"
+    ),
+    false
+  );
+  assert.equal(assessGoalContractPlanCoverage(contract, graph, registry).covered, true);
 });
 
 test("GoalContract rejects first-only and irrelevant successful plans", () => {

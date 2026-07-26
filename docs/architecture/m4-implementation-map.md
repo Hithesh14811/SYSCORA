@@ -32,6 +32,9 @@ This map reflects the code, not the older MVP documentation.
   mechanically obvious steps run locally without another model call.
 - Every proposed action must name a registered capability and pass its input
   schema. UI/DOM mutation targets must appear in runtime-observed state.
+- A mechanically compiled strategy whose required capabilities are absent is
+  rejected before execution with `invalid-composition-graph`; this is distinct
+  from provider unavailability and no partial graph is executed.
 - Each action becomes a one-task plan and re-enters the canonical runtime
   validation, risk, policy, permission, grant, execute, observe, verify and audit
   path.

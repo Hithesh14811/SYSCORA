@@ -213,7 +213,7 @@ describe("ReasoningEngine hardened boundary", () => {
     });
     const r = await re.composeTaskGraph(VALID_INTENT, {});
     assert.equal(r.ok, false);
-    assert.match(String(r.error), /hallucinated capability/i);
+    assert.match(String(r.error), /unknown_capability/i);
   });
 
   it("accepts a task graph that uses only registered capabilities", async () => {

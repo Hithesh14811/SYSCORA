@@ -233,6 +233,7 @@ export class CapabilityRegistry {
   getCatalog(context = {}) {
     return this.getAvailable(context).map(cap => ({
       name: cap.name,
+      aliases: cap.aliases ?? cap.canonicalAliases ?? cap.metadata?.aliases ?? [],
       capabilityId: cap.capabilityId,
       contractVersion: cap.contractVersion,
       version: cap.version,
@@ -1299,6 +1300,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
         if (selector.name && name.toLowerCase() === String(selector.name).toLowerCase()) score += 100;
         if (selector.nameContains && name.toLowerCase().includes(String(selector.nameContains).toLowerCase())) score += 60;
         if (selector.automationId && String(control?.automationId) === String(selector.automationId)) score += 100;
+        if (selector.targetId && String(control?.targetId) === String(selector.targetId)) score += 150;
         if (selector.controlType && semantics.includes(String(selector.controlType).toLowerCase())) score += 30;
         const staticText = /(?:static|text|label)/i.test(`${control?.className ?? ""} ${control?.controlType ?? ""}`);
         const interactive = /(?:button|edit|combo|check|radio|listitem|menuitem|tabitem)/i.test(`${control?.className ?? ""} ${control?.controlType ?? ""}`);
@@ -1309,6 +1311,10 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
         if (wantsToggle && control?.toggleState != null) score += 25;
         if (wantsSelection && selectedValue != null) score += 25;
         if (explicitValue != null && String(explicitValue).trim() !== "") score += 8;
+        if (control?.enabled !== false) score += 2;
+        if (control?.focused === true) score += 8;
+        if (control?.automationId) score += 2;
+        if (control?.offscreen === true) score -= 30;
         return {
           control,
           value,
@@ -1335,6 +1341,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
           reason: tied ? "ambiguous-value" : "no-semantically-grounded-value",
           query: args.query,
           candidates: candidates.slice(0, 6).map((candidate) => ({
+            candidateId: candidate.control?.targetId ?? null,
             value: candidate.value,
             valueSource: candidate.valueSource,
             score: candidate.score,

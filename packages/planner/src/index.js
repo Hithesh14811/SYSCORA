@@ -6,6 +6,10 @@ import { validateSchema } from "../../model-providers/src/index.js";
 import {
   assessGoalContractPlanCoverage
 } from "../../shared-types/src/goal-contract.js";
+import {
+  CapabilityResolutionKind,
+  resolveCapabilityId
+} from "../../shared-types/src/capability-resolution.js";
 
 export const TASK_LIMITS = Object.freeze({
   minTimeoutMs: 1000,
@@ -165,8 +169,8 @@ export const OPERATION_PLANS = {
   "system.summary": () => [
     buildTask("system.inspect", {}, {
       goal: "Inspect system",
-      description: "Retrieve system summary",
-      completionCriteria: ["Got system info"],
+      description: "Retrieve Windows version, CPU details, and installed memory",
+      completionCriteria: ["Windows version, CPU details, and installed memory retrieved"],
       timeout: 10000
     }),
     buildTask("processes.list", {}, {
@@ -614,7 +618,12 @@ export class GeneralPlanner {
 
   _normalizePlan(plan) {
     if (!this._isStructurallyPlan(plan)) return plan;
+    const catalog = this.capabilityRegistry?.getCatalog?.() ?? [];
     for (const task of plan.taskGraph.tasks) {
+      const resolution = resolveCapabilityId(task.capability, catalog);
+      if ([CapabilityResolutionKind.EXACT_MATCH, CapabilityResolutionKind.CANONICAL_ALIAS].includes(resolution.kind)) {
+        task.capability = resolution.canonicalId;
+      }
       const capability = this.capabilityRegistry?.get(task.capability);
       if (!capability) continue;
       task.dependencies = Array.isArray(task.dependencies) ? task.dependencies : [];
@@ -955,7 +964,7 @@ export class GeneralPlanner {
     if (directoryPath !== root && !directoryPath.startsWith(`${root}${path.sep}`)) return [];
 
     const operations = [];
-    const operationPattern = /\b(create|write|modify|update)\s+(?:the\s+)?["'`]?([a-z0-9][a-z0-9 _-]*\.[a-z0-9]{1,8})["'`]?\s+(?:with\s+exact\s+(?:final\s+)?content|so\s+(?:that\s+)?its?\s+exact\s+(?:final\s+)?content\s+is|to\s+contain(?:s)?(?:\s+exactly)?)\s+["'`]?([^,"'`;]+?)["'`]?(?=\s*,|\s+then\b|[.;]|$)/gi;
+    const operationPattern = /\b(create|write|modify|update|change|rewrite)\s+(?:the\s+)?(?:file\s+)?["'`]?([a-z0-9][a-z0-9 _-]*\.[a-z0-9]{1,8})["'`]?\s+(?:with\s+(?:exact\s+)?(?:final\s+)?content(?:\s+(?:of|equal\s+to))?\s+|so\s+(?:that\s+)?its?\s+(?:exact\s+)?(?:final\s+)?content\s+is\s+|to\s+(?:(?:contain(?:s)?(?:\s+exactly)?|read|be)\s+)?)["'`]?([^,"'`;]+?)["'`]?(?=\s*,|\s+then\b|[.;]|$)/gi;
     for (const match of raw.matchAll(operationPattern)) {
       const fileName = match[2].replace(/[^a-z0-9 _.-]/gi, "").trim().slice(0, 64);
       const content = match[3].trim();

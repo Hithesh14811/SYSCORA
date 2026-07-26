@@ -68,6 +68,10 @@ function isProhibition(value) {
   return /\b(?:do not|don't|must not|never|without (?:changing|modifying|editing)|no changes?)\b/i.test(String(value ?? ""));
 }
 
+function isStandaloneProhibition(value) {
+  return /^\s*(?:do not|don't|must not|never|without (?:changing|modifying|editing)|no changes?)\b/i.test(String(value ?? ""));
+}
+
 function isVacuousCriterion(value) {
   const normalized = normalize(value);
   return /^(?:the )?(?:request|task|operation|action|goal) (?:is |was )?(?:processed |completed |performed |executed )?(?:successfully|correctly|as requested)$/.test(normalized)
@@ -95,7 +99,10 @@ export function createGoalContract(intent = {}) {
       const overlap = constraintTokens.filter((token) => originalTokens.has(token)).length;
       return overlap / Math.min(constraintTokens.length, 5) >= 0.6;
     }),
-    ...fallbackCriteria(originalRequest).filter(isProhibition)
+    // A mixed request such as "summarize X without changing anything" is not
+    // itself a prohibition. Preserve only clauses that are independently
+    // phrased as prohibitions; model-provided constraints are handled above.
+    ...fallbackCriteria(originalRequest).filter(isStandaloneProhibition)
   ].map(String).map((value) => value.trim()).filter(Boolean);
   const rawClauses = fallbackCriteria(originalRequest);
   const declaredText = normalize(declared.join(" "));
@@ -173,7 +180,9 @@ function criterionMatch(criterion, evidence) {
 function planHasMutation(taskGraph, capabilityRegistry) {
   return (taskGraph?.tasks ?? []).some((task) => {
     const capability = capabilityRegistry?.get?.(task.capability);
-    if (capability?.permissionModel?.type === "WRITE") return true;
+    if (capability?.permissionModel?.type) {
+      return capability.permissionModel.type !== "READ";
+    }
     return !READ_ONLY_CAPABILITIES.test(String(task.capability ?? ""));
   });
 }
@@ -228,6 +237,8 @@ export function assessGoalContractEvidence(goalContract, input = {}, capabilityR
         && !forbiddenActions.includes(token)
       );
       const violatingTask = (input.taskGraph?.tasks ?? []).some((task) => {
+        const capability = capabilityRegistry?.get?.(task?.capability);
+        if (capability?.permissionModel?.type === "READ") return false;
         if (READ_ONLY_CAPABILITIES.test(String(task?.capability ?? ""))) return false;
         if (task?.capability === "ui.navigateSection") return false;
         const taskTokens = new Set(tokens(taskEvidence(task, capabilityRegistry)));

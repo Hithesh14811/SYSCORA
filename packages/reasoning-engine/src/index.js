@@ -27,6 +27,10 @@ import {
   InteractiveDecisionKind,
   normalizeInteractiveDecision
 } from "../../shared-types/src/interactive-decision.js";
+import {
+  CapabilityResolutionKind,
+  resolveCapabilityId
+} from "../../shared-types/src/capability-resolution.js";
 
 // ---- Strict schemas (Phase 4) -------------------------------------------
 
@@ -337,11 +341,14 @@ Return JSON with:
     const result = await this.understandIntent(rawText, context);
     if (!result.ok) return result;
     const requested = result.data.requiredCapabilities ?? [];
-    const known = new Set(this.capabilityRegistry?.getCatalog().map((capability) => capability.name) ?? []);
-    const invalid = requested.filter((capability) => !known.has(capability));
-    return invalid.length
-      ? { ok: false, error: `hallucinated capability: ${invalid[0]}` }
-      : { ok: true, data: requested };
+    const catalog = this.capabilityRegistry?.getCatalog() ?? [];
+    const resolutions = requested.map((capability) => resolveCapabilityId(capability, catalog));
+    const invalid = resolutions.find((resolution) =>
+      ![CapabilityResolutionKind.EXACT_MATCH, CapabilityResolutionKind.CANONICAL_ALIAS].includes(resolution.kind)
+    );
+    return invalid
+      ? { ok: false, error: `${invalid.kind.toLowerCase()}: ${invalid.requestedId}` }
+      : { ok: true, data: resolutions.map((resolution) => resolution.canonicalId) };
   }
 
   async decideInteractiveAction(context = {}) {
@@ -349,7 +356,6 @@ Return JSON with:
     const catalog = Array.isArray(context.availableCapabilities)
       ? context.availableCapabilities
       : this.capabilityRegistry.getCatalog();
-    const known = new Set(catalog.map((capability) => capability.name));
     const { availableCapabilities: trustedCatalog = [], ...machineContext } = context;
     const classified = classifyExternalContext(machineContext);
     const safeContext = {
@@ -417,7 +423,15 @@ Return only JSON matching the decision schema.`.trim();
         errors.push(`${label} is missing`);
         return;
       }
-      if (!known.has(action.capability)) errors.push(`${label} uses unknown capability: ${action.capability}`);
+      const resolution = resolveCapabilityId(action.capability, catalog);
+      if ([CapabilityResolutionKind.EXACT_MATCH, CapabilityResolutionKind.CANONICAL_ALIAS].includes(resolution.kind)) {
+        action.capability = resolution.canonicalId;
+      } else {
+        const classification = resolution.kind === CapabilityResolutionKind.UNKNOWN_CAPABILITY
+          ? "unknown capability"
+          : "ambiguous capability";
+        errors.push(`${label} uses ${classification}: ${action.capability}`);
+      }
       if (!action.inputs || typeof action.inputs !== "object" || Array.isArray(action.inputs)) {
         errors.push(`${label}.inputs must be an object`);
       }
@@ -494,7 +508,6 @@ Return JSON: { "needsClarification": boolean, "questions": [string] }`.trim();
   async composeTaskGraph(intent, planningContext = {}) {
     if (!this.capabilityRegistry) return { ok: false, error: "no-capability-registry" };
     const catalog = this.capabilityRegistry.getCatalog();
-    const known = new Set(catalog.map((c) => c.name));
 
     const prompt = `
 Generate a task plan for this intent using ONLY the registered capabilities.
@@ -562,7 +575,14 @@ Return JSON:
       const errors = [];
       for (const t of tasks) {
         if (!t || !t.capability) errors.push("task missing capability");
-        else if (!known.has(t.capability)) errors.push(`hallucinated capability: ${t.capability}`);
+        else {
+          const resolution = resolveCapabilityId(t.capability, catalog);
+          if ([CapabilityResolutionKind.EXACT_MATCH, CapabilityResolutionKind.CANONICAL_ALIAS].includes(resolution.kind)) {
+            t.capability = resolution.canonicalId;
+          } else {
+            errors.push(`${resolution.kind.toLowerCase()}: ${t.capability}`);
+          }
+        }
       }
       return { valid: errors.length === 0, errors };
     };
