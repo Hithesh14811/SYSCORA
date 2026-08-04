@@ -24,8 +24,48 @@ import { WindowsSecretBroker } from "../../../packages/secrets/src/index.js";
 import { ReasoningEngine } from "../../../packages/reasoning-engine/src/index.js";
 import { ConsentAwareModelProvider, createModelProviderChain } from "../../../packages/model-providers/src/index.js";
 import { PrivilegedOperationHelper } from "../../../packages/privileged-helpers/src/index.js";
+import { ElevationGrantStore, DEFAULT_ELEVATION_LIFETIME_MS, ELEVATION_SCOPE_ALL } from "../../../packages/permission-broker/src/elevation-grant-store.js";
+import { ElevationService } from "../../../packages/permission-broker/src/elevation-service.js";
+import { ElevatedHostClient } from "../../../os-adapters/windows-host/src/elevated-client.js";
+import fsSync from "node:fs";
 import { InstallationKeyStore } from "../../../packages/permission-broker/src/installation-key.js";
 import { loadModelConfig } from "./model-config.js";
+
+/**
+ * Elevation configuration, from .syscora/config.json (`elevation` block) with
+ * environment overrides. Every switch defaults to the safe value: elevation
+ * disabled, unattended elevation off.
+ *
+ *   "elevation": {
+ *     "enabled": true,          // allow elevated operations at all
+ *     "unattended": false,      // skip SYSCORA's own approval for admin work
+ *     "lifetimeMinutes": 15,    // how long one elevated session lasts
+ *     "operations": ["*"]       // which elevated operations the grant covers
+ *   }
+ */
+export function loadElevationConfig(basePath = process.cwd()) {
+  let file = {};
+  try {
+    const raw = fsSync.readFileSync(path.join(basePath, ".syscora", "config.json"), "utf8");
+    file = JSON.parse(raw)?.elevation ?? {};
+  } catch { /* absent or unreadable config means defaults */ }
+
+  const enabled = process.env.SYSCORA_ELEVATION_ENABLED === "1"
+    || (process.env.SYSCORA_ELEVATION_ENABLED !== "0" && file.enabled === true);
+  const unattended = process.env.SYSCORA_ELEVATION_UNATTENDED === "1"
+    || (process.env.SYSCORA_ELEVATION_UNATTENDED !== "0" && file.unattended === true);
+  const minutes = Number(process.env.SYSCORA_ELEVATION_MINUTES ?? file.lifetimeMinutes);
+  const lifetimeMs = Number.isFinite(minutes) && minutes > 0
+    ? minutes * 60_000
+    : DEFAULT_ELEVATION_LIFETIME_MS;
+  const operations = Array.isArray(file.operations) && file.operations.length > 0
+    ? file.operations
+    : [ELEVATION_SCOPE_ALL];
+
+  // Unattended elevation without elevation enabled is meaningless; treat it as
+  // off rather than as an implicit enable.
+  return { enabled, unattended: enabled && unattended, lifetimeMs, operations };
+}
 
 export function createRuntime(basePath = process.cwd()) {
   const stateDirectory = path.join(basePath, ".syscora");
@@ -58,7 +98,35 @@ export function createRuntime(basePath = process.cwd()) {
   // the privileged capabilities. It shares the runtime's broker and adapter so
   // privileged operations run through the single canonical path — never a
   // separate route.
-  const privilegedHelper = new PrivilegedOperationHelper({ permissionBroker, adapter });
+  //
+  // Elevation is session-scoped: one UAC prompt per elevated session, a grant
+  // with a hard expiry, and a high-integrity host that exits on its own
+  // deadline. Unattended elevation (skipping SYSCORA's own approval question
+  // for admin work) is OFF unless explicitly enabled in .syscora/config.json,
+  // because it removes the last human checkpoint in front of irreversible
+  // administrator actions.
+  const elevationConfig = loadElevationConfig(basePath);
+  const elevationGrantStore = new ElevationGrantStore(path.join(stateDirectory, "permission-broker"));
+  const elevatedHost = elevationConfig.enabled
+    ? new ElevatedHostClient({ lifetimeMs: elevationConfig.lifetimeMs })
+    : null;
+  const elevationService = new ElevationService({
+    elevationGrantStore,
+    elevatedHost,
+    auditRepository,
+    unattendedElevation: elevationConfig.unattended,
+    defaultLifetimeMs: elevationConfig.lifetimeMs,
+    allowedOperations: elevationConfig.operations
+  });
+  const privilegedHelper = new PrivilegedOperationHelper({
+    permissionBroker,
+    adapter,
+    elevatedHost,
+    elevationGrantStore,
+    // Elevated execution is fail-closed on auditability: an elevated action
+    // that cannot be recorded does not run.
+    auditRepository
+  });
   const capabilityRegistry = createDefaultCapabilityRegistry(adapter, { privilegedHelper });
   const recoveryEngine = new RecoveryEngine();
   const troubleshootingEngine = new TroubleshootingEngine();
@@ -88,13 +156,17 @@ export function createRuntime(basePath = process.cwd()) {
     // The RiskEngine reads the authoritative per-capability risk floor from the
     // registry; runtime context may only raise those dimensions.
     riskEngine: new RiskEngine({ capabilityRegistry }),
-    // ELEVATE is a wired control here because the privileged helper + approval
-    // token flow exists. Without a helper it would stay unavailable and any
-    // privileged operation would fail closed (never silently downgraded).
+    // ELEVATE availability must reflect whether elevation can ACTUALLY happen,
+    // not merely that a helper object was constructed. The helper always
+    // exists; its elevated host is null whenever elevation is disabled in
+    // config (the shipped default). Reporting ELEVATE as available in that
+    // state still failed closed at execution, but it misled every upstream
+    // policy and UI decision that asks "can this be elevated?" before trying.
     policyEngine: new PolicyEngine({
-      controlAvailability: { ELEVATE: Boolean(privilegedHelper) }
+      controlAvailability: { ELEVATE: Boolean(privilegedHelper?.canElevate?.()) }
     }),
     permissionBroker,
+    elevationService,
     recoveryEngine,
     troubleshootingEngine,
     adapter,

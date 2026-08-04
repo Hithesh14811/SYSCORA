@@ -1,0 +1,101 @@
+{
+  "$comment": "SINGLE SOURCE OF TRUTH for elevated-operation parameter validation. Loaded and enforced INDEPENDENTLY by both the medium-integrity daemon (packages/privileged-helpers/src/operation-schema.js) and the high-integrity PowerShell host (os-adapters/windows-host/elevated-host.ps1). Neither side trusts the other to have validated. Every regex here must be valid in BOTH ECMAScript and .NET regex dialects - keep to the common subset (no lookbehind, no named groups, no \\p{...}).",
+  "schemaVersion": 1,
+  "formats": {
+    "ipv4": "^(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])(\\.(0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])){3}$",
+    "ipv6": "^(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(:[0-9A-Fa-f]{1,4}){1,6}|:((:[0-9A-Fa-f]{1,4}){1,7}|:))$",
+    "hostnameLabel": "^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+  },
+  "operations": {
+    "service.restart": {
+      "elevated": false,
+      "hostImplemented": true,
+      "timeoutMs": 30000,
+      "scope": {
+        "label": "Windows service name",
+        "pattern": "^[A-Za-z0-9._ -]{1,256}$",
+        "maxLength": 256,
+        "reason": "service.restart scope contains invalid characters; a valid service name is letters, digits, dot, underscore, space or hyphen."
+      },
+      "params": {}
+    },
+    "service.setStartupType": {
+      "elevated": true,
+      "hostImplemented": true,
+      "timeoutMs": 30000,
+      "scope": {
+        "label": "Windows service name",
+        "pattern": "^[A-Za-z0-9._ -]{1,256}$",
+        "maxLength": 256,
+        "reason": "service.setStartupType requires a valid service name scope."
+      },
+      "params": {
+        "startupType": {
+          "required": true,
+          "enum": ["Automatic", "Manual", "Disabled"],
+          "reason": "service.setStartupType requires startupType of Automatic, Manual, or Disabled."
+        }
+      }
+    },
+    "package.install": {
+      "elevated": false,
+      "hostImplemented": true,
+      "timeoutMs": 600000,
+      "scope": {
+        "label": "WinGet package id",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$",
+        "maxLength": 256,
+        "reason": "package.install scope is not a valid package id."
+      },
+      "params": {}
+    },
+    "system.setEnvironmentVariable": {
+      "elevated": true,
+      "hostImplemented": true,
+      "timeoutMs": 30000,
+      "scope": {
+        "label": "machine environment variable name",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_(). -]{0,255}$",
+        "maxLength": 256,
+        "reason": "system.setEnvironmentVariable requires a valid machine variable name scope."
+      },
+      "params": {
+        "value": {
+          "required": true,
+          "maxLength": 8192,
+          "noControlCharacters": true,
+          "reason": "system.setEnvironmentVariable requires a control-character-free string value under 8192 characters."
+        },
+        "name": {
+          "required": false,
+          "mustEqualScope": true,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_(). -]{0,255}$",
+          "maxLength": 256,
+          "reason": "system.setEnvironmentVariable name alias must match the scope exactly."
+        }
+      }
+    },
+    "system.hostsEntry.add": {
+      "elevated": true,
+      "hostImplemented": true,
+      "timeoutMs": 30000,
+      "scope": {
+        "label": "hostname",
+        "format": "hostname",
+        "maxLength": 253,
+        "noControlCharacters": true,
+        "reason": "system.hostsEntry.add requires a syntactically valid hostname scope."
+      },
+      "params": {
+        "address": {
+          "required": true,
+          "format": "ipAddress",
+          "maxLength": 45,
+          "noControlCharacters": true,
+          "reason": "system.hostsEntry.add requires a syntactically valid IPv4 or IPv6 address."
+        }
+      }
+    }
+  },
+  "controlOperations": ["host.health", "host.shutdown"]
+}

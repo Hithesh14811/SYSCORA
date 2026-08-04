@@ -31,6 +31,23 @@ import {
   CapabilityResolutionKind,
   resolveCapabilityId
 } from "../../shared-types/src/capability-resolution.js";
+import { EntityType } from "../../perception/src/entities.js";
+
+// Recursively checks whether a machine-context value carries screen/OCR/pixel
+// data (a durable ScreenSnapshot entity, or a nested screenSnapshot/ocrText/
+// pixelHash marker) as opposed to plain structured UIA control metadata. Used
+// to decide whether an external model call needs SCREENSHOT_OR_VISION consent.
+export function containsVisionContext(value, depth = 0) {
+  if (value == null || typeof value !== "object" || depth > 6) return false;
+  if (value.type === EntityType.ScreenSnapshot) return true;
+  if (typeof value.ocrText === "string" && value.ocrText.length > 0) return true;
+  if (typeof value.pixelHash === "string" && value.pixelHash.length > 0) return true;
+  if (value.screenSnapshot != null) return true;
+  if (Array.isArray(value)) {
+    return value.some((item) => containsVisionContext(item, depth + 1));
+  }
+  return Object.values(value).some((item) => containsVisionContext(item, depth + 1));
+}
 
 // ---- Strict schemas (Phase 4) -------------------------------------------
 
@@ -373,9 +390,19 @@ then local vision when equally effective.
 
 Choose one unresolved subgoal. Return exactly one canonical decision kind:
 ACT, OBSERVE, RECOVER, COMPLETE, FAIL, or CLARIFY.
-Prefer returning the complete deterministic
-happy-path strategy as action + localSteps so one reasoning call can execute
-many mechanical operations. Stop the local sequence before genuine ambiguity.
+
+Reasoning calls are a hard, scarce budget: machineContext.remainingBudgets
+.modelCalls is how many remain for the ENTIRE task. Returning one action per
+call exhausts that budget before a multi-step request finishes. So you MUST
+return the complete remaining deterministic happy path in this single decision
+as action + localSteps (typically 2-5 steps), not just the immediate next step.
+If the request names several operations ("open X, type Y, then screenshot"),
+every one of them belongs in this one response. Give each step an
+"expectedPostcondition" so the controller can execute and verify the whole
+sequence deterministically, from durable screen diffs and grounded-element
+checks, without asking you again between steps.
+Stop the local sequence only at a genuine branch point that needs fresh
+observation — not merely to confirm that a step you already ordered worked.
 Every action is:
 { "capability": "registered.name", "inputs": {}, "modality": "..." }.
 Within localSteps, consume the immediately preceding action's output with a

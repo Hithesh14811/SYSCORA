@@ -157,6 +157,68 @@ class TaskGraphScheduler {
     return readyTasks
   }
 
+  // The set of resources a task contends for. Two tasks may only run
+  // concurrently when these sets are disjoint.
+  //
+  // Capability-declared resources ("desktop", "browser", "clipboard") are the
+  // coarse channel. They are not sufficient on their own: two actions on the
+  // SAME window both declare "desktop" but would also interleave keystrokes, so
+  // the concrete target identity (window, application, file, service) is part of
+  // the key too.
+  taskResourceKeys(task) {
+    const capability = this.capabilityRegistry?.get?.(task.capability)
+    const keys = new Set()
+    for (const resource of capability?.execution?.resources ?? capability?.resources ?? []) {
+      keys.add(`resource:${resource}`)
+    }
+    const inputs = task.inputs ?? {}
+    const identity = [
+      ['window', inputs.windowId ?? inputs.target?.windowId],
+      ['application', inputs.application ?? inputs.target?.windowIdentity?.processName],
+      ['file', inputs.filePath ?? inputs.path],
+      ['service', inputs.serviceName],
+      ['process', inputs.processName ?? inputs.processId]
+    ]
+    for (const [kind, value] of identity) {
+      if (value != null && value !== '') keys.add(`${kind}:${String(value).toLowerCase()}`)
+    }
+    // A task whose contention surface is unknown is treated as exclusive rather
+    // than assumed independent — unknown fails conservatively.
+    if (keys.size === 0) keys.add(`exclusive:${task.taskId}`)
+    return keys
+  }
+
+  // Greedily pick the largest prefix-stable set of ready tasks whose resource
+  // sets are pairwise disjoint. Tasks left out stay ready for the next round, so
+  // ordering is preserved for anything that contends.
+  selectParallelBatch(readyTasks, { maxConcurrency = 4 } = {}) {
+    const batch = []
+    const claimed = new Set()
+    for (const task of readyTasks) {
+      if (batch.length >= Math.max(1, maxConcurrency)) break
+      const keys = this.taskResourceKeys(task)
+      if ([...keys].some((key) => claimed.has(key))) continue
+      for (const key of keys) claimed.add(key)
+      batch.push(task)
+    }
+    return batch
+  }
+
+  // Execute a set of ready tasks, running resource-disjoint ones concurrently
+  // and anything that contends in order. Returns results keyed by taskId.
+  async executeReadyTasks(readyTasks, { maxConcurrency = 4 } = {}) {
+    const results = new Map()
+    let remaining = [...readyTasks]
+    while (remaining.length > 0) {
+      const batch = this.selectParallelBatch(remaining, { maxConcurrency })
+      const settled = await Promise.all(batch.map(async (task) => [task.taskId, await this.executeTask(task)]))
+      for (const [taskId, result] of settled) results.set(taskId, result)
+      const executed = new Set(batch.map((task) => task.taskId))
+      remaining = remaining.filter((task) => !executed.has(task.taskId))
+    }
+    return results
+  }
+
   async executeTask(task) {
     const capability = this.capabilityRegistry?.get(task.capability)
     if (!capability) throw new Error(`Unknown capability ${task.capability}`)

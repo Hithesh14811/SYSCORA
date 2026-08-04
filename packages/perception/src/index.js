@@ -268,6 +268,26 @@ export class PerceptionEngine {
     return { actionId, entityIds, relationshipIds };
   }
 
+  // On-demand screen/OCR/UIA snapshot capture, for the interactive GUI-control
+  // loop's before/after grounding. Delegates the actual capture+normalize work
+  // to the registered VisionProvider (there is at most one), then ingests the
+  // resulting ScreenSnapshot/ScreenElement entities through the same durable
+  // write path as every other provider — so a captured snapshot is queryable
+  // by the planner and visible to rollback/audit like any other entity.
+  async captureVisionSnapshot(request = {}, { force = false, now = new Date().toISOString() } = {}) {
+    const provider = this.providers.find((p) => p.name === "vision");
+    if (!provider || typeof provider.collect !== "function") {
+      return { available: false, reason: "vision-provider-not-registered", snapshot: null };
+    }
+    const raw = await provider.collect({ ...request, forceVision: force === true, includeVision: true });
+    const { entities, relationships, snapshot, reason } = provider.normalize(raw, { now });
+    if (!snapshot) {
+      return { available: false, reason: reason ?? raw?.reason ?? "vision-unavailable", snapshot: null };
+    }
+    const written = await this._ingestBatch({ entities, relationships });
+    return { available: true, snapshot, written };
+  }
+
   // Single choke point for action-effect persistence. Forwards the writer token
   // (required by SemanticState's single-writer guard) and turns any failure into
   // an observable event + thrown error instead of a silent drop.

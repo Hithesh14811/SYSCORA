@@ -29,7 +29,9 @@ export const EntityType = Object.freeze({
   PackageManager: "PackageManager",
   Container: "Container",
   Workspace: "Workspace",
-  Window: "Window"
+  Window: "Window",
+  ScreenSnapshot: "ScreenSnapshot",
+  ScreenElement: "ScreenElement"
 });
 
 export const RelationshipType = Object.freeze({

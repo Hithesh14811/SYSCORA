@@ -19,6 +19,7 @@ import {
   evaluateEvidenceLedger
 } from "../../shared-types/src/evidence-ledger.js";
 import { evaluatePostcondition } from "../../shared-types/src/postconditions.js";
+import { diffScreenSnapshots } from "../../perception/src/vision-provider.js";
 
 const DEFAULT_BUDGETS = Object.freeze({
   maxSteps: 24,
@@ -32,6 +33,12 @@ const DEFAULT_BUDGETS = Object.freeze({
 const TERMINAL = new Set(["COMPLETE", "FAILED", "NEEDS_USER"]);
 const SUCCESS = new Set(["VERIFIED", "PARTIALLY_VERIFIED"]);
 const MAX_MODEL_OBSERVATION_BYTES = 4_000;
+
+export function isUiFacingAction(action) {
+  return /^(application\.(launch|close)|window\.|ui\.|screen\.|ocr\.|vision\.|pointer\.|keyboard\.|gui\.)/.test(
+    String(action?.capability ?? "")
+  );
+}
 
 export const InteractiveConvergenceState = Object.freeze({
   SUPPORTED_ACTION: "SUPPORTED_ACTION",
@@ -104,12 +111,13 @@ function stablePerceptionValue(value) {
     Object.entries(value)
       .filter(([key]) => ![
         "targetId", "observedAt", "timestamp", "capturedAt", "confidence",
-        "runtimeId", "nativeWindowHandle"
+        "runtimeId", "nativeWindowHandle", "snapshotId", "capturePath", "cached"
       ].includes(key))
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([key, child]) => [key, stablePerceptionValue(child)])
   );
 }
+
 
 function stateFingerprint(perception) {
   return crypto.createHash("sha256")
@@ -391,6 +399,36 @@ export function evaluateSubgoalCompletion(subgoal, observations = [], actionResu
       };
     }
   }
+  // A grounded UI interaction can be the entire request (for example,
+  // "select the Harmless Mode control").  Do not require a model follow-up
+  // once the runtime has independently verified the action and perception
+  // shows an observable postcondition.  This remains deliberately narrow:
+  // the control must be named in the request, the exact runtime action must
+  // have succeeded, and the controller's postcondition measurement must show
+  // progress.  It does not treat a bare execution acknowledgement as proof.
+  const requestedControl = goal.match(/["']([^"']+)["']\s+(?:field|button|control|option|setting|mode)/i)?.[1]?.trim();
+  if (mutation && requestedControl) {
+    const requestedTokens = requestedControl.toLowerCase().match(/[a-z0-9]{2,}/g) ?? [];
+    const completedAction = actionResults.find((entry) => {
+      if (!entry?.succeeded || entry?.action?.capability !== "ui.action") return false;
+      if (entry?.verification?.status !== "VERIFIED") return false;
+      if (entry?.progressMeasurement?.state !== InteractiveConvergenceState.PROGRESS) return false;
+      const target = entry.action?.inputs?.target ?? entry.executionResult?.target;
+      const semantics = `${target?.name ?? ""} ${target?.automationId ?? ""}`.toLowerCase();
+      return requestedTokens.length > 0 && requestedTokens.every((token) => semantics.includes(token));
+    });
+    if (completedAction) {
+      const target = completedAction.action?.inputs?.target ?? completedAction.executionResult?.target;
+      return {
+        status: "COMPLETE",
+        result: {
+          summary: `${target?.name ?? requestedControl} was completed and independently verified.`,
+          control: target
+        },
+        evidence: `Grounded UI action on ${target?.name ?? requestedControl} produced the required observable postcondition and verified successfully.`
+      };
+    }
+  }
   const inspectionGoal = /\b(inspect|controls?|interface|available)\b/.test(goal);
   if (inspectionGoal && !mutation && (!navigationRequired || navigationSucceeded)) {
     const controls = [];
@@ -488,7 +526,14 @@ export function enumerateGroundedActionCandidates(goal, perception, exhaustedPai
         score += 6;
         relevant = true;
       }
-      if (action === "invoke" && /\b(click|invoke|press|calculate)\b/i.test(goal)) {
+      // A Button normally exposes InvokePattern rather than SelectionItemPattern.
+      // Natural-language requests such as "choose the Safe Preview control" or
+      // "select Harmless Mode" therefore still need to consider its `invoke`
+      // action.  Previously those verbs only made SelectionItemPattern targets
+      // eligible, so the controller unnecessarily asked the model (and failed
+      // outright while the provider was unavailable) despite having a grounded,
+      // supported local action.
+      if (action === "invoke" && /\b(click|invoke|press|calculate|select|choose)\b/i.test(goal)) {
         score += 4;
         relevant = true;
       }
@@ -1008,6 +1053,181 @@ export function buildGuiToInternalStrategy(goal) {
   };
 }
 
+// Sub-step verbs whose effect the runtime can predict and verify on its own
+// (grounded target + durable screen diff), so resolving them never needs to
+// cost a model call.  This mirrors the planner's DIRECT_OPERATION shortcut, but
+// applies it to the *sub-steps* of an interactive session rather than only to
+// top-level intent routing.
+export const DETERMINISTIC_SUBGOAL_VERBS = Object.freeze(
+  new Set(["type", "click", "select", "screenshot", "scroll", "press"])
+);
+
+const COMPOUND_STEP_PATTERNS = Object.freeze([
+  { verb: "launch", pattern: /^(?:please\s+)?(?:open|launch|start|run)\s+(?:the\s+)?(?:windows\s+)?(.+?)\s*$/i, field: "application" },
+  { verb: "screenshot", pattern: /^(?:(?:take|capture|grab|get)\s+)?(?:a\s+|the\s+)?screen\s?shot(?:\s+(?:of|for)\s+(.+))?\s*$/i, field: "subject" },
+  { verb: "screenshot", pattern: /^capture\s+the\s+screen\s*$/i },
+  { verb: "type", pattern: /^(?:type|enter|write|input)\s+(?:in\s+|into\s+)?(.+?)\s*$/i, field: "text" },
+  { verb: "press", pattern: /^press\s+((?:ctrl|control|alt|shift|win|enter|return|tab|escape|esc|backspace|delete|f\d{1,2})\b.*?)\s*$/i, field: "keys" },
+  { verb: "scroll", pattern: /^scroll\s+(up|down|left|right)\b.*$/i, field: "direction" },
+  { verb: "click", pattern: /^(?:click|press|invoke|tap|push)\s+(?:on\s+)?(?:the\s+)?(.+?)(?:\s+(?:button|control|link|option|item))?\s*$/i, field: "targetName" },
+  { verb: "select", pattern: /^(?:select|choose)\s+(?:the\s+)?(.+?)(?:\s+(?:tab|option|item|control|section))?\s*$/i, field: "targetName" }
+]);
+
+/**
+ * Split a compound natural-language desktop request into ordered, typed
+ * sub-steps.  Quoted spans are masked before splitting so that a literal
+ * "type 'hello and goodbye'" is not torn apart by the conjunction splitter.
+ *
+ * Returns null unless EVERY segment maps to a known verb: a partially
+ * understood request must fall through to the existing strategies rather than
+ * silently dropping a clause the user asked for.
+ */
+export function parseCompoundDesktopRequest(goal) {
+  const raw = String(goal ?? "").trim();
+  if (!raw) return null;
+  const quoted = [];
+  const masked = raw.replace(/(["'])([^"']*)\1/g, (_match, _quote, inner) => {
+    quoted.push(inner);
+    return ` ${quoted.length - 1} `;
+  });
+  const unmask = (value) =>
+    String(value ?? "").replace(/ (\d+) /g, (_match, index) => quoted[Number(index)] ?? "");
+  const segments = masked
+    .split(/\s*[,;]\s*(?:and\s+|then\s+)?|\s+and\s+then\s+|\s+and\s+|\s+then\s+/i)
+    .map((segment) => segment.trim().replace(/[.\s]+$/, ""))
+    .filter(Boolean);
+  if (segments.length < 2) return null;
+  const steps = [];
+  for (const segment of segments) {
+    const matched = COMPOUND_STEP_PATTERNS
+      .map((candidate) => ({ candidate, match: segment.match(candidate.pattern) }))
+      .find((entry) => entry.match);
+    if (!matched) return null;
+    const { candidate, match } = matched;
+    const value = candidate.field ? unmask(match[1] ?? "").trim() : null;
+    if (candidate.field && candidate.field !== "subject" && !value) return null;
+    steps.push({
+      verb: candidate.verb,
+      ...(candidate.field ? { [candidate.field]: value } : {}),
+      source: unmask(segment)
+    });
+  }
+  return steps;
+}
+
+/**
+ * Compile a fully understood compound desktop request into one composition
+ * graph up front.  Every sub-step is mechanically derivable from the request
+ * plus runtime grounding, so the whole task executes with ZERO model calls
+ * instead of spending one reasoning call per micro-decision.
+ */
+export function buildDeterministicCompoundStrategy(goal) {
+  const steps = parseCompoundDesktopRequest(goal);
+  if (!steps || steps.length < 2) return null;
+  if (steps[0].verb !== "launch") return null;
+  const application = steps[0].application;
+  if (!application || /\b(?:file|folder|website|url|browser)\b/i.test(application)) return null;
+  if (!steps.slice(1).every((step) => DETERMINISTIC_SUBGOAL_VERBS.has(step.verb))) return null;
+
+  const localSteps = [
+    {
+      capability: "window.wait",
+      inputs: { application, timeoutMs: 10000 },
+      subgoal: `Wait for ${application} to present a window`,
+      deterministicStepIndex: 0
+    },
+    {
+      capability: "window.activate",
+      inputs: { application },
+      subgoal: `Focus ${application}`,
+      deterministicStepIndex: 0
+    }
+  ];
+  for (const [offset, step] of steps.slice(1).entries()) {
+    localSteps.push(...compileDeterministicSubgoal(step, application, offset + 1));
+  }
+  const terminal = localSteps.at(-1);
+  terminal.completesGoal = true;
+  terminal.completionResult = {
+    summary:
+      `${application} was opened and every requested step ran under runtime verification: ` +
+      `${steps.slice(1).map((step) => step.source).join("; ")}.`
+  };
+  return {
+    action: {
+      capability: "application.launch",
+      inputs: { application },
+      subgoal: `Open ${application}`,
+      deterministicStepIndex: 0
+    },
+    localSteps,
+    source: "DETERMINISTIC_COMPOUND_DESKTOP_COMPILER",
+    application,
+    steps
+  };
+}
+
+function compileDeterministicSubgoal(step, application, stepIndex) {
+  const tag = (action) => ({ ...action, deterministicStepIndex: stepIndex });
+  if (step.verb === "type") {
+    return [tag({
+      capability: "keyboard.type",
+      inputs: { application, text: step.text },
+      subgoal: `Type the requested text into ${application}`,
+      expectedEffect: `The text "${step.text}" becomes visible in the focused ${application} control.`
+    })];
+  }
+  if (step.verb === "screenshot") {
+    return [tag({
+      capability: "screen.capture",
+      inputs: { application },
+      subgoal: "Capture a screenshot",
+      expectedEffect: "A PNG of the current screen is written to a local capture path."
+    })];
+  }
+  if (step.verb === "press") {
+    return [tag({
+      capability: "keyboard.press",
+      inputs: { application, keys: step.keys },
+      subgoal: `Send ${step.keys} to ${application}`
+    })];
+  }
+  if (step.verb === "scroll") {
+    const delta = ["up", "left"].includes(String(step.direction).toLowerCase()) ? 3 : -3;
+    return [tag({
+      capability: "pointer.wheel",
+      inputs: { application, delta },
+      subgoal: `Scroll ${step.direction}`
+    })];
+  }
+  // click / select must consume a target the runtime actually grounded first.
+  const verb = step.verb === "select" ? "select" : "click";
+  return [
+    tag({
+      capability: "ui.find",
+      inputs: { application, selector: { nameContains: step.targetName } },
+      subgoal: `Ground the ${step.targetName} control`
+    }),
+    tag({
+      capability: "ui.action",
+      inputs: { application, target: "$last.output.target", action: verb },
+      subgoal: `${verb === "select" ? "Select" : "Click"} ${step.targetName}`
+    })
+  ];
+}
+
+/**
+ * Per-session model-call budget. A compound task legitimately needs more
+ * reasoning headroom than a single-step one, so the budget varies by task
+ * shape instead of being a flat global constant.
+ */
+export function computeSessionModelCallBudget(goal, strategy, floor = DEFAULT_BUDGETS.maxModelCalls) {
+  const strategySteps = strategy ? 1 + (strategy.localSteps?.length ?? 0) : 0;
+  const parsedSteps = parseCompoundDesktopRequest(goal)?.length ?? 0;
+  const plannedSteps = Math.max(strategySteps, parsedSteps, 1);
+  return Math.min(24, Math.max(floor, plannedSteps * 2));
+}
+
 export function buildExplicitApplicationLaunchStrategy(goal) {
   const text = String(goal ?? "").trim();
   const match = text.match(/^\s*(?:please\s+)?(?:open|launch|start)\s+(.+?)(?=\s+(?:and|then|to)\b|[.,;]|$)/i);
@@ -1075,6 +1295,85 @@ function validateCompletionEvidence(data, initialContext, state, trustedLocalEvi
   return { valid: errors.length === 0, errors };
 }
 
+const BUDGET_EXHAUSTION_REASONS = Object.freeze(
+  new Set(["max-model-calls", "max-steps", "max-elapsed-time"])
+);
+
+/**
+ * Evidence for an early clause must not be mistaken for evidence for the whole
+ * request.  "Open Notepad and type X then take a screenshot" is not complete
+ * once the text is typed: the screenshot is a clause the user explicitly asked
+ * for.  Completion is therefore blocked while any compiled step of the request
+ * is still queued or still unattempted.
+ */
+function outstandingRequestedSteps(state, pendingActions = []) {
+  const queued = pendingActions.map((action) => action.capability);
+  const plan = state.deterministicPlan;
+  const unattempted = [];
+  if (Array.isArray(plan)) {
+    const attempted = new Set(
+      (state.recentActions ?? [])
+        .map((entry) => entry.action?.deterministicStepIndex)
+        .filter(Number.isInteger)
+    );
+    for (const [index, step] of plan.entries()) {
+      if (index > 0 && DETERMINISTIC_SUBGOAL_VERBS.has(step.verb) && !attempted.has(index)) {
+        unattempted.push(step.source ?? step.verb);
+      }
+    }
+  }
+  return [...queued, ...unattempted];
+}
+
+/**
+ * A budget ceiling is a limit on how much *reasoning* the session may spend, not
+ * a statement that nothing was accomplished.  When the primary goal capability
+ * already succeeded under runtime verification, discarding the evidence ledger
+ * and reporting a bare failure loses real, audited progress.  Return the
+ * partial-success shape instead so the caller can report
+ * COMPLETED_WITH_WARNINGS with that evidence attached.
+ *
+ * Returns null when nothing was actually achieved — a genuine failure must
+ * still surface as one.
+ */
+export function assessDegradedCompletion(state, reason) {
+  const ledgerEntries = state?.evidenceLedger?.entries ?? [];
+  if (!ledgerEntries.length) return null;
+  const succeededActions = (state.recentActions ?? []).filter((entry) => entry.succeeded);
+  if (!succeededActions.length) return null;
+  const primaryPattern = /^(?:application\.launch|browser\.launch|process\.start|filesystem\.write|package\.)/;
+  const primary = succeededActions.find((entry) => primaryPattern.test(String(entry.action?.capability ?? "")));
+  if (!primary) return null;
+  const completedCapabilities = succeededActions.map((entry) => entry.action?.capability);
+  const attempted = (state.recentActions ?? [])
+    .filter((entry) => !entry.succeeded)
+    .map((entry) => entry.action?.capability);
+  return {
+    reason,
+    result: {
+      summary:
+        `${primary.action.capability} completed and was runtime-verified, but the session reached its ` +
+        `${reason} ceiling before every requested step could be confirmed.`,
+      completedCapabilities,
+      attemptedWithoutConfirmation: [...new Set(attempted)],
+      evidenceIds: ledgerEntries.map((entry) => entry.evidenceId).filter(Boolean)
+    },
+    verification: {
+      allCriteriaSatisfied: false,
+      locallyEvaluated: true,
+      partial: true,
+      satisfiedCriteria: succeededActions.map((entry) => ({
+        criterion: entry.action?.subgoal ?? entry.action?.capability,
+        evidence: entry.verification?.message ?? `${entry.action?.capability} was runtime-verified`
+      }))
+    },
+    warnings: [
+      `Session stopped at the ${reason} budget ceiling before all requested steps were confirmed.`,
+      ...(attempted.length ? [`Unconfirmed steps: ${[...new Set(attempted)].join(", ")}`] : [])
+    ]
+  };
+}
+
 /**
  * Bounded perceive -> decide -> act -> observe -> verify controller.
  *
@@ -1087,6 +1386,7 @@ export class InteractiveAgentController {
     reasoningEngine,
     capabilityRegistry,
     perceive,
+    captureScreenSnapshot = null,
     executeAction,
     onEvent = null,
     budgets = {},
@@ -1095,9 +1395,13 @@ export class InteractiveAgentController {
     this.reasoningEngine = reasoningEngine;
     this.capabilityRegistry = capabilityRegistry;
     this.perceive = perceive;
+    this.captureScreenSnapshot = captureScreenSnapshot;
     this.executeAction = executeAction;
     this.onEvent = onEvent;
     this.budgets = { ...DEFAULT_BUDGETS, ...budgets };
+    // An explicitly supplied ceiling is authoritative — the adaptive
+    // per-session budget only applies when the caller left it to the default.
+    this.explicitModelCallBudget = Object.hasOwn(budgets ?? {}, "maxModelCalls");
     this.now = now;
   }
 
@@ -1184,6 +1488,53 @@ export class InteractiveAgentController {
     return { valid: errors.length === 0, errors };
   }
 
+  /**
+   * Resolve the next unsatisfied deterministic sub-step of a parsed compound
+   * request without consulting the model.
+   *
+   * Deliberately conservative: it only fires when the surface is already
+   * grounded, and it attempts any given sub-step at most once through this
+   * path, so a step the runtime cannot actually land still escalates to the
+   * model instead of spinning.
+   */
+  _resolveDeterministicContinuation(state, perception) {
+    const plan = state.deterministicPlan;
+    if (!Array.isArray(plan) || plan.length < 2) return null;
+    const grounded = perception?.groundedWindow ?? perception?.foregroundWindow ?? null;
+    if (!grounded) return null;
+    const application = plan[0]?.verb === "launch"
+      ? plan[0].application
+      : (grounded.ProcessName ?? grounded.processName ?? null);
+    if (!application) return null;
+
+    const satisfied = new Set(
+      (state.recentActions ?? [])
+        .filter((entry) => entry.succeeded && Number.isInteger(entry.action?.deterministicStepIndex))
+        .map((entry) => entry.action.deterministicStepIndex)
+    );
+    // The launch step is proven by the window actually being grounded.
+    satisfied.add(0);
+
+    const nextIndex = plan.findIndex((step, index) =>
+      index > 0 && DETERMINISTIC_SUBGOAL_VERBS.has(step.verb) && !satisfied.has(index)
+    );
+    if (nextIndex === -1) return null;
+    const attempts = state.deterministicAttempts.get(nextIndex) ?? 0;
+    if (attempts >= 1) return null;
+    state.deterministicAttempts.set(nextIndex, attempts + 1);
+
+    // Emit the whole remaining deterministic tail in one batch so the queue
+    // drains without returning to the model between steps.
+    const remaining = [];
+    for (let index = nextIndex; index < plan.length; index += 1) {
+      const step = plan[index];
+      if (!DETERMINISTIC_SUBGOAL_VERBS.has(step.verb)) break;
+      remaining.push(...compileDeterministicSubgoal(step, application, index));
+    }
+    if (!remaining.length) return null;
+    return remaining.filter((action) => Boolean(this.capabilityRegistry?.get?.(action.capability)));
+  }
+
   async run(goal, initialContext = {}) {
     if (typeof this.perceive !== "function" || typeof this.executeAction !== "function") {
       throw new Error("InteractiveAgentController requires perceive and executeAction");
@@ -1256,7 +1607,26 @@ export class InteractiveAgentController {
       ?? buildGuiToInternalStrategy(state.goal)
       ?? buildInternalToGuiTransferStrategy(state.goal)
       ?? buildCrossModalTransferStrategy(state.goal)
+      ?? buildDeterministicCompoundStrategy(state.goal)
       ?? buildExplicitApplicationLaunchStrategy(state.goal);
+    // A compound request needs more reasoning headroom than a single-step one.
+    // Derive the ceiling from the plan's shape at session start rather than
+    // relying on a flat global constant.
+    state.deterministicPlan = parseCompoundDesktopRequest(state.goal);
+    state.deterministicAttempts = new Map();
+    const budgets = {
+      ...this.budgets,
+      maxModelCalls: this.explicitModelCallBudget
+        ? this.budgets.maxModelCalls
+        : computeSessionModelCallBudget(state.goal, initialStrategy, this.budgets.maxModelCalls)
+    };
+    state.budgets = budgets;
+    await this.emit("ADAPTIVE_SESSION_BUDGET_RESOLVED", {
+      maxModelCalls: budgets.maxModelCalls,
+      baselineMaxModelCalls: this.budgets.maxModelCalls,
+      plannedSteps: (initialStrategy ? 1 + (initialStrategy.localSteps?.length ?? 0) : 0),
+      parsedSteps: state.deterministicPlan?.length ?? 0
+    });
     if (initialStrategy) {
       if (String(initialStrategy.source ?? "").startsWith("SUPPORTED_")) {
         const terminalStep = initialStrategy.localSteps?.at(-1);
@@ -1329,7 +1699,18 @@ export class InteractiveAgentController {
         state.recentActions.slice(-4),
         state.bindings
       );
-      if (localCompletion.status === "COMPLETE" && state.recentActions.some((entry) => entry.succeeded)) {
+      const outstandingAtTopOfLoop = outstandingRequestedSteps(state, pendingActions);
+      if (outstandingAtTopOfLoop.length && localCompletion.status === "COMPLETE") {
+        await this.emit("ADAPTIVE_COMPLETION_DEFERRED", {
+          reason: "requested steps remain unattempted",
+          outstanding: outstandingAtTopOfLoop
+        });
+      }
+      if (
+        localCompletion.status === "COMPLETE" &&
+        !outstandingAtTopOfLoop.length &&
+        state.recentActions.some((entry) => entry.succeeded)
+      ) {
         const proposedVerification = {
           allCriteriaSatisfied: true,
           locallyEvaluated: true,
@@ -1684,6 +2065,33 @@ export class InteractiveAgentController {
       else if (/^(ui|window|pointer|keyboard)\./.test(action.capability)) state.observability.uiaActions += 1;
       else state.observability.internalActions += 1;
       await this.emit("ADAPTIVE_ACTION_STARTING", { step: state.steps, action });
+      let beforeScreenSnapshot = null;
+      let afterScreenSnapshot = null;
+      let screenDiff = null;
+      if (isUiFacingAction(action) && typeof this.captureScreenSnapshot === "function") {
+        try {
+          beforeScreenSnapshot = await this.captureScreenSnapshot({
+            phase: "before",
+            action,
+            step: state.steps,
+            currentPerception: lastPerception,
+            force: true
+          });
+          await this.emit("ADAPTIVE_SCREEN_SNAPSHOT_CAPTURED", {
+            phase: "before",
+            step: state.steps,
+            action: action.capability,
+            snapshotId: beforeScreenSnapshot?.snapshotId ?? null
+          });
+        } catch (error) {
+          await this.emit("ADAPTIVE_SCREEN_SNAPSHOT_FAILED", {
+            phase: "before",
+            step: state.steps,
+            action: action.capability,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
       let outcome;
       try {
         outcome = await this.executeAction(action, {
@@ -1702,6 +2110,36 @@ export class InteractiveAgentController {
         state.reason = outcome.reason ?? "Approval or user input is required";
         break;
       }
+      if (isUiFacingAction(action) && typeof this.captureScreenSnapshot === "function") {
+        try {
+          afterScreenSnapshot = await this.captureScreenSnapshot({
+            phase: "after",
+            action,
+            step: state.steps,
+            currentPerception: lastPerception,
+            force: true
+          });
+          screenDiff = beforeScreenSnapshot && afterScreenSnapshot
+            ? diffScreenSnapshots(beforeScreenSnapshot, afterScreenSnapshot)
+            : null;
+          state.semanticState.latestScreenSnapshotId = afterScreenSnapshot?.snapshotId ?? null;
+          state.semanticState.latestScreenDiff = screenDiff;
+          await this.emit("ADAPTIVE_SCREEN_DIFF", {
+            step: state.steps,
+            action: action.capability,
+            beforeSnapshotId: beforeScreenSnapshot?.snapshotId ?? null,
+            afterSnapshotId: afterScreenSnapshot?.snapshotId ?? null,
+            diff: screenDiff
+          });
+        } catch (error) {
+          await this.emit("ADAPTIVE_SCREEN_SNAPSHOT_FAILED", {
+            phase: "after",
+            step: state.steps,
+            action: action.capability,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
       lastOutcome = {
         output: outcome?.executionResult,
         observation: outcome?.observation,
@@ -1718,6 +2156,29 @@ export class InteractiveAgentController {
       let succeeded = SUCCESS.has(verification.status);
       let progressMeasurement = null;
       let deterministicVerifierPending = false;
+      // Deterministic postcondition check for a batched sub-step: when the
+      // capability could not judge its own effect, the durable screen diff is
+      // authoritative evidence that the action landed. This replaces a model
+      // call per step. An explicit FAILED verification is never overridden.
+      if (
+        !succeeded &&
+        Number.isInteger(action.deterministicStepIndex) &&
+        screenDiff?.changed === true &&
+        verification.status !== "FAILED"
+      ) {
+        succeeded = true;
+        progressMeasurement = {
+          state: InteractiveConvergenceState.PROGRESS,
+          evidence: "durable-screen-snapshot-diff",
+          screenDiff
+        };
+        await this.emit("ADAPTIVE_DETERMINISTIC_POSTCONDITION_ACCEPTED", {
+          step: state.steps,
+          capability: action.capability,
+          stepIndex: action.deterministicStepIndex,
+          evidence: "durable-screen-snapshot-diff"
+        });
+      }
       if (action.capability === "ui.action") {
         const postActionPerception = await this.perceive({
           goal: state.goal,
@@ -1727,6 +2188,30 @@ export class InteractiveAgentController {
         state.currentPerception = postActionPerception;
         lastPerception = postActionPerception;
         progressMeasurement = measureUiProgress(expectedUiPostcondition, postActionPerception);
+        if (
+          expectedUiPostcondition?.kind === "OBSERVABLE_DELTA" &&
+          progressMeasurement.state !== InteractiveConvergenceState.PROGRESS &&
+          screenDiff?.changed === true
+        ) {
+          progressMeasurement = {
+            state: InteractiveConvergenceState.PROGRESS,
+            expected: expectedUiPostcondition,
+            evidence: "durable-screen-snapshot-diff",
+            screenDiff
+          };
+        }
+        // Some adapters return a freshly grounded action observation before the
+        // next broad perception cycle has caught up (common for selection state
+        // in Windows UIA).  Accept that observation only when it independently
+        // proves the exact predicted delta; never accept `performed: true` by
+        // itself.  This avoids discarding a verified interaction merely because
+        // the subsequent ambient scan is eventually consistent.
+        if (progressMeasurement.state !== InteractiveConvergenceState.PROGRESS && outcome?.observation) {
+          const actionObservationProgress = measureUiProgress(expectedUiPostcondition, outcome.observation);
+          if (actionObservationProgress.state === InteractiveConvergenceState.PROGRESS) {
+            progressMeasurement = actionObservationProgress;
+          }
+        }
         succeeded = succeeded && progressMeasurement.state === InteractiveConvergenceState.PROGRESS;
         state.semanticState.interactiveConvergence = progressMeasurement.state;
         await this.emit("ADAPTIVE_PROGRESS_MEASURED", {
@@ -1793,7 +2278,10 @@ export class InteractiveAgentController {
         executionResult: outcome?.executionResult,
         resultEnvelope: lastOutcome.resultEnvelope,
         verification,
-        progressMeasurement
+        progressMeasurement,
+        beforeScreenSnapshotId: beforeScreenSnapshot?.snapshotId ?? null,
+        afterScreenSnapshotId: afterScreenSnapshot?.snapshotId ?? null,
+        screenDiff
       });
       state.recentObservations.push(
         action.capability === "ui.action"
@@ -1909,7 +2397,14 @@ export class InteractiveAgentController {
         const ledgerCompletion = initialContext.goalContract?.enforceable
           ? evaluateEvidenceLedger(initialContext.goalContract, state.evidenceLedger, state.bindings)
           : null;
-        if (ledgerCompletion?.satisfied) {
+        const outstanding = outstandingRequestedSteps(state, pendingActions);
+        if (ledgerCompletion?.satisfied && outstanding.length) {
+          await this.emit("ADAPTIVE_COMPLETION_DEFERRED", {
+            reason: "goal-contract evidence is satisfied but requested steps remain",
+            outstanding
+          });
+        }
+        if (ledgerCompletion?.satisfied && !outstanding.length) {
           state.status = "COMPLETE";
           state.result = {
             summary: "All original goal criteria were satisfied by locally verified evidence.",
@@ -1978,7 +2473,24 @@ export class InteractiveAgentController {
         continue;
       }
       state.failedAttempts.push({ action, verification });
-      pendingActions = [];
+      // Discarding the whole batch on one soft failure is what forces a fresh
+      // model call per micro-step. Keep the tail when the remaining steps are
+      // genuinely independent of the one that failed — no runtime reference to
+      // its output, no declared dependency, no binding it was to produce.
+      const tailIsIndependent = pendingActions.length > 0
+        && Number.isInteger(action.deterministicStepIndex)
+        && pendingActions.every((queued) =>
+          !JSON.stringify(queued.inputs ?? {}).includes("$last")
+          && !(queued.dependsOn ?? []).includes(action.nodeId)
+          && (queued.requiresBindings ?? []).length === 0);
+      if (tailIsIndependent) {
+        await this.emit("ADAPTIVE_INDEPENDENT_BATCH_PRESERVED", {
+          failedCapability: action.capability,
+          remaining: pendingActions.map((queued) => queued.capability)
+        });
+      } else {
+        pendingActions = [];
+      }
       const sectionQuery = action.capability === "ui.find"
         && /TabItem$/i.test(String(action.inputs?.selector?.controlType ?? ""))
         ? action.inputs?.selector?.name ?? action.inputs?.selector?.nameContains
@@ -2038,10 +2550,12 @@ export class InteractiveAgentController {
     state.metrics.totalDurationMs = this.now() - startedAt;
     await this.emit("ADAPTIVE_CONTROLLER_FINISHED", {
       status: state.status,
+      completionStatus: state.completionStatus ?? null,
       reason: state.reason,
       metrics: state.metrics,
       steps: state.steps,
-      modelCalls: state.modelCalls
+      modelCalls: state.modelCalls,
+      maxModelCalls: budgets.maxModelCalls
     });
     return state;
   }

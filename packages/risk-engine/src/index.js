@@ -161,6 +161,29 @@ export class RiskEngine {
         reasons.push({ dimension: RiskDimension.DATA_SENSITIVITY, value: "CREDENTIAL", why: `Task references a sensitive key/value (${key || "value"}).` });
       }
 
+      // Browser interactions carry real exfiltration / unintended-action risk.
+      // Read-only navigation and extraction stay MEDIUM (declared on the
+      // capability), but interacting with a control whose own label says it
+      // submits, buys, sends or deletes is a consequential external effect.
+      // Classified from the SAME verb vocabulary used for OS actions, and, like
+      // every other rule here, raise-only.
+      const consequential = this._detectConsequentialBrowserAction(task);
+      if (consequential) {
+        evidence[RiskDimension.EXTERNAL_EFFECT] = maxRiskValue(
+          RiskDimension.EXTERNAL_EFFECT, evidence[RiskDimension.EXTERNAL_EFFECT], consequential.externalEffect
+        );
+        evidence[RiskDimension.MUTATION_IMPACT] = maxRiskValue(
+          RiskDimension.MUTATION_IMPACT, evidence[RiskDimension.MUTATION_IMPACT], "PERSISTENT"
+        );
+        reasons.push({
+          dimension: RiskDimension.EXTERNAL_EFFECT,
+          value: consequential.externalEffect,
+          why: `Browser interaction targets a consequential control (${consequential.matched}); ` +
+            "submitting, purchasing, sending or deleting through a page is an external effect " +
+            "this runtime cannot roll back."
+        });
+      }
+
       // Writing over an existing file is at least a persistent mutation.
       if (modifiesExistingEnvFile) {
         evidence[RiskDimension.MUTATION_IMPACT] = maxRiskValue(RiskDimension.MUTATION_IMPACT, evidence[RiskDimension.MUTATION_IMPACT], "PERSISTENT");
@@ -257,6 +280,52 @@ export class RiskEngine {
         taskCount: tasks.length
       }
     };
+  }
+
+  // Verbs that mark a page control as producing an irreversible external
+  // effect. Deliberately matched against the control's OWN accessible label /
+  // text / type, never against the user's phrasing, so a benign request cannot
+  // be talked into a low tier and a dangerous button cannot hide behind one.
+  // Graded by consequence, using the SAME externalEffect vocabulary as OS
+  // actions: money/security first, then communication, then any other external
+  // mutation. Ordered most-severe-first so the first match wins.
+  static CONSEQUENTIAL_BROWSER_VERBS = Object.freeze([
+    {
+      externalEffect: "FINANCIAL_OR_SECURITY",
+      pattern: /\b(buy|purchase|order|checkout|pay|payment|place\s+order|transfer|withdraw|deposit|subscribe|book\s+now|reserve)\b/i
+    },
+    {
+      externalEffect: "COMMUNICATION",
+      pattern: /\b(send|post|publish|reply|share|invite|message)\b/i
+    },
+    {
+      externalEffect: "EXTERNAL_MUTATION",
+      pattern: /\b(submit|confirm|delete|remove|destroy|sign\s+up|apply\s+now|save\s+changes|update)\b/i
+    }
+  ]);
+
+  _detectConsequentialBrowserAction(task) {
+    const capability = String(task?.capability ?? task?.selectedCapability ?? "");
+    if (!/^browser\.(click|type|select|download)$/.test(capability)) return null;
+    const inputs = task?.inputs ?? task?.action?.parameters ?? {};
+    const target = inputs.target ?? {};
+    // Matched against the control's OWN label/type — never the user's phrasing —
+    // so a benign request cannot talk a dangerous button into a lower tier.
+    const label = [target.text, target.name, target.controlType, target.role, target.id, inputs.value]
+      .filter((entry) => typeof entry === "string")
+      .join(" ");
+    for (const { externalEffect, pattern } of RiskEngine.CONSEQUENTIAL_BROWSER_VERBS) {
+      const matched = label.match(pattern)?.[0];
+      if (matched) return { matched, capability, externalEffect };
+    }
+    // A submit-typed control is consequential regardless of its wording.
+    if (String(target.type ?? "").toLowerCase() === "submit") {
+      return { matched: "submit-input", capability, externalEffect: "EXTERNAL_MUTATION" };
+    }
+    if (String(target.tag ?? "").toLowerCase() === "form") {
+      return { matched: "form", capability, externalEffect: "EXTERNAL_MUTATION" };
+    }
+    return null;
   }
 
   _resolveCapability(task) {

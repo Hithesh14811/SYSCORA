@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { PolicyEffect } from "../../shared-types/src/domain.js";
+import { PolicyEffect, ConfirmationLevel } from "../../shared-types/src/domain.js";
 import { buildApprovalManifest, APPROVAL_MANIFEST_VERSION } from "./approval-manifest.js";
 
 export class PermissionBroker {
@@ -35,7 +35,17 @@ export class PermissionBroker {
   //                      Echoed back on the decision so the runtime records
   //                      exactly what was approved and can detect a later plan
   //                      whose commitment differs.
-  evaluate({ policyDecision, autoApprove = false, approvalCommitment = null }) {
+  // Approval tiers, weakest to strongest:
+  //   autoApprove: false            - every confirmation stops for a human.
+  //   autoApprove: true             - CONFIRM-level work proceeds unattended.
+  //   autoApproveElevated: true     - ELEVATE-level work also proceeds
+  //                                   unattended. Strictly opt-in, and never
+  //                                   implied by autoApprove, because elevated
+  //                                   actions are the ones a mistake cannot be
+  //                                   walked back from.
+  //
+  // A DENY is never auto-approved at any tier: policy denial is terminal.
+  evaluate({ policyDecision, autoApprove = false, autoApproveElevated = false, approvalCommitment = null }) {
     if (!policyDecision || !policyDecision.effect) {
       return {
         required: true,
@@ -64,16 +74,31 @@ export class PermissionBroker {
       };
     }
 
+    // ELEVATE needs its own opt-in. An operator who enabled unattended
+    // CONFIRM has not thereby consented to unattended administrator actions.
+    const isElevated = confirmationLevel === ConfirmationLevel.ELEVATE;
+    const approved = isElevated
+      ? (autoApprove === true && autoApproveElevated === true)
+      : autoApprove === true;
+
     return {
       required: true,
-      approved: autoApprove === true,
+      approved,
       confirmationLevel,
       // The approval, if granted, is bound to THIS commitment. A later resume
       // whose recomputed commitment differs must not reuse this approval.
       approvalCommitment,
-      reason: autoApprove === true
-        ? "Approval granted by caller."
-        : "Approval required for this action."
+      // Surfaced so the runtime can record, on every single use, that a human
+      // checkpoint was skipped and at which tier.
+      unattendedApproval: approved && (isElevated || autoApprove === true),
+      elevatedApproval: approved && isElevated,
+      reason: approved
+        ? (isElevated
+            ? "Elevated action auto-approved by explicit unattended-elevation configuration."
+            : "Approval granted by caller.")
+        : (isElevated && autoApprove === true
+            ? "Elevated action requires explicit unattended-elevation opt-in; autoApprove alone is not sufficient."
+            : "Approval required for this action.")
     };
   }
 
