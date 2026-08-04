@@ -1,3 +1,5 @@
+import { readIntentSession } from "./intent-client.js";
+
 const generalIntentForm = document.getElementById("generalIntentForm");
 const form = document.getElementById("intentForm");
 const runProjectForm = document.getElementById("runProjectForm");
@@ -618,8 +620,8 @@ generalIntentForm.addEventListener("submit", async (event) => {
       },
       body: JSON.stringify(requestEnvelope)
     });
-    const json = await response.json();
-    renderSessionResult(json);
+    const session = await readIntentSession(response);
+    renderSessionResult({ session });
     await loadSessions();
   } catch (error) {
     executionSummary.innerHTML = "";

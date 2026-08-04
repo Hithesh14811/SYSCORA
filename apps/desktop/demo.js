@@ -4,6 +4,8 @@
 // approval, and shows a plain-language result. No runtime bypass — every action
 // flows through the canonical pipeline. Raw JSON is only shown in debug mode.
 
+import { readIntentSession } from "./intent-client.js";
+
 const TOKEN_STORAGE_KEY = "syscora_token";
 let apiToken = (window.syscora && window.syscora.apiToken)
   || sessionStorage.getItem(TOKEN_STORAGE_KEY)
@@ -265,14 +267,8 @@ async function submit(text) {
         autoApprove: Boolean(autoApprove?.checked)
       })
     });
+    const session = await readIntentSession(res);
     thinking.remove();
-    if (!res.ok) {
-      addBubble("assistant", textNode(`SYSCORA encountered a problem (${res.status}). Please try again.`));
-      return;
-    }
-    const json = await res.json();
-    const session = getPayload(json).session ?? json.session;
-    if (!session) { addBubble("assistant", textNode("No response from the runtime.")); return; }
     renderSession(session);
   } catch (err) {
     thinking.remove();
