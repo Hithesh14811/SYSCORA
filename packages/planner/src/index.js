@@ -407,8 +407,8 @@ export const OPERATION_PLANS = {
   // WinGet check or process-list scan is composed — Spotify is launched through
   // the known route inside the capability itself. Bounded timeout + retryBudget 0
   // (plus the capability's ABORT_ON_FAILURE) prevent any replan loop.
-  "spotify.track.play": (e) => [
-    buildTask("spotify.track.play", { query: spotifyQuery(e) }, {
+  "spotify.track.play": (e) => {
+    const playTask = buildTask("spotify.track.play", { query: spotifyQuery(e) }, {
       goal: `Play ${spotifyQuery(e)} in Spotify`,
       description: "Launch/focus Spotify, search, select the track, and start playback",
       riskHints: "LOW",
@@ -416,8 +416,23 @@ export const OPERATION_PLANS = {
       verificationCriteria: [`Spotify is playing ${spotifyQuery(e)}`],
       timeout: 28000,
       retryBudget: 0
-    })
-  ],
+    });
+    if (typeof e.queueQuery !== "string" || !e.queueQuery.trim()) return [playTask];
+    const queueQuery = e.queueQuery.trim();
+    return [
+      playTask,
+      buildTask("spotify.track.queue", { query: queueQuery }, {
+        goal: `Queue ${queueQuery} in Spotify`,
+        description: "Search for the requested follow-up track and add it to the Spotify queue",
+        dependencies: [playTask.taskId],
+        riskHints: "LOW",
+        completionCriteria: [`${queueQuery} is in the Spotify queue`],
+        verificationCriteria: [`Spotify queue contains ${queueQuery}`],
+        timeout: 30000,
+        retryBudget: 0
+      })
+    ];
+  },
   // Developer workflow. The caller resolves ordered steps from the project
   // profile (install, run) into entities.steps; the planner turns them into a
   // linear dependency chain of developer.command.run tasks.

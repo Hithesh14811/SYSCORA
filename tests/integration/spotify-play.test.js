@@ -26,7 +26,7 @@ import { ContextEngine } from "../../packages/context-engine/src/index.js";
 
 let counter = 0;
 
-async function buildRuntime(adapter) {
+async function buildRuntime(adapter, { reasoningEngine = null } = {}) {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), `syscora-spot-${counter++}-`));
   const registry = createDefaultCapabilityRegistry(adapter);
   const runtime = new AgentRuntime({
@@ -39,9 +39,10 @@ async function buildRuntime(adapter) {
     recoveryEngine: new RecoveryEngine(),
     troubleshootingEngine: new TroubleshootingEngine(),
     adapter,
+    ...(reasoningEngine ? { reasoningEngine } : {}),
     // Deterministic intent classification; no semanticState/memory so no
     // perception sweep runs (mirrors the runtime fast path for this operation).
-    intentEngine: new IntentEngine(null),
+    intentEngine: new IntentEngine(reasoningEngine),
     contextEngine: new ContextEngine([])
   });
   return { runtime, tempRoot };
@@ -67,6 +68,64 @@ test("successful play is reported COMPLETED with the now-playing track", async (
     assert.equal(s.finalResponse.status, "COMPLETED", `expected COMPLETED, got ${s.finalResponse.status}`);
     const lastMessage = s.verifications.at(-1)?.message ?? "";
     assert.match(lastMessage, /Playing "The Weeknd - Cry For Me" in Spotify/);
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("compound play and queue request completes both ordered capabilities", async () => {
+  const calls = [];
+  const { runtime, tempRoot } = await buildRuntime({
+    playSpotifyTrack: async (query) => {
+      calls.push(["play", query]);
+      return { query, available: true, invoked: true, playback: { playing: true, title: "Jagave Neenu Gelathiye" } };
+    },
+    readSpotifyPlayback: async () => ({ running: true, playing: true, title: "Jagave Neenu Gelathiye", nowPlaying: "Jagave Neenu Gelathiye" }),
+    queueSpotifyTrack: async (query) => {
+      calls.push(["queue", query]);
+      return { query, available: true, queued: true };
+    },
+    readSpotifyQueue: async (query) => ({ query, queued: true, evidence: "Cry For Me", source: "queue-panel" })
+  });
+  try {
+    const session = await runtime.submitIntent("play jagave neenu gelatiye on spotify and then put cry for me on queue", { autoApprove: true });
+    assert.equal(session.finalResponse.status, "COMPLETED");
+    assert.deepEqual(session.plan.taskGraph.tasks.map((task) => task.capability), ["spotify.track.play", "spotify.track.queue"]);
+    assert.deepEqual(calls, [["play", "jagave neenu gelatiye"], ["queue", "cry for me"]]);
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("model-routed Spotify request keeps the typed plan ahead of generic interactive control", async () => {
+  let interactiveCalls = 0;
+  const reasoningEngine = {
+    hasModel: () => true,
+    isModelHealthy: async () => true,
+    understandIntent: async () => ({ ok: true, data: {
+      operation: "spotify.track.play",
+      normalizedGoal: "Play Jagave Neenu Gelatiye and queue Cry For Me",
+      category: "APPLICATION",
+      entities: {},
+      successCriteria: ["Jagave Neenu Gelatiye is playing", "Cry For Me is queued"],
+      confidence: 0.95
+    } }),
+    decideInteractiveAction: async () => {
+      interactiveCalls += 1;
+      throw new Error("generic interactive controller must not run");
+    }
+  };
+  const { runtime, tempRoot } = await buildRuntime({
+    playSpotifyTrack: async (query) => ({ query, available: true, invoked: true, playback: { playing: true, title: "Jagave Neenu Gelathiye" } }),
+    readSpotifyPlayback: async () => ({ running: true, playing: true, title: "Jagave Neenu Gelathiye", nowPlaying: "Jagave Neenu Gelathiye" }),
+    queueSpotifyTrack: async (query) => ({ query, available: true, queued: true }),
+    readSpotifyQueue: async (query) => ({ query, queued: true, evidence: "Cry For Me" })
+  }, { reasoningEngine });
+  try {
+    const session = await runtime.submitIntent("play jagave neenu gelatiye on spotify and then put cry for me on queue", { autoApprove: true });
+    assert.equal(session.finalResponse.status, "COMPLETED");
+    assert.equal(interactiveCalls, 0);
+    assert.deepEqual(session.plan.taskGraph.tasks.map((task) => task.capability), ["spotify.track.play", "spotify.track.queue"]);
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }

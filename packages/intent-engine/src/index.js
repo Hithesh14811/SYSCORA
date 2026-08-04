@@ -80,7 +80,15 @@ export class IntentEngine {
           knownOperations: KNOWN_OPERATIONS
         })
       : null;
-    if (modelUnderstanding?.ok) modelResult = modelUnderstanding.data;
+    // A real model (or an explicitly injected reasoning test double) may route
+    // the request. The built-in MockModelProvider only returns canned fixtures;
+    // treating those as user intent can turn an unrelated fixture into an
+    // executable task (for example, Spotify becoming a WinGet search).
+    const exposesModelProvider = this.reasoningEngine
+      && Object.prototype.hasOwnProperty.call(this.reasoningEngine, "modelProvider");
+    const modelCanRouteIntent = !exposesModelProvider
+      || providerIsRemoteModel(this.reasoningEngine.modelProvider);
+    if (modelUnderstanding?.ok && modelCanRouteIntent) modelResult = modelUnderstanding.data;
 
     // Rollback fast path (system-internal). A rollback is an explicit operation
     // triggered by the runtime/daemon, never free-form natural language, so it
@@ -184,7 +192,30 @@ export class IntentEngine {
     if (modelResult) {
       const chosen = typeof modelResult.operation === "string" ? modelResult.operation.trim() : "";
       if (chosen && KNOWN_OPERATION_SET.has(chosen)) {
-        const intent = this._buildOperationIntent(intentId, text, chosen, modelResult, context);
+        let operationResult = modelResult;
+        // A model may correctly choose Spotify playback while omitting the
+        // concrete track entities. Recover only those bounded entities from the
+        // original request, and preserve a second queue instruction when the
+        // user supplied a compound command.
+        if (chosen === "spotify.track.play" || chosen === "spotify.track.open") {
+          const extracted = this.extractSpotifyTrackRequest(lower, text);
+          if (extracted) {
+            const modelEntities = modelResult.entities && typeof modelResult.entities === "object"
+              ? modelResult.entities
+              : {};
+            const hasTrack = ["query", "trackQuery", "track", "trackTitle", "song", "songTitle", "title"]
+              .some((key) => typeof modelEntities[key] === "string" && modelEntities[key].trim());
+            operationResult = {
+              ...modelResult,
+              entities: {
+                ...modelEntities,
+                ...(!hasTrack ? { query: extracted.query } : {}),
+                ...(extracted.queueQuery ? { queueQuery: extracted.queueQuery } : {})
+              }
+            };
+          }
+        }
+        const intent = this._buildOperationIntent(intentId, text, chosen, operationResult, context);
         const validation = validateSchema(intent, USER_INTENT_SCHEMA);
         if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
         return intent;
@@ -193,17 +224,23 @@ export class IntentEngine {
 
     const spotifyRequest = llmFirst ? null : this.extractSpotifyTrackRequest(lower, text);
     if (spotifyRequest) {
-      const { query, operation } = spotifyRequest;
+      const { query, queueQuery, operation } = spotifyRequest;
       const playing = operation === "spotify.track.play";
+      const queued = playing && Boolean(queueQuery);
       const intent = {
         intentId, rawText: text,
-        normalizedGoal: playing ? `Play ${query} in Spotify` : `Open Spotify results for ${query}`,
+        normalizedGoal: queued
+          ? `Play ${query} in Spotify and queue ${queueQuery}`
+          : (playing ? `Play ${query} in Spotify` : `Open Spotify results for ${query}`),
         category: "APPLICATION",
         operation,
-        entities: { workspacePath: context.workspacePath ?? process.cwd(), query },
+        entities: { workspacePath: context.workspacePath ?? process.cwd(), query, ...(queueQuery ? { queueQuery } : {}) },
         constraints: [], preferences: [], assumptions: [], unknowns: [],
-        successCriteria: [playing ? `Spotify is playing ${query}` : `Spotify opens results for ${query}`],
-        requiredContext: [], requiredCapabilities: [operation],
+        successCriteria: [
+          playing ? `Spotify is playing ${query}` : `Spotify opens results for ${query}`,
+          ...(queueQuery ? [`${queueQuery} is in the Spotify queue`] : [])
+        ],
+        requiredContext: [], requiredCapabilities: [operation, ...(queueQuery ? ["spotify.track.queue"] : [])],
         confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
       };
       const validation = validateSchema(intent, USER_INTENT_SCHEMA);
@@ -521,6 +558,20 @@ export class IntentEngine {
     const wantsPlay = /\b(play|listen to)\b/.test(normalizedLower);
     const wantsOpen = /\b(open|search)\b/.test(normalizedLower);
     if (!wantsPlay && !wantsOpen) return null;
+    const compoundPatterns = [
+      /\b(?:play|listen to)\s+["“]?(.+?)["”]?\s+on\s+spotify\s+(?:and\s+then|then|and)\s+(?:put|add)\s+["“]?(.+?)["”]?\s+(?:on|to)\s+(?:the\s+)?queue\s*$/i,
+      /\b(?:play|listen to)\s+["“]?(.+?)["”]?\s+on\s+spotify\s+(?:and\s+then|then|and)\s+queue(?:\s+up)?\s+["“]?(.+?)["”]?\s*$/i
+    ];
+    for (const pattern of compoundPatterns) {
+      const match = normalizedRaw.match(pattern);
+      if (match?.[1] && match?.[2]) {
+        return {
+          query: match[1].trim().replace(/^["“]+|["”]+$/g, "").trim(),
+          queueQuery: match[2].trim().replace(/^["“]+|["”]+$/g, "").trim(),
+          operation: "spotify.track.play"
+        };
+      }
+    }
     // Pull the track name out of the common phrasings, e.g.
     //   "open spotify and play "Cry For Me""
     //   "play Cry For Me by The Weeknd on Spotify"

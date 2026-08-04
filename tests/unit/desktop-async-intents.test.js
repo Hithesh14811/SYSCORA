@@ -52,13 +52,32 @@ test("desktop intent client preserves synchronous compatibility", async () => {
   assert.deepEqual(result, session);
 });
 
+test("desktop intent client returns a resumable approval session without waiting for terminal", async () => {
+  const session = { sessionId: "session_approval", finalResponse: { status: "AWAITING_APPROVAL" } };
+  const result = await readIntentSession(jsonResponse(202, {
+    status: "RUNNING",
+    sessionId: session.sessionId,
+    statusUrl: `/api/intents/${session.sessionId}/status`
+  }), {
+    pollIntervalMs: 0,
+    fetchImpl: async () => jsonResponse(200, {
+      sessionId: session.sessionId,
+      status: "AWAITING_APPROVAL",
+      settled: true,
+      terminal: false,
+      session
+    })
+  });
+  assert.deepEqual(result, session);
+});
+
 test("both desktop intent forms consume the shared async response handler", () => {
   const demoHtml = fs.readFileSync(path.join(repoRoot, "apps/desktop/demo.html"), "utf8");
   const demoJs = fs.readFileSync(path.join(repoRoot, "apps/desktop/demo.js"), "utf8");
   const consoleJs = fs.readFileSync(path.join(repoRoot, "apps/desktop/app.js"), "utf8");
 
   assert.match(demoHtml, /<script src="\/demo\.js" type="module"><\/script>/);
-  assert.match(demoJs, /readIntentSession\(res\)/);
+  assert.match(demoJs, /readIntentSession\(res,\s*\{/);
   assert.match(consoleJs, /readIntentSession\(response\)/);
   assert.doesNotMatch(demoJs, /No response from the runtime\./);
 });

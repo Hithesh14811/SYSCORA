@@ -6,6 +6,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { IntentEngine } from "../../packages/intent-engine/src/index.js";
+import { ReasoningEngine } from "../../packages/reasoning-engine/src/index.js";
+import { MockModelProvider } from "../../packages/model-providers/src/index.js";
 import { GeneralPlanner, PlanValidator } from "../../packages/planner/src/index.js";
 import {
   createDefaultCapabilityRegistry,
@@ -13,7 +15,7 @@ import {
 } from "../../packages/capability-registry/src/index.js";
 import { RiskEngine } from "../../packages/risk-engine/src/index.js";
 import { PolicyEngine } from "../../packages/policy-engine/src/index.js";
-import { WindowsAdapter } from "../../os-adapters/windows/src/windows-adapter.js";
+import { WindowsAdapter, spotifyNameMatchesQuery } from "../../os-adapters/windows/src/windows-adapter.js";
 
 // ---- Intent extraction (deterministic, model-free) --------------------------
 
@@ -47,6 +49,39 @@ test("intent: a request without Spotify is not treated as a track request", asyn
   assert.notEqual(intent.operation, "spotify.track.play");
 });
 
+test("intent: compound play and queue request preserves both track names", async () => {
+  const intent = await new IntentEngine(null).classify("play jagave neenu gelatiye on spotify and then put cry for me on queue");
+  assert.equal(intent.operation, "spotify.track.play");
+  assert.equal(intent.entities.query, "jagave neenu gelatiye");
+  assert.equal(intent.entities.queueQuery, "cry for me");
+  assert.deepEqual(intent.requiredCapabilities, ["spotify.track.play", "spotify.track.queue"]);
+});
+
+test("intent: the built-in mock provider cannot replace a Spotify request with a canned fixture", async () => {
+  const reasoning = new ReasoningEngine({ modelProvider: new MockModelProvider() });
+  const intent = await new IntentEngine(reasoning).classify(
+    "play jagave neenu gelatiye on spotify and then put cry for me on queue"
+  );
+  assert.equal(intent.operation, "spotify.track.play");
+  assert.equal(intent.entities.query, "jagave neenu gelatiye");
+  assert.equal(intent.entities.queueQuery, "cry for me");
+});
+
+test("LLM-selected Spotify operation is enriched when the model omits track entities", async () => {
+  const reasoning = {
+    understandIntent: async () => ({ ok: true, data: {
+      operation: "spotify.track.play",
+      normalizedGoal: "Play Jagave Neenu Gelatiye and queue Cry For Me",
+      entities: {},
+      successCriteria: ["Both requested Spotify actions complete"],
+      confidence: 0.95
+    } })
+  };
+  const intent = await new IntentEngine(reasoning).classify("play jagave neenu gelatiye on spotify and then put cry for me on queue");
+  assert.equal(intent.entities.query, "jagave neenu gelatiye");
+  assert.equal(intent.entities.queueQuery, "cry for me");
+});
+
 // ---- Routing skips LLM planning (DIRECT_OPERATION) --------------------------
 
 test("planner: play request maps 1:1 to spotify.track.play and skips the model", async () => {
@@ -72,6 +107,18 @@ test("planner: the play task carries a bounded timeout and no retry budget", asy
   const task = plan.taskGraph.tasks[0];
   assert.ok(task.timeout <= 30000, "task timeout stays within the capability bound");
   assert.equal(task.retryBudget, 0, "no runtime replan retry for the UI task");
+});
+
+test("planner: compound request becomes ordered play then queue tasks", async () => {
+  const intent = await new IntentEngine(null).classify("play jagave neenu gelatiye on spotify and then put cry for me on queue");
+  const registry = createDefaultCapabilityRegistry({});
+  const plan = await new GeneralPlanner(null, registry).generatePlan(intent, []);
+  const [play, queue] = plan.taskGraph.tasks;
+  assert.deepEqual([play.capability, queue.capability], ["spotify.track.play", "spotify.track.queue"]);
+  assert.equal(play.inputs.query, "jagave neenu gelatiye");
+  assert.equal(queue.inputs.query, "cry for me");
+  assert.deepEqual(queue.dependencies, [play.taskId]);
+  assert.deepEqual(new PlanValidator(registry).validatePlan(plan.taskGraph), { valid: true, errors: [] });
 });
 
 test("planner: model-provided track alias becomes the Spotify query", async () => {
@@ -158,10 +205,50 @@ test("Spotify selector binds a generic Play button to the matching result bounds
   const result = await adapter._invokeSpotifyPlayButton("cry for me", 1000, 1234);
   assert.equal(result.invoked, true);
   assert.equal(result.matchedLabel, "Cry For Me");
-  assert.match(script, /\$button\.CenterX/);
-  assert.match(script, /\$button\.CenterY/);
+  assert.match(script, /ControlViewWalker\.GetParent/);
+  assert.match(script, /NameProperty,'Play'/);
   assert.match(script, /\$rr\.Height -gt 260/);
-  assert.doesNotMatch(script, /GetParent\(\$row\)/, "must never climb to the page/root and select the global player");
+  assert.match(script, /\$depth-lt 5/, "ancestor search must remain bounded");
+});
+
+test("Spotify accessible-name matching tolerates the search correction seen in the live app", () => {
+  assert.equal(
+    spotifyNameMatchesQuery("Play Jagave Neenu Gelathiye by Arjun Janya, Shashank, Sid Sriram", "Jagave Neenu Gelatiye"),
+    true
+  );
+  assert.equal(spotifyNameMatchesQuery("Play Jagave Neenu Gelathiye", "Cry For Me"), false);
+});
+
+test("Spotify queue uses the matching options control and Add to queue menu item", async () => {
+  const adapter = new WindowsAdapter();
+  adapter.launchApplication = async () => ({ launch: { started: true } });
+  adapter.waitForApplicationWindow = async () => ({ ready: true, window: { WindowHandle: 1234 } });
+  adapter.openSpotifySearch = async () => ({ launch: { opened: true } });
+  let invocation = null;
+  adapter._invokeSpotifyQueueButton = async (...args) => {
+    invocation = args;
+    return { found: true, invoked: true, matchedLabel: "Cry For Me" };
+  };
+
+  const result = await adapter.queueSpotifyTrack("Cry For Me", { searchSettleMs: 200 });
+  assert.equal(result.queued, true);
+  assert.deepEqual(invocation, ["Cry For Me", 8000, 1234]);
+  assert.equal(result.matchedTrack, "Cry For Me");
+});
+
+test("Spotify queue selector stays localized and has a grounded click fallback", async () => {
+  const adapter = new WindowsAdapter();
+  let script = "";
+  adapter.runPowerShell = async (value) => {
+    script = value;
+    return { exitCode: 0, stdout: JSON.stringify({ found: true, invoked: true, matchedLabel: "Cry For Me" }), stderr: "" };
+  };
+  const result = await adapter._invokeSpotifyQueueButton("Cry For Me", 1000, 1234);
+  assert.equal(result.invoked, true);
+  assert.match(script, /More options for \*/);
+  assert.match(script, /NameProperty,'Add to queue'/);
+  assert.match(script, /BoundingRectangle/);
+  assert.match(script, /SetCursorPos/);
 });
 
 test("live Spotify verification uses Player controls Pause plus Now playing label", async () => {

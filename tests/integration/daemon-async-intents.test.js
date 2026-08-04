@@ -56,17 +56,20 @@ function createFakeRuntime({ stepDelayMs = 15 } = {}) {
     async submitIntent(rawText, options = {}) {
       counter += 1;
       const sessionId = `session_fake_${counter}`;
+      const awaitingApproval = rawText === "needs approval";
       const session = {
         sessionId,
         createdAt: new Date().toISOString(),
-        currentState: "COMPLETED",
+        currentState: awaitingApproval ? "REQUEST_CONFIRMATION_IF_REQUIRED" : "COMPLETED",
         intent: null,
         plan: null,
         taskResults: [],
         observations: [],
         verifications: [],
         events: [],
-        finalResponse: { status: "COMPLETED", message: `handled: ${rawText}` }
+        finalResponse: awaitingApproval
+          ? { status: "AWAITING_APPROVAL", reason: "Approval required" }
+          : { status: "COMPLETED", message: `handled: ${rawText}` }
       };
       options.onSessionStarted?.(sessionId);
       for (const eventType of ["INTENT_RECEIVED", "PLAN_GENERATED", "TASK_EXECUTED", "FINAL_VERIFICATION_COMPLETED"]) {
@@ -181,6 +184,21 @@ describe("Daemon async intent HTTP contract", () => {
     );
     assert.ok(received.some((event) => event.eventType === "FINAL_VERIFICATION_COMPLETED"));
     assert.ok(received.some((event) => event.type === "SESSION_SETTLED"));
+  });
+
+  it("settles and exposes a resumable approval session without marking it terminal", async () => {
+    const submitted = await api(port, "POST", "/api/intents", { body: { text: "needs approval" } });
+    const deadline = Date.now() + 20000;
+    let status = null;
+    while (Date.now() < deadline) {
+      const polled = await api(port, "GET", submitted.json.statusUrl);
+      if (polled.json.settled) { status = polled.json; break; }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(status, "approval session must settle within the deadline");
+    assert.equal(status.status, "AWAITING_APPROVAL");
+    assert.equal(status.terminal, false);
+    assert.equal(status.session.finalResponse.status, "AWAITING_APPROVAL");
   });
 
   it("returns 404 for an unknown session on both progress channels", async () => {

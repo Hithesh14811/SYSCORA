@@ -57,6 +57,31 @@ function spotifyQueryTokens(value) {
   return [...new Set(String(value ?? "").toLowerCase().match(/[a-z0-9]{2,}/g)?.filter((token) => !ignored.has(token)) ?? [])].slice(0, 8);
 }
 
+function spotifyTokenDistance(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diagonal = row[0]; row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const prior = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = prior;
+    }
+  }
+  return row[b.length];
+}
+
+export function spotifyNameMatchesQuery(name, query) {
+  const expected = spotifyQueryTokens(query);
+  const candidates = spotifyQueryTokens(name);
+  return expected.length > 0 && expected.every((token) => candidates.some((candidate) =>
+    candidate === token || spotifyTokenDistance(candidate, token) <= 1
+  ));
+}
+
+function uiBounds(target) {
+  return target?.boundingRect ?? target?.bounds ?? {};
+}
+
 function identityTokens(value) {
   return new Set(
     String(value ?? "").toLowerCase().match(/[a-z0-9]+/g)?.filter((token) => token.length > 1) ?? []
@@ -1039,10 +1064,12 @@ export class WindowsAdapter {
       `$tokens=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedTokens}')) | ConvertFrom-Json);`,
       `$query=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedQuery}'));`,
       `$displayQuery=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedDisplayQuery}'));`,
-      // Search itself handles spelling correction. UI targeting must be exact
-      // and fast: all meaningful query tokens must be present as whole words.
-      // Avoid per-element edit-distance loops across Spotify's large UI tree.
-      "$matches={ param($name) if(-not $name){ return $false }; $words=@(([string]$name).ToLower() -split '[^a-z0-9]+' | Where-Object { $_ }); foreach($token in @($tokens)){ if($words -notcontains ([string]$token)){ return $false } }; return $true };",
+      "$lowerQuery=$query.ToLower();$queryVariants=@($displayQuery);foreach($digraph in @('t','d','k','g','p','b','c','s')){for($i=0;$i-lt$lowerQuery.Length;$i++){if($lowerQuery[$i]-eq$digraph){$queryVariants+=[cultureinfo]::InvariantCulture.TextInfo.ToTitleCase($lowerQuery.Insert($i+1,'h'))}}};",
+      // Spotify frequently corrects spelling in search results. Accept a single
+      // insertion/deletion/substitution per meaningful token, matching the same
+      // tolerance used by independent playback verification.
+      "$near={param($a,$b);$a=[string]$a;$b=[string]$b;if($a -eq $b){return $true};if([Math]::Abs($a.Length-$b.Length)-gt 1){return $false};if($a.Length -eq $b.Length){$d=0;for($i=0;$i-lt$a.Length;$i++){if($a[$i]-ne$b[$i]){$d++}};return $d-le 1};$long=if($a.Length-gt$b.Length){$a}else{$b};$short=if($a.Length-gt$b.Length){$b}else{$a};for($i=0;$i-lt$long.Length;$i++){if(($long.Remove($i,1))-eq$short){return $true}};return $false};",
+      "$matches={ param($name) if(-not $name){ return $false }; $words=@(([string]$name).ToLower() -split '[^a-z0-9]+' | Where-Object { $_ }); foreach($token in @($tokens)){ $hit=$false;foreach($word in $words){if(& $near ([string]$word) ([string]$token)){$hit=$true;break}};if(-not $hit){return $false} }; return $true };",
       "$play=$null;",
       "$matchedLabel=$null;",
       "$matchedBounds=$null;",
@@ -1054,18 +1081,13 @@ export class WindowsAdapter {
       // PropertyConditionFlags.IgnoreCase is used. Try exact user casing, then
       // the title-cased display form that Spotify normally exposes.
       "  try{$nameCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$query);$labels=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$nameCond);if($labels.Count -eq 0 -and $displayQuery -ne $query){$displayCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$displayQuery);$labels=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$displayCond)}}catch{$labels=@()};",
-      // If Spotify decorated the title, fall back to a single broad scan and the
-      // exact token matcher; this path remains bounded by the outer deadline.
-      "  if($labels.Count -eq 0){try{$labels=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)}catch{$labels=@()}};",
-      // Spotify's top-result card exposes the title as DataItem/Group/Hyperlink
-      // and its button merely as "Play". Match any accessible label, but accept
-      // a generic Play button only when its centre lies inside the same bounded
-      // result row. The root, page and bottom player are too tall to qualify.
-      // Snapshot button properties once. Repeated descendant queries on Spotify's
-      // web-backed DataItems can block for seconds and were the source of the
-      // previous timeout.
-      "  try{$buttonElements=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$buttonCond);$buttonData=@($buttonElements|ForEach-Object{$button=$_;$br=$button.Current.BoundingRectangle;if(-not $button.Current.IsOffscreen -and $button.Current.IsEnabled -and $br.Width -gt 0 -and $br.Height -gt 0){[pscustomobject]@{Element=$button;Name=$button.Current.Name;Bounds=$br;CenterX=$br.X+($br.Width/2);CenterY=$br.Y+($br.Height/2)}}})}catch{$buttonData=@()};",
-      "  foreach($labelEl in $labels){try{$label=$labelEl.Current.Name;$rr=$labelEl.Current.BoundingRectangle;if($labelEl.Current.IsOffscreen -or -not (& $matches $label) -or $rr.Width -le 0 -or $rr.Height -le 0 -or $rr.Height -gt 260){continue};foreach($button in $buttonData){$sameRow=$button.CenterY -ge ($rr.Y-80) -and $button.CenterY -le ($rr.Y+$rr.Height+80);$nearLabel=$button.CenterX -ge ($rr.X-80) -and $button.CenterX -le ($rr.X+$rr.Width+900);if($sameRow -and $nearLabel -and $button.Name -match '^Play( |$)'){$score=1000-[Math]::Max(0,$rr.Y)-[Math]::Abs($button.CenterY-($rr.Y+($rr.Height/2)));if($button.Name -match '^Play ' -and (& $matches $button.Name)){$score+=500};if($score -gt $bestScore){$best=$button.Element;$bestScore=$score;$matchedLabel=$label;$matchedBounds=$rr}}}}catch{};if($best){break}};",
+      // Resolve Spotify's spelling correction with one provider-side UIA query
+      // over bounded single-edit title variants. Then search only the matching
+      // title's few ancestors for the generic Play button. This is substantially
+      // faster than walking every descendant in Spotify's Chromium tree.
+      "  if($labels.Count -eq 0){try{foreach($variant in @($queryVariants)){if($sw.ElapsedMilliseconds -ge (" + limit + "/2)){break};$variantCondition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,[string]$variant);$variantLabel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$variantCondition);if($variantLabel){$labels=@($variantLabel);break}}}catch{$labels=@()}};",
+      "  $playNameCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Play');$genericPlayCond=New-Object System.Windows.Automation.AndCondition($buttonCond,$playNameCond);",
+      "  foreach($labelEl in $labels){try{$label=$labelEl.Current.Name;$rr=$labelEl.Current.BoundingRectangle;if($labelEl.Current.IsOffscreen -or -not (& $matches $label) -or $rr.Width -le 0 -or $rr.Height -le 0 -or $rr.Height -gt 260){continue};$ancestor=$labelEl;for($depth=0;$depth-lt 5;$depth++){$ancestor=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor);if(-not $ancestor){break};$candidate=$ancestor.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$genericPlayCond);if($candidate -and -not $candidate.Current.IsOffscreen -and $candidate.Current.IsEnabled){$best=$candidate;$matchedLabel=$label;$matchedBounds=$rr;break}}}catch{};if($best){break}};",
       "  if($best){$play=$best;break};",
       "  if(-not $play){ Start-Sleep -Milliseconds 400 }",
       "};",
@@ -1086,6 +1108,86 @@ export class WindowsAdapter {
       reason: parsed?.reason ?? null,
       commandResult: ps
     };
+  }
+
+  // Add a requested track to Spotify's queue through accessible, named controls:
+  // search -> matching "More options" -> "Add to queue". No coordinates or
+  // ungrounded first-result fallback are used.
+  async queueSpotifyTrack(query, options = {}) {
+    const text = String(query ?? "").trim();
+    if (!text) throw new Error("A Spotify queue query is required");
+    const readyTimeoutMs = clampInt(options.readyTimeoutMs, 500, 20000, 8000);
+    const searchSettleMs = clampInt(options.searchSettleMs, 200, 6000, 1500);
+    const launch = await this.launchApplication("spotify");
+    const ready = await this.waitForApplicationWindow("spotify", readyTimeoutMs);
+    if (!ready.ready) return { query: text, available: false, queued: false, reason: "spotify-window-not-ready", launch, ready };
+
+    const search = await this.openSpotifySearch(text);
+    await new Promise((resolve) => setTimeout(resolve, searchSettleMs));
+    const added = await this._invokeSpotifyQueueButton(text, options.queueDeadlineMs ?? 8000, ready.window?.WindowHandle);
+    return {
+      query: text,
+      available: true,
+      queued: Boolean(added?.invoked),
+      reason: added?.invoked ? null : (added?.reason ?? "add-to-queue-failed"),
+      matchedTrack: added?.matchedLabel ?? null,
+      search,
+      added
+    };
+  }
+
+  async _invokeSpotifyQueueButton(query, deadlineMs, windowHandle = null) {
+    const limit = clampInt(deadlineMs, 500, 15000, 8000);
+    const tokens = spotifyQueryTokens(query);
+    if (tokens.length === 0) return { found: false, invoked: false, reason: "invalid-track-query" };
+    const encodedTokens = Buffer.from(JSON.stringify(tokens), "utf8").toString("base64");
+    const encodedQuery = Buffer.from(String(query).trim(), "utf8").toString("base64");
+    const script = [
+      "Add-Type -AssemblyName UIAutomationClient;Add-Type -AssemblyName UIAutomationTypes;Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class SyscoraSpotifyMouse{[DllImport(\"user32.dll\")]public static extern bool SetCursorPos(int x,int y);[DllImport(\"user32.dll\")]public static extern void mouse_event(uint f,uint x,uint y,uint d,UIntPtr e);}';",
+      "$windowHandle=" + Number(windowHandle || 0) + ";if($windowHandle -eq 0){[pscustomobject]@{found=$false;invoked=$false;reason='no-window'}|ConvertTo-Json -Compress;return};",
+      "$root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$windowHandle);",
+      `$tokens=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedTokens}'))|ConvertFrom-Json);$query=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedQuery}'));`,
+      "$near={param($a,$b);$a=[string]$a;$b=[string]$b;if($a-eq$b){return $true};if([Math]::Abs($a.Length-$b.Length)-gt 1){return $false};if($a.Length-eq$b.Length){$d=0;for($i=0;$i-lt$a.Length;$i++){if($a[$i]-ne$b[$i]){$d++}};return $d-le 1};$long=if($a.Length-gt$b.Length){$a}else{$b};$short=if($a.Length-gt$b.Length){$b}else{$a};for($i=0;$i-lt$long.Length;$i++){if($long.Remove($i,1)-eq$short){return $true}};return $false};",
+      "$matches={param($name);$words=@(([string]$name).ToLower()-split'[^a-z0-9]+'|Where-Object{$_});foreach($token in @($tokens)){$hit=$false;foreach($word in $words){if(&$near $word $token){$hit=$true;break}};if(-not$hit){return $false}};return $true};",
+      "$activate={param($el);try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern);$pattern.Invoke();return $true}catch{};try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern);$pattern.DoDefaultAction();return $true}catch{};try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern);$pattern.Select();return $true}catch{};try{$b=$el.Current.BoundingRectangle;if($b.Width-gt 0-and$b.Height-gt 0){[void][SyscoraSpotifyMouse]::SetCursorPos([int]($b.X+$b.Width/2),[int]($b.Y+$b.Height/2));[SyscoraSpotifyMouse]::mouse_event(2,0,0,0,[UIntPtr]::Zero);[SyscoraSpotifyMouse]::mouse_event(4,0,0,0,[UIntPtr]::Zero);return $true}}catch{};return $false};",
+      "$display=[cultureinfo]::InvariantCulture.TextInfo.ToTitleCase($query.ToLower());$variants=@($display);foreach($digraph in @('t','d','k','g','p','b','c','s')){for($i=0;$i-lt$query.Length;$i++){if($query[$i]-eq$digraph){$variants+=[cultureinfo]::InvariantCulture.TextInfo.ToTitleCase($query.ToLower().Insert($i+1,'h'))}}};",
+      "$label=$null;foreach($variant in $variants){$cond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$variant);$label=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$cond);if($label){break}};",
+      "if(-not$label){[pscustomobject]@{found=$false;invoked=$false;reason='matching-track-not-found'}|ConvertTo-Json -Compress;return};",
+      "$buttonCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button);$option=$null;$ancestor=$label;",
+      "for($depth=0;$depth-lt 5;$depth++){$ancestor=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor);if(-not$ancestor){break};$buttons=$ancestor.FindAll([System.Windows.Automation.TreeScope]::Descendants,$buttonCond);foreach($button in $buttons){if($button.Current.Name-like'More options for *'-and(&$matches $button.Current.Name)){$option=$button;break}};if($option){break}};",
+      "if(-not$option){[pscustomobject]@{found=$false;invoked=$false;reason='matching-track-options-not-found'}|ConvertTo-Json -Compress;return};",
+      "if(-not(&$activate $option)){[pscustomobject]@{found=$true;invoked=$false;reason='track-options-not-opened'}|ConvertTo-Json -Compress;return};Start-Sleep -Milliseconds 350;",
+      "$queueName=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Add to queue');$queue=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$queueName);if(-not$queue){[pscustomobject]@{found=$true;invoked=$false;reason='add-to-queue-control-not-found'}|ConvertTo-Json -Compress;return};",
+      "$invoked=&$activate $queue;[pscustomobject]@{found=$true;invoked=$invoked;matchedLabel=$label.Current.Name;optionName=$option.Current.Name}|ConvertTo-Json -Compress"
+    ].join(" ");
+    const ps = await this.runPowerShell(script, { timeoutMs: limit + 4000 });
+    let parsed = null;
+    try { parsed = JSON.parse(ps.stdout || "null"); } catch { parsed = null; }
+    return { ...parsed, found: Boolean(parsed?.found), invoked: Boolean(parsed?.invoked), commandResult: ps };
+  }
+
+  // Independent postcondition probe. Prefer Spotify's live-region confirmation;
+  // otherwise open the Queue panel and require the requested track below a queue
+  // heading in the same right-side region.
+  async readSpotifyQueue(query) {
+    const text = String(query ?? "").trim();
+    if (!text) return { queued: false, reason: "invalid-track-query" };
+    const playback = await this.readSpotifyPlayback();
+    const handle = playback.window?.WindowHandle;
+    if (!handle) return { queued: false, query: text, reason: "spotify-window-not-ready" };
+    const encodedQuery = Buffer.from(text, "utf8").toString("base64");
+    const script = [
+      "Add-Type -AssemblyName UIAutomationClient;Add-Type -AssemblyName UIAutomationTypes;$root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]" + Number(handle) + ");",
+      "$queueCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Queue');$queue=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$queueCond);if($queue){try{$qp=$queue.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern);if($qp.Current.ToggleState-eq[System.Windows.Automation.ToggleState]::Off){$qp.Toggle()}}catch{}};Start-Sleep -Milliseconds 300;",
+      `$query=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedQuery}'));$display=[cultureinfo]::InvariantCulture.TextInfo.ToTitleCase($query.ToLower());`,
+      "$nameCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$display);$labels=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$nameCond);$rb=$root.Current.BoundingRectangle;$match=$null;foreach($label in $labels){$b=$label.Current.BoundingRectangle;if(-not$label.Current.IsOffscreen-and$b.X-ge($rb.X+($rb.Width*0.55))){$match=$label;break}};[pscustomobject]@{queued=[bool]$match;evidence=if($match){$match.Current.Name}else{$null}}|ConvertTo-Json -Compress"
+    ].join(" ");
+    const ps = await this.runPowerShell(script, { timeoutMs: 7000 });
+    let parsed = null;
+    try { parsed = JSON.parse(ps.stdout || "null"); } catch { parsed = null; }
+    return parsed?.queued
+      ? { queued: true, query: text, evidence: parsed.evidence, source: "queue-panel", commandResult: ps }
+      : { queued: false, query: text, reason: "track-not-observed-in-queue", commandResult: ps };
   }
 
   // General-purpose, read-only UI perception.  It deliberately returns the

@@ -2025,6 +2025,49 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
+  registry.register({
+    name: "spotify.track.queue",
+    version: "1.0.0",
+    description: "Add a requested track to the Spotify playback queue through grounded accessible controls",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" }, options: { type: "object" } },
+      required: ["query"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["SESSION"], type: "WRITE" },
+    // Queue state is ephemeral playback state rather than a persistent account,
+    // filesystem, or system mutation.
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.query === "string" && args.query.trim() !== "",
+    execute: async (args) => adapter.queueSpotifyTrack(args.query, args.options ?? {}),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "spotify.track.queue", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId,
+      detectedChanges: result?.queued ? ["application.queue"] : [],
+      confidence: result?.queued ? 0.9 : 0.5, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation, args) => {
+      const result = observation?.structuredState ?? {};
+      const query = String(args?.query ?? result.query ?? "").trim();
+      if (result.available === false) {
+        return { status: "FAILED", message: "Spotify was not available, so the track could not be queued.", evidence: result, confidence: 1 };
+      }
+      const live = typeof adapter.readSpotifyQueue === "function"
+        ? await adapter.readSpotifyQueue(query)
+        : { queued: false, reason: "queue-verifier-unavailable" };
+      return live.queued
+        ? { status: "VERIFIED", message: `Queued "${query}" in Spotify.`, evidence: live, confidence: 0.9 }
+        : { status: "FAILED", message: `I could not confirm "${query}" was added to the Spotify queue.`, evidence: live, confidence: 1 };
+    },
+    timeout: 35000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    recoveryHints: ["ABORT_ON_FAILURE"],
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
   /* Removed compatibility registrations. Kept as a non-executable migration
    * record until the next source compaction; they cannot enter discovery.
   registry.register({

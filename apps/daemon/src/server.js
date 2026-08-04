@@ -54,8 +54,43 @@ function inferContentType(filePath) {
 }
 
 
-export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
-  const runtime = createRuntime(basePath);
+export function startServer({ port = 4317, basePath = process.cwd(), runtime: injectedRuntime = null, warmHost = true } = {}) {
+  const runtime = injectedRuntime ?? createRuntime(basePath);
+  const intentRuns = new Map();
+  const terminalStates = new Set(["COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "TIMED_OUT", "CANCELLED", "ROLLED_BACK", "DENIED", "PLAN_REJECTED"]);
+
+  const writeSse = (response, event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
+  const publish = (sessionId, event) => {
+    const run = intentRuns.get(sessionId);
+    if (!run) return;
+    run.events.push(event);
+    for (const subscriber of run.subscribers) writeSse(subscriber, event);
+  };
+  const priorOnSessionEvent = runtime.onSessionEvent;
+  runtime.onSessionEvent = (sessionId, event) => {
+    priorOnSessionEvent?.(sessionId, event);
+    publish(sessionId, event);
+  };
+
+  const ensureRun = (sessionId) => {
+    if (!intentRuns.has(sessionId)) {
+      intentRuns.set(sessionId, { sessionId, status: "RUNNING", settled: false, terminal: false, session: null, events: [], subscribers: new Set() });
+    }
+    return intentRuns.get(sessionId);
+  };
+
+  const settleRun = (sessionId, session, error = null) => {
+    const run = ensureRun(sessionId);
+    run.session = session ?? null;
+    run.settled = true;
+    run.status = error ? "FAILED" : (session?.finalResponse?.status ?? session?.currentState ?? "FAILED");
+    run.terminal = error ? true : terminalStates.has(run.status) || terminalStates.has(session?.currentState);
+    const settled = { type: "SESSION_SETTLED", sessionId, status: run.status, terminal: run.terminal, error: error?.message ?? null };
+    publish(sessionId, settled);
+    publish(sessionId, { type: "STREAM_END", sessionId, status: run.status });
+    for (const subscriber of run.subscribers) subscriber.end();
+    run.subscribers.clear();
+  };
   // Opt-in signed capability plugins (SYSCORA_PLUGIN_DIR + trusted keys). Loading
   // is best-effort at startup and never blocks the server; a failure to load a
   // plugin leaves the built-in capabilities intact.
@@ -93,6 +128,41 @@ export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
         return;
       }
 
+      const progressMatch = requestUrl.pathname.match(/^\/api\/intents\/([^/]+)\/(status|stream)$/);
+      if (request.method === "GET" && progressMatch) {
+        const [, sessionId, channel] = progressMatch;
+        const run = intentRuns.get(sessionId);
+        if (!run) {
+          sendJson(response, 404, { error: "Unknown intent session." });
+          return;
+        }
+        if (channel === "status") {
+          sendJson(response, 200, {
+            sessionId,
+            status: run.status,
+            settled: run.settled,
+            terminal: run.terminal,
+            eventCount: run.events.length,
+            latestEvent: run.events.at(-1) ?? null,
+            session: run.session
+          });
+          return;
+        }
+        response.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          connection: "keep-alive"
+        });
+        for (const event of run.events) writeSse(response, event);
+        if (run.settled) {
+          response.end();
+        } else {
+          run.subscribers.add(response);
+          request.on("close", () => run.subscribers.delete(response));
+        }
+        return;
+      }
+
       if (request.method === "POST" && requestUrl.pathname === "/api/intents") {
         const body = await readJsonBody(request);
         const parsed = parseRequestBodyWithEnvelope(body, "intent_request");
@@ -101,14 +171,42 @@ export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
           sendJson(response, 400, { error: "text is required." });
           return;
         }
-        const session = await runtime.submitIntent(payload.text, {
+        const runOptions = {
           workspacePath: basePath,
           autoApprove: payload.autoApprove === true
+        };
+        if (requestUrl.searchParams.get("sync") === "true") {
+          const session = await runtime.submitIntent(payload.text, runOptions);
+          const legacy = buildSessionResponse(session);
+          sendJson(response, 200, {
+            envelope: buildEnvelope("intent_response", legacy, parsed.requestId),
+            ...legacy
+          });
+          return;
+        }
+
+        let resolveStarted;
+        let rejectStarted;
+        let submittedSessionId = null;
+        const started = new Promise((resolve, reject) => { resolveStarted = resolve; rejectStarted = reject; });
+        const runPromise = Promise.resolve(runtime.submitIntent(payload.text, {
+          ...runOptions,
+          onSessionStarted: (sessionId) => {
+            submittedSessionId = sessionId;
+            ensureRun(sessionId);
+            resolveStarted(sessionId);
+          }
+        }));
+        runPromise.then((session) => settleRun(session.sessionId, session)).catch((error) => {
+          if (submittedSessionId) settleRun(submittedSessionId, null, error);
+          rejectStarted(error);
         });
-        const legacy = buildSessionResponse(session);
-        sendJson(response, 200, {
-          envelope: buildEnvelope("intent_response", legacy, parsed.requestId),
-          ...legacy
+        const sessionId = await started;
+        sendJson(response, 202, {
+          status: "RUNNING",
+          sessionId,
+          statusUrl: `/api/intents/${sessionId}/status`,
+          streamUrl: `/api/intents/${sessionId}/stream`
         });
         return;
       }

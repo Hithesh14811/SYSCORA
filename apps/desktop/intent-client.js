@@ -50,8 +50,11 @@ export async function readIntentSession(response, {
 
     const status = payloadOf(statusJson);
     onProgress(status);
+    // submitIntent has returned whenever the daemon exposes a session. Some
+    // returned states are resumable rather than terminal (notably approval),
+    // but the UI must render them immediately instead of polling forever.
+    if (status?.session) return status.session;
     if (status?.terminal) {
-      if (status.session) return status.session;
       throw new Error(`Runtime ended with status ${status.status ?? "UNKNOWN"} without a session result.`);
     }
     await delay(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));

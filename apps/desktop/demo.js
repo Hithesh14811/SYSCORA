@@ -67,6 +67,7 @@ function humanizeEvent(ev) {
   const t = ev.eventType;
   const d = ev.details ?? {};
   switch (t) {
+    case "VERIFICATION_UNCERTAIN": return { icon: "!", text: `Not verified: ${d.message || d.capability || "step"}` };
     case "INTENT_RECEIVED": return { icon: "•", text: "Understanding your request…" };
     case "INTENT_CLASSIFIED": return { icon: "•", text: `Understood: ${d.normalizedGoal ?? "request"}` };
     case "CONTEXT_COLLECTED": return { icon: "•", text: "Inspecting relevant system state…" };
@@ -267,7 +268,13 @@ async function submit(text) {
         autoApprove: Boolean(autoApprove?.checked)
       })
     });
-    const session = await readIntentSession(res);
+    const session = await readIntentSession(res, {
+      onProgress: (status) => {
+        if (!thinking.isConnected) return;
+        const progress = humanizeEvent(status?.latestEvent ?? {});
+        if (progress?.text) thinking.replaceChildren(textNode(progress.text));
+      }
+    });
     thinking.remove();
     renderSession(session);
   } catch (err) {

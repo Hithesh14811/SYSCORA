@@ -157,7 +157,74 @@ export class AgentRuntime {
     }
   }
 
+  _createSession(options = {}) {
+    return {
+      sessionId: createId("session"),
+      createdAt: new Date().toISOString(),
+      receivedAtMs: Date.now(),
+      currentState: RuntimeState.RECEIVE_INTENT,
+      intent: null,
+      goalContract: null,
+      context: null,
+      plan: null,
+      riskAssessment: null,
+      policyDecision: null,
+      rollback: { records: [], completed: false, result: null },
+      taskResults: [],
+      observations: [],
+      verifications: [],
+      diagnoses: [],
+      recoveryBudget: createRecoveryBudget(),
+      replanAttempts: 0,
+      finalResponse: null,
+      events: [],
+      autoApprove: options.autoApprove === true
+    };
+  }
+
   async submitIntent(rawText, options = {}) {
+    const timeoutMs = Number(options.maxElapsedTime);
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return this._submitIntent(rawText, options);
+    }
+
+    let startedSessionId = null;
+    let timer = null;
+    const callerStarted = options.onSessionStarted;
+    const work = this._submitIntent(rawText, {
+      ...options,
+      onSessionStarted: (sessionId) => {
+        startedSessionId = sessionId;
+        callerStarted?.(sessionId);
+      }
+    });
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({
+        sessionId: startedSessionId ?? createId("session_timeout"),
+        createdAt: new Date().toISOString(),
+        currentState: RuntimeState.FAILED,
+        intent: null,
+        plan: null,
+        taskResults: [],
+        observations: [],
+        verifications: [],
+        events: [],
+        deadlineExceeded: true,
+        finalResponse: {
+          status: "TIMED_OUT",
+          message: `Session exceeded its ${timeoutMs}ms wall-clock deadline.`,
+          timeoutMs
+        }
+      }), timeoutMs);
+    });
+    try {
+      return await Promise.race([work, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _submitIntent(rawText, options = {}) {
     const MAX_REPLAN_ATTEMPTS = 2; // Bounded replanning - max 2 attempts
     let replanAttempts = 0;
     let originalPlan = null;
@@ -191,6 +258,7 @@ export class AgentRuntime {
       // but a materially riskier replan is still re-gated — see _authorizePlan).
       autoApprove: options.autoApprove === true
     };
+    options.onSessionStarted?.(session.sessionId);
 
     await this.addSessionEvent(session, "INTENT_RECEIVED", { rawText });
     await this.persistSession(session);
@@ -339,7 +407,17 @@ export class AgentRuntime {
         buildInternalToGuiTransferStrategy(rawText) ??
         buildExplicitApplicationLaunchStrategy(rawText)
       );
+      // Spotify has a complete typed workflow (including compound play+queue
+      // entities) whose capabilities perform their own grounded perception and
+      // postcondition verification. Do not let a generic GUI strategy replace
+      // that safer, more specific plan merely because the wording contains
+      // "put" or another interactive verb.
+      const preferTypedInteractiveOperation = new Set([
+        "spotify.track.open",
+        "spotify.track.play"
+      ]).has(session.intent.operation);
       const earlyInteractiveGoal =
+        !preferTypedInteractiveOperation &&
         (!session.intent.operation || hasLocalInteractiveStrategy) &&
         (
           ["APPLICATION", "BROWSER"].includes(String(session.intent.category ?? "").toUpperCase()) ||
@@ -759,14 +837,8 @@ export class AgentRuntime {
     }
   }
 
-  // Autonomous-execution approval classifier. Returns { requiresApproval, reasons }
-  // for a candidate plan. Approval is required ONLY for the three risky action
-  // classes; everything else is autonomous:
-  //   1. DELETE — a task that deletes a file or uninstalls/removes an app.
-  //   2. EDIT-EXISTING-FILE — a write-class task whose target FILE already exists
-  //      (creating a new file is autonomous; overwriting an existing one is an edit).
-  //   3. NON-WINGET INSTALL — installing software sourced from a browser/external
-  //      site (WinGet installs from the signed community source are exempt).
+  // Supplementary action classifier for approval explanations and audit.
+  // Policy remains authoritative; this classifier cannot relax a policy control.
   // Existence is probed via the adapter (cheap, read-only). If existence cannot be
   // determined for a write, we fail SAFE (require approval) rather than silently
   // editing an existing file. Deterministic and side-effect free.
@@ -780,6 +852,11 @@ export class AgentRuntime {
       const inputs = task?.inputs ?? {};
       const capability = this.capabilityRegistry?.get?.(name) ?? null;
 
+      if (/^(?:package\..*\.install|application\.install)$/.test(name)) {
+        reasons.push(`${name} installs software and requires approval.`);
+        continue;
+      }
+
       // (1) DELETE — file deletion or app uninstall/removal.
       if (name === "filesystem.delete" || name === "application.uninstall" || name === "package.uninstall") {
         reasons.push(`${name} deletes from the system and requires approval.`);
@@ -789,8 +866,8 @@ export class AgentRuntime {
       // Generic UI interaction can change a third-party account, submit a form,
       // or purchase something. Inspection is read-only; click/type requires an
       // explicit approval bound to the exact selector and text in the plan.
-      if (name === "gui.interact") {
-        reasons.push("gui.interact can alter a third-party application and requires approval.");
+      if (["gui.interact", "ui.action", "browser.click", "browser.type", "browser.select", "browser.download"].includes(name)) {
+        reasons.push(`${name} can alter local or external state and requires approval when policy requires confirmation.`);
         continue;
       }
 
@@ -800,10 +877,9 @@ export class AgentRuntime {
       // capability ships today, so this is driven by an explicit capability flag
       // rather than by guessing from a name.
       const installSource = capability?.installSource ?? capability?.security?.installSource ?? null;
-      const isWinget = name.startsWith("package.winget.") || installSource === "winget";
       const isExternalInstall = (installSource && installSource !== "winget")
         || capability?.requiresBrowserDownload === true;
-      if (isExternalInstall && !isWinget) {
+      if (isExternalInstall) {
         reasons.push(`${name} installs software from a non-WinGet/browser source and requires approval.`);
         continue;
       }
@@ -949,35 +1025,17 @@ export class AgentRuntime {
       });
     }
 
-    // AUTONOMOUS-EXECUTION APPROVAL SCOPE. Per the autonomous-controller policy,
-    // explicit user approval is required ONLY for the three risky action classes:
-    //   (1) deleting files/apps, (2) editing an EXISTING file, and
-    //   (3) installing software sourced from a browser (non-WinGet).
-    // Every other action proceeds autonomously. We compute that classification for
-    // THIS plan and, when it is not risky, grant the CONFIRM-level approval on the
-    // caller's behalf (fold into autoApprove). A policy DENY still fails closed
-    // above/inside evaluate(); a plan classified risky still parks in
-    // AWAITING_APPROVAL unless the caller supplied standing autoApprove. The
-    // cryptographic commitment binding and replan re-gate are unchanged — this only
-    // narrows WHEN the human is asked, never what is bound or audited.
+    // Record supplementary classification, but never manufacture authorization.
+    // Only caller-supplied scoped approval may satisfy CONFIRM or ELEVATE.
     const approvalClass = await this._classifyPlanApproval(plan);
-    // SAFETY FLOOR (never relaxed). The autonomous narrowing may only grant
-    // approval on the caller's behalf for genuinely benign, standard-user
-    // mutations. It must NEVER auto-approve:
-    //   - a destructive or irreversible mutation (the generalized form of the
-    //     "delete from the system" risky class), or
-    //   - a privileged/elevated operation (ELEVATE) — those keep their own
-    //     token-gated approval and re-gate on replan.
-    // This preserves the M2.1 replan-escalation guarantee: a LOW plan that replans
-    // into a HIGH/destructive/elevated task still PARKS for fresh approval.
     const dims = riskAssessment?.dimensions ?? {};
     const destructiveOrIrreversible =
       dims[RiskDimension.MUTATION_IMPACT] === "DESTRUCTIVE" ||
       dims[RiskDimension.REVERSIBILITY] === "IRREVERSIBLE";
     const needsElevation = policyDecision.confirmationLevel === ConfirmationLevel.ELEVATE;
-    const canRelax = approvalClass.requiresApproval === false
-      && !destructiveOrIrreversible
-      && !needsElevation;
+    // Policy is authoritative. Classification is recorded for audit and
+    // explanation, but it cannot mint approval for CONFIRM or ELEVATE.
+    const canRelax = false;
     await this.addSessionEvent(session, ev("APPROVAL_SCOPE_CLASSIFIED", "REPLAN_APPROVAL_SCOPE_CLASSIFIED"), {
       requiresApproval: approvalClass.requiresApproval,
       reasons: approvalClass.reasons,
@@ -985,7 +1043,7 @@ export class AgentRuntime {
       destructiveOrIrreversible,
       needsElevation
     });
-    const effectiveAutoApprove = autoApprove === true || canRelax;
+    const effectiveAutoApprove = autoApprove === true;
 
     const permissionDecision = this.permissionBroker.evaluate({
       policyDecision,
@@ -1217,7 +1275,11 @@ export class AgentRuntime {
 
         await this.addSessionEvent(session, "TASK_EXECUTED", { taskId: task.taskId, result: executionResult });
         await this.addSessionEvent(session, "OBSERVATION_COLLECTED", observation);
-        await this.addSessionEvent(session, "VERIFICATION_COMPLETED", verification);
+        await this.addSessionEvent(
+          session,
+          verification.status === "VERIFIED" ? "VERIFICATION_COMPLETED" : "VERIFICATION_UNCERTAIN",
+          verification
+        );
         const lifecycleResult = await this.capabilityRegistry.pipeline.recordResult(task, execution);
         for (const auditEvent of lifecycleResult.auditEvents) {
           await this.addSessionEvent(session, "CAPABILITY_AUDIT_EVENT", { taskId: task.taskId, capability: task.capability, auditEvent });
@@ -1230,7 +1292,7 @@ export class AgentRuntime {
           });
         }
         if (this.memory && lifecycleResult.memoryUpdates.length > 0 &&
-            (verification.status === "VERIFIED" || verification.status === "PARTIALLY_VERIFIED")) {
+            verification.status === "VERIFIED") {
           for (const update of lifecycleResult.memoryUpdates) {
             await this.memory.store({
               id: createId("capability_memory"),
@@ -1258,7 +1320,7 @@ export class AgentRuntime {
         if (this.perception) {
           const written = await this.perception.ingestObservation(observation);
           if (
-            (verification.status === "VERIFIED" || verification.status === "PARTIALLY_VERIFIED") &&
+            verification.status === "VERIFIED" &&
             Array.isArray(observation?.detectedChanges) && observation.detectedChanges.length > 0
           ) {
             // Semantic action-effect persistence must not fail silently. If it
@@ -1279,7 +1341,7 @@ export class AgentRuntime {
 
         await this.persistSession(session);
 
-        if (verification.status !== "VERIFIED" && verification.status !== "PARTIALLY_VERIFIED") {
+        if (verification.status !== "VERIFIED") {
           await this.addSessionEvent(session, "VERIFICATION_FAILED", verification);
           const handleResult = await this.handleTaskFailure(session, task, verification, {
             replanAttempts,
@@ -1356,6 +1418,7 @@ export class AgentRuntime {
       details
     };
     session.events.push(event);
+    this.onSessionEvent?.(session.sessionId, event);
     await this.auditRepository.append(session.sessionId, eventType, details);
   }
 
@@ -1522,7 +1585,7 @@ export class AgentRuntime {
           .flatMap((o) => o.detectedChanges),
         recoveriesPerformed: (session.recoveryBudget?.attempts ?? []).map((a) => a.action),
         remainingProblems: session.verifications
-          .filter((v) => v && v.status !== "VERIFIED" && v.status !== "PARTIALLY_VERIFIED")
+          .filter((v) => v && v.status !== "VERIFIED")
           .map((v) => v.message)
       };
       const summaryResult = await this.reasoningEngine.summarizeExecution(facts);
