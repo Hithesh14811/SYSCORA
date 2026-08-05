@@ -22,8 +22,30 @@ const CATEGORY_TO_ACTION = {
   ENVIRONMENT: "replan",
   NETWORK: "retry_with_backoff",
   UNSUPPORTED_CAPABILITY: "abort",
+  // Typed classes. Each one changes strategy, asks the user something specific,
+  // or terminates — none of them repeats the action that just failed.
+  PROVIDER_UNAVAILABLE: "replan",
+  INVALID_PLAN: "replan",
+  MISSING_PREREQUISITE: "request_clarification",
+  AUTHENTICATION_REQUIRED: "request_clarification",
+  TARGET_NOT_FOUND: "replan",
+  STALE_TARGET: "retry_with_backoff",
+  WRONG_FOREGROUND_WINDOW: "abort",
+  EMPTY_DOMAIN_RESULT: "abort",
+  USER_CANCELLED: "abort",
+  DEADLINE_EXHAUSTED: "abort",
   UNEXPECTED: "replan"
 };
+
+// Classes for which no recovery attempt can help. They terminate immediately
+// and must not consume recovery budget.
+const TERMINAL_CATEGORIES = new Set([
+  "UNSUPPORTED_CAPABILITY",
+  "WRONG_FOREGROUND_WINDOW",
+  "EMPTY_DOMAIN_RESULT",
+  "USER_CANCELLED",
+  "DEADLINE_EXHAUSTED"
+]);
 
 export const DEFAULT_RECOVERY_BUDGET = 6;
 
@@ -72,9 +94,14 @@ export class RecoveryEngine {
       return record("rollback", "Recovery budget exhausted; stopping.", false);
     }
 
-    // Non-recoverable: unsupported capability. No point spending budget.
-    if (category === "UNSUPPORTED_CAPABILITY") {
-      return record("abort", "Capability is unsupported; no recovery possible.", false);
+    // Non-recoverable classes. No attempt can change the outcome, so terminate
+    // without spending budget.
+    if (TERMINAL_CATEGORIES.has(category)) {
+      return record(
+        "abort",
+        diagnosis?.rootCause ?? `${category} cannot be recovered from; ending safely.`,
+        false
+      );
     }
 
     // Permission failures need an explicit approval from the user; surface it

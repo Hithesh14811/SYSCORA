@@ -18,6 +18,19 @@ export const FailureClass = Object.freeze({
   ENVIRONMENT: "ENVIRONMENT",
   NETWORK: "NETWORK",
   UNSUPPORTED_CAPABILITY: "UNSUPPORTED_CAPABILITY",
+  // Typed classes below exist so recovery can change strategy instead of
+  // repeating an action that already failed for a known reason. Each names a
+  // distinct real-world condition the generic classes previously merged.
+  PROVIDER_UNAVAILABLE: "PROVIDER_UNAVAILABLE",
+  INVALID_PLAN: "INVALID_PLAN",
+  MISSING_PREREQUISITE: "MISSING_PREREQUISITE",
+  AUTHENTICATION_REQUIRED: "AUTHENTICATION_REQUIRED",
+  TARGET_NOT_FOUND: "TARGET_NOT_FOUND",
+  STALE_TARGET: "STALE_TARGET",
+  WRONG_FOREGROUND_WINDOW: "WRONG_FOREGROUND_WINDOW",
+  EMPTY_DOMAIN_RESULT: "EMPTY_DOMAIN_RESULT",
+  USER_CANCELLED: "USER_CANCELLED",
+  DEADLINE_EXHAUSTED: "DEADLINE_EXHAUSTED",
   UNEXPECTED: "UNEXPECTED"
 });
 
@@ -111,6 +124,13 @@ export class TroubleshootingEngine {
   _classify({ evidence, capability, verification, executionResult }) {
     const combined = `${evidence.stderr}\n${evidence.stdout}\n${evidence.verificationMessage ?? ""}`;
 
+    // 0. Typed signals first. Capabilities and adapters report *why* they could
+    // not proceed; those declarations beat any text pattern, and merging them
+    // into a generic class is what previously caused the same ineffective
+    // recovery to run repeatedly.
+    const typed = this._classifyTypedSignals({ evidence, verification, executionResult, combined });
+    if (typed) return typed;
+
     // 1. Timeout is unambiguous.
     if (evidence.timedOut) {
       return {
@@ -164,6 +184,99 @@ export class TroubleshootingEngine {
       rootCause: "No specific failure pattern matched the available evidence.",
       confidence: 0.3
     };
+  }
+
+  // Declared failure categories and terminal conditions, in precedence order.
+  // Returns null when no typed signal applies, leaving the text/heuristic path
+  // below untouched.
+  _classifyTypedSignals({ evidence, verification, executionResult, combined }) {
+    const declared = String(
+      verification?.failureCategory
+      ?? verification?.category
+      ?? executionResult?.failureCategory
+      ?? executionResult?.reason
+      ?? ""
+    );
+    const errorText = `${executionResult?.error ?? ""} ${combined}`;
+
+    if (executionResult?.cancelled === true || /^CANCELLED$/i.test(declared)) {
+      return {
+        failureClass: FailureClass.USER_CANCELLED,
+        rootCause: "The request was cancelled before it could finish.",
+        confidence: 1
+      };
+    }
+    if (executionResult?.deadlineExhausted === true || /^DEADLINE_EXHAUSTED$/i.test(declared)) {
+      return {
+        failureClass: FailureClass.DEADLINE_EXHAUSTED,
+        rootCause: "The session deadline was reached before the goal could be verified.",
+        confidence: 1
+      };
+    }
+    // A verified outcome is not a failure. When the runtime asks for a diagnosis
+    // anyway, the capability returned a valid — often empty — domain answer that
+    // simply did not satisfy the goal. Retrying cannot change it.
+    if (verification?.status === "VERIFIED") {
+      return {
+        failureClass: FailureClass.EMPTY_DOMAIN_RESULT,
+        rootCause: verification.message
+          ? `The operation succeeded and reported: ${verification.message}`
+          : "The operation succeeded but returned no matching result.",
+        confidence: 0.9
+      };
+    }
+    if (/APPLICATION_NOT_INSTALLED|MISSING_PREREQUISITE|NO_INSTALLED_IDENTITY/i.test(declared)) {
+      return {
+        failureClass: FailureClass.MISSING_PREREQUISITE,
+        rootCause: "The requested application is not installed on this system.",
+        confidence: 0.95
+      };
+    }
+    if (/STALE_OBSERVATION|STALE_TARGET/i.test(`${declared} ${errorText}`)) {
+      return {
+        failureClass: FailureClass.STALE_TARGET,
+        rootCause: "The target was resolved from an observation that is no longer current.",
+        confidence: 0.9
+      };
+    }
+    if (/FOREGROUND_ACQUISITION_FAILED|WRONG_FOREGROUND_WINDOW|foreground-not-acquired/i.test(declared)) {
+      return {
+        failureClass: FailureClass.WRONG_FOREGROUND_WINDOW,
+        rootCause: "The intended window could not be brought to the foreground; acting would hit an unrelated window.",
+        confidence: 0.95
+      };
+    }
+    if (/WINDOW_GROUNDING_FAILED|TARGET_WINDOW_MISSING|TARGET_CONTROL_MISSING|TARGET_NOT_FOUND|window-not-found|target-not-found|control-not-found/i.test(declared)) {
+      return {
+        failureClass: FailureClass.TARGET_NOT_FOUND,
+        rootCause: "The expected window or control could not be located in current state.",
+        confidence: 0.9
+      };
+    }
+    if (/model provider unavailable|all configured providers|no healthy provider|provider unhealthy|provider is unavailable/i.test(errorText)) {
+      return {
+        failureClass: FailureClass.PROVIDER_UNAVAILABLE,
+        rootCause: "The reasoning provider is unavailable; deterministic work can still continue.",
+        confidence: 0.9
+      };
+    }
+    // Plan-level rejection only. A bare "unknown capability" is a registry
+    // problem and stays UNSUPPORTED_CAPABILITY.
+    if (/invalid plan|plan validation failed|unknown capability .* for task/i.test(errorText)) {
+      return {
+        failureClass: FailureClass.INVALID_PLAN,
+        rootCause: "The proposed plan did not validate against the capability contract.",
+        confidence: 0.85
+      };
+    }
+    if (/\b(?:401|403)\b|unauthorized|sign in to continue|login required|authentication required|not (?:signed|logged) in/i.test(errorText)) {
+      return {
+        failureClass: FailureClass.AUTHENTICATION_REQUIRED,
+        rootCause: "The target requires an authenticated session that only the user can establish.",
+        confidence: 0.85
+      };
+    }
+    return null;
   }
 
   _matchText(combined) {
@@ -260,6 +373,26 @@ export class TroubleshootingEngine {
         return { action: RecoveryAction.REPLAN, reason: "Observed state diverged from expectation; replan." };
       case FailureClass.UNSUPPORTED_CAPABILITY:
         return { action: RecoveryAction.ABORT, reason: "No capability can satisfy this task." };
+      case FailureClass.MISSING_PREREQUISITE:
+        return { action: RecoveryAction.REQUEST_CLARIFICATION, reason: "A prerequisite is absent; obtaining it needs the user's decision." };
+      case FailureClass.AUTHENTICATION_REQUIRED:
+        return { action: RecoveryAction.REQUEST_CLARIFICATION, reason: "Only the user can complete the sign-in." };
+      case FailureClass.STALE_TARGET:
+        return { action: RecoveryAction.REFRESH_CONTEXT, reason: "Re-observe the target before acting again." };
+      case FailureClass.TARGET_NOT_FOUND:
+        return { action: RecoveryAction.REPLAN, reason: "Inspect current windows/tabs and reacquire the target." };
+      case FailureClass.WRONG_FOREGROUND_WINDOW:
+        return { action: RecoveryAction.ABORT, reason: "Acting now would reach an unrelated window." };
+      case FailureClass.PROVIDER_UNAVAILABLE:
+        return { action: RecoveryAction.REPLAN, reason: "Continue deterministically without the model." };
+      case FailureClass.INVALID_PLAN:
+        return { action: RecoveryAction.REPLAN, reason: "Compose a plan that validates against the catalog." };
+      case FailureClass.EMPTY_DOMAIN_RESULT:
+        return { action: RecoveryAction.ABORT, reason: "The operation already returned a valid result; retrying cannot change it." };
+      case FailureClass.USER_CANCELLED:
+        return { action: RecoveryAction.ABORT, reason: "The user cancelled the request." };
+      case FailureClass.DEADLINE_EXHAUSTED:
+        return { action: RecoveryAction.ABORT, reason: "The session deadline has passed." };
       default:
         // Unknown: one bounded retry, otherwise replan.
         return attempt < 1
