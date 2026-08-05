@@ -214,3 +214,5 @@ export class ContextEngine {
     return { intent, items: selected, tokenBudget: limit, estimatedTokens: usedTokens };
   }
 }
+
+export { EnvironmentModel, Freshness, Sensitivity } from "./environment-model.js";
