@@ -359,10 +359,21 @@ class TaskGraphScheduler {
 
     const commandResult = executionResult?.commandResult ?? executionResult
     const exitCode = commandResult?.exitCode
+    // A capability may declare that its command output is a PROBE it interprets
+    // itself rather than the outcome. The declaration is only honored for a
+    // non-mutating capability whose own verification independently reached
+    // VERIFIED; the exit code is still recorded so the evidence stays truthful.
+    const probeInterpreted = capability.observationContract?.commandResult === 'PROBE'
+      && verification?.status === 'VERIFIED'
     const executionFailed = (typeof exitCode === 'number' && exitCode !== 0)
       || commandResult?.timedOut === true
       || commandResult?.cancelled === true
-    if (executionFailed) {
+    if (executionFailed && probeInterpreted && !commandResult?.timedOut && !commandResult?.cancelled) {
+      verification = {
+        ...verification,
+        evidence: { ...(verification.evidence ?? {}), exitCode: exitCode ?? null, commandResultContract: 'PROBE' }
+      }
+    } else if (executionFailed) {
       verification = {
         status: 'FAILED',
         message: typeof exitCode === 'number' && exitCode !== 0

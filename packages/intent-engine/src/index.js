@@ -11,6 +11,16 @@ const createId = () => crypto.randomBytes(16).toString("hex");
 const KNOWN_OPERATIONS = Object.freeze(Object.keys(OPERATION_PLANS));
 const KNOWN_OPERATION_SET = new Set(KNOWN_OPERATIONS);
 
+// Operations that start a locally installed program. A model naming a website
+// ("open youtube") will often reach for one of these, which sends a web goal
+// into an application that was never installed. When the request itself
+// classifies as a web outcome, that classification wins — see classify().
+const DESKTOP_LAUNCH_OPERATIONS = new Set([
+  "application.launch",
+  "application.notepad.launch",
+  "process.launch"
+]);
+
 // Whether a provider is a REAL remote language model (as opposed to the
 // deterministic Mock, or a Failover chain that only wraps Mock). Only a real
 // model is authoritative for LLM-first routing; Mock/offline falls through to the
@@ -189,8 +199,25 @@ export class IntentEngine {
     // intent while a model has supplied a usable interpretation.  This matters
     // for arbitrary desktop work where a keyword list can never be complete.
     const llmFirst = Boolean(modelResult);
+    // Outcome classification of the request itself. It is computed for every
+    // request — including the LLM-first path — because it is the only signal
+    // that can contradict a model routing a web destination into a desktop
+    // application launch.
+    const webOutcome = this.extractWebOutcome(lower, text);
     if (modelResult) {
       const chosen = typeof modelResult.operation === "string" ? modelResult.operation.trim() : "";
+      // A website is not an installed application. When the request classifies
+      // as a web outcome and the model chose a local launch, take the web route
+      // and record the override so the correction stays auditable.
+      if (webOutcome && DESKTOP_LAUNCH_OPERATIONS.has(chosen)) {
+        const intent = this._buildWebOutcomeIntent(intentId, text, webOutcome, context, {
+          from: chosen,
+          reason: "WEB_DESTINATION_IS_NOT_AN_INSTALLED_APPLICATION"
+        });
+        const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+        if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+        return intent;
+      }
       if (chosen && KNOWN_OPERATION_SET.has(chosen)) {
         let operationResult = modelResult;
         // A model may correctly choose Spotify playback while omitting the
@@ -285,22 +312,8 @@ export class IntentEngine {
       return intent;
     }
 
-    const webOutcome = llmFirst ? null : this.extractWebOutcome(lower, text);
-    if (webOutcome) {
-      const operation = webOutcome.operation ?? "browser.navigate";
-      const intent = {
-        intentId,
-        rawText: text,
-        normalizedGoal: webOutcome.normalizedGoal,
-        category: "BROWSER",
-        operation,
-        entities: { workspacePath: context.workspacePath ?? process.cwd(), url: webOutcome.url, ...(webOutcome.entities ?? {}) },
-        constraints: webOutcome.constraints,
-        preferences: [], assumptions: [], unknowns: [],
-        successCriteria: webOutcome.successCriteria,
-        requiredContext: [], requiredCapabilities: webOutcome.requiredCapabilities ?? [operation],
-        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
-      };
+    if (!llmFirst && webOutcome) {
+      const intent = this._buildWebOutcomeIntent(intentId, text, webOutcome, context);
       const validation = validateSchema(intent, USER_INTENT_SCHEMA);
       if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
       return intent;
@@ -450,6 +463,31 @@ export class IntentEngine {
       ambiguity: false,
       clarificationQuestions: [],
       sensitivityFlags: Array.isArray(modelResult?.sensitivityFlags) ? modelResult.sensitivityFlags : []
+    };
+  }
+
+  // Build a BROWSER intent from a classified web outcome. Shared by the
+  // deterministic path and by the LLM-first override so both produce exactly the
+  // same typed intent.
+  _buildWebOutcomeIntent(intentId, text, webOutcome, context, routingOverride = null) {
+    const operation = webOutcome.operation ?? "browser.navigate";
+    return {
+      intentId,
+      rawText: text,
+      normalizedGoal: webOutcome.normalizedGoal,
+      category: "BROWSER",
+      operation,
+      ...(routingOverride ? { routingOverride } : {}),
+      entities: {
+        workspacePath: context.workspacePath ?? process.cwd(),
+        url: webOutcome.url,
+        ...(webOutcome.entities ?? {})
+      },
+      constraints: webOutcome.constraints,
+      preferences: [], assumptions: [], unknowns: [],
+      successCriteria: webOutcome.successCriteria,
+      requiredContext: [], requiredCapabilities: webOutcome.requiredCapabilities ?? [operation],
+      confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
     };
   }
 
@@ -609,7 +647,20 @@ export class IntentEngine {
     const youtube = /\byoutube\b/i.test(text);
     if (youtube) {
       const mediaMatch = text.match(/\b(?:play|watch|find|search(?:\s+for)?)\s+(.+?)(?:\s+(?:video\s+)?on\s+youtube|\s+youtube\s+video|$)/i);
-      const query = mediaMatch?.[1]?.trim().replace(/\s+(?:a\s+)?video$/i, "");
+      const query = mediaMatch?.[1]?.trim()
+        .replace(/\s+(?:a\s+)?video$/i, "")
+        .replace(/^(?:a|an|the|some|any)\b\s*/i, "")
+        .trim();
+      // "Play a YouTube video" names no subject. Opening the site is the honest
+      // reading; searching for the leftover article would not be.
+      if (!query && /\b(?:play|watch)\b/i.test(text)) {
+        return {
+          url: "https://www.youtube.com/",
+          normalizedGoal: "Open YouTube in a browser",
+          constraints: negative,
+          successCriteria: ["The controlled browser is on youtube.com"]
+        };
+      }
       if (query && /\b(?:play|watch)\b/i.test(text)) {
         return {
           operation: "browser.media.play",

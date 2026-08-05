@@ -469,23 +469,44 @@ export class WindowsAdapter {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error("Port must be an integer from 1 through 65535");
     }
+    // The probe emits a self-describing envelope. "No listener" and "the probe
+    // could not run" are different answers, and neither may be inferred from the
+    // host process exit code: `Get-NetTCPConnection` finding nothing sets a
+    // nonzero exit code on an otherwise perfectly successful inspection, which
+    // previously turned a valid "nothing is listening on port 3000" into a
+    // repeated execution failure.
     const ps = await this.runPowerShell(
+      "$ErrorActionPreference='SilentlyContinue'; " +
       `$connections=@(Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | ` +
-      "Select-Object -First 10 LocalAddress,LocalPort,OwningProcess);" +
-      "if($connections.Count -eq 0){'[]'}else{$connections|ConvertTo-Json -Compress}"
+      "Select-Object -First 10 LocalAddress,LocalPort,OwningProcess); " +
+      "[pscustomobject]@{ok=$true;connections=$connections} | ConvertTo-Json -Compress -Depth 4; " +
+      "exit 0"
     );
-    let parsed = [];
+    let parsed = null;
     try {
-      parsed = JSON.parse(ps.stdout || "[]");
+      parsed = JSON.parse(ps.stdout || "null");
     } catch {
-      parsed = [];
+      parsed = null;
     }
-    const connections = Array.isArray(parsed) ? parsed : [parsed];
+    const probeSucceeded = parsed?.ok === true;
+    if (!probeSucceeded) {
+      return {
+        port,
+        listening: null,
+        status: "INDETERMINATE",
+        connections: [],
+        probe: { ok: false, reason: "PORT_PROBE_FAILED", exitCode: ps?.exitCode ?? null },
+        commandResult: ps
+      };
+    }
+    const raw = parsed.connections ?? [];
+    const connections = Array.isArray(raw) ? raw : [raw];
     return {
       port,
       listening: connections.length > 0,
       status: connections.length > 0 ? "LISTENING" : "NOT_LISTENING",
       connections,
+      probe: { ok: true, exitCode: ps?.exitCode ?? null },
       commandResult: ps
     };
   }
@@ -769,6 +790,74 @@ export class WindowsAdapter {
     };
   }
 
+  // Resolve an application name to a concrete installed identity WITHOUT
+  // starting anything. Read-only by construction, so an unknown name is a
+  // truthful "not installed" answer rather than a failed launch — which is what
+  // the prerequisite/install-and-resume workflow needs to distinguish.
+  async resolveApplicationTarget(application, executable = application) {
+    const escapedApplication = escapePowerShellSingleQuoted(application);
+    const escapedExe = escapePowerShellSingleQuoted(executable);
+    const commandResult = await this.runPowerShell(
+      `$ErrorActionPreference = 'SilentlyContinue'; ` +
+      `$app = Get-StartApps | Where-Object { $_.Name -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
+      `$command = Get-Command -Name '${escapedExe}' -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
+      `$appPath = Get-ItemProperty -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\' + '${escapedExe}') -ErrorAction SilentlyContinue; ` +
+      `$roots = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms')) | Where-Object { $_ }; ` +
+      `$shortcut = $roots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue } | ` +
+      `Where-Object { $_.BaseName -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
+      `if ($app) { $kind = 'start-menu'; $target = $app.AppID } ` +
+      `elseif ($command) { $kind = 'command'; $target = $command.Source } ` +
+      `elseif ($appPath.'(default)') { $kind = 'app-path'; $target = $appPath.'(default)' } ` +
+      `elseif ($shortcut) { $kind = 'start-menu-shortcut'; $target = $shortcut.FullName } ` +
+      `else { $kind = $null; $target = $null } ` +
+      `[pscustomobject]@{ ok = $true; resolved = [bool]$kind; kind = $kind; target = $target } | ConvertTo-Json -Compress; ` +
+      `exit 0`,
+      { timeoutMs: 8000 }
+    );
+    let parsed = null;
+    try { parsed = JSON.parse(commandResult.stdout || "null"); } catch { parsed = null; }
+    if (parsed?.ok !== true) {
+      return {
+        application,
+        executable,
+        resolved: false,
+        kind: null,
+        target: null,
+        reason: "RESOLUTION_PROBE_FAILED",
+        commandResult
+      };
+    }
+    return {
+      application,
+      executable,
+      resolved: parsed.resolved === true,
+      kind: parsed.kind ?? null,
+      target: parsed.target ?? null,
+      reason: parsed.resolved === true ? null : "NO_INSTALLED_IDENTITY",
+      commandResult
+    };
+  }
+
+  // Start an already-resolved identity. Every branch targets a concrete path or
+  // AppUserModelId that resolution proved exists.
+  async launchResolvedTarget(resolution) {
+    const escapedTarget = escapePowerShellSingleQuoted(String(resolution.target ?? ""));
+    if (resolution.kind === "start-menu") {
+      return this.runPowerShell(
+        `$ErrorActionPreference = 'Stop'; ` +
+        `Start-Process -FilePath 'explorer.exe' -ArgumentList ('shell:AppsFolder\\' + '${escapedTarget}'); ` +
+        `[pscustomobject]@{ started = $true; method = 'start-menu'; appId = '${escapedTarget}' } | ConvertTo-Json -Compress`,
+        { timeoutMs: 8000 }
+      );
+    }
+    return this.runPowerShell(
+      `$ErrorActionPreference = 'Stop'; ` +
+      `$process = Start-Process -FilePath '${escapedTarget}' -PassThru; ` +
+      `[pscustomobject]@{ started = $true; method = '${resolution.kind}'; processId = $process.Id; target = '${escapedTarget}' } | ConvertTo-Json -Compress`,
+      { timeoutMs: 8000 }
+    );
+  }
+
   async launchApplication(application) {
     const launchStartedAt = Date.now();
     const map = {
@@ -779,32 +868,44 @@ export class WindowsAdapter {
     };
     const exe = map[application.toLowerCase()] ?? application;
     const beforeWindows = await this.listWindows();
-    // Do not wait for a GUI application's process to exit. The previous direct
-    // spawn treated a correctly-launched Spotify window as a timeout after 8s,
-    // then the runtime re-planned the same action indefinitely. Prefer a Start
-    // menu AppUserModelId (reliable for Store/WinGet apps), then fall back to
-    // the executable name. Start-Process returns as soon as Windows accepts the
-    // launch request.
-    const escapedApplication = escapePowerShellSingleQuoted(application);
-    const escapedExe = escapePowerShellSingleQuoted(exe);
-    const result = await this.runPowerShell(
-      `$ErrorActionPreference = 'Stop'; ` +
-      `$app = Get-StartApps | Where-Object { $_.Name -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
-      `if ($app) { Start-Process -FilePath 'explorer.exe' -ArgumentList ('shell:AppsFolder\\' + $app.AppID); ` +
-      `[pscustomobject]@{ started = $true; method = 'start-menu'; appId = $app.AppID } | ConvertTo-Json -Compress } ` +
-      `else { ` +
-      `$command = Get-Command -Name '${escapedExe}' -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
-      `$appPath = Get-ItemProperty -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\' + '${escapedExe}') -ErrorAction SilentlyContinue; ` +
-      `$roots = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms')) | Where-Object { $_ }; ` +
-      `$shortcut = $roots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue } | ` +
-      `Where-Object { $_.BaseName -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
-      `if ($command) { $process = Start-Process -FilePath $command.Source -PassThru; $method = 'command'; $target = $command.Source } ` +
-      `elseif ($appPath.'(default)') { $process = Start-Process -FilePath $appPath.'(default)' -PassThru; $method = 'app-path'; $target = $appPath.'(default)' } ` +
-      `elseif ($shortcut) { $process = Start-Process -FilePath $shortcut.FullName -PassThru; $method = 'start-menu-shortcut'; $target = $shortcut.FullName } ` +
-      `else { $process = Start-Process -FilePath '${escapedExe}' -PassThru; $method = 'literal'; $target = '${escapedExe}' } ` +
-      `[pscustomobject]@{ started = $true; method = $method; processId = $process.Id; target = $target } | ConvertTo-Json -Compress }`,
-      { timeoutMs: 8000 }
-    );
+    // Resolution and launch are two separate stages. A launch may only target a
+    // concrete installed identity — a Start menu AppUserModelId, a resolvable
+    // command, an App Paths registration, or a Start menu shortcut. The previous
+    // single-stage script ended in a `literal` Start-Process fallback, which
+    // turned an unknown name (a website such as "youtube", a typo, or an
+    // uninstalled application) into a bogus launch attempt whose failure was
+    // then indistinguishable from "the window could not be grounded".
+    const resolution = await this.resolveApplicationTarget(application, exe);
+    if (!resolution.resolved) {
+      return {
+        application,
+        exe,
+        resolution,
+        launchResult: resolution.commandResult,
+        launch: { started: false, method: null },
+        window: null,
+        windowIdentity: null,
+        failureCategory: "APPLICATION_NOT_INSTALLED",
+        grounding: {
+          grounded: false,
+          attempts: 0,
+          elapsedMs: Date.now() - launchStartedAt,
+          progressExtended: false,
+          readinessState: "APPLICATION_NOT_INSTALLED",
+          confidence: 0,
+          signals: [],
+          candidates: []
+        },
+        before: {
+          windowIds: beforeWindows.map((candidate) => String(candidate.WindowHandle ?? candidate.windowId)),
+          foregroundWindowId: String(beforeWindows.find((candidate) => candidate.Foreground ?? candidate.foreground)?.WindowHandle ?? "")
+        },
+        windows: beforeWindows
+      };
+    }
+    // Do not wait for a GUI application's process to exit. Start-Process returns
+    // as soon as Windows accepts the launch request.
+    const result = await this.launchResolvedTarget(resolution);
     let launch = null;
     try { launch = JSON.parse(result.stdout || 'null'); } catch { launch = null; }
     const baseDeadline = Date.now() + 4000;
@@ -844,6 +945,7 @@ export class WindowsAdapter {
     return {
       application,
       exe,
+      resolution,
       launchResult: result,
       launch,
       window,

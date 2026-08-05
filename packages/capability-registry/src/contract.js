@@ -384,6 +384,19 @@ export function normalizeCapability(capability, options = {}) {
     ?? (capability?.confirmationRequired === true ? ConfirmationPolicy.ALWAYS
       : mutationLike ? ConfirmationPolicy.POLICY_ENGINE : ConfirmationPolicy.NEVER);
   const preferredModality = capability?.execution?.preferredModality ?? ExecutionModality.INTERNAL;
+  // How the scheduler must read a subordinate command result.
+  //   OUTCOME (default) — the command IS the outcome; a nonzero exit code is an
+  //     authoritative execution failure and overrides any claimed success.
+  //   PROBE — the command is one input to an observation the capability
+  //     interprets itself (for example a port query that legitimately exits
+  //     nonzero when nothing is listening). Only honored for non-mutating
+  //     capabilities, and only when their own verify() returned VERIFIED, so a
+  //     mutating action can never wave away a failed command.
+  const declaredCommandContract = capability?.observationContract?.commandResult;
+  const observationContract = {
+    ...capability?.observationContract,
+    commandResult: declaredCommandContract === "PROBE" && !mutationLike ? "PROBE" : "OUTCOME"
+  };
   const defaultApplicationIdentities = /^spotify\./.test(name ?? "")
     ? ["Spotify"]
     : /^browser\./.test(name ?? "") ? ["Controlled Chromium"]
@@ -461,6 +474,7 @@ export function normalizeCapability(capability, options = {}) {
       ...capability?.identities
     },
     trustedExecutionModality: capability?.trustedExecutionModality ?? preferredModality,
+    observationContract,
     availability: {
       check: capability?.availability?.check ?? capability?.availabilityCheck ?? (() => healthyByLifecycle),
       available: capability?.availability?.available ?? healthyByLifecycle,

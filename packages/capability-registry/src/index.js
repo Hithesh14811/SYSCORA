@@ -478,6 +478,10 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     requiredContext: [],
     riskMetadata: { level: RiskLevel.LOW },
     reversibility: "NOT_REQUIRED",
+    // `Get-NetTCPConnection` exits nonzero when no socket matches. That is a
+    // valid read-only answer, not an execution failure, so the adapter's
+    // self-describing probe envelope is authoritative here.
+    observationContract: { commandResult: "PROBE" },
     preconditions: (args) => Number.isInteger(args.port) && args.port >= 1 && args.port <= 65535,
     execute: async (args) => {
       return adapter.inspectPort(args.port);
@@ -1109,10 +1113,25 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     verify: async (observation) => {
       const result = observation?.structuredState ?? {};
       const started = Boolean(result.windowIdentity ?? result.window);
+      // "Not installed" and "installed but could not be grounded" are separate
+      // states. Reporting them as one would let the prerequisite workflow either
+      // reinstall a present application or give up on a transient grounding miss.
+      const notInstalled = result.failureCategory === "APPLICATION_NOT_INSTALLED";
       return {
         status: started ? "VERIFIED" : "FAILED",
-        message: started ? `Launched and grounded ${result.application}` : `Could not ground a window for ${result.application}`,
-        evidence: { window: result.window ?? null, windowIdentity: result.windowIdentity ?? null, grounding: result.grounding ?? null },
+        message: started
+          ? `Launched and grounded ${result.application}`
+          : notInstalled
+            ? `${result.application} does not resolve to an installed application on this system.`
+            : `Could not ground a window for ${result.application}`,
+        category: started ? null : (notInstalled ? "MISSING_PREREQUISITE" : "TARGET_NOT_FOUND"),
+        failureCategory: started ? null : (result.failureCategory ?? "WINDOW_GROUNDING_FAILED"),
+        evidence: {
+          window: result.window ?? null,
+          windowIdentity: result.windowIdentity ?? null,
+          grounding: result.grounding ?? null,
+          resolution: result.resolution ?? null
+        },
         confidence: started ? (result.windowIdentity?.confidence ?? 0.9) : 0
       };
     },
