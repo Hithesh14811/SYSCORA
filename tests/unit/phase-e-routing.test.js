@@ -178,3 +178,23 @@ test("a probe whose own verification is not VERIFIED still fails on a nonzero ex
   );
   assert.equal(verification.status, "FAILED");
 });
+
+test("an application registered only by its executable file name still resolves", async () => {
+  // App Paths and Get-Command register browsers as "msedge.exe" while users and
+  // models say "msedge". Reporting a present application as absent would send
+  // the prerequisite workflow off to install something already installed.
+  const probed = [];
+  const adapter = new WindowsAdapter();
+  adapter.runPowerShell = async (script) => {
+    probed.push(script);
+    const suffixed = /App Paths\' \+ 'msedge\.exe'/.test(script) || /msedge\.exe/.test(script);
+    return {
+      stdout: JSON.stringify({ ok: true, resolved: suffixed, kind: suffixed ? "app-path" : null, target: suffixed ? "C:\Edge\msedge.exe" : null }),
+      stderr: "",
+      exitCode: 0
+    };
+  };
+  const resolution = await adapter.resolveApplicationTarget("msedge", "msedge");
+  assert.equal(resolution.resolved, true);
+  assert.ok(probed.some((script) => /msedge\.exe/.test(script)), "the .exe spelling must be probed");
+});

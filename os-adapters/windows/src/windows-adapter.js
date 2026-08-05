@@ -862,11 +862,21 @@ export class WindowsAdapter {
   async resolveApplicationTarget(application, executable = application) {
     const escapedApplication = escapePowerShellSingleQuoted(application);
     const escapedExe = escapePowerShellSingleQuoted(executable);
+    // App Paths and Get-Command register browsers and many desktop programs
+    // under their executable file name ("msedge.exe"), while users and models
+    // name them without it. Try both spellings rather than reporting a present
+    // application as absent.
+    const escapedExeWithSuffix = escapePowerShellSingleQuoted(
+      /\.exe$/i.test(executable) ? executable : `${executable}.exe`
+    );
     const commandResult = await this.runPowerShell(
       `$ErrorActionPreference = 'SilentlyContinue'; ` +
       `$app = Get-StartApps | Where-Object { $_.Name -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
+      `if (-not $app) { $app = Get-StartApps | Where-Object { $_.Name -ilike '${escapedApplication}*' } | Select-Object -First 1 }; ` +
       `$command = Get-Command -Name '${escapedExe}' -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
-      `$appPath = Get-ItemProperty -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\' + '${escapedExe}') -ErrorAction SilentlyContinue; ` +
+      `if (-not $command) { $command = Get-Command -Name '${escapedExeWithSuffix}' -ErrorAction SilentlyContinue | Select-Object -First 1 }; ` +
+      `$appPath = Get-ItemProperty -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\' + '${escapedExeWithSuffix}') -ErrorAction SilentlyContinue; ` +
+      `if (-not $appPath.'(default)') { $appPath = Get-ItemProperty -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\' + '${escapedExe}') -ErrorAction SilentlyContinue }; ` +
       `$roots = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms')) | Where-Object { $_ }; ` +
       `$shortcut = $roots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue } | ` +
       `Where-Object { $_.BaseName -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
