@@ -191,3 +191,21 @@ test("the approval proposal names the publisher reported by the package feed", a
   const outcome = await resolver.ensureApplicationAvailable("Acme Notes", { originalTask });
   assert.equal(outcome.proposal.publisher, "Acme Incorporated");
 });
+
+test("the runtime turns a diagnosed missing application into an actionable install proposal", async () => {
+  const { AgentRuntime } = await import("../../packages/agent-runtime/src/index.js");
+  const { adapter } = build({ installed: false });
+  const runtime = Object.create(AgentRuntime.prototype);
+  runtime.adapter = adapter;
+
+  const task = { taskId: "t1", capability: "application.launch", inputs: { application: "Acme Notes" } };
+  const proposal = await runtime._proposePrerequisite({ intent: {} }, task, { category: "MISSING_PREREQUISITE" });
+  assert.equal(proposal.state, PrerequisiteState.APPROVAL_REQUIRED);
+  assert.equal(proposal.proposal.packageId, "Acme.Notes");
+  assert.deepEqual(proposal.resumeTask, task);
+
+  // Any other diagnosis must not produce an install prompt.
+  for (const category of ["TARGET_NOT_FOUND", "WRONG_FOREGROUND_WINDOW", "VERIFICATION_FAILURE"]) {
+    assert.equal(await runtime._proposePrerequisite({ intent: {} }, task, { category }), null, category);
+  }
+});

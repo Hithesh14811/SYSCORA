@@ -46,6 +46,8 @@ import {
   evaluateEvidenceLedger
 } from "../../shared-types/src/evidence-ledger.js";
 import { summarizeReadOnlyResults } from "./read-result-summary.js";
+import { PrerequisiteResolver } from "./prerequisite-resolver.js";
+import { EnvironmentModel } from "../../context-engine/src/environment-model.js";
 
 export {
   InteractiveAgentController,
@@ -1624,6 +1626,28 @@ export class AgentRuntime {
 
   // Steps 9-11 of the canonical flow: persist semantic state + memory, then
   // derive the final goal verification from the scheduler's terminal status and
+  // Turn a diagnosed missing prerequisite into an actionable, identity-bound
+  // installation proposal. Returns null whenever the failure is anything other
+  // than a genuinely absent application, so a grounding miss never becomes an
+  // install prompt.
+  async _proposePrerequisite(session, task, diagnosis) {
+    if (diagnosis?.category !== "MISSING_PREREQUISITE") return null;
+    if (!this.adapter || typeof this.adapter.resolveApplicationTarget !== "function") return null;
+    const application = task?.inputs?.application ?? session?.intent?.entities?.application;
+    if (typeof application !== "string" || !application.trim()) return null;
+    try {
+      const resolver = new PrerequisiteResolver({
+        environmentModel: new EnvironmentModel({ adapter: this.adapter }),
+        adapter: this.adapter
+      });
+      return await resolver.ensureApplicationAvailable(application, { originalTask: task });
+    } catch {
+      // A prerequisite lookup is an enhancement to the failure message; it must
+      // never replace one failure with another.
+      return null;
+    }
+  }
+
   // set the session's final response. Shared by submitIntent and
   // continueApprovedSession so both end identically.
   async _finalizeSession(session) {
@@ -1991,6 +2015,19 @@ export class AgentRuntime {
         reason: diagnosis.rootCause,
         diagnosis
       };
+      // A missing application is answerable: name the exact package, publisher
+      // and source, and keep the original task so the goal resumes once the
+      // prerequisite is satisfied. Without this the user is only told that
+      // something is absent, with no way to act on it.
+      const prerequisite = await this._proposePrerequisite(session, task, diagnosis);
+      if (prerequisite) {
+        session.finalResponse = { ...session.finalResponse, status: "AWAITING_APPROVAL", prerequisite };
+        await this.addSessionEvent(session, "PREREQUISITE_APPROVAL_REQUESTED", {
+          application: prerequisite.application,
+          state: prerequisite.state,
+          proposal: prerequisite.proposal ?? null
+        });
+      }
       await this.persistSession(session);
       return { shouldContinue: false };
     }
