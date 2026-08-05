@@ -164,9 +164,17 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           // Clients render this rather than re-deriving "is it done?" from raw
           // events, which is what previously let a stale "Working" survive a
           // finished session and let an executed action read as a completed goal.
+          // A settled run is authoritative over the last state the session
+          // persisted mid-flight: without this a request that has already
+          // finished can still be shown as "Inspecting" or "Working".
           const currentSession = run.session ?? persisted ?? null;
           const lifecycle = currentSession
-            ? projectSessionLifecycle(currentSession, { developerMode: requestUrl.searchParams.get("developer") === "1" })
+            ? projectSessionLifecycle(
+                run.terminal && !terminalStates.has(currentSession.currentState)
+                  ? { ...currentSession, currentState: run.status === "COMPLETED" ? "COMPLETED" : "FAILED" }
+                  : currentSession,
+                { developerMode: requestUrl.searchParams.get("developer") === "1" }
+              )
             : null;
           sendJson(response, 200, {
             sessionId,
