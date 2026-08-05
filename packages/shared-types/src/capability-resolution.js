@@ -46,7 +46,6 @@ export function resolveCapabilityId(requestedId, catalog = []) {
 
   const matches = capabilities.filter((capability) => {
     if (!capability?.name) return false;
-    if (structuralKey(capability.name) === requestedKey) return true;
     return declaredAliases(capability).some((alias) => structuralKey(alias) === requestedKey);
   });
   const candidates = [...new Set(matches.map((capability) => capability.name))];

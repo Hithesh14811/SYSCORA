@@ -168,6 +168,22 @@ describe("ReasoningEngine hardened boundary", () => {
     assert.equal(r.data.category, "ENVIRONMENT");
   });
 
+  it("receives the live registry catalog and rejects invented intent capabilities", async () => {
+    const invented = { ...VALID_INTENT, requiredCapabilities: ["invented.tool"] };
+    const provider = new ScriptedProvider([{ value: invented }, { value: invented }]);
+    const re = new ReasoningEngine({
+      modelProvider: provider,
+      capabilityRegistry: registryWith(["system.inspect"]),
+      repairAttempts: 1
+    });
+    const result = await re.understandIntent("inspect this computer");
+    assert.equal(result.ok, false);
+    assert.match(result.error, /unknown_capability/i);
+    assert.match(provider.prompts[0], /Live capability catalog/);
+    assert.match(provider.prompts[0], /system\.inspect/);
+    assert.doesNotMatch(provider.prompts[0], /invented\.tool/);
+  });
+
   it("treats a thrown provider error (failure/timeout/rate-limit) as ok:false", async () => {
     for (const msg of ["network down", "AbortError timeout", "HTTP 429 rate limited"]) {
       const re = new ReasoningEngine({ modelProvider: new ScriptedProvider([{ throw: msg }]) });

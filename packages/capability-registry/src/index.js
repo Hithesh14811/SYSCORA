@@ -5,6 +5,7 @@ import { PRIVILEGED_OPERATIONS } from "../../privileged-helpers/src/index.js";
 import crypto from "crypto";
 import {
   CAPABILITY_CONTRACT_VERSION,
+  ConfirmationPolicy,
   CapabilityHealth,
   isCapabilityHealthy,
   normalizeCapability,
@@ -127,6 +128,22 @@ export class CapabilityRegistry {
 
   register(capability, options = {}) {
     const normalized = normalizeCapability(capability, options);
+    if (this.capabilities.has(normalized.name)) throw new Error(`Duplicate capability registration: ${normalized.name}`);
+
+    const structuralAliasKey = (value) => String(value ?? "").normalize("NFKC").trim().toLowerCase().replace(/[\s._-]+/g, "");
+    const proposedKeys = new Map([[structuralAliasKey(normalized.name), normalized.name]]);
+    for (const alias of normalized.aliases) {
+      const key = structuralAliasKey(alias);
+      if (!key || proposedKeys.has(key)) throw new Error(`Invalid or duplicate alias for ${normalized.name}: ${alias}`);
+      proposedKeys.set(key, alias);
+    }
+    for (const existing of this.capabilities.values()) {
+      for (const value of [existing.name, ...(existing.aliases ?? [])]) {
+        if (proposedKeys.has(structuralAliasKey(value))) {
+          throw new Error(`Capability alias collision: ${proposedKeys.get(structuralAliasKey(value))} conflicts with ${value}`);
+        }
+      }
+    }
 
     // ELEVATION ROUTING INVARIANT (M2.1 Part E/F), enforced FIRST — before the
     // contract validator — so a capability attempting to self-grant privilege is
@@ -170,8 +187,6 @@ export class CapabilityRegistry {
     if (!satisfiesVersion(this.runtimeVersion, normalized.packaging.runtimeVersion)) {
       throw new Error(`Capability ${normalized.name} requires runtime ${normalized.packaging.runtimeVersion}`);
     }
-    if (this.capabilities.has(normalized.name)) throw new Error(`Duplicate capability registration: ${normalized.name}`);
-
     this.capabilities.set(normalized.name, normalized);
     this.emit("CAPABILITY_REGISTERED", { capability: normalized.name, source: normalized.packaging.source, version: normalized.version });
     return normalized;
@@ -210,9 +225,45 @@ export class CapabilityRegistry {
     return this.list().filter((capability) => this.isAvailable(capability.name, context));
   }
 
+  async checkAvailability(name, context = {}) {
+    const capability = this.get(name);
+    if (!capability) return { name, available: false, reason: "UNKNOWN_CAPABILITY" };
+    if ([CapabilityHealth.DISABLED, CapabilityHealth.DEPRECATED, CapabilityHealth.UNSUPPORTED].includes(capability.health.status)) {
+      return { name, available: false, reason: capability.health.status };
+    }
+    let available = false;
+    let reason = null;
+    try {
+      const result = await capability.availability.check(context);
+      available = typeof result === "object" ? result.available === true : result !== false;
+      reason = typeof result === "object" ? result.reason ?? null : null;
+    } catch (error) {
+      reason = error.message;
+    }
+    const lastCheckedAt = new Date().toISOString();
+    capability.availability = { ...capability.availability, available, reason, lastCheckedAt };
+    capability.health.status = available ? CapabilityHealth.HEALTHY : CapabilityHealth.UNAVAILABLE;
+    this.emit("CAPABILITY_AVAILABILITY_CHECKED", { capability: name, available, reason, checkedAt: lastCheckedAt });
+    return { name, available, reason, checkedAt: lastCheckedAt };
+  }
+
+  async refreshAvailability(context = {}) {
+    const results = [];
+    await Promise.all(this.list().map(async (capability) => {
+      if ([CapabilityHealth.DISABLED, CapabilityHealth.DEPRECATED, CapabilityHealth.UNSUPPORTED].includes(capability.health.status)) {
+        results.push({ name: capability.name, available: false, reason: capability.health.status });
+        return;
+      }
+      const result = await this.checkAvailability(capability.name, context);
+      results.push(result);
+    }));
+    return results.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
   isAvailable(name, context = {}, visited = new Set()) {
     const capability = this.get(name);
     if (!capability || visited.has(name) || !isCapabilityHealthy(capability, context)) return false;
+    if (capability.availability?.available === false) return false;
     if (context.platform && !capability.requirements.operatingSystems.includes(context.platform)) return false;
     const stack = new Set(visited).add(name);
     return capability.requirements.capabilities.every((requirement) => {
@@ -251,14 +302,23 @@ export class CapabilityRegistry {
       owner: cap.owner,
       inputSchema: cap.inputSchema,
       outputSchema: cap.outputSchema,
+      postconditionSchema: cap.postconditionSchema,
       risk: cap.risk,
       requirements: cap.requirements,
       security: cap.security,
+      permissionModel: cap.permissionModel,
+      confirmationPolicy: cap.confirmationPolicy,
+      idempotency: cap.idempotency,
+      dataSensitivity: cap.dataSensitivity,
+      networkConstraints: cap.networkConstraints,
+      identities: cap.identities,
+      trustedExecutionModality: cap.trustedExecutionModality,
       reversibility: cap.reversibility,
       rollbackSupport: cap.rollbackSupport,
       lifecycle: cap.lifecycle,
       lifecycleStatus: cap.lifecycleStatus,
-      health: cap.health,
+      health: { status: cap.health.status },
+      availability: { available: cap.availability.available, reason: cap.availability.reason, lastCheckedAt: cap.availability.lastCheckedAt },
       documentation: cap.documentation,
       deprecation: cap.deprecation,
       packaging: cap.packaging
@@ -266,10 +326,41 @@ export class CapabilityRegistry {
   }
 }
 
-export { CAPABILITY_CONTRACT_VERSION, CapabilityHealth, CapabilityLifecyclePipeline, validateCapabilityContract };
+export { CAPABILITY_CONTRACT_VERSION, CapabilityHealth, ConfirmationPolicy, CapabilityLifecyclePipeline, validateCapabilityContract };
 
 export function createDefaultCapabilityRegistry(adapter, options = {}) {
   const registry = new CapabilityRegistry();
+  let wingetAvailabilityPromise = null;
+  let wingetAvailabilityResult = null;
+  let wingetAvailabilityCheckedAt = 0;
+  const checkWingetAvailability = async () => {
+    if (wingetAvailabilityResult && Date.now() - wingetAvailabilityCheckedAt < 30000) return wingetAvailabilityResult;
+    if (wingetAvailabilityPromise) return wingetAvailabilityPromise;
+    wingetAvailabilityPromise = (async () => {
+      if (typeof adapter?.executeCommand !== "function") return { available: false, reason: "WinGet adapter is unavailable" };
+      const result = await adapter.executeCommand(process.cwd(), "winget", ["--version"], { timeoutMs: 5000 });
+      return result.exitCode === 0
+        ? { available: true, reason: null }
+        : { available: false, reason: result.stderr || "winget executable not found" };
+    })();
+    try {
+      wingetAvailabilityResult = await wingetAvailabilityPromise;
+      wingetAvailabilityCheckedAt = Date.now();
+      return wingetAvailabilityResult;
+    } finally {
+      wingetAvailabilityPromise = null;
+    }
+  };
+  const checkBrowserAvailability = async () => {
+    try {
+      const executable = adapter?.browserAutomation?._findExecutable?.();
+      return executable
+        ? { available: true, reason: null }
+        : { available: false, reason: "Controlled Chromium browser is unavailable" };
+    } catch (error) {
+      return { available: false, reason: error.message };
+    }
+  };
   // Optional privileged-operation boundary. When provided (production wiring),
   // the privileged capabilities below become executable through the canonical
   // runtime: each consumes a single-use approval token and dispatches to the
@@ -628,6 +719,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     requiredContext: [],
     riskMetadata: { level: RiskLevel.LOW },
     reversibility: "NOT_REQUIRED",
+    availabilityCheck: checkWingetAvailability,
     preconditions: (args) => !!args.query,
     execute: async (args) => {
       return adapter.wingetSearch(args.query);
@@ -667,6 +759,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     riskMetadata: { level: RiskLevel.LOW },
     permissions: ["system:read"],
     reversibility: "NOT_REQUIRED",
+    availabilityCheck: checkWingetAvailability,
     preconditions: (args) => !!args.id,
     execute: async (args) => adapter.wingetList(args.id),
     observe: async (result, args) => ({
@@ -1794,6 +1887,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     rollback: permissionType === "WRITE"
       ? { supported: false, reason: "Browser mutations have no reliable generic rollback; recovery requires fresh observation." }
       : { supported: false, reason: "Read-only browser operations do not require rollback." },
+    availabilityCheck: checkBrowserAvailability,
     preconditions: () => typeof adapter?.browserDomAction === "function",
     execute: async (args, { signal } = {}) => adapter.browserDomAction(operation, args, { signal }),
     observe: async (result, args) => ({
@@ -2273,6 +2367,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     riskMetadata: { level: RiskLevel.MEDIUM },
     permissions: ["system:write"],
     reversibility: "PARTIAL",
+    availabilityCheck: checkWingetAvailability,
     preconditions: () => true,
     execute: async () => ({}),
     observe: async (result) => ({
@@ -2551,6 +2646,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     riskMetadata: { level: RiskLevel.MEDIUM },
     permissions: ["system:write"],
     reversibility: "PARTIAL",
+    availabilityCheck: checkWingetAvailability,
     preconditions: (args) => !!args.id,
     execute: async (args) => {
       return adapter.wingetInstall(args.id);

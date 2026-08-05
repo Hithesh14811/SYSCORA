@@ -9,6 +9,12 @@ export class CapabilityLifecyclePipeline {
   async prepare(task, context = {}) {
     const capability = this.registry.get(task.capability);
     if (!capability) throw new Error(`Unknown capability ${task.capability}`);
+    const availability = await this.registry.checkAvailability(task.capability, context);
+    if (!availability.available) {
+      const error = new Error(`Capability ${task.capability} is unavailable: ${availability.reason ?? "availability check failed"}`);
+      error.code = "CAPABILITY_UNAVAILABLE";
+      throw error;
+    }
     if (!isCapabilityHealthy(capability, context)) throw new Error(`Capability ${task.capability} is not healthy`);
     // ELEVATION ROUTING INVARIANT (M2.1 Part E/F). Elevation is NOT a boolean the
     // caller can assert to run an arbitrary execute(). An elevated capability may
@@ -48,7 +54,7 @@ export class CapabilityLifecyclePipeline {
       });
       if (!decision?.approved) throw new Error(decision?.reason ?? `Capability ${task.capability} permission denied`);
     }
-    if (typeof capability.preconditions === "function" && !capability.preconditions(task.inputs)) {
+    if (typeof capability.preconditions === "function" && !await capability.preconditions(task.inputs)) {
       throw new Error(`Capability ${task.capability} preconditions failed`);
     }
     await this.emit("CAPABILITY_EXECUTION_PREPARED", { taskId: task.taskId, capability: capability.name, requirements: capability.requirements });

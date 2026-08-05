@@ -495,7 +495,11 @@ describe("M2.1 ELEVATE is execution routing (HIGH 3)", () => {
         { taskId: "t", capability: "service.restart", inputs: { scope: "demo", token: "x" } },
         { platform: process.platform, privilegeApproved: true, authorize: async () => ({ approved: true }) }
       ),
-      /no live bounded privileged route|not healthy|requires elevation/
+      (error) => {
+        assert.equal(error.code, "CAPABILITY_UNAVAILABLE");
+        assert.match(error.message, /service\.restart is unavailable/);
+        return true;
+      }
     );
   });
 });

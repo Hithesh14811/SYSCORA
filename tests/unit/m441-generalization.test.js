@@ -18,22 +18,14 @@ import {
 import { createGoalContract } from "../../packages/shared-types/src/goal-contract.js";
 import { InteractiveAgentController } from "../../packages/agent-runtime/src/interactive-agent-controller.js";
 
-test("capability resolution accepts only exact or structurally canonical registry identities", () => {
+test("capability resolution accepts only exact identities or explicitly declared aliases", () => {
   const catalog = [
     { name: "filesystem.write", aliases: ["file-write"] },
-    { name: "ui.action" },
-    { name: "ui_action" }
+    { name: "ui.action", aliases: ["uiaction"] },
+    { name: "ui_action", aliases: ["ui-action"] }
   ];
   assert.equal(resolveCapabilityId("filesystem.write", catalog).kind, CapabilityResolutionKind.EXACT_MATCH);
-  assert.deepEqual(
-    resolveCapabilityId("FileSystem Write", catalog),
-    {
-      kind: CapabilityResolutionKind.CANONICAL_ALIAS,
-      requestedId: "FileSystem Write",
-      canonicalId: "filesystem.write",
-      candidates: ["filesystem.write"]
-    }
-  );
+  assert.equal(resolveCapabilityId("FileSystem Write", catalog).kind, CapabilityResolutionKind.UNKNOWN_CAPABILITY);
   assert.equal(resolveCapabilityId("file-write", catalog).canonicalId, "filesystem.write");
   assert.equal(resolveCapabilityId("filesystem.writes", catalog).kind, CapabilityResolutionKind.UNKNOWN_CAPABILITY);
   assert.equal(resolveCapabilityId("uiaction", catalog).kind, CapabilityResolutionKind.AMBIGUOUS_CAPABILITY);

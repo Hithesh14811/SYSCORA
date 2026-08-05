@@ -122,8 +122,8 @@ demo("D. winget search prompt → real search, no approval", async () => {
     if (availability.exitCode === 0) {
       assert.equal(s.finalResponse.status, "COMPLETED", `available WinGet search must complete, got ${s.finalResponse.status}`);
     } else {
-      assert.equal(s.finalResponse.status, "FAILED", "missing WinGet must fail exactly rather than report success");
-      assert.match(s.finalResponse.message, /winget|ENOENT|failed/i);
+      assert.equal(s.finalResponse.status, "PLAN_REJECTED", "an unavailable required tool must reject the plan before execution");
+      assert.match(JSON.stringify(s.finalResponse.errors), /package\.winget\.search|unavailable/i);
     }
   } finally {
     runtime.adapter.close();

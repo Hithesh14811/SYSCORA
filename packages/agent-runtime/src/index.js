@@ -307,6 +307,13 @@ export class AgentRuntime {
     await this.persistSession(session);
 
     try {
+      const availability = await this.capabilityRegistry?.refreshAvailability?.({ platform: process.platform }) ?? [];
+      await this.addSessionEvent(session, "CAPABILITY_CATALOG_REFRESHED", {
+        checked: availability.length,
+        available: availability.filter((item) => item.available).length,
+        unavailable: availability.filter((item) => !item.available).map((item) => ({ name: item.name, reason: item.reason }))
+      });
+      this._assertSessionActive(session, options);
       // 1. Understand intent
       session.currentState = RuntimeState.BUILD_CONTEXT;
       session.intent = await this.intentEngine.classify(rawText, { workspacePath: process.cwd(), ...options });

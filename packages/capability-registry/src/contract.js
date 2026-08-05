@@ -27,6 +27,13 @@ const ACTIVE_HEALTH = new Set([
   CapabilityHealth.DEPRECATED
 ]);
 
+export const ConfirmationPolicy = Object.freeze({
+  NEVER: "NEVER",
+  POLICY_ENGINE: "POLICY_ENGINE",
+  ALWAYS: "ALWAYS",
+  CONSEQUENTIAL_BOUNDARY: "CONSEQUENTIAL_BOUNDARY"
+});
+
 const VALID_RISK_LEVELS = new Set(Object.values(RiskLevel));
 
 export function compareVersions(actual, required) {
@@ -370,6 +377,18 @@ export function normalizeCapability(capability, options = {}) {
   // Authoritative structured risk floor for this capability. Runtime evidence
   // (RiskEngine) may only raise these dimensions, never lower them.
   const riskProfile = deriveRiskProfile(name, capability, resolvedSecurity, resolvedPermissionModel);
+  const aliases = [...new Set(list(capability?.aliases ?? capability?.canonicalAliases ?? capability?.metadata?.aliases).map(String).filter(Boolean))];
+  const mutationLike = [PermissionType.WRITE, PermissionType.EXECUTE].includes(resolvedPermissionModel.type)
+    || riskProfile[RiskDimension.MUTATION_IMPACT] !== "READ_ONLY";
+  const confirmationMode = capability?.confirmationPolicy?.mode
+    ?? (capability?.confirmationRequired === true ? ConfirmationPolicy.ALWAYS
+      : mutationLike ? ConfirmationPolicy.POLICY_ENGINE : ConfirmationPolicy.NEVER);
+  const preferredModality = capability?.execution?.preferredModality ?? ExecutionModality.INTERNAL;
+  const defaultApplicationIdentities = /^spotify\./.test(name ?? "")
+    ? ["Spotify"]
+    : /^browser\./.test(name ?? "") ? ["Controlled Chromium"]
+      : /^application\./.test(name ?? "") ? ["$input.application"] : [];
+  const defaultPackageIdentities = /^package\./.test(name ?? "") ? ["$input.id"] : [];
   return {
     ...capability,
     name,
@@ -385,6 +404,7 @@ export function normalizeCapability(capability, options = {}) {
     verify: capability?.verify ?? (async () => ({ status: "FAILED", message: `Capability ${name} has no verification handler` })),
     contractVersion: capability?.contractVersion ?? CAPABILITY_CONTRACT_VERSION,
     category: capability?.category ?? name?.split(".")[0] ?? "general",
+    aliases,
     execution: capability?.execution ?? {
       modalities: [modalityProfile(ExecutionModality.INTERNAL)],
       preferredModality: ExecutionModality.INTERNAL,
@@ -417,6 +437,37 @@ export function normalizeCapability(capability, options = {}) {
     riskProfile,
     security: resolvedSecurity,
     permissionModel: resolvedPermissionModel,
+    confirmationPolicy: {
+      mode: confirmationMode,
+      cannotBypass: capability?.confirmationPolicy?.cannotBypass ?? confirmationMode !== ConfirmationPolicy.NEVER,
+      ...capability?.confirmationPolicy
+    },
+    postconditionSchema: capability?.postconditionSchema ?? {
+      type: "object",
+      required: ["status", "evidence"],
+      properties: { status: { type: "string", enum: ["VERIFIED", "FAILED", "UNCERTAIN"] }, evidence: {} }
+    },
+    idempotency: capability?.idempotency ?? capability?.idempotent ?? !mutationLike,
+    dataSensitivity: capability?.dataSensitivity ?? riskProfile[RiskDimension.DATA_SENSITIVITY],
+    networkConstraints: {
+      domainPolicy: resolvedSecurity.network === "NONE" ? "NONE" : "USER_OR_CAPABILITY_SCOPED",
+      allowedDomains: [],
+      allowedMethods: resolvedSecurity.network === "NONE" ? [] : ["GET"],
+      ...capability?.networkConstraints
+    },
+    identities: {
+      applications: list(capability?.identities?.applications ?? capability?.applicationIdentities ?? defaultApplicationIdentities),
+      packages: list(capability?.identities?.packages ?? capability?.packageIdentities ?? capability?.requirements?.software ?? capability?.requiredSoftware ?? defaultPackageIdentities),
+      ...capability?.identities
+    },
+    trustedExecutionModality: capability?.trustedExecutionModality ?? preferredModality,
+    availability: {
+      check: capability?.availability?.check ?? capability?.availabilityCheck ?? (() => healthyByLifecycle),
+      available: capability?.availability?.available ?? healthyByLifecycle,
+      reason: capability?.availability?.reason ?? null,
+      lastCheckedAt: capability?.availability?.lastCheckedAt ?? null,
+      ...capability?.availability
+    },
     stateMutations: list(capability?.stateMutations ?? capability?.mutations ?? builtin.stateMutations),
     failureClassifications: list(capability?.failureClassifications),
     recoveryHints: list(capability?.recoveryHints),
@@ -450,7 +501,7 @@ export function normalizeCapability(capability, options = {}) {
     packaging: {
       runtimeVersion: capability?.packaging?.runtimeVersion ?? `>=${CAPABILITY_RUNTIME_VERSION}`,
       manifestVersion: capability?.packaging?.manifestVersion ?? "1",
-      tests: capability?.packaging?.tests ?? [],
+      tests: capability?.packaging?.tests ?? (source === "builtin" ? ["tests/unit/capability-framework.test.js"] : []),
       migration: capability?.packaging?.migration ?? builtin.packaging?.migration ?? null,
       versionHistory: capability?.packaging?.versionHistory ?? builtin.packaging?.versionHistory ?? [],
       ...capability?.packaging,
@@ -467,6 +518,14 @@ export function validateCapabilityContract(capability, { strict = false } = {}) 
   required(capability?.category, "category", errors);
   required(capability?.owner, "owner", errors);
   if (!capability?.inputSchema || !capability?.outputSchema) errors.push("inputSchema and outputSchema are required");
+  if (!capability?.postconditionSchema) errors.push("postconditionSchema is required");
+  if (!Object.values(ConfirmationPolicy).includes(capability?.confirmationPolicy?.mode)) errors.push("confirmationPolicy.mode is invalid");
+  if (typeof capability?.idempotency !== "boolean") errors.push("idempotency must be boolean");
+  required(capability?.dataSensitivity, "dataSensitivity", errors);
+  required(capability?.trustedExecutionModality, "trustedExecutionModality", errors);
+  if (!capability?.networkConstraints || !Array.isArray(capability.networkConstraints.allowedDomains)) errors.push("networkConstraints.allowedDomains is required");
+  if (!capability?.identities || !Array.isArray(capability.identities.applications) || !Array.isArray(capability.identities.packages)) errors.push("application/package identities are required");
+  if (typeof capability?.availability?.check !== "function") errors.push("availability.check handler is required");
   for (const handler of ["preconditions", "execute", "observe", "verify"]) {
     if (typeof capability?.[handler] !== "function") errors.push(`${handler} handler is required`);
   }

@@ -8,6 +8,7 @@ import {
   CapabilityHealth,
   CapabilityPluginLoader,
   CapabilityRegistry,
+  CapabilityLifecyclePipeline,
   createCapabilityTemplate,
   createDefaultCapabilityRegistry,
   validatePluginCapabilityDefinition,
@@ -39,7 +40,47 @@ test("registry normalizes legacy capabilities to the V2 contract", () => {
   assert.equal(registered.capabilityId, "test.capability");
   assert.equal(registered.health.status, CapabilityHealth.HEALTHY);
   assert.deepEqual(registered.requirements.permissions, []);
+  for (const field of [
+    "postconditionSchema", "confirmationPolicy", "idempotency", "dataSensitivity",
+    "networkConstraints", "identities", "trustedExecutionModality", "availability"
+  ]) assert.ok(field in registered, `missing canonical field ${field}`);
   assert.equal(validateCapabilityContract(registered).valid, true);
+});
+
+test("catalog contains only serializable live contract metadata", async () => {
+  const registry = new CapabilityRegistry([
+    capability({ name: "live", availabilityCheck: async () => ({ available: true }) }),
+    capability({ name: "missing", availabilityCheck: async () => ({ available: false, reason: "not installed" }) })
+  ]);
+  const refreshed = await registry.refreshAvailability({ platform: process.platform });
+  assert.equal(refreshed.find((entry) => entry.name === "missing").available, false);
+  const catalog = registry.getCatalog();
+  assert.deepEqual(catalog.map((entry) => entry.name), ["live"]);
+  assert.doesNotThrow(() => JSON.stringify(catalog));
+  assert.equal(catalog[0].health.status, CapabilityHealth.HEALTHY);
+  assert.equal("check" in catalog[0].health, false);
+  assert.equal("check" in catalog[0].availability, false);
+});
+
+test("registry rejects ambiguous alias declarations", () => {
+  const registry = new CapabilityRegistry([
+    capability({ name: "keyboard.type", aliases: ["ui.type_text"] })
+  ]);
+  assert.throws(
+    () => registry.register(capability({ name: "legacy.type", aliases: ["ui-type-text"] })),
+    /alias collision/i
+  );
+});
+
+test("execution preparation rechecks live availability and fails typed", async () => {
+  const registry = new CapabilityRegistry([
+    capability({ name: "temporarily.missing", availabilityCheck: async () => ({ available: false, reason: "dependency missing" }) })
+  ]);
+  const pipeline = new CapabilityLifecyclePipeline({ registry });
+  await assert.rejects(
+    pipeline.prepare({ taskId: "t1", capability: "temporarily.missing", inputs: {} }),
+    (error) => error.code === "CAPABILITY_UNAVAILABLE" && /dependency missing/.test(error.message)
+  );
 });
 
 test("catalog ignores disabled and unresolved dependency capabilities", () => {
@@ -63,7 +104,7 @@ test("registry resolves ordered dependencies and rejects duplicate ids", () => {
 test("all built-in capabilities are contract-compatible reference capabilities", () => {
   const registry = createDefaultCapabilityRegistry({});
   for (const registered of registry.list()) {
-    const validation = validateCapabilityContract(registered);
+    const validation = validateCapabilityContract(registered, { strict: true });
     assert.equal(validation.valid, true, `${registered.name}: ${validation.errors.join(", ")}`);
     assert.equal(registered.packaging.source, "builtin");
   }
