@@ -15,6 +15,10 @@ const KNOWN_OPERATION_SET = new Set(KNOWN_OPERATIONS);
 // ("open youtube") will often reach for one of these, which sends a web goal
 // into an application that was never installed. When the request itself
 // classifies as a web outcome, that classification wins — see classify().
+// Ways a person asks for media to start. Kept in one place so the media route
+// recognizes an intent rather than one memorized phrasing.
+const PLAYBACK_VERBS = /\b(?:play|watch|put\s+on|turn\s+on)\b/i;
+
 const DESKTOP_LAUNCH_OPERATIONS = new Set([
   "application.launch",
   "application.notepad.launch",
@@ -646,14 +650,14 @@ export class IntentEngine {
     }
     const youtube = /\byoutube\b/i.test(text);
     if (youtube) {
-      const mediaMatch = text.match(/\b(?:play|watch|find|search(?:\s+for)?)\s+(.+?)(?:\s+(?:video\s+)?on\s+youtube|\s+youtube\s+video|$)/i);
+      const mediaMatch = text.match(/\b(?:play|watch|put\s+on|turn\s+on|find|search(?:\s+for)?)\s+(.+?)(?:\s+(?:video\s+)?on\s+youtube|\s+youtube\s+video|$)/i);
       const query = mediaMatch?.[1]?.trim()
         .replace(/\s+(?:a\s+)?video$/i, "")
         .replace(/^(?:a|an|the|some|any)\b\s*/i, "")
         .trim();
       // "Play a YouTube video" names no subject. Opening the site is the honest
       // reading; searching for the leftover article would not be.
-      if (!query && /\b(?:play|watch)\b/i.test(text)) {
+      if (!query && PLAYBACK_VERBS.test(text)) {
         return {
           url: "https://www.youtube.com/",
           normalizedGoal: "Open YouTube in a browser",
@@ -661,7 +665,7 @@ export class IntentEngine {
           successCriteria: ["The controlled browser is on youtube.com"]
         };
       }
-      if (query && /\b(?:play|watch)\b/i.test(text)) {
+      if (query && PLAYBACK_VERBS.test(text)) {
         return {
           operation: "browser.media.play",
           url: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
@@ -776,7 +780,9 @@ export class IntentEngine {
       };
     }
 
-    const launch = String(rawText).match(/^\s*(?:please\s+)?(?:open|launch|start)\s+(?:the\s+)?([\w.-]+)\s*[.!?]*\s*$/i);
+    // A trailing courtesy word ("open notepad please", "start spotify thanks")
+    // is as common as a leading one and must not change the route.
+    const launch = String(rawText).match(/^\s*(?:please\s+)?(?:open|launch|start)\s+(?:the\s+)?([\w.-]+)(?:\s+(?:please|thanks|thank\s+you))?\s*[.!?]*\s*$/i);
     if (launch) {
       const requested = launch[1].toLowerCase();
       const application = ["notepad", "calculator", "calc", "spotify"]
