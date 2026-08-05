@@ -40,7 +40,14 @@ export class RecoveryEngine {
   //   input: { diagnosis, budget: { total, spent, attempts }, replanAttempts, maxReplanAttempts }
   //   returns: { action, reason, budget }
   // The budget is always returned (updated) so the caller can persist it.
-  recover({ diagnosis, budget, replanAttempts = 0, maxReplanAttempts = 2 } = {}) {
+  recover({
+    diagnosis,
+    budget,
+    replanAttempts = 0,
+    maxReplanAttempts = 2,
+    failureFingerprint = null,
+    stateFingerprint = null
+  } = {}) {
     const currentBudget = createRecoveryBudget(budget);
     const category = diagnosis?.category ?? diagnosis?.failureClass ?? "UNEXPECTED";
     const remaining = currentBudget.total - currentBudget.spent;
@@ -48,7 +55,13 @@ export class RecoveryEngine {
     const record = (action, reason, consumes = true) => {
       if (consumes) {
         currentBudget.spent += 1;
-        currentBudget.attempts.push({ action, category, at: new Date().toISOString() });
+        currentBudget.attempts.push({
+          action,
+          category,
+          failureFingerprint,
+          stateFingerprint,
+          at: new Date().toISOString()
+        });
       }
       return { action, reason, category, budget: currentBudget };
     };
@@ -74,6 +87,20 @@ export class RecoveryEngine {
     const preferredAction = CATEGORY_TO_ACTION[category] ?? "replan";
     if ((preferredAction === "replan") && replanAttempts >= maxReplanAttempts) {
       return record("rollback", "Maximum replan attempts reached.", false);
+    }
+
+    const duplicate = currentBudget.attempts.some((attempt) =>
+      attempt.action === preferredAction
+      && attempt.failureFingerprint === failureFingerprint
+      && attempt.stateFingerprint === stateFingerprint
+    );
+    if (duplicate && failureFingerprint && stateFingerprint) {
+      return {
+        action: "abort",
+        reason: "Identical recovery rejected because no relevant state changed.",
+        category: "IDENTICAL_RECOVERY_REJECTED",
+        budget: currentBudget
+      };
     }
 
     return record(

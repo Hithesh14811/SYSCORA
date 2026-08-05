@@ -67,6 +67,14 @@ export function matchesTrackQuery(title, query) {
   return hits === q.length;
 }
 
+export function matchesMediaQuery(title, query) {
+  const q = trackTokens(query);
+  if (q.length === 0) return false;
+  const titleTokens = new Set(trackTokens(title));
+  const hits = q.filter((token) => titleTokens.has(token)).length;
+  return hits >= Math.max(1, Math.ceil(q.length / 2));
+}
+
 export const LifecycleStatus = {
   IMPLEMENTED: "IMPLEMENTED",
   VERIFIED: "VERIFIED",
@@ -379,7 +387,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     requiredContext: [],
     riskMetadata: { level: RiskLevel.LOW },
     reversibility: "NOT_REQUIRED",
-    preconditions: (args) => typeof args.port === "number",
+    preconditions: (args) => Number.isInteger(args.port) && args.port >= 1 && args.port <= 65535,
     execute: async (args) => {
       return adapter.inspectPort(args.port);
     },
@@ -394,11 +402,20 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       trustLevel: "SYSTEM_TRUSTED"
     }),
     verify: async (observation) => {
-      return { 
-        status: "VERIFIED", 
-        message: "Port inspection complete",
-        evidence: observation.structuredState,
-        confidence: 1
+      const result = observation.structuredState ?? {};
+      const valid = Number.isInteger(result.port)
+        && Array.isArray(result.connections)
+        && ["LISTENING", "NOT_LISTENING"].includes(result.status)
+        && result.listening === (result.connections.length > 0);
+      return {
+        status: valid ? "VERIFIED" : "FAILED",
+        message: valid
+          ? (result.listening
+              ? `Port ${result.port} is listening with ${result.connections.length} observed connection(s).`
+              : `Port ${result.port} is not listening.`)
+          : "Port inspection returned an invalid or ambiguous result.",
+        evidence: result,
+        confidence: valid ? 1 : 0
       };
     },
     rollback: null,
@@ -1149,41 +1166,44 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     const validation = validateInteractionTarget(target);
     if (!validation.valid) throw new Error(`Unsafe visual target: ${validation.errors.join(", ")}`);
     const age = Date.now() - Date.parse(target.observedAt);
-    if (!Number.isFinite(age) || age > 5000) throw new Error("Unsafe visual target: evidence is stale");
-    if (!target.relativeCoordinates || target.windowId === "screen") return target;
+    const maxAge = Math.max(1, Number(target.maxObservationAgeMs ?? 5000));
+    if (!Number.isFinite(age) || age < 0 || age > maxAge) throw new Error("STALE_OBSERVATION: coordinate evidence expired");
     const windows = await adapter.listWindows();
-    let window = windows.find((candidate) =>
+    const window = windows.find((candidate) =>
       String(candidate.WindowHandle ?? candidate.windowId) === String(target.windowId)
     );
-    if (!window && target.windowIdentity) {
-      const identity = target.windowIdentity;
-      window = windows
-        .map((candidate) => {
-          let score = 0;
-          if (identity.processId && Number(candidate.Id ?? candidate.processId) === Number(identity.processId)) score += 4;
-          if (identity.processName && String(candidate.ProcessName ?? candidate.processName).toLowerCase() === String(identity.processName).toLowerCase()) score += 3;
-          if (identity.className && String(candidate.ClassName ?? candidate.className) === String(identity.className)) score += 2;
-          if (identity.title && String(candidate.MainWindowTitle ?? candidate.title) === String(identity.title)) score += 3;
-          return { candidate, score };
-        })
-        .sort((left, right) => right.score - left.score)[0];
-      window = window?.score >= 5 ? window.candidate : null;
+    if (!window) throw new Error("STALE_OBSERVATION: source window no longer exists");
+    const foreground = windows.find((candidate) => candidate.Foreground ?? candidate.foreground);
+    const foregroundId = foreground ? String(foreground.WindowHandle ?? foreground.windowId) : null;
+    if (foregroundId !== String(target.expectedForegroundWindowId) || foregroundId !== String(target.windowId)) {
+      throw new Error("FOREGROUND_MISMATCH: observed target window is no longer foreground");
     }
-    if (!window) throw new Error("Unsafe visual target: source window no longer exists");
-    const bounds = window.Bounds ?? window.bounds;
-    if (!bounds) return target;
-    return {
-      ...target,
+    const expected = target.windowIdentity;
+    const actual = {
       windowId: String(window.WindowHandle ?? window.windowId),
-      boundingRect: {
-        x: Number(bounds.x) + Number(target.relativeCoordinates.x),
-        y: Number(bounds.y) + Number(target.relativeCoordinates.y),
-        width: target.boundingRect.width,
-        height: target.boundingRect.height
-      },
-      observedAt: new Date().toISOString(),
-      reGrounded: true
+      processId: Number(window.Id ?? window.processId),
+      processName: String(window.ProcessName ?? window.processName ?? ""),
+      title: String(window.MainWindowTitle ?? window.title ?? ""),
+      className: String(window.ClassName ?? window.className ?? ""),
+      bounds: window.Bounds ?? window.bounds ?? null,
+      displayId: window.DisplayId ?? window.displayId ?? null,
+      dpi: Number(window.Dpi ?? window.dpi)
     };
+    const sameBounds = ["x", "y", "width", "height"].every((key) =>
+      Number(actual.bounds?.[key]) === Number(expected.bounds?.[key])
+    );
+    const sameIdentity = actual.windowId === String(expected.windowId ?? target.windowId)
+      && (!expected.processId || actual.processId === Number(expected.processId))
+      && (!expected.processName || actual.processName.toLowerCase() === String(expected.processName).toLowerCase())
+      && (!expected.title || actual.title === String(expected.title))
+      && (!expected.className || actual.className === String(expected.className))
+      && actual.displayId === expected.displayId
+      && actual.dpi === Number(expected.dpi)
+      && sameBounds;
+    if (!sameIdentity) throw new Error("STALE_OBSERVATION: window identity, bounds, display, or DPI changed");
+    const bounds = window.Bounds ?? window.bounds;
+    if (!bounds) throw new Error("STALE_OBSERVATION: current window bounds unavailable");
+    return target;
   };
 
   registerM4Primitive({
@@ -1747,7 +1767,8 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
 
   const registerBrowserPrimitive = ({
     name, description, inputSchema, operation, permissionType = "READ",
-    risk = RiskLevel.LOW, detectedChanges = [], filesystem = "NONE"
+    risk = RiskLevel.LOW, detectedChanges = [], filesystem = "NONE",
+    observeOperation = null, verifyResult = null, timeout = 20000
   }) => registry.register({
     name,
     version: "1.0.0",
@@ -1764,21 +1785,28 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     },
     security: {
       filesystem, registry: "NONE",
-      network: ["launch", "navigate"].includes(operation) ? "OUTBOUND" : "NONE",
+      network: ["launch", "navigate", "playMedia", "research"].includes(operation) ? "OUTBOUND" : "NONE",
       browser: permissionType === "WRITE" ? "CONTROLLED" : "READ",
       clipboard: "NONE", windowAutomation: "NONE", externalProcesses: operation === "launch" ? "BROWSER" : "NONE"
     },
-    reversibility: "NOT_REQUIRED",
+    reversibility: permissionType === "WRITE" ? "UNSUPPORTED" : "NOT_REQUIRED",
+    rollbackSupport: permissionType === "WRITE" ? "UNSUPPORTED" : "NOT_REQUIRED",
+    rollback: permissionType === "WRITE"
+      ? { supported: false, reason: "Browser mutations have no reliable generic rollback; recovery requires fresh observation." }
+      : { supported: false, reason: "Read-only browser operations do not require rollback." },
     preconditions: () => typeof adapter?.browserDomAction === "function",
-    execute: async (args) => adapter.browserDomAction(operation, args),
+    execute: async (args, { signal } = {}) => adapter.browserDomAction(operation, args, { signal }),
     observe: async (result, args) => ({
       observationId: createId(), source: name, timestamp: new Date().toISOString(),
-      structuredState: result, relatedActionId: args?.actionId,
+      structuredState: observeOperation
+        ? { actionResult: result, observedState: await adapter.browserDomAction(observeOperation, args) }
+        : result,
       detectedChanges, confidence: result?.performed === false || result?.found === false ? 0.4 : 0.98,
       trustLevel: "SYSTEM_TRUSTED"
     }),
     verify: async (observation) => {
       const result = observation?.structuredState ?? {};
+      if (verifyResult) return verifyResult(result, observation);
       const failed = result.performed === false || result.found === false || result.matched === false;
       return {
         status: failed ? "FAILED" : "VERIFIED",
@@ -1787,7 +1815,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
         confidence: 0.98
       };
     },
-    timeout: 20000,
+    timeout,
     retryPolicy: { maxAttempts: 1, backoffMs: 0 },
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
@@ -1809,6 +1837,59 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     description: "Navigate the controlled browser to one explicit HTTP(S) URL",
     inputSchema: { type: "object", properties: { url: { type: "string" }, waitUntil: { type: "string" }, timeoutMs: { type: "number" } }, required: ["url"] },
     operation: "navigate", detectedChanges: ["browser.location"]
+  });
+  registerBrowserPrimitive({
+    name: "browser.media.play",
+    description: "Open a structured browser media result and independently verify that its media element is playing",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string" }, query: { type: "string" }, resultSelector: { type: "string" },
+        mediaSelector: { type: "string" }, blockedStateSelector: { type: "string" }, timeoutMs: { type: "number" }
+      },
+      required: ["url", "query"]
+    },
+    operation: "playMedia", permissionType: "WRITE", risk: RiskLevel.MEDIUM,
+    detectedChanges: ["browser.location", "browser.media.playback"],
+    observeOperation: "mediaState", timeout: 90000,
+    verifyResult: ({ actionResult = {}, observedState = {} }) => {
+      const requestedMediaMatches = matchesMediaQuery(actionResult.selectedTitle, actionResult.query);
+      const selectedIdentityObserved = matchesMediaQuery(observedState.title, actionResult.selectedTitle);
+      const independentlyProgressed = Number(observedState.currentTime) > Number(actionResult.mediaState?.currentTime ?? 0);
+      const activeMedia = observedState.playing === true || (
+        selectedIdentityObserved && observedState.paused === false && observedState.ended === false && observedState.readyState >= 2
+      );
+      const verified = actionResult.performed === true && requestedMediaMatches && selectedIdentityObserved
+        && observedState.found === true && activeMedia && independentlyProgressed;
+      return {
+        status: verified ? "VERIFIED" : "FAILED",
+        message: verified ? "Requested browser media playback was independently observed" : (actionResult.reason ?? observedState.reason ?? (requestedMediaMatches ? "Browser media is not playing" : "Opened media does not match the request")),
+        evidence: { actionResult, observedState, requestedMediaMatches, selectedIdentityObserved, independentlyProgressed },
+        confidence: verified ? 0.99 : 0.99
+      };
+    }
+  });
+  registerBrowserPrimitive({
+    name: "browser.research",
+    description: "Extract bounded, timestamped, sourced results from a controlled browser without submitting forms or transactions",
+    inputSchema: {
+      type: "object",
+      properties: { url: { type: "string" }, resultSelector: { type: "string" }, limit: { type: "number" } },
+      required: ["url"]
+    },
+    operation: "research", permissionType: "READ", risk: RiskLevel.LOW,
+    observeOperation: "researchState",
+    verifyResult: ({ actionResult = {}, observedState = {} }) => {
+      const samePage = actionResult.sourceUrl && observedState.sourceUrl === actionResult.sourceUrl;
+      const sources = Array.isArray(observedState.items) ? observedState.items : [];
+      const verified = actionResult.found === true && observedState.found === true && samePage && sources.length > 0
+        && sources.every((item) => /^https?:\/\//i.test(item.url ?? "") && item.title && item.snippet);
+      return {
+        status: verified ? "VERIFIED" : "FAILED",
+        message: verified ? "Structured browser research results were independently observed" : (observedState.reason ?? "Structured research evidence is missing or stale"),
+        evidence: { actionResult, observedState }, confidence: 0.98
+      };
+    }
   });
   registerBrowserPrimitive({
     name: "browser.currentState",
@@ -2571,12 +2652,19 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       confidence: 1,
       trustLevel: "SYSTEM_TRUSTED"
     }),
-    verify: async (observation) => ({
-      status: "VERIFIED",
-      message: "Git repository inspection complete",
-      evidence: observation.structuredState,
-      confidence: 1
-    }),
+    verify: async (observation) => {
+      const result = observation.structuredState ?? {};
+      const valid = typeof result.isRepository === "boolean"
+        && ["REPOSITORY", "NOT_A_REPOSITORY"].includes(result.status);
+      return {
+        status: valid ? "VERIFIED" : "FAILED",
+        message: valid
+          ? (result.isRepository ? "Git repository state inspected." : "Workspace is not a Git repository.")
+          : "Git repository probe failed.",
+        evidence: result,
+        confidence: valid ? 1 : 0
+      };
+    },
     rollback: null,
     timeout: 10000,
     retryPolicy: { maxAttempts: 1, backoffMs: 500 },
@@ -2612,12 +2700,19 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       confidence: 1,
       trustLevel: "SYSTEM_TRUSTED"
     }),
-    verify: async (observation) => ({
-      status: "VERIFIED",
-      message: "Docker environment inspection complete",
-      evidence: observation.structuredState,
-      confidence: 1
-    }),
+    verify: async (observation) => {
+      const result = observation.structuredState ?? {};
+      const valid = typeof result.available === "boolean"
+        && ["AVAILABLE", "NOT_AVAILABLE"].includes(result.status);
+      return {
+        status: valid ? "VERIFIED" : "FAILED",
+        message: valid
+          ? (result.available ? "Docker is available." : "Docker is not available.")
+          : "Docker availability probe failed.",
+        evidence: result,
+        confidence: valid ? 1 : 0
+      };
+    },
     rollback: null,
     timeout: 10000,
     retryPolicy: { maxAttempts: 1, backoffMs: 500 },
@@ -2653,12 +2748,19 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       confidence: 1,
       trustLevel: "SYSTEM_TRUSTED"
     }),
-    verify: async (observation) => ({
-      status: "VERIFIED",
-      message: "Package manager inspection complete",
-      evidence: observation.structuredState,
-      confidence: 1
-    }),
+    verify: async (observation) => {
+      const result = observation.structuredState ?? {};
+      const valid = typeof result.available === "boolean"
+        && ["AVAILABLE", "NOT_AVAILABLE"].includes(result.status);
+      return {
+        status: valid ? "VERIFIED" : "FAILED",
+        message: valid
+          ? `${result.packageManager ?? "Package manager"} is ${result.available ? "available" : "not available"}.`
+          : "Package manager availability probe failed.",
+        evidence: result,
+        confidence: valid ? 1 : 0
+      };
+    },
     rollback: null,
     timeout: 10000,
     retryPolicy: { maxAttempts: 1, backoffMs: 500 },

@@ -91,3 +91,34 @@ test("recovery engine honors attempt budgets", async () => {
   assert.equal(result.attempt, 2);
   assert.equal(attempts, 2);
 });
+
+test("recovery engine rejects an identical strategy until relevant state changes", () => {
+  const recoveryEngine = new RecoveryEngine();
+  const diagnosis = { category: "NETWORK", rootCause: "connection reset" };
+  const first = recoveryEngine.recover({
+    diagnosis,
+    budget: { total: 4, spent: 0, attempts: [] },
+    failureFingerprint: "browser.navigate:connection-reset",
+    stateFingerprint: "tabs:v1"
+  });
+  assert.equal(first.action, "retry_with_backoff");
+
+  const duplicate = recoveryEngine.recover({
+    diagnosis,
+    budget: first.budget,
+    failureFingerprint: "browser.navigate:connection-reset",
+    stateFingerprint: "tabs:v1"
+  });
+  assert.equal(duplicate.action, "abort");
+  assert.equal(duplicate.category, "IDENTICAL_RECOVERY_REJECTED");
+  assert.equal(duplicate.budget.spent, 1, "rejected duplicate does not consume budget");
+
+  const changed = recoveryEngine.recover({
+    diagnosis,
+    budget: duplicate.budget,
+    failureFingerprint: "browser.navigate:connection-reset",
+    stateFingerprint: "tabs:v2"
+  });
+  assert.equal(changed.action, "retry_with_backoff");
+  assert.equal(changed.budget.spent, 2);
+});

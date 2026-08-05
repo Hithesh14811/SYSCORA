@@ -10,7 +10,7 @@ import {
 } from "../../shared-types/src/domain.js";
 import { IntentEngine } from "../../intent-engine/src/index.js";
 import { ContextEngine, SystemContextProvider, ProcessContextProvider, PortContextProvider, EnvironmentContextProvider, WorkspaceContextProvider } from "../../context-engine/src/index.js";
-import { GeneralPlanner, PlanValidator, assessPlanGoalCoverage } from "../../planner/src/index.js";
+import { GeneralPlanner, OPERATION_PLANS, PlanValidator, assessPlanGoalCoverage } from "../../planner/src/index.js";
 import { MockModelProvider, validateSchema } from "../../model-providers/src/index.js";
 import { TaskGraphScheduler } from "../../task-graph-scheduler/src/index.js";
 import { PerceptionEngine } from "../../perception/src/index.js";
@@ -53,6 +53,21 @@ export {
   classifyInteractiveContext,
   INTERACTIVE_AGENT_DEFAULT_BUDGETS
 } from "./interactive-agent-controller.js";
+
+const RECOVERY_VOLATILE_KEYS = new Set([
+  "at", "timestamp", "observedAt", "capturedAt", "createdAt", "updatedAt", "elapsedMs"
+]);
+
+function stableRecoveryFingerprint(value) {
+  const normalize = (item) => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.keys(item).sort()
+      .filter((key) => !RECOVERY_VOLATILE_KEYS.has(key))
+      .map((key) => [key, normalize(item[key])]));
+  };
+  try { return JSON.stringify(normalize(value)); } catch { return String(value); }
+}
 
 export class AgentRuntime {
   constructor({
@@ -189,38 +204,62 @@ export class AgentRuntime {
     }
 
     let startedSessionId = null;
+    let activeSession = null;
     let timer = null;
+    const deadlineController = new AbortController();
+    const deadlineAt = Date.now() + timeoutMs;
     const callerStarted = options.onSessionStarted;
     const work = this._submitIntent(rawText, {
       ...options,
+      deadlineAt,
+      deadlineSignal: deadlineController.signal,
+      onSessionCreated: (session) => { activeSession = session; },
       onSessionStarted: (sessionId) => {
         startedSessionId = sessionId;
         callerStarted?.(sessionId);
       }
     });
     const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => resolve({
-        sessionId: startedSessionId ?? createId("session_timeout"),
-        createdAt: new Date().toISOString(),
-        currentState: RuntimeState.FAILED,
-        intent: null,
-        plan: null,
-        taskResults: [],
-        observations: [],
-        verifications: [],
-        events: [],
-        deadlineExceeded: true,
-        finalResponse: {
+      timer = setTimeout(async () => {
+        deadlineController.abort(new Error("SESSION_DEADLINE_EXCEEDED"));
+        const timedOut = activeSession ?? {
+          sessionId: startedSessionId ?? createId("session_timeout"),
+          createdAt: new Date().toISOString(),
+          intent: null,
+          plan: null,
+          taskResults: [],
+          observations: [],
+          verifications: [],
+          events: []
+        };
+        timedOut.currentState = RuntimeState.TIMED_OUT;
+        timedOut.deadlineExceeded = true;
+        timedOut.deadlineAt = new Date(deadlineAt).toISOString();
+        timedOut.finalResponse = {
           status: "TIMED_OUT",
           message: `Session exceeded its ${timeoutMs}ms wall-clock deadline.`,
           timeoutMs
-        }
-      }), timeoutMs);
+        };
+        try {
+          await this.addSessionEvent(timedOut, "SESSION_TIMED_OUT", { timeoutMs, deadlineAt });
+          await this.persistSession(timedOut);
+        } catch { /* the terminal result still returns even if persistence is unavailable */ }
+        resolve(timedOut);
+      }, timeoutMs);
     });
     try {
       return await Promise.race([work, timeout]);
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  _assertSessionActive(session, options = {}) {
+    if (session?.deadlineExceeded || options.deadlineSignal?.aborted ||
+        (Number.isFinite(options.deadlineAt) && Date.now() >= options.deadlineAt)) {
+      const error = new Error("SESSION_DEADLINE_EXCEEDED");
+      error.code = "SESSION_DEADLINE_EXCEEDED";
+      throw error;
     }
   }
 
@@ -258,6 +297,10 @@ export class AgentRuntime {
       // but a materially riskier replan is still re-gated — see _authorizePlan).
       autoApprove: options.autoApprove === true
     };
+    session.deadlineAt = Number.isFinite(options.deadlineAt)
+      ? new Date(options.deadlineAt).toISOString()
+      : null;
+    options.onSessionCreated?.(session);
     options.onSessionStarted?.(session.sessionId);
 
     await this.addSessionEvent(session, "INTENT_RECEIVED", { rawText });
@@ -267,6 +310,7 @@ export class AgentRuntime {
       // 1. Understand intent
       session.currentState = RuntimeState.BUILD_CONTEXT;
       session.intent = await this.intentEngine.classify(rawText, { workspacePath: process.cwd(), ...options });
+      this._assertSessionActive(session, options);
       session.intent.operationProvenance = options.operation
         ? "EXPLICIT_CONTEXT"
         : (session.intent.operation ? "NATURAL_LANGUAGE_ROUTED" : null);
@@ -339,6 +383,7 @@ export class AgentRuntime {
       const skipAdvisoryPlanningState = fastReadOnlyOperation || !modelHealthyForConversational;
       const requiredContext = session.intent.requiredContext || [];
       const baseContext = await this.contextEngine.collectContext(requiredContext, session.intent.entities);
+      this._assertSessionActive(session, options);
       let semanticContext = [];
       let relevantMemory = [];
       
@@ -407,17 +452,15 @@ export class AgentRuntime {
         buildInternalToGuiTransferStrategy(rawText) ??
         buildExplicitApplicationLaunchStrategy(rawText)
       );
-      // Spotify has a complete typed workflow (including compound play+queue
-      // entities) whose capabilities perform their own grounded perception and
-      // postcondition verification. Do not let a generic GUI strategy replace
-      // that safer, more specific plan merely because the wording contains
-      // "put" or another interactive verb.
-      const preferTypedInteractiveOperation = new Set([
-        "spotify.track.open",
-        "spotify.track.play"
-      ]).has(session.intent.operation);
+      // A known typed operation already has a deterministic capability graph.
+      // Preserve that graph ahead of generic UI reasoning for every operation,
+      // not just for individual applications. The typed capability remains
+      // responsible for its own grounding and postcondition evidence.
+      const hasDirectOperationPlan = Boolean(
+        session.intent.operation && OPERATION_PLANS[session.intent.operation]
+      );
       const earlyInteractiveGoal =
-        !preferTypedInteractiveOperation &&
+        !hasDirectOperationPlan &&
         (!session.intent.operation || hasLocalInteractiveStrategy) &&
         (
           ["APPLICATION", "BROWSER"].includes(String(session.intent.category ?? "").toUpperCase()) ||
@@ -458,6 +501,7 @@ export class AgentRuntime {
         relevantMemory,
         { priorProcedures, priorFailures }
       );
+      this._assertSessionActive(session, options);
       originalPlan = session.plan;
 
       // Graceful no-plan path (MVP). When neither a model nor the deterministic
@@ -593,6 +637,7 @@ export class AgentRuntime {
         phase: "INITIAL",
         autoApprove: options.autoApprove === true
       });
+      this._assertSessionActive(session, options);
       if (!gate.authorized) {
         // The gate set session.currentState + finalResponse (PLAN_REJECTED /
         // DENIED / AWAITING_APPROVAL) and persisted the session.
@@ -602,6 +647,7 @@ export class AgentRuntime {
       // 8. Execute tasks with TaskGraphScheduler (single canonical pipeline).
       session.currentState = RuntimeState.EXECUTING;
       const execResult = await this._executeTaskGraph(session, { replanAttempts, MAX_REPLAN_ATTEMPTS, originalPlan });
+      this._assertSessionActive(session, options);
 
       // 9-11. Update semantic state + memory, then final goal verification.
       // Skip finalization if the loop already reached a terminal state
@@ -611,6 +657,7 @@ export class AgentRuntime {
       }
       return session;
     } catch (error) {
+      if (session.deadlineExceeded || error?.code === "SESSION_DEADLINE_EXCEEDED") return session;
       session.currentState = RuntimeState.FAILED;
       session.finalResponse = { status: "FAILED", message: error.message };
       await this.addSessionEvent(session, "ERROR_OCCURRED", { error: error.message });
@@ -634,11 +681,23 @@ export class AgentRuntime {
   }
 
   async _runInteractiveController(session, rawText, options = {}) {
+    const remainingSessionMs = session.deadlineAt
+      ? Math.max(1, Date.parse(session.deadlineAt) - Date.now())
+      : null;
     const controller = new InteractiveAgentController({
       reasoningEngine: this.reasoningEngine,
       capabilityRegistry: this.capabilityRegistry,
-      budgets: options.interactiveBudgets,
+      budgets: {
+        ...(options.interactiveBudgets ?? {}),
+        ...(remainingSessionMs != null
+          ? { maxElapsedTime: Math.min(
+              Number(options.interactiveBudgets?.maxElapsedTime ?? remainingSessionMs),
+              remainingSessionMs
+            ) }
+          : {})
+      },
       perceive: async (controllerState = {}) => {
+        this._assertSessionActive(session, { deadlineAt: Date.parse(session.deadlineAt) });
         const windows = await this.adapter.listWindows().catch(() => []);
         const rawForeground = windows.find((window) => window.Foreground ?? window.foreground) ?? null;
         const goalTokens = new Set(
@@ -712,7 +771,8 @@ export class AgentRuntime {
         };
       },
       executeAction: async (action, controllerContext) =>
-        this._executeInteractiveAction(session, action, controllerContext),
+        (this._assertSessionActive(session, { deadlineAt: Date.parse(session.deadlineAt) }),
+        this._executeInteractiveAction(session, action, controllerContext)),
       onEvent: async (event) => this.addSessionEvent(session, event.type, event)
     });
     const result = await controller.run(rawText, {
@@ -1153,14 +1213,18 @@ export class AgentRuntime {
     // task runs. Deny-by-default enforcement in the pipeline's authorize()
     // callback consumes these; without a grant a capability cannot execute even
     // though the session and policy approval exist.
+    const deadlineAt = session.deadlineAt ? Date.parse(session.deadlineAt) : null;
+    this._assertSessionActive(session, { deadlineAt });
     await this._issuePlanGrants(session, session.plan);
 
     this.taskGraphScheduler.initialize(session.plan.taskGraph);
 
     while (!this.taskGraphScheduler.isComplete()) {
+      this._assertSessionActive(session, { deadlineAt });
       const readyTasks = this.taskGraphScheduler.getReadyTasks();
 
       for (const task of readyTasks) {
+        this._assertSessionActive(session, { deadlineAt });
         const referencedInputs = task.inputs;
         const resolved = resolveTaskInputs(referencedInputs, {
           taskResults: this.taskGraphScheduler.taskResults,
@@ -1262,7 +1326,12 @@ export class AgentRuntime {
 
         let execution;
         try {
+          if (Number.isFinite(deadlineAt)) {
+            const remaining = Math.max(1, deadlineAt - Date.now());
+            task.timeout = Math.min(Number(task.timeout ?? remaining), remaining);
+          }
           execution = await this.taskGraphScheduler.executeTask(task);
+          this._assertSessionActive(session, { deadlineAt });
         } finally {
           // Scrub even if execution throws during observation or verification.
           if (injectedSecrets) this._scrubInjectedSecrets(task, injectedSecrets);
@@ -1686,7 +1755,25 @@ export class AgentRuntime {
       diagnosis,
       budget: session.recoveryBudget,
       replanAttempts,
-      maxReplanAttempts: MAX_REPLAN_ATTEMPTS
+      maxReplanAttempts: MAX_REPLAN_ATTEMPTS,
+      failureFingerprint: stableRecoveryFingerprint({
+        capability: task.capability,
+        inputs: task.inputs,
+        verification: {
+          status: verification?.status,
+          category: verification?.category,
+          message: verification?.message
+        },
+        execution: {
+          exitCode: executionResult?.exitCode ?? executionResult?.commandResult?.exitCode,
+          reason: executionResult?.reason,
+          error: executionResult?.error
+        }
+      }),
+      stateFingerprint: stableRecoveryFingerprint({
+        observation: observation?.structuredState ?? observation ?? null,
+        semanticState: session.context?.semanticState ?? null
+      })
     });
     session.recoveryBudget = decision.budget;
     const recoveryReasoning = await this.reasoningEngine.reasonAboutRecovery({

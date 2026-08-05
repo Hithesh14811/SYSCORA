@@ -43,10 +43,10 @@ test("volume adjustment remains a low-risk no-confirmation interaction", () => {
   assert.equal(decision.effect, "ALLOW");
 });
 
-test("a single install pinned to the trusted WinGet source needs no visible confirmation", () => {
+test("a single install pinned to WinGet still requires explicit confirmation", () => {
   const registry = createDefaultCapabilityRegistry({});
   const plan = { taskGraph: { tasks: [{ capability: "package.winget.install", inputs: { id: "Spotify.Spotify" } }] } };
   const assessment = new RiskEngine({ capabilityRegistry: registry }).assess(plan, {});
   const decision = new PolicyEngine().decide(assessment, plan, { capabilities: [registry.get("package.winget.install")] });
-  assert.equal(decision.effect, "ALLOW");
+  assert.equal(decision.effect, "CONFIRM");
 });

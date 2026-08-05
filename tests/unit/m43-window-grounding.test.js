@@ -105,3 +105,93 @@ test("stale UIA target is refreshed and retried once before model recovery", asy
   assert.equal(result.deterministicRecovery.succeeded, true);
   assert.deepEqual(requests.map((request) => request.operation), ["ui.action", "ui.find", "ui.action"]);
 });
+
+for (const reason of ["window-not-found", "foreground-not-acquired"]) {
+  test(`${reason} aborts without redirecting the action through target recovery`, async () => {
+    const requests = [];
+    const host = {
+      async request(operation, params) {
+        requests.push({ operation, params });
+        if (operation === "ui.action") return { performed: false, reason };
+        return {
+          found: true,
+          target: {
+            targetId: "unrelated",
+            source: "UIA",
+            windowId: "99",
+            automationId: "editor",
+            name: "Text editor",
+            controlType: "ControlType.Edit"
+          }
+        };
+      }
+    };
+    const adapter = new WindowsAdapter({ automationHost: host, browserAutomation: {} });
+    const result = await adapter.performUiAction({
+      application: "Browser",
+      windowId: "20",
+      target: {
+        targetId: "stale-browser-field",
+        source: "UIA",
+        windowId: "20",
+        automationId: "search",
+        name: "Search",
+        controlType: "ControlType.Edit"
+      },
+      action: "type",
+      text: "flight search"
+    });
+
+    assert.equal(result.performed, false);
+    assert.equal(result.reason, reason);
+    assert.deepEqual(requests.map((request) => request.operation), ["ui.action"]);
+  });
+}
+
+test("semantic UI invocation combines an action prefix and object name", async () => {
+  const requests = [];
+  const target = {
+    targetId: "play-good-for-you",
+    source: "UIA",
+    windowId: "20",
+    name: "Play Good For You by Selena Gomez, A$AP Rocky",
+    controlType: "ControlType.Button"
+  };
+  const host = {
+    async request(operation, params) {
+      requests.push({ operation, params });
+      if (operation === "ui.find") return { found: true, ambiguous: false, matchCount: 1, target };
+      return { performed: true, method: "InvokePattern", target };
+    }
+  };
+  const adapter = new WindowsAdapter({ automationHost: host, browserAutomation: {} });
+  const result = await adapter.findAndInvokeSemanticControl({
+    application: "spotify",
+    windowId: "20",
+    actionPrefix: "Play ",
+    objectName: "Good For You"
+  });
+  assert.equal(result.invoked, true);
+  assert.deepEqual(requests.map((request) => request.operation), ["ui.find", "ui.action"]);
+  assert.deepEqual(requests[0].params.selector, {
+    nameStartsWith: "Play",
+    nameContains: "Good For You",
+    controlType: "Button"
+  });
+});
+
+test("semantic UI invocation refuses an ambiguous control", async () => {
+  const host = {
+    async request() {
+      return { found: true, ambiguous: true, matchCount: 2, target: { name: "Open report", windowId: "1" } };
+    }
+  };
+  const adapter = new WindowsAdapter({ automationHost: host, browserAutomation: {} });
+  const result = await adapter.findAndInvokeSemanticControl({
+    application: "files",
+    actionPrefix: "Open ",
+    objectName: "report"
+  });
+  assert.equal(result.invoked, false);
+  assert.equal(result.reason, "ambiguous-semantic-target");
+});

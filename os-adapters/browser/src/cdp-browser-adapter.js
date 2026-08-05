@@ -5,6 +5,50 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const throwIfAborted = (signal) => {
+  if (!signal?.aborted) return;
+  const error = new Error("Browser operation cancelled");
+  error.name = "AbortError";
+  error.code = "CANCELLED";
+  throw error;
+};
+
+export const BROWSER_TARGET_KIND = "BROWSER_DOM";
+export const DESKTOP_TARGET_KIND = "DESKTOP_UI";
+export const MAX_BROWSER_TEXT_BYTES = 64 * 1024;
+
+export function boundBrowserText(value, maxBytes = MAX_BROWSER_TEXT_BYTES) {
+  const text = String(value ?? "");
+  const originalBytes = Buffer.byteLength(text, "utf8");
+  if (originalBytes <= maxBytes) return { text, truncated: false };
+  let bounded = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
+  if (bounded.endsWith("\uFFFD")) bounded = bounded.slice(0, -1);
+  return { text: bounded, truncated: true, originalBytes };
+}
+
+export function normalizeBrowserElement(element = {}) {
+  const tag = String(element.tag ?? element.controlType ?? "").toLowerCase();
+  const inferredRole = { button: "button", a: "link", input: "textbox", select: "combobox", textarea: "textbox" }[tag] ?? tag ?? null;
+  const role = element.role ?? inferredRole;
+  return {
+    ...element,
+    id: String(element.id ?? element.targetId ?? `browser-${element.index ?? "element"}`),
+    source: "DOM",
+    targetKind: BROWSER_TARGET_KIND,
+    role,
+    text: String(element.text ?? element.name ?? ""),
+    bbox: element.bbox ?? element.boundingRect ?? element.bounds ?? null,
+    clickable: element.clickable ?? (["button", "a", "input", "select", "textarea"].includes(tag) || role === "button" || role === "link"),
+    controlType: element.controlType ?? tag ?? null,
+    name: element.name ?? element.text ?? null
+  };
+}
+
+export function resolveTargetSurface(target) {
+  return target?.targetKind === BROWSER_TARGET_KIND || target?.source === "DOM"
+    ? BROWSER_TARGET_KIND
+    : DESKTOP_TARGET_KIND;
+}
 
 export const BrowserLifecycleState = Object.freeze({
   DISCOVER: "DISCOVER",
@@ -118,9 +162,10 @@ export class CdpBrowserAdapter {
     return response.json();
   }
 
-  async launch({ url = "about:blank", headless = false } = {}) {
+  async launch({ url = "about:blank", headless = false, signal = null } = {}) {
+    throwIfAborted(signal);
     if (this.process && this.connection) {
-      if (url && url !== "about:blank") await this.navigate({ url });
+      if (url && url !== "about:blank") await this.navigate({ url, signal });
       return { launched: true, reused: true, target: this.target };
     }
     this._transition(BrowserLifecycleState.DISCOVER);
@@ -141,6 +186,8 @@ export class CdpBrowserAdapter {
       url
     ];
     this.process = spawn(executable, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: headless });
+    const abortLaunch = () => this.close();
+    signal?.addEventListener("abort", abortLaunch, { once: true });
     this._transition(BrowserLifecycleState.WAIT_FOR_CDP);
     let endpoint = "";
     try {
@@ -161,6 +208,7 @@ export class CdpBrowserAdapter {
     } catch (error) {
       this._transition(BrowserLifecycleState.FAILED, { code: error.code ?? "CDP_START_FAILED" });
       this.close();
+      throwIfAborted(signal);
       throw error;
     }
     const browserConnection = new CdpConnection(endpoint, { timeoutMs: this.requestTimeoutMs });
@@ -187,6 +235,7 @@ export class CdpBrowserAdapter {
       if (ready?.result?.value !== 2) throw browserError("DOM_UNAVAILABLE", "Browser runtime is unavailable");
       this.target = { targetId: target.targetId, url: target.url };
       this._transition(BrowserLifecycleState.READY, { targetId: target.targetId });
+      throwIfAborted(signal);
       return { launched: true, executable, target: this.target, lifecycle: structuredClone(this.lifecycle) };
     } catch (error) {
       if (this.connection !== browserConnection) browserConnection.close();
@@ -194,6 +243,8 @@ export class CdpBrowserAdapter {
       this._transition(BrowserLifecycleState.FAILED, { code });
       this.close();
       throw browserError(code, error.message, error);
+    } finally {
+      signal?.removeEventListener("abort", abortLaunch);
     }
   }
 
@@ -220,7 +271,8 @@ export class CdpBrowserAdapter {
     return result.result?.value;
   }
 
-  async navigate({ url, waitUntil = "complete", timeoutMs = 15000 } = {}) {
+  async navigate({ url, waitUntil = "complete", timeoutMs = 15000, signal = null } = {}) {
+    throwIfAborted(signal);
     if (!/^(?:https?:\/\/|data:text\/html(?:[;,]|$)|about:blank$)/i.test(String(url))) {
       throw browserError("NAVIGATION_FAILED", "browser.navigate requires an http(s), HTML data, or about:blank URL");
     }
@@ -230,7 +282,7 @@ export class CdpBrowserAdapter {
       throw browserError("NAVIGATION_FAILED", `Browser navigation failed: ${error.message}`, error);
     }
     this.observedTargets.clear();
-    await this.wait({ condition: "document.readyState", value: waitUntil, timeoutMs });
+    await this.wait({ condition: "document.readyState", value: waitUntil, timeoutMs, signal });
     return this.currentState();
   }
 
@@ -240,6 +292,7 @@ export class CdpBrowserAdapter {
       title: document.title,
       readyState: document.readyState,
       viewport: { width: innerWidth, height: innerHeight },
+      scroll: { x: scrollX, y: scrollY },
       activeElement: document.activeElement ? {
         tag: document.activeElement.tagName,
         id: document.activeElement.id,
@@ -248,9 +301,117 @@ export class CdpBrowserAdapter {
     }))()`);
   }
 
+  async mediaState({ selector = "video, audio", blockedStateSelector = null } = {}) {
+    const selected = JSON.stringify(String(selector || "video, audio"));
+    const blocked = JSON.stringify(blockedStateSelector == null ? null : String(blockedStateSelector));
+    return this._evaluate(`(() => {
+      const media=document.querySelector(${selected});
+      if(!media)return {found:false,playing:false,reason:"media-element-not-found",url:location.href,title:document.title};
+      const blockedSelector=${blocked}; const visible=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);
+        return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden"&&s.opacity!=="0"};
+      const blockedByPage=blockedSelector?[...document.querySelectorAll(blockedSelector)].some(visible):false;
+      return {found:true,playing:!blockedByPage&&!media.paused&&!media.ended&&media.readyState>=2,blockedByPage,paused:media.paused,
+        ended:media.ended,currentTime:media.currentTime,duration:Number.isFinite(media.duration)?media.duration:null,
+        readyState:media.readyState,muted:media.muted,volume:media.volume,url:location.href,title:document.title};
+    })()`);
+  }
+
+  async playMedia({
+    url,
+    query = null,
+    resultSelector = "a#video-title, a[href*='/watch'], a[href*='/video/']",
+    mediaSelector = "video, audio",
+    blockedStateSelector = null,
+    timeoutMs = 75000,
+    signal = null
+  } = {}) {
+    if (!url) throw new Error("browser media playback requires an explicit URL");
+    await this.launch({ url, signal });
+    const deadline = Date.now() + Math.min(75000, Math.max(1000, Number(timeoutMs) || 75000));
+    let state = await this.currentState();
+    let selectedTitle = null;
+    if (!/\/(?:watch|video|shorts)\b/i.test(new URL(state.url).pathname)) {
+      const ready = await this.wait({ condition: "selector", selector: resultSelector, timeoutMs: Math.min(10000, timeoutMs), signal });
+      if (!ready.matched) return { performed: false, playing: false, reason: "media-result-not-found", state };
+      const found = query
+        ? await this.findBest({ selector: resultSelector, text: query, minCoverage: 0.5 })
+        : await this.find({ selector: resultSelector });
+      const target = found.found ? found.target : null;
+      if (!target) return { performed: false, playing: false, reason: "media-result-not-found", state };
+      selectedTitle = target.text ?? target.name ?? null;
+      const clicked = await this.click({ target });
+      if (!clicked.performed) return { performed: false, playing: false, reason: "media-result-not-opened", state };
+      while (Date.now() < deadline) {
+        throwIfAborted(signal);
+        await delay(150);
+        state = await this.currentState();
+        if (/\/(?:watch|video|shorts)\b/i.test(new URL(state.url).pathname)) break;
+      }
+    }
+    const mediaReady = await this.wait({ condition: "selector", selector: mediaSelector, timeoutMs: Math.max(500, deadline - Date.now()), signal });
+    if (!mediaReady.matched) return { performed: false, playing: false, reason: "media-element-not-found", state };
+    const selector = JSON.stringify(mediaSelector);
+    const started = await this._evaluate(`(()=>{const media=document.querySelector(${selector});if(!media)return false;
+      try{const pending=media.play();if(pending&&typeof pending.catch==="function")pending.catch(()=>{});return true}catch{return false}})()`);
+    let observed = await this.mediaState({ selector: mediaSelector, blockedStateSelector });
+    let firstPlayingTime = null;
+    while (Date.now() < deadline) {
+      throwIfAborted(signal);
+      const selectedIdentityObserved = selectedTitle && String(observed.title ?? "").toLowerCase().includes(String(selectedTitle).toLowerCase());
+      const contentPlaying = observed.playing || (selectedIdentityObserved && !observed.paused && !observed.ended && observed.readyState >= 2);
+      if (contentPlaying && observed.currentTime > 0) {
+        if (firstPlayingTime == null) firstPlayingTime = observed.currentTime;
+        else if (observed.currentTime > firstPlayingTime) break;
+      }
+      await delay(250);
+      observed = await this.mediaState({ selector: mediaSelector, blockedStateSelector });
+    }
+    return {
+      performed: started === true,
+      playing: observed.playing === true || Boolean(selectedTitle && String(observed.title ?? "").toLowerCase().includes(String(selectedTitle).toLowerCase()) && !observed.paused && !observed.ended && observed.readyState >= 2),
+      query,
+      selectedTitle,
+      mediaState: observed,
+      url: observed.url,
+      title: observed.title,
+      reason: observed.playing ? null : "media-playback-not-observed"
+    };
+  }
+
+  async researchState({
+    resultSelector = "main a[href], article a[href], [role='main'] a[href]",
+    limit = 12
+  } = {}) {
+    const selector = JSON.stringify(String(resultSelector));
+    const bounded = Math.max(1, Math.min(50, Number(limit) || 12));
+    return this._evaluate(`(() => {
+      const clean=value=>String(value||"").replace(/\\s+/g," ").trim();
+      const absolute=value=>{try{return new URL(value,location.href).href}catch{return null}};
+      const items=[]; const seen=new Set();
+      for(const anchor of document.querySelectorAll(${selector})){
+        if(items.length>=${bounded})break;
+        const href=absolute(anchor.getAttribute("href"));
+        const container=anchor.closest("article,[data-result],[role='article'],div")||anchor;
+        const text=clean(container.innerText||anchor.innerText||anchor.textContent);
+        const title=clean(anchor.innerText||anchor.textContent||anchor.getAttribute("aria-label"));
+        if(!href||!/^https?:/i.test(href)||!text||seen.has(href))continue;
+        seen.add(href); items.push({title:title||text.slice(0,200),snippet:text.slice(0,1000),url:href});
+      }
+      return {found:items.length>0,items,sourceUrl:location.href,pageTitle:document.title,
+        observedAt:new Date().toISOString(),reason:items.length?null:"research-results-not-found"};
+    })()`);
+  }
+
+  async research({ url, resultSelector, limit = 12, signal = null } = {}) {
+    if (!url) throw new Error("browser research requires an explicit URL");
+    await this.launch({ url, signal });
+    await this.wait({ condition: "document.readyState", value: "complete", timeoutMs: 15000, signal });
+    return this.researchState({ resultSelector, limit });
+  }
+
   async inspect({ limit = 120 } = {}) {
     const bounded = Math.max(1, Math.min(500, Number(limit) || 120));
-    return this._evaluate(`(() => {
+    const elements = await this._evaluate(`(() => {
       const visible = e => { const r=e.getBoundingClientRect(); const s=getComputedStyle(e);
         return r.width>0 && r.height>0 && s.visibility!=="hidden" && s.display!=="none"; };
       return [...document.querySelectorAll("a,button,input,select,textarea,[role],[contenteditable=true],h1,h2,h3,p")]
@@ -261,6 +422,7 @@ export class CdpBrowserAdapter {
             href:e.href||null, bounds:{x:r.x,y:r.y,width:r.width,height:r.height} };
         });
     })()`);
+    return (elements ?? []).map(normalizeBrowserElement);
   }
 
   async find({ selector = null, text = null, role = null, name = null } = {}) {
@@ -281,7 +443,32 @@ export class CdpBrowserAdapter {
     })()`.replace("crypto.randomUUID()", "(globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2))"));
     if (!found) return { found: false, reason: "dom-target-not-found" };
     this.observedTargets.set(found.targetId, found);
-    return { found: true, target: found };
+    return { found: true, target: normalizeBrowserElement(found) };
+  }
+
+  async findBest({ selector, text, minCoverage = 0.5 } = {}) {
+    if (!selector || !text) return { found: false, reason: "selector-and-text-required" };
+    const query = JSON.stringify({ selector: String(selector), text: String(text), minCoverage: Number(minCoverage) });
+    const found = await this._evaluate(`(() => {
+      const q=${query}; let candidates=[]; try{candidates=[...document.querySelectorAll(q.selector)]}catch{return null}
+      const tokens=value=>String(value||"").toLowerCase().match(/[a-z0-9]+/g)?.filter(x=>x.length>=2)||[];
+      const wanted=[...new Set(tokens(q.text))]; let best=null;
+      for(const hit of candidates){
+        const label=(hit.innerText||hit.textContent||hit.getAttribute("aria-label")||hit.getAttribute("title")||"").trim();
+        const actual=new Set(tokens(label)); const hits=wanted.filter(token=>actual.has(token)).length;
+        const coverage=wanted.length?hits/wanted.length:0;
+        if(!best||coverage>best.coverage||(coverage===best.coverage&&label.length>best.label.length))best={hit,label,coverage};
+      }
+      if(!best||best.coverage<Math.max(0,Math.min(1,q.minCoverage||0.5)))return null;
+      const r=best.hit.getBoundingClientRect(); const token="syscora-"+(globalThis.crypto?.randomUUID?.()||Math.random().toString(36).slice(2));
+      best.hit.dataset.syscoraTarget=token;
+      return {targetId:token,source:"DOM",selector:'[data-syscora-target="'+token+'"]',name:best.label,
+        controlType:best.hit.tagName.toLowerCase(),boundingRect:{x:r.x,y:r.y,width:r.width,height:r.height},
+        confidence:best.coverage,observedAt:new Date().toISOString(),url:location.href,textCoverage:best.coverage};
+    })()`);
+    if (!found) return { found: false, reason: "matching-dom-target-not-found" };
+    this.observedTargets.set(found.targetId, found);
+    return { found: true, target: normalizeBrowserElement(found), textCoverage: found.textCoverage };
   }
 
   _targetSelector(target) {
@@ -319,15 +506,24 @@ export class CdpBrowserAdapter {
   }
 
   async scroll({ target = null, x = 0, y = 600 } = {}) {
+    const scrollBefore = await this._evaluate(`({x:scrollX,y:scrollY})`);
     const expression = target
       ? `(() => { const e=document.querySelector(${this._targetSelector(target)}); if(!e)return false; e.scrollIntoView({block:"center"}); return true; })()`
       : `(() => { scrollBy(${Number(x) || 0},${Number(y) || 0}); return true; })()`;
-    return { performed: await this._evaluate(expression) };
+    const performed = await this._evaluate(expression);
+    const scrollAfter = await this._evaluate(`({x:scrollX,y:scrollY})`);
+    return {
+      performed,
+      scrollBefore,
+      scrollAfter,
+      moved: scrollBefore.x !== scrollAfter.x || scrollBefore.y !== scrollAfter.y
+    };
   }
 
-  async wait({ condition = "selector", selector = null, value = null, timeoutMs = 10000 } = {}) {
+  async wait({ condition = "selector", selector = null, value = null, timeoutMs = 10000, signal = null } = {}) {
     const deadline = Date.now() + Math.min(30000, Math.max(100, Number(timeoutMs) || 10000));
     while (Date.now() < deadline) {
+      throwIfAborted(signal);
       const matched = condition === "document.readyState"
         ? await this._evaluate(`document.readyState === ${JSON.stringify(value ?? "complete")}`)
         : await this._evaluate(`Boolean(document.querySelector(${JSON.stringify(selector)}))`);
@@ -383,7 +579,12 @@ export class CdpBrowserAdapter {
 
   close() {
     this.connection?.close();
-    this.process?.kill();
+    if (this.process) {
+      this.process.stderr?.removeAllListeners();
+      this.process.stderr?.destroy();
+      try { this.process.kill(); } catch { /* process already exited */ }
+      this.process.unref?.();
+    }
     this.connection = null;
     this.process = null;
     this.observedTargets.clear();

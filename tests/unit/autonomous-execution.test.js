@@ -151,10 +151,10 @@ test("approval: editing an EXISTING file requires approval", async () => {
   }
 });
 
-test("approval: a WinGet install is autonomous (trusted signed source)", async () => {
+test("approval: a WinGet install requires explicit approval", async () => {
   const runtime = runtimeWithAdapter(new WindowsAdapter());
   const result = await runtime._classifyPlanApproval(planOf("package.winget.install", { id: "VideoLAN.VLC" }));
-  assert.equal(result.requiresApproval, false, "WinGet install proceeds autonomously");
+  assert.equal(result.requiresApproval, true, "software installation must not proceed autonomously");
 });
 
 test("approval: a read-only inspection is autonomous", async () => {

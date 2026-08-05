@@ -40,6 +40,7 @@ public static class M4Native {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] static extern IntPtr SetFocus(IntPtr h);
@@ -79,6 +80,7 @@ public static class M4Native {
   }
 
   public static bool EnableDpiAwareness() { return SetProcessDPIAware(); }
+  public static uint DpiForWindow(IntPtr h) { try { var dpi=GetDpiForWindow(h); return dpi == 0 ? 96u : dpi; } catch { return 96u; } }
   public static bool Activate(IntPtr h) {
     if (!IsWindow(h)) return false;
     if (GetForegroundWindow() == h) return true;
@@ -249,6 +251,8 @@ function Read-OcrImage($path, $windowId=$null, $originX=0, $originY=0) {
 function Get-WindowList {
   @([M4Native]::Windows() | ForEach-Object {
     $process = Get-Process -Id $_.processId -ErrorAction SilentlyContinue
+    $handle = [IntPtr][Int64]$_.windowId
+    $display = [System.Windows.Forms.Screen]::FromHandle($handle)
     [pscustomobject]@{
       windowId = [string]$_.windowId
       processId = $_.processId
@@ -256,6 +260,8 @@ function Get-WindowList {
       title = $_.title
       className = $_.className
       bounds = @{ x=$_.x; y=$_.y; width=$_.width; height=$_.height }
+      displayId = if($display){$display.DeviceName}else{$null}
+      dpi = [int][M4Native]::DpiForWindow($handle)
       foreground = $_.foreground
     }
   })
@@ -265,7 +271,18 @@ function Resolve-Window($params) {
   $windows = Get-WindowList
   if ($params.windowId) {
     $exact = $windows | Where-Object { $_.windowId -eq [string]$params.windowId } | Select-Object -First 1
-    if ($exact) { return @{resolved=$true;window=$exact;confidence=1.0;resolutionMethod="hwnd"} }
+    if (-not $exact) {
+      return @{resolved=$false;window=$null;confidence=0;resolutionMethod="hwnd-missing";reason="TARGET_WINDOW_MISSING"}
+    }
+    $mismatches=@()
+    if($params.processId -and [int64]$exact.processId -ne [int64]$params.processId){$mismatches+="processId"}
+    if($params.processName -and -not $exact.processName.Equals([string]$params.processName,[StringComparison]::OrdinalIgnoreCase)){$mismatches+="processName"}
+    if($params.className -and $exact.className -ne [string]$params.className){$mismatches+="className"}
+    if($params.title -and $exact.title -ne [string]$params.title){$mismatches+="title"}
+    if($mismatches.Count -gt 0){
+      return @{resolved=$false;window=$exact;confidence=0;resolutionMethod="hwnd-identity-mismatch";reason="TARGET_IDENTITY_MISMATCH";mismatches=$mismatches}
+    }
+    return @{resolved=$true;window=$exact;confidence=1.0;resolutionMethod="hwnd"}
   }
   $candidates = @()
   foreach($window in $windows) {
@@ -400,6 +417,7 @@ function Find-UiElement($params) {
       $ok = -not $element.Current.IsOffscreen -and $element.Current.IsEnabled -and $finite
       if ($selector.automationId -and $element.Current.AutomationId -ne [string]$selector.automationId) { $ok=$false }
       if ($selector.name -and $name -ne [string]$selector.name) { $ok=$false }
+      if ($selector.nameStartsWith -and -not $name.StartsWith([string]$selector.nameStartsWith, [StringComparison]::OrdinalIgnoreCase)) { $ok=$false }
       if ($selector.nameContains -and $name.IndexOf([string]$selector.nameContains, [StringComparison]::OrdinalIgnoreCase) -lt 0) { $ok=$false }
       if ($selector.controlType) {
         $expectedControlType = [string]$selector.controlType
@@ -448,8 +466,16 @@ function Invoke-UiAction($params) {
     }
   }
   $resolvedWindow = Resolve-Window $params
-  if (-not $resolvedWindow.resolved) { return @{ performed=$false; reason="window-not-found"; resolution=$resolvedWindow } }
+  if (-not $resolvedWindow.resolved) { return @{ performed=$false; reason=if($resolvedWindow.reason){$resolvedWindow.reason}else{"TARGET_WINDOW_MISSING"}; resolution=$resolvedWindow } }
   $params.windowId = $resolvedWindow.window.windowId
+  $foreground = Acquire-Foreground $params
+  if(-not $foreground.acquired){
+    return @{performed=$false;reason=if($foreground.reason -eq "window-not-found"){"TARGET_WINDOW_MISSING"}else{"FOREGROUND_ACQUISITION_FAILED"};foreground=$foreground}
+  }
+  # Activation can change the accessible tree or expose a modal. Re-resolve the
+  # exact HWND and identity before finding a fresh control for this one action.
+  $resolvedWindow = Resolve-Window $params
+  if(-not $resolvedWindow.resolved){return @{performed=$false;reason=if($resolvedWindow.reason){$resolvedWindow.reason}else{"TARGET_WINDOW_MISSING"};resolution=$resolvedWindow}}
   $found = $null
   for($groundAttempt=0;$groundAttempt -lt 3 -and (-not $found -or -not $found.found);$groundAttempt++){
     if($groundAttempt -gt 0){Start-Sleep -Milliseconds (120*$groundAttempt)}
@@ -470,7 +496,6 @@ function Invoke-UiAction($params) {
     } catch {}
   }
   if (-not $hit) { return @{ performed=$false; reason="stale-target"; target=$found.target } }
-  $foreground=$null
   $currentBounds = $found.target.boundingRect
   $geometryChanged = [bool]($originalBounds -and $currentBounds -and (
     [int]$originalBounds.x -ne [int]$currentBounds.x -or
@@ -600,6 +625,16 @@ function Invoke-Operation($operation, $params) {
       $pattern="(?i)(?<!\p{L})"+[regex]::Escape($query)+"(?!\p{L})"
       $matches=@($ocr.targets|Where-Object{[regex]::IsMatch([string]$_.name,$pattern)})
       $matchedTarget=if($matches.Count){$matches[0]}else{$null}
+      if($matchedTarget -and $w){
+        $observationId="vision-"+[guid]::NewGuid().ToString()
+        $matchedTarget | Add-Member -NotePropertyName observationId -NotePropertyValue $observationId -Force
+        $matchedTarget | Add-Member -NotePropertyName expectedForegroundWindowId -NotePropertyValue $(if($w.foreground){[string]$w.windowId}else{$null}) -Force
+        $matchedTarget | Add-Member -NotePropertyName maxObservationAgeMs -NotePropertyValue 5000 -Force
+        $matchedTarget | Add-Member -NotePropertyName windowIdentity -NotePropertyValue @{
+          windowId=[string]$w.windowId;processId=$w.processId;processName=$w.processName;title=$w.title;className=$w.className
+          bounds=$w.bounds;displayId=$w.displayId;dpi=$w.dpi
+        } -Force
+      }
       $reason=if($matches.Count){$null}else{"visual-target-not-found"}
       return @{found=($matches.Count -gt 0);target=$matchedTarget;matches=$matches;ocrText=$ocr.text;capturePath=$capturePath;reason=$reason}
     }

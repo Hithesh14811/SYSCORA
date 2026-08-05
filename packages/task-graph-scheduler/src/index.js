@@ -357,11 +357,28 @@ class TaskGraphScheduler {
       throw error
     }
 
+    const commandResult = executionResult?.commandResult ?? executionResult
+    const exitCode = commandResult?.exitCode
+    const executionFailed = (typeof exitCode === 'number' && exitCode !== 0)
+      || commandResult?.timedOut === true
+      || commandResult?.cancelled === true
+    if (executionFailed) {
+      verification = {
+        status: 'FAILED',
+        message: typeof exitCode === 'number' && exitCode !== 0
+          ? `Execution exited with nonzero code ${exitCode}.`
+          : (commandResult?.timedOut ? 'Execution timed out.' : 'Execution was cancelled.'),
+        evidence: { executionResult, exitCode: exitCode ?? null, timedOut: commandResult?.timedOut === true, cancelled: commandResult?.cancelled === true },
+        category: commandResult?.timedOut ? 'TIMEOUT' : 'EXECUTION_FAILED',
+        confidence: 1
+      }
+    }
+
     this.verifications.set(task.taskId, verification)
 
-    if (verification.status === 'VERIFIED' || verification.status === 'PARTIALLY_VERIFIED') {
+    if (verification.status === 'VERIFIED') {
       this._setTaskState(task.taskId, TaskState.VERIFIED)
-    } else if (verification.status === 'INCONCLUSIVE') {
+    } else if (verification.status === 'INCONCLUSIVE' || verification.status === 'UNCERTAIN' || verification.status === 'PARTIALLY_VERIFIED') {
       this._setTaskState(task.taskId, TaskState.UNCERTAIN)
     } else {
       this._setTaskState(task.taskId, TaskState.FAILED)

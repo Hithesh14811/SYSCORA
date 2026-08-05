@@ -61,7 +61,7 @@ export class CapabilityLifecyclePipeline {
 
   async recordResult(task, result) {
     const capability = this.registry.get(task.capability);
-    const type = ["VERIFIED", "PARTIALLY_VERIFIED"].includes(result?.verification?.status)
+    const type = result?.verification?.status === "VERIFIED"
       ? "CAPABILITY_VERIFIED"
       : "CAPABILITY_FAILED";
     await this.emit(type, { taskId: task.taskId, capability: task.capability, verification: result?.verification });

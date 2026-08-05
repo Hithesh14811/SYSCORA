@@ -185,7 +185,7 @@ test("interpretSpotifyPlayback: a track title reads as playing", () => {
 });
 
 test("Spotify selector binds a generic Play button to the matching result bounds", async () => {
-  const adapter = new WindowsAdapter();
+  const adapter = new WindowsAdapter({ automationHost: false, browserAutomation: {} });
   let script = "";
   adapter.runPowerShell = async (value) => {
     script = value;
@@ -207,6 +207,8 @@ test("Spotify selector binds a generic Play button to the matching result bounds
   assert.equal(result.matchedLabel, "Cry For Me");
   assert.match(script, /ControlViewWalker\.GetParent/);
   assert.match(script, /NameProperty,'Play'/);
+  assert.match(script, /StartsWith\('Play '/, "descriptive action buttons must be matched by action plus object");
+  assert.match(script, /\$actionButtons/, "fallback scans only actionable button controls");
   assert.match(script, /\$rr\.Height -gt 260/);
   assert.match(script, /\$depth-lt 5/, "ancestor search must remain bounded");
 });
@@ -217,6 +219,35 @@ test("Spotify accessible-name matching tolerates the search correction seen in t
     true
   );
   assert.equal(spotifyNameMatchesQuery("Play Jagave Neenu Gelathiye", "Cry For Me"), false);
+});
+
+test("Spotify play uses a descriptive accessible action before the legacy tree walk", async () => {
+  const requests = [];
+  const target = {
+    targetId: "good-for-you",
+    source: "UIA",
+    windowId: "1234",
+    name: "Play Good For You by Selena Gomez, A$AP Rocky",
+    controlType: "ControlType.Button",
+    boundingRect: { x: 10, y: 20, width: 200, height: 40 }
+  };
+  const adapter = new WindowsAdapter({
+    automationHost: {
+      async request(operation, params) {
+        requests.push({ operation, params });
+        if (operation === "ui.find") return { found: true, ambiguous: false, matchCount: 1, target };
+        return { performed: true, method: "InvokePattern", target };
+      }
+    },
+    browserAutomation: {}
+  });
+  adapter.runPowerShell = async () => {
+    throw new Error("legacy UIA fallback must not run");
+  };
+  const result = await adapter._invokeSpotifyPlayButton("Good For You", 1000, 1234);
+  assert.equal(result.invoked, true);
+  assert.equal(result.name, target.name);
+  assert.deepEqual(requests.map((request) => request.operation), ["ui.find", "ui.action"]);
 });
 
 test("Spotify queue uses the matching options control and Add to queue menu item", async () => {

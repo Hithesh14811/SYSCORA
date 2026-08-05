@@ -38,7 +38,7 @@ export function evaluateEvidenceLedger(goalContract, ledger, bindings = {}) {
   const criteria = (goalContract?.criteria ?? []).map((criterion) => {
     const evidence = entries.filter((entry) =>
       entry.criterionIds.includes(criterion.criterionId)
-      && ["VERIFIED", "PARTIALLY_VERIFIED"].includes(entry.verification?.status)
+      && entry.verification?.status === "VERIFIED"
     );
     return {
       criterionId: criterion.criterionId,

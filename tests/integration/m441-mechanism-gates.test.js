@@ -57,7 +57,7 @@ test("M4.4.1 gate 2: unknown GUI action completes locally after provider becomes
         return { ok: false, error: "provider-unavailable-after-postcondition" };
       }
     },
-    capabilityRegistry: registry(["application.launch", "ui.action"]),
+    capabilityRegistry: registry(["application.launch", "window.wait", "window.activate", "ui.find", "ui.action"]),
     perceive: async () => launched ? { relevantControls: [target] } : { relevantControls: [] },
     executeAction: async (action) => {
       if (action.capability === "application.launch") launched = true;
@@ -80,7 +80,7 @@ test("M4.4.1 gate 2: unknown GUI action completes locally after provider becomes
   });
   assert.equal(result.status, "COMPLETE");
   assert.equal(modelCalls, 0);
-  assert.equal(result.metrics.localActions, 2);
+  assert.equal(result.metrics.localActions, 5);
 });
 
 test("M4.4.1 gate 3: grounded GUI value persists internally with exact typed lineage", async () => {

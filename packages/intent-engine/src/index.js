@@ -266,6 +266,46 @@ export class IntentEngine {
       return intent;
     }
 
+    // Package discovery is read-only and must stay distinct from both an
+    // installed-state inspection and an install mutation. Hypothetical wording
+    // such as "what would be installed" must never become either of those.
+    const packageSearchQuery = llmFirst ? null : this.extractPackageSearchQuery(lower, text);
+    if (packageSearchQuery) {
+      const intent = {
+        intentId, rawText: text, normalizedGoal: `Find ${packageSearchQuery} with Windows Package Manager`, category: "SYSTEM",
+        operation: "package.winget.search",
+        entities: { workspacePath: context.workspacePath ?? process.cwd(), query: packageSearchQuery },
+        constraints: [], preferences: [], assumptions: [], unknowns: [],
+        successCriteria: [`Report matching packages for ${packageSearchQuery}`],
+        requiredContext: [], requiredCapabilities: ["package.winget.search"],
+        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    const webOutcome = llmFirst ? null : this.extractWebOutcome(lower, text);
+    if (webOutcome) {
+      const operation = webOutcome.operation ?? "browser.navigate";
+      const intent = {
+        intentId,
+        rawText: text,
+        normalizedGoal: webOutcome.normalizedGoal,
+        category: "BROWSER",
+        operation,
+        entities: { workspacePath: context.workspacePath ?? process.cwd(), url: webOutcome.url, ...(webOutcome.entities ?? {}) },
+        constraints: webOutcome.constraints,
+        preferences: [], assumptions: [], unknowns: [],
+        successCriteria: webOutcome.successCriteria,
+        requiredContext: [], requiredCapabilities: webOutcome.requiredCapabilities ?? [operation],
+        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
     const knownInstallId = llmFirst ? null : this.extractKnownInstallTarget(lower);
     if (!llmFirst && /\binstall\b/.test(lower) && knownInstallId && !/\b(dependenc|project)\b/.test(lower)) {
       const intent = {
@@ -522,6 +562,7 @@ export class IntentEngine {
 
   extractInstalledPackageId(lower) {
     if (!/\binstalled\b/.test(lower)) return null;
+    if (/\b(?:would|could|might|will)\s+be\s+installed\b/.test(lower)) return null;
     const known = {
       vlc: "VideoLAN.VLC",
       git: "Git.Git",
@@ -536,12 +577,80 @@ export class IntentEngine {
     return null;
   }
 
+  extractPackageSearchQuery(lower, raw) {
+    if (!/\b(?:winget|windows package manager)\b/.test(lower)) return null;
+    const match = String(raw ?? "").match(
+      /\b(?:find|search(?:\s+for)?|look\s+up)\s+(.+?)(?=\s+(?:using|with|via|in|on)\s+(?:the\s+)?(?:windows package manager|winget)\b|[.,]|$)/i
+    );
+    const query = match?.[1]?.trim();
+    return query && query.length <= 120 ? query : null;
+  }
+
   extractKnownInstallTarget(lower) {
     const known = {
       vlc: "VideoLAN.VLC", git: "Git.Git", node: "OpenJS.NodeJS.LTS",
       python: "Python.Python.3.12", docker: "Docker.DockerDesktop", spotify: "Spotify.Spotify"
     };
     return Object.entries(known).find(([name]) => lower.includes(name))?.[1] ?? null;
+  }
+
+  extractWebOutcome(lower, rawText) {
+    const text = String(rawText ?? "").trim();
+    const negative = [];
+    if (/\b(?:do not|don't|never)\s+(?:book|reserve|purchase|buy|pay|submit)\b/i.test(text)) {
+      negative.push("NO_BOOKING");
+    }
+    const youtube = /\byoutube\b/i.test(text);
+    if (youtube) {
+      const mediaMatch = text.match(/\b(?:play|watch|find|search(?:\s+for)?)\s+(.+?)(?:\s+(?:video\s+)?on\s+youtube|\s+youtube\s+video|$)/i);
+      const query = mediaMatch?.[1]?.trim().replace(/\s+(?:a\s+)?video$/i, "");
+      if (query && /\b(?:play|watch)\b/i.test(text)) {
+        return {
+          operation: "browser.media.play",
+          url: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+          entities: {
+            query,
+            resultSelector: "a#video-title",
+            mediaSelector: "video",
+            blockedStateSelector: ".ad-showing"
+          },
+          requiredCapabilities: ["browser.media.play"],
+          normalizedGoal: `Play ${query} on YouTube`,
+          constraints: negative,
+          successCriteria: [
+            `A YouTube result for ${query} is opened`,
+            "Video playback is independently observed as playing"
+          ]
+        };
+      }
+      if (/^\s*(?:please\s+)?(?:open|go\s+to|visit|launch)\s+(?:the\s+)?youtube(?:\s+website)?\s*[.!?]*$/i.test(text)) {
+        return {
+          url: "https://www.youtube.com/",
+          normalizedGoal: "Open YouTube in a browser",
+          constraints: negative,
+          successCriteria: ["The controlled browser is on youtube.com"]
+        };
+      }
+    }
+
+    const flightResearch = /\b(?:find|search|compare|show)\b[\s\S]*\bflights?\b/i.test(text)
+      || /\b(?:cheapest|lowest|best)\b[\s\S]*\bflights?\b/i.test(text);
+    if (flightResearch) {
+      return {
+        operation: "browser.research",
+        url: `https://www.google.com/search?q=${encodeURIComponent(text)}`,
+        entities: { goal: "Compare read-only flight options", limit: 12 },
+        requiredCapabilities: ["browser.research"],
+        normalizedGoal: "Research and compare flight options without booking",
+        constraints: [...new Set([...negative, "NO_BOOKING"])],
+        successCriteria: [
+          "Flight options are observed from browser results",
+          "Prices and relevant itinerary details are reported with their source",
+          "No booking, purchase, passenger-data, or payment action occurs"
+        ]
+      };
+    }
+    return null;
   }
 
   // Deterministically detect a direct Spotify track request and classify it as

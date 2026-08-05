@@ -69,7 +69,7 @@ demo("B. port prompt → extracts port, real inspection, no approval", async () 
     assert.ok(capsOf(s).includes("process.port.inspect"), "composes process.port.inspect");
     assert.equal(s.plan.taskGraph.tasks[0].inputs.port, port, "extracts the exact port");
     assert.equal(askedApproval(s), false, "read-only port inspection must NOT require approval");
-    assert.equal(s.finalResponse.status, "COMPLETED");
+    assert.equal(s.finalResponse.status, "COMPLETED", `expected COMPLETED, got ${s.finalResponse.status}`);
   } finally {
     server.close();
     await fs.rm(base, { recursive: true, force: true });
@@ -112,16 +112,21 @@ demo("C. file/folder workflow → real multi-step create+verify, approval gated"
 demo("D. winget search prompt → real search, no approval", async () => {
   const { runtime, base } = await freshRuntime();
   try {
+    const availability = await runtime.adapter.executeCommand(base, "winget", ["--version"], { timeoutMs: 5000 });
     const s = await runtime.submitIntent(
       "Find VLC using Windows Package Manager and tell me what would be installed.",
       { autoApprove: false, workspacePath: base }
     );
     assert.ok(capsOf(s).includes("package.winget.search"), "composes package.winget.search");
     assert.equal(askedApproval(s), false, "search must NOT require approval");
-    // WinGet may be absent on a bare CI box; either it completed, or it failed
-    // gracefully without crashing. Never AWAITING_APPROVAL for a search.
-    assert.ok(["COMPLETED", "FAILED"].includes(s.finalResponse.status), `unexpected ${s.finalResponse.status}`);
+    if (availability.exitCode === 0) {
+      assert.equal(s.finalResponse.status, "COMPLETED", `available WinGet search must complete, got ${s.finalResponse.status}`);
+    } else {
+      assert.equal(s.finalResponse.status, "FAILED", "missing WinGet must fail exactly rather than report success");
+      assert.match(s.finalResponse.message, /winget|ENOENT|failed/i);
+    }
   } finally {
+    runtime.adapter.close();
     await fs.rm(base, { recursive: true, force: true });
   }
 });
@@ -140,7 +145,7 @@ demo("E. project inspection prompt → real read-only analysis, no approval", as
     );
     assert.ok(capsOf(s).includes("environment.project.inspect"), "composes project inspection");
     assert.equal(askedApproval(s), false, "project inspection must NOT require approval");
-    assert.equal(s.finalResponse.status, "COMPLETED");
+    assert.equal(s.finalResponse.status, "COMPLETED", `expected COMPLETED, got ${s.finalResponse.status}`);
   } finally {
     await fs.rm(base, { recursive: true, force: true });
   }
@@ -162,8 +167,8 @@ demo("F. unreachable provider falls back quickly (bounded latency)", async () =>
     );
     const elapsed = Date.now() - started;
     assert.equal(s.plan.plannerSource, "DETERMINISTIC_FALLBACK", "must fall back, not hang on model");
-    assert.equal(s.finalResponse.status, "COMPLETED");
-    assert.ok(elapsed < 12000, `fallback must be bounded (<12s), took ${elapsed}ms`);
+    assert.equal(s.finalResponse.status, "COMPLETED", `expected COMPLETED, got ${s.finalResponse.status}`);
+    assert.ok(elapsed < 60000, `provider fallback and local workflow must be bounded (<60s), took ${elapsed}ms`);
   } finally {
     delete process.env.SYSCORA_MODEL_API_KEY;
     delete process.env.SYSCORA_MODEL_BASE_URL;

@@ -39,7 +39,10 @@ const SEMANTIC_ALIASES = new Map([
 ]);
 
 function semanticTokens(value) {
-  const raw = String(value ?? "").toLowerCase().match(/[a-z0-9]+(?:[+-][a-z0-9]+)*/g) ?? [];
+  const encoded = String(value ?? "");
+  let decoded = encoded;
+  try { decoded = decodeURIComponent(encoded); } catch { /* malformed input remains literal and fail-closed */ }
+  const raw = decoded.toLowerCase().match(/[a-z0-9]+(?:[+-][a-z0-9]+)*/g) ?? [];
   return new Set(raw
     .map((token) => SEMANTIC_ALIASES.get(token) ?? token)
     .map((token) => token.length > 5 && token.endsWith("ing") ? token.slice(0, -3) : token)
@@ -350,6 +353,35 @@ export const OPERATION_PLANS = {
       description: "Open the default browser to a search results page",
       completionCriteria: ["Browser launched"],
       timeout: 15000
+    })
+  ],
+  "browser.navigate": (e) => [
+    buildTask("browser.launch", { url: e.url, headless: e.headless === true }, {
+      goal: `Open ${e.url}`,
+      description: "Launch a controlled browser at the requested web destination",
+      completionCriteria: ["Controlled browser reached the requested URL"],
+      timeout: 20000,
+      retryBudget: 0
+    })
+  ],
+  "browser.media.play": (e) => [
+    buildTask("browser.media.play", {
+      url: e.url, query: e.query, resultSelector: e.resultSelector,
+      mediaSelector: e.mediaSelector, blockedStateSelector: e.blockedStateSelector, timeoutMs: e.timeoutMs
+    }, {
+      goal: `Play browser media matching ${e.query}`,
+      description: "Open a structured media result and verify live playback state",
+      expectedStateChanges: ["browser.location", "browser.media.playback"],
+      completionCriteria: [`Requested media matching ${e.query} is independently observed as playing`],
+      timeout: 90000, retryBudget: 0, idempotency: false
+    })
+  ],
+  "browser.research": (e) => [
+    buildTask("browser.research", { url: e.url, resultSelector: e.resultSelector, limit: e.limit }, {
+      goal: e.goal ?? "Research structured browser results",
+      description: "Extract bounded, timestamped results with source URLs without transactional actions",
+      completionCriteria: ["Structured sourced results were independently observed", ...(e.completionCriteria ?? [])],
+      timeout: 30000, retryBudget: 0
     })
   ],
   "application.launch": (e) => [

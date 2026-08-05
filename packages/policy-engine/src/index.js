@@ -65,13 +65,6 @@ export class PolicyEngine {
     const dimensions = completeRiskDimensions(riskAssessment?.dimensions ?? {});
     const overallRisk = riskAssessment?.overallRisk ?? RiskLevel.MEDIUM;
     const uncertainty = riskAssessment?.uncertainty ?? 0;
-    // The built-in WinGet install capability pins every command to the signed
-    // `winget` community source and accepts only an exact package id. This is a
-    // trusted-source install, unlike an arbitrary downloaded installer. Keep
-    // confirmation for third-party/install-from-URL capabilities, but permit
-    // this one bounded install when it is the whole requested operation.
-    const trustedWingetInstall = tasks.length === 1 && tasks[0]?.capability === "package.winget.install";
-
     // Independent control rules. Each proposes the MINIMUM control it requires;
     // the decision takes the STRONGEST across all of them (controls only ever
     // escalate — maxConfirmationLevel guarantees monotonicity).
@@ -111,7 +104,7 @@ export class PolicyEngine {
     if (mutation === "DESTRUCTIVE" || reversibility === "IRREVERSIBLE") {
       raise(ConfirmationLevel.CONFIRM, "Destructive or irreversible change requires explicit confirmation.");
     }
-    if (!trustedWingetInstall && (mutation === "PERSISTENT" || reversibility === "PARTIALLY_REVERSIBLE") && recovery !== "VERIFIED_ROLLBACK") {
+    if ((mutation === "PERSISTENT" || reversibility === "PARTIALLY_REVERSIBLE") && recovery !== "VERIFIED_ROLLBACK") {
       raise(ConfirmationLevel.CONFIRM, "Persistent change without verified rollback requires confirmation.");
     }
 
@@ -144,9 +137,9 @@ export class PolicyEngine {
     // control still requires, at minimum, explicit confirmation. This is the
     // floor that replaces the old blanket "HIGH => DENY": high risk is allowed
     // to proceed, but never silently.
-    if (overallRisk === RiskLevel.HIGH && !trustedWingetInstall) {
+    if (overallRisk === RiskLevel.HIGH) {
       raise(ConfirmationLevel.CONFIRM, "High-risk operation requires explicit confirmation.");
-    } else if (overallRisk === RiskLevel.MEDIUM && !trustedWingetInstall) {
+    } else if (overallRisk === RiskLevel.MEDIUM) {
       raise(ConfirmationLevel.CONFIRM, "Medium-risk persistent operation requires confirmation.");
     }
 

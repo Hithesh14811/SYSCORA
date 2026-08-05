@@ -29,6 +29,7 @@ const FIXTURE_HTML = `<!doctype html>
 <html><head><title>SYSCORA fixture</title></head>
 <body style="margin:0">
   <h1 id="heading">Fixture ready</h1>
+  <main><article data-result><a href="/fare-one">Delhi to Mumbai fare</a><p>Nonstop itinerary INR 5,000</p></article></main>
   <p id="status">Not clicked</p>
   <button id="go" onclick="document.getElementById('status').textContent='Clicked once'">Continue</button>
   <form id="payment" onsubmit="event.preventDefault();document.getElementById('status').textContent='Submitted'">
@@ -155,6 +156,21 @@ describe("Browser automation against a local fixture", { skip: process.platform 
     const extracted = await browser.extract({ kind: "version", query: "Fixture release", selector: "body" });
     assert.equal(extracted.found, true);
     assert.equal(extracted.value, "4.12.9");
+  });
+
+  it("extracts bounded sourced research without clicking or submitting", async () => {
+    await browser.navigate({ url: fixtureUrl });
+    const before = await browser.read({ selector: "#status" });
+    const result = await browser.researchState({ limit: 5 });
+    const after = await browser.read({ selector: "#status" });
+    assert.equal(result.found, true);
+    assert.equal(result.items.length, 1);
+    assert.equal(result.items[0].title, "Delhi to Mumbai fare");
+    assert.match(result.items[0].snippet, /INR 5,000/);
+    assert.match(result.items[0].url, /\/fare-one$/);
+    assert.equal(before.text, "Not clicked");
+    assert.equal(after.text, "Not clicked", "research must not click or submit anything");
+    assert.ok(!Number.isNaN(Date.parse(result.observedAt)));
   });
 
   it("refuses a fabricated target that perception never returned", async () => {

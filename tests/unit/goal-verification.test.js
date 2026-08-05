@@ -15,14 +15,14 @@ test("goal is COMPLETED when scheduler completed and no warnings", () => {
   assert.ok(Array.isArray(result.evidence) && result.evidence.length > 0, "conclusion is justified with evidence");
 });
 
-test("goal is COMPLETED_WITH_WARNINGS on partial verification", () => {
+test("goal is INCONCLUSIVE on partial verification", () => {
   const result = verifier.verify({
     intent: { successCriteria: ["done"] },
     schedulerStatus: { status: "COMPLETED" },
     verifications: [{ status: "VERIFIED" }, { status: "PARTIALLY_VERIFIED" }],
     observations: []
   });
-  assert.equal(result.status, GoalStatus.COMPLETED_WITH_WARNINGS);
+  assert.equal(result.status, GoalStatus.INCONCLUSIVE);
   assert.ok(result.warnings.length > 0, "warnings explain the qualification");
 });
 

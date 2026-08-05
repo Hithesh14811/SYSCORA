@@ -91,6 +91,26 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
     for (const subscriber of run.subscribers) subscriber.end();
     run.subscribers.clear();
   };
+
+  // The session store is the durable source of truth. Reconcile polling with
+  // it so a dropped/delayed promise callback or renderer reconnect cannot leave
+  // the UI displaying an obsolete "Working" event after the runtime has
+  // already persisted a terminal result.
+  const reconcilePersistedRun = async (sessionId, run) => {
+    const getPersisted = runtime.sessionStore?.get ?? runtime.sessionStore?.load;
+    if (typeof getPersisted !== "function") return null;
+    let persisted = null;
+    try {
+      persisted = await getPersisted.call(runtime.sessionStore, sessionId);
+    } catch {
+      return null;
+    }
+    if (!persisted) return null;
+    const status = persisted.finalResponse?.status ?? persisted.currentState;
+    const terminal = terminalStates.has(status) || terminalStates.has(persisted.currentState);
+    if (terminal && (!run.terminal || !run.session)) settleRun(sessionId, persisted);
+    return persisted;
+  };
   // Opt-in signed capability plugins (SYSCORA_PLUGIN_DIR + trusted keys). Loading
   // is best-effort at startup and never blocks the server; a failure to load a
   // plugin leaves the built-in capabilities intact.
@@ -136,14 +156,16 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           sendJson(response, 404, { error: "Unknown intent session." });
           return;
         }
+        const persisted = await reconcilePersistedRun(sessionId, run);
         if (channel === "status") {
+          const latestPersistedEvent = persisted?.events?.at?.(-1) ?? null;
           sendJson(response, 200, {
             sessionId,
             status: run.status,
             settled: run.settled,
             terminal: run.terminal,
             eventCount: run.events.length,
-            latestEvent: run.events.at(-1) ?? null,
+            latestEvent: latestPersistedEvent ?? run.events.at(-1) ?? null,
             session: run.session
           });
           return;

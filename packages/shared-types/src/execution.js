@@ -40,6 +40,12 @@ export function createInteractionTarget(value = {}) {
     relativeCoordinates: value.relativeCoordinates ?? null,
     confidence,
     observedAt: value.observedAt ?? new Date().toISOString(),
+    observationId: value.observationId ?? value.snapshotId ?? null,
+    maxObservationAgeMs: Math.max(1, Number(value.maxObservationAgeMs ?? 5000)),
+    expectedForegroundWindowId: value.expectedForegroundWindowId != null
+      ? String(value.expectedForegroundWindowId)
+      : null,
+    windowIdentity: value.windowIdentity ?? null,
     evidence: value.evidence ?? null
   };
 }
@@ -52,6 +58,15 @@ export function validateInteractionTarget(target, { minVisualConfidence = 0.75 }
   if (["OCR", "VISION", "COORDINATE"].includes(target.source)) {
     if (!target.boundingRect) errors.push("visual/coordinate target requires boundingRect");
     if (Number(target.confidence) < minVisualConfidence) errors.push("visual target confidence is below threshold");
+    if (!target.observationId) errors.push("visual/coordinate target requires observationId");
+    if (!target.observedAt || !Number.isFinite(Date.parse(target.observedAt))) errors.push("visual/coordinate target requires observedAt");
+    if (!target.windowIdentity || typeof target.windowIdentity !== "object") errors.push("visual/coordinate target requires windowIdentity");
+    if (!target.expectedForegroundWindowId) errors.push("visual/coordinate target requires expectedForegroundWindowId");
+    if (target.windowId === "screen") errors.push("screen-wide coordinate targets are not actionable");
+    const identity = target.windowIdentity ?? {};
+    if (!identity.bounds) errors.push("visual/coordinate window identity requires bounds");
+    if (!identity.displayId) errors.push("visual/coordinate window identity requires displayId");
+    if (!Number.isFinite(Number(identity.dpi))) errors.push("visual/coordinate window identity requires dpi");
   }
   if (target.source === "UIA" && !target.automationId && !target.name && !target.selector) {
     errors.push("UIA target requires an accessible selector");

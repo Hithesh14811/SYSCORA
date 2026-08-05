@@ -219,6 +219,67 @@ describe("Daemon async intent HTTP contract", () => {
   });
 });
 
+describe("Daemon durable progress reconciliation", () => {
+  let server;
+  let port;
+  let basePath;
+
+  before(async () => {
+    basePath = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-durable-progress-"));
+    process.env.SYSCORA_API_TOKEN = TOKEN;
+    let persisted = null;
+    const runtime = {
+      onSessionEvent: null,
+      sessionStore: {
+        list: async () => [],
+        get: async () => persisted
+      },
+      async submitIntent(_rawText, options = {}) {
+        const sessionId = "session_durable_terminal";
+        options.onSessionStarted?.(sessionId);
+        setTimeout(() => {
+          persisted = {
+            sessionId,
+            createdAt: new Date().toISOString(),
+            currentState: "COMPLETED",
+            intent: null,
+            plan: null,
+            taskResults: [],
+            observations: [],
+            verifications: [],
+            events: [{ eventType: "FINAL_VERIFICATION_COMPLETED", timestamp: new Date().toISOString(), details: {} }],
+            finalResponse: { status: "COMPLETED", message: "Persisted completion" }
+          };
+        }, 30);
+        return new Promise(() => {});
+      }
+    };
+    server = startServer({ port: 0, basePath, warmHost: false, runtime });
+    await new Promise((resolve) => server.on("listening", resolve));
+    port = server.address().port;
+  });
+
+  after(async () => {
+    delete process.env.SYSCORA_API_TOKEN;
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(basePath, { recursive: true, force: true });
+  });
+
+  it("surfaces a persisted terminal session when the in-memory promise never settles", async () => {
+    const submitted = await api(port, "POST", "/api/intents", { body: { text: "durable result" } });
+    const deadline = Date.now() + 3000;
+    let status = null;
+    while (Date.now() < deadline) {
+      const polled = await api(port, "GET", submitted.json.statusUrl);
+      if (polled.json.terminal) { status = polled.json; break; }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(status?.status, "COMPLETED");
+    assert.equal(status?.session?.finalResponse?.message, "Persisted completion");
+    assert.equal(status?.latestEvent?.eventType, "FINAL_VERIFICATION_COMPLETED");
+  });
+});
+
 describe("Legacy synchronous intent shape (real pipeline)", () => {
   let server;
   let port;
@@ -259,8 +320,9 @@ describe("Session wall-clock timeout", () => {
     // A runtime whose intent classification never settles. Without a top-level
     // deadline this hangs forever; the test's own wall-clock assertion below is
     // what proves the deadline is real (a status check alone would hang too).
+    let persisted = null;
     const runtime = new AgentRuntime({
-      sessionStore: { save: async () => {}, list: async () => [], load: async () => null },
+      sessionStore: { save: async (session) => { persisted = structuredClone(session); }, list: async () => [], load: async () => persisted },
       auditRepository: { append: async () => {} },
       intentEngine: { classify: () => new Promise(() => {}) },
       capabilityRegistry: { get: () => null, getCatalog: () => [] }
@@ -274,11 +336,15 @@ describe("Session wall-clock timeout", () => {
     const elapsedMs = Date.now() - startedAt;
 
     assert.equal(session.finalResponse.status, "TIMED_OUT");
+    assert.equal(session.currentState, "TIMED_OUT");
     assert.equal(session.finalResponse.timeoutMs, timeoutMs);
     assert.equal(session.deadlineExceeded, true);
     assert.ok(
       elapsedMs < timeoutMs + 2000,
       `submitIntent must return at its deadline; took ${elapsedMs}ms for a ${timeoutMs}ms budget`
     );
+    assert.equal(persisted?.finalResponse?.status, "TIMED_OUT");
+    assert.equal(persisted?.currentState, "TIMED_OUT");
+    assert.equal(persisted?.events?.at(-1)?.eventType, "SESSION_TIMED_OUT");
   });
 });

@@ -47,9 +47,12 @@ win("process listing returns running processes", async () => {
 });
 
 win("port inspection runs against the real network stack", async () => {
-  // Port 0 is never listening; the call must still succeed and report no owner.
-  const result = await adapter.inspectPort(0);
+  // A valid high port may be either occupied or empty; both are verified domain results.
+  const result = await adapter.inspectPort(54321);
   assert.ok(result, "port inspection returned a result");
+  assert.equal(result.port, 54321);
+  assert.ok(["LISTENING", "NOT_LISTENING"].includes(result.status));
+  assert.equal(result.commandResult.exitCode, 0);
 });
 
 win("temporary filesystem write → verify → delete round-trips", async () => {

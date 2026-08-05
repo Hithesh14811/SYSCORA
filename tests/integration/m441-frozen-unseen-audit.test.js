@@ -93,7 +93,7 @@ test("frozen unseen 3/6: unknown GUI action recognizes the reached postcondition
   const goal = 'Launch Sample Utility and choose the "Safe Preview" control.';
   const controller = new InteractiveAgentController({
     reasoningEngine: { decideInteractiveAction: async () => { modelCalls += 1; return { ok: false, error: "provider-offline" }; } },
-    capabilityRegistry: registry(["application.launch", "ui.action"]),
+    capabilityRegistry: registry(["application.launch", "window.wait", "window.activate", "ui.find", "ui.action"]),
     perceive: async () => launched ? { relevantControls: [{ ...target, selected: invoked }] } : { relevantControls: [] },
     executeAction: async (action) => {
       if (action.capability === "application.launch") launched = true;

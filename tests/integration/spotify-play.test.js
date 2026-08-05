@@ -131,6 +131,43 @@ test("model-routed Spotify request keeps the typed plan ahead of generic interac
   }
 });
 
+test("every known direct operation stays ahead of generic interactive control", async () => {
+  let interactiveCalls = 0;
+  const reasoningEngine = {
+    hasModel: () => true,
+    isModelHealthy: async () => true,
+    understandIntent: async () => ({ ok: true, data: {
+      operation: "application.launch",
+      normalizedGoal: "Open Calculator",
+      category: "APPLICATION",
+      entities: { application: "calculator" },
+      successCriteria: ["Calculator is open"],
+      confidence: 0.95
+    } }),
+    decideInteractiveAction: async () => {
+      interactiveCalls += 1;
+      throw new Error("generic interactive controller must not run");
+    }
+  };
+  const { runtime, tempRoot } = await buildRuntime({
+    launchApplication: async (application) => ({
+      application,
+      launch: { started: true },
+      window: { WindowHandle: 99, ProcessName: "Calculator", MainWindowTitle: "Calculator" },
+      grounding: { grounded: true, readinessState: "APPLICATION_READY" }
+    }),
+    listWindows: async () => [{ WindowHandle: 99, ProcessName: "Calculator", MainWindowTitle: "Calculator" }]
+  }, { reasoningEngine });
+  try {
+    const session = await runtime.submitIntent("open calculator", { autoApprove: true });
+    assert.equal(interactiveCalls, 0);
+    assert.equal(session.plan.plannerSource, "DIRECT_OPERATION");
+    assert.deepEqual(session.plan.taskGraph.tasks.map((task) => task.capability), ["application.launch"]);
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("Spotify not installed is reported FAILED, not success", async () => {
   const { runtime, tempRoot } = await buildRuntime({
     playSpotifyTrack: async (query) => ({

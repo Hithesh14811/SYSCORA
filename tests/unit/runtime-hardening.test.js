@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { CapabilityRegistry, createDefaultCapabilityRegistry } from "../../packages/capability-registry/src/index.js";
 import { RollbackManager } from "../../packages/agent-runtime/src/rollback-manager.js";
-import { GeneralPlanner, PlanValidator } from "../../packages/planner/src/index.js";
+import { GeneralPlanner, PlanValidator, assessPlanGoalCoverage } from "../../packages/planner/src/index.js";
 import { WorkspaceContextProvider } from "../../packages/context-engine/src/index.js";
 import { OpenAIModelProvider } from "../../packages/model-providers/src/index.js";
 import { IntentEngine } from "../../packages/intent-engine/src/index.js";
@@ -72,6 +72,111 @@ test("known package install and system-info requests use direct operations", asy
   assert.equal(install.operation, "package.winget.install");
   assert.equal(install.entities.id, "Spotify.Spotify");
   assert.equal(system.operation, "system.inspect");
+});
+
+test("web outcomes route to semantic browser tools while installed apps stay application launches", async () => {
+  const engine = new IntentEngine(null);
+  const youtube = await engine.classify("Play a lofi focus video on YouTube");
+  assert.equal(youtube.category, "BROWSER");
+  assert.equal(youtube.operation, "browser.media.play");
+  assert.match(youtube.entities.url, /^https:\/\/www\.youtube\.com\/results\?/);
+  assert.ok(youtube.successCriteria.some((criterion) => /playback/i.test(criterion)));
+
+  const flights = await engine.classify("Find the cheapest flight from Delhi to Mumbai next Friday, but do not book");
+  assert.equal(flights.category, "BROWSER");
+  assert.equal(flights.operation, "browser.research");
+  assert.match(flights.entities.url, /^https:\/\/www\.google\.com\/search\?/);
+  assert.ok(flights.constraints.includes("NO_BOOKING"));
+
+  const website = await engine.classify("Open YouTube");
+  assert.equal(website.operation, "browser.navigate");
+  assert.equal(website.entities.url, "https://www.youtube.com/");
+
+  const calculator = await engine.classify("Launch Calculator");
+  assert.equal(calculator.operation, "application.launch");
+  assert.equal(calculator.entities.application, "calculator");
+});
+
+test("no-booking research plans contain only a read-only structured browser capability", async () => {
+  const intent = await new IntentEngine(null).classify(
+    "Compare flights from Delhi to Mumbai next Friday and do not book or pay"
+  );
+  const registry = createDefaultCapabilityRegistry({
+    browserDomAction: async () => ({ found: true, items: [{ title: "Fare", snippet: "Delhi to Mumbai INR 5000", url: "https://example.test/fare" }], sourceUrl: "https://example.test", observedAt: new Date().toISOString() })
+  });
+  const plan = await new GeneralPlanner(null, registry).generatePlan(intent, []);
+  assert.deepEqual(plan.taskGraph.tasks.map((task) => task.capability), ["browser.research"]);
+  assert.ok(intent.constraints.includes("NO_BOOKING"));
+  assert.equal(registry.get("browser.research").permissionModel.type, "READ");
+  assert.ok(!plan.taskGraph.tasks.some((task) => ["browser.click", "browser.type", "browser.select"].includes(task.capability)));
+  assert.equal(assessPlanGoalCoverage(intent, plan.taskGraph, registry).covered, true, "encoded research inputs must cover the concrete route/date goal");
+});
+
+test("browser media playback cannot verify from its action result alone", async () => {
+  const adapter = {
+    browserDomAction: async (operation) => operation === "playMedia"
+      ? { performed: true, playing: true, url: "https://media.test/watch/1" }
+      : { found: true, playing: false, paused: true, url: "https://media.test/watch/1" }
+  };
+  const capability = createDefaultCapabilityRegistry(adapter).get("browser.media.play");
+  const execution = await capability.execute({ url: "https://media.test/search", query: "focus" });
+  const observation = await capability.observe(execution, { url: "https://media.test/search", query: "focus" });
+  const verification = await capability.verify(observation);
+  assert.equal(verification.status, "FAILED");
+  assert.equal(verification.evidence.observedState.paused, true);
+});
+
+test("browser capability forwards cancellation to the controlled adapter", async () => {
+  let receivedSignal = null;
+  const adapter = {
+    browserDomAction: async (_operation, _args, { signal } = {}) => {
+      receivedSignal = signal;
+      return new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(Object.assign(new Error("cancelled"), { code: "CANCELLED" })), { once: true });
+      });
+    }
+  };
+  const capability = createDefaultCapabilityRegistry(adapter).get("browser.research");
+  const controller = new AbortController();
+  const pending = capability.execute({ url: "https://example.test" }, { signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, (error) => error.code === "CANCELLED");
+  assert.equal(receivedSignal, controller.signal);
+});
+
+test("package discovery is not confused with installed-state inspection or installation", async () => {
+  const engine = new IntentEngine(null);
+  const search = await engine.classify(
+    "Find VLC using Windows Package Manager and tell me what would be installed."
+  );
+  assert.equal(search.operation, "package.winget.search");
+  assert.equal(search.entities.query, "VLC");
+
+  const status = await engine.classify("Is VLC already installed?");
+  assert.equal(status.operation, "package.winget.inspect");
+
+  const install = await engine.classify("Install VLC with winget");
+  assert.equal(install.operation, "package.winget.install");
+});
+
+test("port inspection verifies an empty listener set as NOT_LISTENING", async () => {
+  const adapter = {
+    inspectPort: async (port) => ({
+      port,
+      listening: false,
+      status: "NOT_LISTENING",
+      connections: [],
+      commandResult: { exitCode: 0, stdout: "[]", stderr: "" }
+    })
+  };
+  const registry = createDefaultCapabilityRegistry(adapter);
+  const capability = registry.get("process.port.inspect");
+  const result = await capability.execute({ port: 54321 });
+  const observation = await capability.observe(result, { port: 54321 });
+  const verification = await capability.verify(observation, { port: 54321 });
+  assert.equal(result.status, "NOT_LISTENING");
+  assert.equal(verification.status, "VERIFIED");
+  assert.match(verification.message, /not listening/i);
 });
 
 test("Spotify play phrasing bypasses model planning and plays the requested track", async () => {

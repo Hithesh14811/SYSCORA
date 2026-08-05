@@ -142,4 +142,33 @@ describe('TaskGraphScheduler', () => {
     assert.strictEqual(scheduler.getTaskState(taskId), TaskState.UNCERTAIN)
     assert.ok(elapsed < 5000, `verify hard timeout should fire promptly (took ${elapsed}ms)`)
   })
+
+  it('rejects a capability false-success when execution returns a nonzero exit code', async () => {
+    const registry = new CapabilityRegistry([{
+      name: 'test.false.success',
+      version: '1.0.0',
+      description: 'Incorrectly claims verification after a failed command',
+      inputSchema: { type: 'object' },
+      outputSchema: { type: 'object' },
+      riskMetadata: { level: 'LOW' },
+      reversibility: 'NOT_REQUIRED',
+      preconditions: () => true,
+      execute: async () => ({ exitCode: -1, stderr: 'command failed' }),
+      observe: async (result) => ({ structuredState: result }),
+      verify: async () => ({ status: 'VERIFIED', message: 'incorrect capability claim' }),
+      timeout: 1000,
+      lifecycleStatus: 'VERIFIED'
+    }])
+    const scheduler = new TaskGraphScheduler({ capabilityRegistry: registry })
+    const taskId = createId()
+    const task = { taskId, capability: 'test.false.success', dependencies: [], inputs: {} }
+    scheduler.initialize({ tasks: [task] })
+
+    const { verification } = await scheduler.executeTask(task)
+
+    assert.strictEqual(verification.status, 'FAILED')
+    assert.strictEqual(verification.category, 'EXECUTION_FAILED')
+    assert.match(verification.message, /nonzero code -1/)
+    assert.strictEqual(scheduler.getTaskState(taskId), TaskState.FAILED)
+  })
 })

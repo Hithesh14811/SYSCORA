@@ -31,7 +31,7 @@ const DEFAULT_BUDGETS = Object.freeze({
 });
 
 const TERMINAL = new Set(["COMPLETE", "FAILED", "NEEDS_USER"]);
-const SUCCESS = new Set(["VERIFIED", "PARTIALLY_VERIFIED"]);
+const SUCCESS = new Set(["VERIFIED"]);
 const MAX_MODEL_OBSERVATION_BYTES = 4_000;
 
 export function isUiFacingAction(action) {
@@ -2152,7 +2152,7 @@ export class InteractiveAgentController {
           step: state.steps
         })
       };
-      const verification = outcome?.verification ?? {};
+      let verification = outcome?.verification ?? {};
       let succeeded = SUCCESS.has(verification.status);
       let progressMeasurement = null;
       let deterministicVerifierPending = false;
@@ -2212,7 +2212,28 @@ export class InteractiveAgentController {
             progressMeasurement = actionObservationProgress;
           }
         }
-        succeeded = succeeded && progressMeasurement.state === InteractiveConvergenceState.PROGRESS;
+        if (
+          verification.status === "PARTIALLY_VERIFIED" &&
+          progressMeasurement.state === InteractiveConvergenceState.PROGRESS
+        ) {
+          verification = {
+            ...verification,
+            status: "VERIFIED",
+            message: verification.message ?? "UI action independently verified by its observed postcondition.",
+            independentPostcondition: true,
+            postconditionEvidence: progressMeasurement
+          };
+          lastOutcome.verification = verification;
+          lastOutcome.resultEnvelope = createResultEnvelope({
+            capability: action.capability,
+            executionResult: outcome?.executionResult,
+            observation: outcome?.observation,
+            verification,
+            step: state.steps
+          });
+        }
+        succeeded = verification.status === "VERIFIED" &&
+          progressMeasurement.state === InteractiveConvergenceState.PROGRESS;
         state.semanticState.interactiveConvergence = progressMeasurement.state;
         await this.emit("ADAPTIVE_PROGRESS_MEASURED", {
           step: state.steps,

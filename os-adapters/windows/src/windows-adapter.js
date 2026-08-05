@@ -143,8 +143,17 @@ export function correlateLaunchWindow({
 
 export class WindowsAdapter {
   constructor({ automationHost = null, browserAutomation = null } = {}) {
-    this.automationHost = automationHost ?? (process.platform === "win32" ? getWindowsAutomationHost() : null);
+    // `false` is an explicit opt-out used by deterministic tests and degraded
+    // environments; null/undefined keeps the normal Windows-host default.
+    this.automationHost = automationHost === false
+      ? null
+      : (automationHost ?? (process.platform === "win32" ? getWindowsAutomationHost() : null));
     this.browserAutomation = browserAutomation ?? new CdpBrowserAdapter();
+  }
+
+  close() {
+    this.browserAutomation?.close?.();
+    this.automationHost?.close?.();
   }
 
   async hostRequest(operation, params = {}, options = {}) {
@@ -457,9 +466,13 @@ export class WindowsAdapter {
 
   async inspectPort(portNumber) {
     const port = Number(portNumber);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("Port must be an integer from 1 through 65535");
+    }
     const ps = await this.runPowerShell(
-      `Get-NetTCPConnection -State Listen -LocalPort ${port} | ` +
-      "Select-Object -First 10 LocalAddress,LocalPort,OwningProcess | ConvertTo-Json -Compress"
+      `$connections=@(Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | ` +
+      "Select-Object -First 10 LocalAddress,LocalPort,OwningProcess);" +
+      "if($connections.Count -eq 0){'[]'}else{$connections|ConvertTo-Json -Compress}"
     );
     let parsed = [];
     try {
@@ -468,7 +481,13 @@ export class WindowsAdapter {
       parsed = [];
     }
     const connections = Array.isArray(parsed) ? parsed : [parsed];
-    return { port, connections, commandResult: ps };
+    return {
+      port,
+      listening: connections.length > 0,
+      status: connections.length > 0 ? "LISTENING" : "NOT_LISTENING",
+      connections,
+      commandResult: ps
+    };
   }
 
   async wingetSearch(query) {
@@ -606,11 +625,30 @@ export class WindowsAdapter {
   }
 
   async inspectGitRepository(workspacePath) {
-    return this.executeCommand(workspacePath, "git", ["status", "--short", "--branch"], { timeoutMs: 6000 });
+    try {
+      await fs.access(path.join(workspacePath, ".git"));
+    } catch {
+      return { workspacePath, isRepository: false, status: "NOT_A_REPOSITORY", probeMethod: "filesystem" };
+    }
+    const probeResult = await this.executeCommand(workspacePath, "git", ["status", "--short", "--branch"], { timeoutMs: 6000 });
+    return {
+      workspacePath,
+      isRepository: probeResult.exitCode === 0,
+      status: probeResult.exitCode === 0 ? "REPOSITORY" : "PROBE_FAILED",
+      branchStatus: probeResult.stdout,
+      probeResult
+    };
   }
 
   async inspectDockerEnvironment(workspacePath) {
-    return this.executeCommand(workspacePath, "docker", ["--version"], { timeoutMs: 6000 });
+    const probeResult = await this.executeCommand(workspacePath, "docker", ["--version"], { timeoutMs: 6000 });
+    return {
+      workspacePath,
+      available: probeResult.exitCode === 0,
+      status: probeResult.exitCode === 0 ? "AVAILABLE" : "NOT_AVAILABLE",
+      version: probeResult.exitCode === 0 ? probeResult.stdout.trim() : null,
+      probeResult
+    };
   }
 
   async inspectService(serviceName) {
@@ -618,10 +656,15 @@ export class WindowsAdapter {
   }
 
   async inspectPackageManager(managerName) {
-    if (managerName === "winget") {
-      return this.executeCommand(process.cwd(), "winget", ["--version"], { timeoutMs: 6000 });
-    }
-    return this.executeCommand(process.cwd(), managerName, ["--version"], { timeoutMs: 6000 });
+    const manager = String(managerName ?? "winget");
+    const probeResult = await this.executeCommand(process.cwd(), manager, ["--version"], { timeoutMs: 6000 });
+    return {
+      packageManager: manager,
+      available: probeResult.exitCode === 0,
+      status: probeResult.exitCode === 0 ? "AVAILABLE" : "NOT_AVAILABLE",
+      version: probeResult.exitCode === 0 ? probeResult.stdout.trim() : null,
+      probeResult
+    };
   }
 
   getDocumentsPath() {
@@ -1048,6 +1091,34 @@ export class WindowsAdapter {
     const limit = clampInt(deadlineMs, 500, 15000, 6000);
     const tokens = spotifyQueryTokens(query);
     if (tokens.length === 0) return { found: false, invoked: false, name: null, reason: "invalid-track-query", commandResult: null };
+    // Modern Chromium accessibility trees often expose a result as one button
+    // named "Play <title> by <artist>" instead of a title label containing a
+    // nested generic Play button. Try the general compound-name selector first.
+    if (this.automationHost) {
+      try {
+        const semantic = await this.findAndInvokeSemanticControl({
+          application: "spotify",
+          windowId: windowHandle,
+          actionPrefix: "Play ",
+          objectName: String(query).trim(),
+          controlType: "Button"
+        });
+        if (semantic.invoked) {
+          return {
+            found: true,
+            invoked: true,
+            name: semantic.target?.name ?? null,
+            matchedLabel: semantic.target?.name ?? null,
+            matchedBounds: semantic.target?.boundingRect ?? null,
+            reason: null,
+            semantic
+          };
+        }
+      } catch {
+        // The bounded legacy UIA path below also tolerates minor spelling
+        // corrections and keeps compatibility when the host is unavailable.
+      }
+    }
     const encodedTokens = Buffer.from(JSON.stringify(tokens), "utf8").toString("base64");
     const queryText = String(query).trim();
     const displayQuery = queryText.toLowerCase().replace(/\b[a-z0-9]/g, (character) => character.toUpperCase());
@@ -1088,6 +1159,12 @@ export class WindowsAdapter {
       "  if($labels.Count -eq 0){try{foreach($variant in @($queryVariants)){if($sw.ElapsedMilliseconds -ge (" + limit + "/2)){break};$variantCondition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,[string]$variant);$variantLabel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$variantCondition);if($variantLabel){$labels=@($variantLabel);break}}}catch{$labels=@()}};",
       "  $playNameCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Play');$genericPlayCond=New-Object System.Windows.Automation.AndCondition($buttonCond,$playNameCond);",
       "  foreach($labelEl in $labels){try{$label=$labelEl.Current.Name;$rr=$labelEl.Current.BoundingRectangle;if($labelEl.Current.IsOffscreen -or -not (& $matches $label) -or $rr.Width -le 0 -or $rr.Height -le 0 -or $rr.Height -gt 260){continue};$ancestor=$labelEl;for($depth=0;$depth-lt 5;$depth++){$ancestor=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor);if(-not $ancestor){break};$candidate=$ancestor.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$genericPlayCond);if($candidate -and -not $candidate.Current.IsOffscreen -and $candidate.Current.IsEnabled){$best=$candidate;$matchedLabel=$label;$matchedBounds=$rr;break}}}catch{};if($best){break}};",
+      // Some Chromium apps expose the action and object as one accessibility
+      // control (for example "Play Good For You by ..."). Search only Button
+      // controls, not the entire raw tree, and bind the action to the requested
+      // object tokens before invoking it. This is the same general semantic
+      // action+object shape used by the persistent host selector above.
+      "  if(-not $best -and $sw.ElapsedMilliseconds -lt " + limit + "){try{$actionButtons=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$buttonCond);foreach($candidate in $actionButtons){if($sw.ElapsedMilliseconds -ge " + limit + "){break};$candidateName=$candidate.Current.Name;$candidateBounds=$candidate.Current.BoundingRectangle;if(-not $candidate.Current.IsOffscreen -and $candidate.Current.IsEnabled -and $candidateName.StartsWith('Play ',[StringComparison]::OrdinalIgnoreCase) -and (& $matches $candidateName) -and $candidateBounds.Width -gt 0 -and $candidateBounds.Height -gt 0){$best=$candidate;$matchedLabel=$candidateName;$matchedBounds=$candidateBounds;break}}}catch{}};",
       "  if($best){$play=$best;break};",
       "  if(-not $play){ Start-Sleep -Milliseconds 400 }",
       "};",
@@ -1332,6 +1409,8 @@ export class WindowsAdapter {
           WindowHandle: Number(window.windowId),
           ClassName: window.className,
           Bounds: window.bounds,
+          DisplayId: window.displayId,
+          Dpi: window.dpi,
           Foreground: window.foreground
         }));
       } catch {
@@ -1387,13 +1466,68 @@ public static class SyscoraWindowEnumerator {
     return this.hostRequest("ui.find", { application, windowId, selector }, { timeoutMs: 8000 });
   }
 
+  // Reusable semantic UI primitive for controls whose accessible name combines
+  // an action and an object, such as "Play <track>", "Open <document>", or
+  // "Watch <video>". Requiring both fragments is more precise than choosing the
+  // first generic button and avoids application- or item-specific coordinates.
+  async findAndInvokeSemanticControl({
+    application = null,
+    windowId = null,
+    actionPrefix,
+    objectName,
+    controlType = "Button"
+  } = {}) {
+    const prefix = String(actionPrefix ?? "").trim();
+    const object = String(objectName ?? "").trim();
+    if (!prefix || !object) {
+      return { found: false, invoked: false, reason: "semantic-selector-incomplete" };
+    }
+    const selector = {
+      nameStartsWith: prefix,
+      nameContains: object,
+      controlType
+    };
+    const found = await this.findUiTarget({ application, windowId, selector });
+    if (!found?.found || !found.target) {
+      return { found: false, invoked: false, reason: found?.reason ?? "target-not-found", selector };
+    }
+    if (found.ambiguous) {
+      return {
+        found: true,
+        invoked: false,
+        reason: "ambiguous-semantic-target",
+        matchCount: found.matchCount,
+        target: found.target,
+        selector
+      };
+    }
+    const action = await this.performUiAction({
+      application,
+      windowId: windowId ?? found.target.windowId,
+      target: found.target,
+      action: "invoke"
+    });
+    return {
+      found: true,
+      invoked: action?.performed === true,
+      reason: action?.performed === true ? null : (action?.reason ?? "invoke-failed"),
+      target: found.target,
+      selector,
+      action
+    };
+  }
+
   async performUiAction({ application = null, windowId = null, target, action, text = "", allowFirst = false } = {}) {
     const params = {
       application, windowId: windowId ?? target?.windowId, target, selector: target?.selector ?? target,
       action, text, allowFirst
     };
     const first = await this.hostRequest("ui.action", params, { timeoutMs: 10000 });
-    if (first?.performed !== false || !["stale-target", "target-not-found", "window-not-found", "foreground-not-acquired"].includes(first?.reason)) {
+    // Only a stale control may be refreshed deterministically. A missing or
+    // mismatched window and a foreground-acquisition failure are safety
+    // boundaries: resolving another control after either failure could redirect
+    // input to a different window.
+    if (first?.performed !== false || !["stale-target", "target-not-found"].includes(first?.reason)) {
       return first;
     }
     const stableSelector = {
@@ -1465,10 +1599,10 @@ public static class SyscoraWindowEnumerator {
     return this.hostRequest("vision.locate", params, { timeoutMs: 20000 });
   }
 
-  async browserDomAction(operation, params = {}) {
+  async browserDomAction(operation, params = {}, { signal } = {}) {
     const method = this.browserAutomation?.[operation];
     if (typeof method !== "function") throw new Error(`Unsupported browser DOM operation: ${operation}`);
-    return method.call(this.browserAutomation, params);
+    return method.call(this.browserAutomation, { ...params, ...(signal ? { signal } : {}) });
   }
 
   async notepadTypeAndSave({ content, filename }) {

@@ -49,7 +49,7 @@ export function createResultEnvelope({
     type: "syscora.result",
     version: 1,
     capability: String(capability ?? "unknown"),
-    ok: ["VERIFIED", "PARTIALLY_VERIFIED"].includes(verification?.status),
+    ok: verification?.status === "VERIFIED",
     data,
     raw: output,
     evidence: {

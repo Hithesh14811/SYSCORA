@@ -12,6 +12,7 @@ export class WindowsAutomationHostClient {
     this.child = null;
     this.pending = new Map();
     this.stderr = "";
+    this.reader = null;
   }
 
   start() {
@@ -21,7 +22,8 @@ export class WindowsAutomationHostClient {
       "-ExecutionPolicy", "Bypass", "-File", hostScript
     ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     this.child.stderr.on("data", (chunk) => { this.stderr = `${this.stderr}${chunk}`.slice(-8000); });
-    readline.createInterface({ input: this.child.stdout }).on("line", (line) => {
+    this.reader = readline.createInterface({ input: this.child.stdout });
+    this.reader.on("line", (line) => {
       let message;
       try { message = JSON.parse(line); } catch { return; }
       const pending = this.pending.get(message.id);
@@ -38,6 +40,8 @@ export class WindowsAutomationHostClient {
         pending.reject(error);
       }
       this.pending.clear();
+      this.reader?.close();
+      this.reader = null;
       this.child = null;
     });
   }
@@ -57,7 +61,20 @@ export class WindowsAutomationHostClient {
 
   close() {
     if (!this.child) return;
-    this.child.stdin.end();
+    const child = this.child;
+    const error = Object.assign(new Error("Windows automation host closed"), { code: "CANCELLED" });
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    this.reader?.close();
+    this.reader = null;
+    try { child.stdin.end(); } catch { /* already closed */ }
+    try { child.kill(); } catch { /* already exited */ }
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    child.unref?.();
     this.child = null;
   }
 }

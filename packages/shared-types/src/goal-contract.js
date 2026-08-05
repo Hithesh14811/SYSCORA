@@ -157,7 +157,7 @@ function executionEvidence(input = {}) {
     parts.push(observation?.source, evidenceObject(observation?.structuredState ?? observation));
   }
   for (const verification of input.verifications ?? []) {
-    if (verification?.status === "VERIFIED" || verification?.status === "PARTIALLY_VERIFIED") {
+    if (verification?.status === "VERIFIED") {
       parts.push(verification?.message, evidenceObject(verification?.evidence), evidenceObject(verification?.expectedState));
     }
   }

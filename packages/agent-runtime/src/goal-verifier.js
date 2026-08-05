@@ -51,9 +51,7 @@ export class GoalVerifier {
 
     // 1. Aggregate task-level verification signal.
     const total = verifications.length;
-    const verified = verifications.filter(
-      (v) => v && (v.status === "VERIFIED" || v.status === "PARTIALLY_VERIFIED")
-    ).length;
+    const verified = verifications.filter((v) => v && v.status === "VERIFIED").length;
     const fullyVerified = verifications.filter((v) => v && v.status === "VERIFIED").length;
     const partiallyVerified = verifications.filter((v) => v && v.status === "PARTIALLY_VERIFIED").length;
     const failed = verifications.filter((v) => v && v.status === "FAILED").length;
@@ -129,7 +127,7 @@ export class GoalVerifier {
 
     // 6. Failure evidence: collect messages from failed/inconclusive tasks.
     const failureEvidence = verifications
-      .filter((v) => v && v.status !== "VERIFIED" && v.status !== "PARTIALLY_VERIFIED")
+      .filter((v) => v && v.status !== "VERIFIED")
       .map((v) => v.message)
       .filter(Boolean);
     if (failureEvidence.length > 0) evidence.push({ kind: "failure_evidence", messages: failureEvidence });
@@ -167,6 +165,13 @@ export class GoalVerifier {
           GoalStatus.INCONCLUSIVE,
           `Scheduler reported COMPLETED, but ${inconclusive} task outcome(s) could not be independently confirmed.`,
           0.5
+        );
+      }
+      if (total > 0 && partiallyVerified > 0) {
+        return build(
+          GoalStatus.INCONCLUSIVE,
+          `Scheduler reported COMPLETED, but ${partiallyVerified} task outcome(s) were only partially verified.`,
+          0.45
         );
       }
       if (total > 0 && verified < total) {
@@ -234,7 +239,15 @@ export class GoalVerifier {
       return build(GoalStatus.INCONCLUSIVE, `${verified}/${total} tasks verified; ${inconclusive} inconclusive.`, 0.5);
     }
 
-    // Every task verified (or partially verified) and scheduler absent/COMPLETED.
+    if (partiallyVerified > 0) {
+      return build(
+        GoalStatus.INCONCLUSIVE,
+        `${verified}/${total} tasks were independently verified; ${partiallyVerified} were only partially verified.`,
+        0.45
+      );
+    }
+
+    // Every task independently verified and scheduler absent/COMPLETED.
     if (verified === total && (!schedulerStatus || schedulerStatus.status === "COMPLETED")) {
       if (warnings.length > 0) {
         return build(

@@ -33,10 +33,18 @@ test("missing runtime references fail closed", () => {
 test("unified visual targets require fresh confidence and bounds", () => {
   const target = createInteractionTarget({
     source: "OCR", windowId: "w1", name: "Settings",
-    bounds: { x: 10, y: 20, width: 80, height: 20 }, confidence: 0.9
+    bounds: { x: 10, y: 20, width: 80, height: 20 }, confidence: 0.9,
+    observationId: "screen-1",
+    expectedForegroundWindowId: "w1",
+    windowIdentity: {
+      windowId: "w1", processId: 7, processName: "sample", title: "Sample",
+      className: "SampleWindow", bounds: { x: 0, y: 0, width: 800, height: 600 },
+      displayId: "DISPLAY1", dpi: 96
+    }
   });
   assert.equal(validateInteractionTarget(target).valid, true);
   assert.equal(validateInteractionTarget({ ...target, confidence: 0.2 }).valid, false);
+  assert.equal(validateInteractionTarget({ ...target, observationId: null }).valid, false);
 });
 
 test("general M4 primitives are planner-visible with modality metadata", () => {
@@ -63,15 +71,27 @@ test("general M4 primitives are planner-visible with modality metadata", () => {
 
 test("target resolver audits UIA to visual fallback and unified action consumes it", async () => {
   const calls = [];
+  const observedWindow = {
+    WindowHandle: "w1", Id: 7, ProcessName: "sample", MainWindowTitle: "Sample",
+    ClassName: "SampleWindow", Bounds: { x: 0, y: 0, width: 800, height: 600 },
+    DisplayId: "DISPLAY1", Dpi: 96, Foreground: true
+  };
   const adapter = {
-    listWindows: async () => [],
+    listWindows: async () => [observedWindow],
     manageWindow: async () => ({}),
     findUiTarget: async () => ({ found: false, reason: "target-not-found" }),
     locateVisualTarget: async () => ({
       found: true,
       target: createInteractionTarget({
         source: "OCR", windowId: "w1", name: "File",
-        bounds: { x: 10, y: 10, width: 40, height: 20 }, confidence: 0.9
+        bounds: { x: 10, y: 10, width: 40, height: 20 }, confidence: 0.9,
+        observationId: "screen-1",
+        expectedForegroundWindowId: "w1",
+        windowIdentity: {
+          windowId: "w1", processId: 7, processName: "sample", title: "Sample",
+          className: "SampleWindow", bounds: observedWindow.Bounds,
+          displayId: "DISPLAY1", dpi: 96
+        }
       })
     }),
     performUiAction: async () => ({}),
@@ -95,3 +115,39 @@ test("target resolver audits UIA to visual fallback and unified action consumes 
   assert.equal(action.performed, true);
   assert.deepEqual(calls[0], { windowId: "w1", x: 30, y: 20, button: "left" });
 });
+
+for (const [label, mutate] of [
+  ["window bounds", (window) => ({ ...window, Bounds: { ...window.Bounds, x: 40 } })],
+  ["display", (window) => ({ ...window, DisplayId: "DISPLAY2" })],
+  ["DPI", (window) => ({ ...window, Dpi: 144 })],
+  ["foreground window", (window) => ({ ...window, Foreground: false })]
+]) {
+  test(`coordinate action rejects changed ${label} before pointer input`, async () => {
+    let pointerCalls = 0;
+    const original = {
+      WindowHandle: "w1", Id: 7, ProcessName: "sample", MainWindowTitle: "Sample",
+      ClassName: "SampleWindow", Bounds: { x: 0, y: 0, width: 800, height: 600 },
+      DisplayId: "DISPLAY1", Dpi: 96, Foreground: true
+    };
+    const adapter = {
+      listWindows: async () => [mutate(original)],
+      pointerAction: async () => { pointerCalls += 1; return { performed: true }; }
+    };
+    const registry = createDefaultCapabilityRegistry(adapter);
+    const target = createInteractionTarget({
+      source: "COORDINATE", windowId: "w1", name: "Search",
+      bounds: { x: 10, y: 10, width: 40, height: 20 }, confidence: 0.95,
+      observationId: "screen-1", expectedForegroundWindowId: "w1",
+      windowIdentity: {
+        windowId: "w1", processId: 7, processName: "sample", title: "Sample",
+        className: "SampleWindow", bounds: original.Bounds, displayId: "DISPLAY1", dpi: 96
+      }
+    });
+
+    await assert.rejects(
+      registry.get("pointer.click").execute({ target }),
+      /STALE_OBSERVATION|FOREGROUND_MISMATCH/
+    );
+    assert.equal(pointerCalls, 0);
+  });
+}
