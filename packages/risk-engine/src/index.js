@@ -103,6 +103,19 @@ const DIMENSION_CONTRIBUTION = Object.freeze({
 // treat the decision as less-certain and fail conservatively.
 const UNCERTAIN_VALUES = new Set(["UNKNOWN", "STALE", "INCOMPLETE", "CONFLICTING", "MODEL_DERIVED", "EXTERNAL_UNTRUSTED"]);
 
+// The stages a browser workflow moves through. Reading and preparing are cheap
+// and reversible; entering credentials or payment details and submitting are
+// not. Keeping them as distinct named stages is what lets research proceed
+// freely while the two consequential stages always stop for the user.
+export const BrowserStage = Object.freeze({
+  RESEARCH: "RESEARCH",
+  SELECTION: "SELECTION",
+  FORM_PREPARATION: "FORM_PREPARATION",
+  SENSITIVE_DATA_ENTRY: "SENSITIVE_DATA_ENTRY",
+  CONSEQUENTIAL_SUBMISSION: "CONSEQUENTIAL_SUBMISSION",
+  CONFIRMATION_VERIFICATION: "CONFIRMATION_VERIFICATION"
+});
+
 export class RiskEngine {
   // The registry is optional. When present, the authoritative per-capability
   // risk floor (capability.riskProfile) is read from it; runtime context may
@@ -181,6 +194,26 @@ export class RiskEngine {
           why: `Browser interaction targets a consequential control (${consequential.matched}); ` +
             "submitting, purchasing, sending or deleting through a page is an external effect " +
             "this runtime cannot roll back."
+        });
+      }
+
+      // Entering credentials, payment instruments or government identifiers into
+      // a page transmits data this runtime cannot recall. It is a financial or
+      // security effect in its own right, independent of whether the eventual
+      // submit button happens to be worded consequentially.
+      const browserStage = this.classifyBrowserStage(task);
+      if (browserStage === BrowserStage.SENSITIVE_DATA_ENTRY) {
+        evidence[RiskDimension.EXTERNAL_EFFECT] = maxRiskValue(
+          RiskDimension.EXTERNAL_EFFECT, evidence[RiskDimension.EXTERNAL_EFFECT], "FINANCIAL_OR_SECURITY"
+        );
+        evidence[RiskDimension.DATA_SENSITIVITY] = maxRiskValue(
+          RiskDimension.DATA_SENSITIVITY, evidence[RiskDimension.DATA_SENSITIVITY], "SECRET"
+        );
+        reasons.push({
+          dimension: RiskDimension.EXTERNAL_EFFECT,
+          value: "FINANCIAL_OR_SECURITY",
+          why: "Browser interaction enters credential, payment or identity data into a page; " +
+            "transmitted secrets cannot be withdrawn once sent."
         });
       }
 
@@ -303,6 +336,58 @@ export class RiskEngine {
       pattern: /\b(submit|confirm|delete|remove|destroy|sign\s+up|apply\s+now|save\s+changes|update)\b/i
     }
   ]);
+
+  // Classify a browser task into its transactional stage. The stage is derived
+  // ONLY from the capability and the control's own attributes — never from the
+  // user's phrasing or the value being typed — so a benign-sounding request can
+  // never lower the tier of a payment field or an order button.
+  classifyBrowserStage(task) {
+    const capability = String(task?.capability ?? task?.selectedCapability ?? "");
+    if (!/^browser\./.test(capability)) return null;
+    const inputs = task?.inputs ?? task?.action?.parameters ?? {};
+
+    if (/^browser\.(read|extract|inspect|find|currentState|wait)$/.test(capability)) {
+      return String(inputs.purpose ?? "").toLowerCase() === "confirmation"
+        ? BrowserStage.CONFIRMATION_VERIFICATION
+        : BrowserStage.RESEARCH;
+    }
+    if (/^browser\.(launch|navigate|research|search|media\.play)$/.test(capability)) {
+      return BrowserStage.RESEARCH;
+    }
+    if (this._detectConsequentialBrowserAction(task)) {
+      return BrowserStage.CONSEQUENTIAL_SUBMISSION;
+    }
+    if (/^browser\.(type|select)$/.test(capability)) {
+      return RiskEngine.isSensitiveField(inputs.target ?? {})
+        ? BrowserStage.SENSITIVE_DATA_ENTRY
+        : BrowserStage.FORM_PREPARATION;
+    }
+    if (/^browser\.(click|download)$/.test(capability)) {
+      return BrowserStage.SELECTION;
+    }
+    return BrowserStage.RESEARCH;
+  }
+
+  // A field that carries credentials, payment instruments or government
+  // identifiers. Detected from the field's own type, autocomplete token, name,
+  // id and visible label.
+  static isSensitiveField(target = {}) {
+    if (String(target.type ?? "").toLowerCase() === "password") return true;
+    const autocomplete = String(target.autocomplete ?? "").toLowerCase();
+    if (/\b(?:cc-(?:number|exp|exp-month|exp-year|csc|name)|current-password|new-password)\b/.test(autocomplete)) {
+      return true;
+    }
+    const descriptor = [target.name, target.id, target.label, target.text, target.placeholder, target.ariaLabel]
+      .filter((entry) => typeof entry === "string")
+      .join(" ")
+      .toLowerCase();
+    return /\b(?:password|passcode|pin\b|card\s*number|cardnumber|credit\s*card|debit\s*card|cvv|cvc|csc|security\s*code|expiry|expiration|iban|swift|sort\s*code|routing\s*number|account\s*number|accountnumber|ssn|social\s*security|tax\s*id|passport|national\s*id|driver'?s?\s*licen[cs]e|date\s*of\s*birth)\b/
+      .test(descriptor);
+  }
+
+  static browserStageRequiresConfirmation(stage) {
+    return stage === BrowserStage.SENSITIVE_DATA_ENTRY || stage === BrowserStage.CONSEQUENTIAL_SUBMISSION;
+  }
 
   _detectConsequentialBrowserAction(task) {
     const capability = String(task?.capability ?? task?.selectedCapability ?? "");
