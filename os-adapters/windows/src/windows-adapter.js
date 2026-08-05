@@ -30,6 +30,39 @@ function escapePowerShellSingleQuoted(value) {
   return String(value).replace(/'/g, "''");
 }
 
+// Parse `winget search` output into structured candidates.
+//
+// WinGet prints a padded table, but a value wider than its column simply pushes
+// into the next one, so fixed header offsets truncate long package ids. Columns
+// are instead separated by runs of two or more spaces — a separator that single
+// spaces inside a display name never produce. Name/Id/Version are read from the
+// left and Source from the right, so the optional Match column cannot shift the
+// source onto the wrong field. Rows that yield no id are dropped rather than
+// guessed at.
+export function parseWingetSearchTable(stdout) {
+  const lines = String(stdout ?? "").split(/\r?\n/);
+  const headerIndex = lines.findIndex((line) => /^\s*Name\s+Id\s+Version/i.test(line));
+  if (headerIndex === -1) return [];
+  const hasSource = /\bSource\b/i.test(lines[headerIndex]);
+
+  const records = [];
+  for (const line of lines.slice(headerIndex + 1)) {
+    if (!line.trim() || /^\s*-+\s*$/.test(line)) continue;
+    const fields = line.trim().split(/\s{2,}/).map((field) => field.trim()).filter(Boolean);
+    const [name, id, version] = fields;
+    if (!id) continue;
+    const source = hasSource && fields.length > 3 ? fields[fields.length - 1] : null;
+    records.push({
+      id,
+      name: name || id,
+      version: version || null,
+      source: source ? source.toLowerCase() : null,
+      publisher: null
+    });
+  }
+  return records;
+}
+
 function expandWindowsEnvironmentPath(value) {
   const environment = new Map(
     Object.entries(process.env).map(([key, item]) => [key.toUpperCase(), item])
@@ -514,6 +547,38 @@ export class WindowsAdapter {
   async wingetSearch(query) {
     const q = String(query ?? "").trim();
     return this.executeCommand(process.cwd(), "winget", ["search", "--name", q, "--source", "winget"], { timeoutMs: 20000 });
+  }
+
+  // Typed package discovery for the prerequisite workflow. Returns structured
+  // candidates with an explicit source so an approval can bind to an exact
+  // identity; free-text output is never handed on as a package identity.
+  async searchPackages(query, source = "winget") {
+    const result = await this.wingetSearch(query);
+    if (result.exitCode !== 0) return [];
+    return parseWingetSearchTable(result.stdout ?? "").map((entry) => ({ ...entry, source: entry.source || source }));
+  }
+
+  // Publisher and version for one already-identified package, so the approval
+  // prompt shows who is actually being trusted.
+  async describePackage(id, source = "winget") {
+    const result = await this.executeCommand(
+      process.cwd(),
+      "winget",
+      ["show", "--id", id, "--source", source, "--accept-source-agreements"],
+      { timeoutMs: 20000 }
+    );
+    if (result.exitCode !== 0) return { id, source, publisher: null, version: null, commandResult: result };
+    const field = (label) => result.stdout?.match(new RegExp(`^\\s*${label}:\\s*(.+)$`, "im"))?.[1]?.trim() ?? null;
+    return { id, source, publisher: field("Publisher"), version: field("Version"), commandResult: result };
+  }
+
+  async installPackage(id, source = "winget") {
+    return this.executeCommand(
+      process.cwd(),
+      "winget",
+      ["install", "--id", id, "--source", source, "--accept-package-agreements", "--accept-source-agreements"],
+      { timeoutMs: 300000 }
+    );
   }
 
   async wingetShow(id) {
