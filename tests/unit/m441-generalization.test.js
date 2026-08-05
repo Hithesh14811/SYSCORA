@@ -82,21 +82,27 @@ test("evidence ledger maps compound criteria and verifies typed binding lineage"
     capability: "browser.extract",
     verification: { status: "VERIFIED" },
     value: "Saffron-819",
-    producedBindings: ["B1"]
+    producedBindings: ["B1"],
+    observation: { value: "Saffron-819" }, source: "DOM", confidence: 1,
+    verificationMethod: "DOM_EXTRACTION", independentFromActionResult: true
   });
   appendEvidence(ledger, {
     criterionIds: ["c2"],
     capability: "filesystem.read",
     verification: { status: "VERIFIED", evidence: { contents: "Saffron-819" } },
     consumedBindings: ["B1"],
-    value: "Saffron-819"
+    value: "Saffron-819",
+    observation: { contents: "Saffron-819" }, source: "FILESYSTEM", confidence: 1,
+    verificationMethod: "READ_BACK", independentFromActionResult: true
   });
   appendEvidence(ledger, {
     criterionIds: ["c3"],
     capability: "ui.verifyValue",
     verification: { status: "VERIFIED", evidence: { value: "Saffron-819" } },
     consumedBindings: ["B1"],
-    value: "Saffron-819"
+    value: "Saffron-819",
+    observation: { value: "Saffron-819" }, source: "UIA", confidence: 1,
+    verificationMethod: "ACCESSIBILITY_INSPECTION", independentFromActionResult: true
   });
   const result = evaluateEvidenceLedger(contract, ledger, {
     transferred: {

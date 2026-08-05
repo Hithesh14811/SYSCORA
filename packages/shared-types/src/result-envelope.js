@@ -45,6 +45,15 @@ export function createResultEnvelope({
 } = {}) {
   const output = executionResult ?? {};
   const data = inferData(capability, output);
+  const state = observation?.structuredState ?? {};
+  const window = data.window ?? state.groundedWindow ?? state.window ?? data.target?.windowIdentity ?? {};
+  const source = observation?.source ?? data.target?.source ?? (/^browser\./.test(capability ?? "") ? "DOM"
+    : /^ui\./.test(capability ?? "") ? "UIA"
+      : "INTERNAL");
+  const independentFromActionResult = verification?.independentFromActionResult === true
+    || (verification?.evidence != null
+      && verification.evidence !== executionResult
+      && verification.evidence !== observation?.structuredState);
   return {
     type: "syscora.result",
     version: 1,
@@ -56,15 +65,23 @@ export function createResultEnvelope({
       status: verification?.status ?? "UNKNOWN",
       message: verification?.message ?? null,
       confidence: verification?.confidence ?? null,
-      observation: observation ?? null
+      observation: observation ?? null,
+      source,
+      verificationMethod: verification?.method ?? `${String(capability ?? "unknown")}:verify`,
+      independentFromActionResult,
+      identity: {
+        application: window.application ?? window.processName ?? null,
+        processId: window.processId ?? state.processId ?? null,
+        windowId: window.windowId ?? data.target?.windowId ?? null,
+        pageId: state.pageId ?? state.tabId ?? null,
+        url: data.url ?? null
+      }
     },
     provenance: {
       capability: String(capability ?? "unknown"),
       step: Number.isInteger(step) ? step : null,
       observedAt,
-      source: data.target?.source ?? (/^browser\./.test(capability ?? "") ? "DOM"
-        : /^ui\./.test(capability ?? "") ? "UIA"
-          : "INTERNAL")
+      source
     }
   };
 }

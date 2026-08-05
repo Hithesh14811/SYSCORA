@@ -484,6 +484,9 @@ export class IntentEngine {
     if (lower.includes("edge") || lower.includes("browser") || lower.includes("search")) {
       return "Open Edge and search for something";
     }
+    if (lower.includes("project") && /\b(?:inspect|analy[sz]e|what\b.*\bneed\b.*\brun)\b/.test(lower)) {
+      return "Inspect the project and report its run requirements";
+    }
     if (lower.includes("run") && lower.includes("project")) {
       return "Detect, configure, run, and verify a project";
     }
@@ -527,6 +530,9 @@ export class IntentEngine {
     }
     if (lower.includes("notepad")) {
       return ["Notepad is opened and file is saved"];
+    }
+    if (lower.includes("project") && /\b(?:inspect|analy[sz]e|what\b.*\bneed\b.*\brun)\b/.test(lower)) {
+      return ["Project setup is inspected"];
     }
     if (lower.includes("project")) {
       return ["Project is running and healthy"];

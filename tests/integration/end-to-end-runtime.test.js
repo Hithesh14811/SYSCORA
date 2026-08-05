@@ -51,6 +51,19 @@ describe("End-to-end production runtime", () => {
 
     assert.equal(session.finalResponse.status, "COMPLETED");
     assert.equal(session.currentState, "COMPLETED");
+    assert.equal(session.finalResponse.evidenceCoverage.satisfied, true);
+    assert.ok(session.evidenceLedger.entries.some((entry) =>
+      entry.capability === "environment.project.set"
+      && entry.verification.status === "VERIFIED"
+      && entry.independentFromActionResult === true
+      && entry.verificationMethod
+      && entry.source
+    ), "completion is backed by an independently verified, sourced ledger entry");
+    assert.ok(session.finalResponse.outcome.completed.length > 0);
+    assert.deepEqual(session.finalResponse.outcome.notCompleted, []);
+    const persisted = await runtime.sessionStore.get(session.sessionId);
+    assert.ok(Array.isArray(persisted.goalContract.criteria[0].semanticTerms), "goal semantics survive persistence without secret-token redaction");
+    assert.equal(persisted.finalResponse.evidenceCoverage.satisfied, true);
 
     // The .env file was really written.
     const envContents = await fs.readFile(path.join(workspace, ".env"), "utf8");

@@ -35,7 +35,16 @@ import {
   buildInternalToGuiTransferStrategy,
   buildExplicitApplicationLaunchStrategy
 } from "./interactive-agent-controller.js";
-import { createGoalContract } from "../../shared-types/src/goal-contract.js";
+import {
+  assessGoalContractEvidence,
+  createGoalContract,
+  matchGoalCriteriaForTask
+} from "../../shared-types/src/goal-contract.js";
+import {
+  appendEvidence,
+  createEvidenceLedger,
+  evaluateEvidenceLedger
+} from "../../shared-types/src/evidence-ledger.js";
 import { summarizeReadOnlyResults } from "./read-result-summary.js";
 
 export {
@@ -67,6 +76,28 @@ function stableRecoveryFingerprint(value) {
       .map((key) => [key, normalize(item[key])]));
   };
   try { return JSON.stringify(normalize(value)); } catch { return String(value); }
+}
+
+function evidenceIdentity(task, observation) {
+  const state = observation?.structuredState ?? {};
+  const target = state.target ?? task?.inputs?.target ?? {};
+  const window = state.groundedWindow ?? state.window ?? target.windowIdentity ?? {};
+  return {
+    application: window.application ?? window.processName ?? task?.inputs?.application ?? null,
+    processId: window.processId ?? state.processId ?? null,
+    windowId: window.windowId ?? target.windowId ?? task?.inputs?.windowId ?? null,
+    pageId: state.pageId ?? state.tabId ?? null,
+    url: state.url ?? state.location ?? null
+  };
+}
+
+function verificationIsIndependent(capability, executionResult, observation, verification) {
+  if (verification?.independentFromActionResult === true) return true;
+  if (capability?.permissionModel?.type === "READ") return true;
+  const evidence = verification?.evidence;
+  return evidence != null
+    && evidence !== executionResult
+    && evidence !== observation?.structuredState;
 }
 
 export class AgentRuntime {
@@ -180,6 +211,7 @@ export class AgentRuntime {
       currentState: RuntimeState.RECEIVE_INTENT,
       intent: null,
       goalContract: null,
+      evidenceLedger: createEvidenceLedger(),
       context: null,
       plan: null,
       riskAssessment: null,
@@ -275,6 +307,7 @@ export class AgentRuntime {
       currentState: RuntimeState.RECEIVE_INTENT,
       intent: null,
       goalContract: null,
+      evidenceLedger: createEvidenceLedger(),
       context: null,
       plan: null,
       riskAssessment: null,
@@ -321,9 +354,7 @@ export class AgentRuntime {
       session.intent.operationProvenance = options.operation
         ? "EXPLICIT_CONTEXT"
         : (session.intent.operation ? "NATURAL_LANGUAGE_ROUTED" : null);
-      session.goalContract = session.intent.operationProvenance === "EXPLICIT_CONTEXT"
-        ? null
-        : createGoalContract(session.intent);
+      session.goalContract = createGoalContract(session.intent);
       session.intent.goalContract = session.goalContract;
       await this.addSessionEvent(session, "INTENT_CLASSIFIED", session.intent);
       if (session.goalContract) {
@@ -518,6 +549,14 @@ export class AgentRuntime {
       // response that the UI can show — never a protocol crash on a request the
       // system simply doesn't know how to handle yet.
       const plannedTasks = session.plan?.taskGraph?.tasks ?? [];
+      if (session.intent.operationProvenance === "EXPLICIT_CONTEXT") {
+        const stateCriterionIds = (session.goalContract?.criteria ?? [])
+          .filter((criterion) => criterion.kind === "STATE")
+          .map((criterion) => criterion.criterionId);
+        for (const task of plannedTasks) {
+          task.goalCriterionIds = [...new Set([...(task.goalCriterionIds ?? []), ...stateCriterionIds])];
+        }
+      }
       if (plannedTasks.length === 0) {
         const canTryInteractive = options.interactive !== false &&
           !this._looksConversational(rawText) &&
@@ -793,6 +832,49 @@ export class AgentRuntime {
     });
     session.interactiveController = result;
     if (result.status === "COMPLETE") {
+      session.evidenceLedger = result.evidenceLedger ?? createEvidenceLedger();
+      const successfulActions = (result.recentActions ?? []).filter((entry) => entry.succeeded);
+      const constraintAssessment = assessGoalContractEvidence(session.goalContract, {
+        taskGraph: { tasks: successfulActions.map((entry) => entry.action) },
+        taskResults: successfulActions.map((entry) => ({
+          capability: entry.action?.capability,
+          executionResult: entry.executionResult
+        })),
+        verifications: successfulActions.map((entry) => entry.verification).filter(Boolean),
+        observations: result.recentObservations ?? [],
+        approvalGranted: session.events.some((event) =>
+          event.eventType === "APPROVAL_EVALUATED" && event.details?.approved === true)
+      }, this.capabilityRegistry);
+      for (const criterion of session.goalContract?.criteria ?? []) {
+        if (!["PROHIBITION", "CONSTRAINT"].includes(criterion.kind)) continue;
+        const assessment = constraintAssessment.criteria.find((item) => item.criterionId === criterion.criterionId);
+        if (!assessment?.satisfied) continue;
+        appendEvidence(session.evidenceLedger, {
+          criterionIds: [criterion.criterionId],
+          capability: "runtime.constraint.audit",
+          observation: { actions: successfulActions.map((entry) => entry.action?.capability) },
+          verification: { status: "VERIFIED", message: assessment.evidence, confidence: 1 },
+          source: "RUNTIME_AUDIT",
+          confidence: 1,
+          verificationMethod: "NEGATIVE_CONSTRAINT_AUDIT",
+          identity: {},
+          independentFromActionResult: true
+        });
+      }
+      const evidenceCoverage = evaluateEvidenceLedger(session.goalContract, session.evidenceLedger, result.bindings ?? {});
+      if (!evidenceCoverage.satisfied) {
+        session.currentState = RuntimeState.FAILED;
+        session.finalResponse = {
+          status: evidenceCoverage.satisfiedCount > 0 ? "PARTIALLY_COMPLETED" : "INCONCLUSIVE",
+          message: `Interactive actions finished, but independent evidence satisfies only ${evidenceCoverage.satisfiedCount}/${evidenceCoverage.totalCriteria} goal criteria.`,
+          interactive: true,
+          evidenceCoverage,
+          evidenceLedger: session.evidenceLedger
+        };
+        await this.addSessionEvent(session, "INTERACTIVE_GOAL_EVIDENCE_INCOMPLETE", evidenceCoverage);
+        await this.persistSession(session);
+        return result;
+      }
       session.currentState = RuntimeState.COMPLETED;
       session.finalResponse = {
         status: "COMPLETED",
@@ -802,6 +884,20 @@ export class AgentRuntime {
         interactive: true,
         result: result.result,
         verification: result.completionVerification,
+        evidenceLedger: session.evidenceLedger,
+        evidenceCoverage,
+        outcome: {
+          completed: evidenceCoverage.criteria.map((criterion) => criterion.description),
+          notCompleted: [],
+          changed: successfulActions.flatMap((entry) => entry.screenDiff?.changes ?? []),
+          verified: session.evidenceLedger.entries.map((entry) => ({
+            evidenceId: entry.evidenceId,
+            source: entry.source,
+            method: entry.verificationMethod
+          })),
+          uncertain: [],
+          userActionNeeded: null
+        },
         metrics: result.metrics,
         observability: result.observability
       };
@@ -1349,6 +1445,34 @@ export class AgentRuntime {
         session.observations.push(observation);
         session.verifications.push(verification);
 
+        session.evidenceLedger ??= createEvidenceLedger();
+        const criterionIds = verification.status === "VERIFIED"
+          ? matchGoalCriteriaForTask(session.goalContract, task, this.capabilityRegistry)
+          : [];
+        const evidenceEntry = appendEvidence(session.evidenceLedger, {
+          taskId: task.taskId,
+          criterionIds,
+          capability: task.capability,
+          modality: cap.trustedExecutionModality ?? cap.execution?.preferredModality ?? null,
+          observation,
+          verification,
+          source: observation?.source ?? task.capability,
+          confidence: verification?.confidence ?? observation?.confidence ?? 0.8,
+          verificationMethod: verification?.method ?? `${task.capability}:verify`,
+          identity: evidenceIdentity(task, observation),
+          independentFromActionResult: verificationIsIndependent(cap, executionResult, observation, verification),
+          provenance: {
+            source: observation?.source ?? task.capability,
+            observationId: observation?.observationId ?? null
+          }
+        });
+        await this.addSessionEvent(session, "EVIDENCE_RECORDED", {
+          evidenceId: evidenceEntry.evidenceId,
+          taskId: task.taskId,
+          criterionIds,
+          independentFromActionResult: evidenceEntry.independentFromActionResult
+        });
+
         await this.addSessionEvent(session, "TASK_EXECUTED", { taskId: task.taskId, result: executionResult });
         await this.addSessionEvent(session, "OBSERVATION_COLLECTED", observation);
         await this.addSessionEvent(
@@ -1503,6 +1627,7 @@ export class AgentRuntime {
   // set the session's final response. Shared by submitIntent and
   // continueApprovedSession so both end identically.
   async _finalizeSession(session) {
+    session.evidenceLedger ??= createEvidenceLedger();
     if (this.perception) {
       session.currentState = RuntimeState.UPDATE_SEMANTIC_STATE;
       await this.perception.snapshot(session.sessionId);
@@ -1533,6 +1658,40 @@ export class AgentRuntime {
     const reconciledVerifications = typeof this.taskGraphScheduler.getReconciledVerifications === "function"
       ? this.taskGraphScheduler.getReconciledVerifications()
       : session.verifications;
+    // Negative and behavioral constraints are verified from the complete
+    // execution audit, not from an action's own return value. Record one
+    // independent audit entry for each satisfied constraint before applying the
+    // authoritative ledger gate.
+    const constraintAssessment = session.goalContract?.enforceable
+      ? assessGoalContractEvidence(session.goalContract, {
+          taskGraph: session.plan?.taskGraph,
+          taskResults: session.taskResults,
+          verifications: reconciledVerifications,
+          observations: session.observations,
+          approvalGranted: session.events.some((event) =>
+            event.eventType === "APPROVAL_EVALUATED" && event.details?.approved === true)
+        }, this.capabilityRegistry)
+      : null;
+    for (const criterion of session.goalContract?.criteria ?? []) {
+      if (!["PROHIBITION", "CONSTRAINT"].includes(criterion.kind)) continue;
+      const assessment = constraintAssessment?.criteria?.find((item) => item.criterionId === criterion.criterionId);
+      if (!assessment?.satisfied) continue;
+      if (session.evidenceLedger.entries.some((entry) => entry.criterionIds.includes(criterion.criterionId))) continue;
+      appendEvidence(session.evidenceLedger, {
+        criterionIds: [criterion.criterionId],
+        capability: "runtime.constraint.audit",
+        observation: {
+          plannedCapabilities: (session.plan?.taskGraph?.tasks ?? []).map((task) => task.capability),
+          detectedChanges: session.observations.flatMap((observation) => observation?.detectedChanges ?? [])
+        },
+        verification: { status: "VERIFIED", message: assessment.evidence, confidence: 1 },
+        source: "RUNTIME_AUDIT",
+        confidence: 1,
+        verificationMethod: "NEGATIVE_CONSTRAINT_AUDIT",
+        identity: {},
+        independentFromActionResult: true
+      });
+    }
     const finalVerification = this.goalVerifier.verify({
       intent: session.intent,
       goalContract: session.goalContract,
@@ -1541,7 +1700,9 @@ export class AgentRuntime {
       verifications: reconciledVerifications,
       observations: session.observations,
       taskResults: session.taskResults,
-      semanticState: semanticSnapshot
+      semanticState: semanticSnapshot,
+      evidenceLedger: session.evidenceLedger,
+      bindings: session.bindings ?? {}
     });
     // A goal that completed with warnings is still a success for the purpose of
     // recording an episodic (reusable) memory; only PARTIAL/FAILED/INCONCLUSIVE
@@ -1681,6 +1842,14 @@ export class AgentRuntime {
       executionSummary = { ...(executionSummary ?? {}), summary: directAnswer };
     }
 
+    const evidenceCoverage = session.goalContract?.enforceable
+      ? evaluateEvidenceLedger(session.goalContract, session.evidenceLedger, session.bindings ?? {})
+      : null;
+    const detectedChanges = [...new Set(session.observations.flatMap((observation) => observation?.detectedChanges ?? []))];
+    const userActionNeeded = ["INCONCLUSIVE", "PARTIALLY_COMPLETED"].includes(finalVerification.status)
+      ? "Review the unverified criteria or provide the requested prerequisite/input before resuming."
+      : null;
+
     session.finalResponse = {
       status: finalVerification.status,
       message: finalVerification.message,
@@ -1688,6 +1857,18 @@ export class AgentRuntime {
       verifications: session.verifications,
       finalStatus,
       finalVerification,
+      evidenceLedger: session.evidenceLedger,
+      evidenceCoverage,
+      outcome: {
+        completed: evidenceCoverage?.criteria.filter((criterion) => criterion.satisfied).map((criterion) => criterion.description) ?? [],
+        notCompleted: evidenceCoverage?.unsatisfiedCriteria ?? [],
+        changed: detectedChanges,
+        verified: (session.evidenceLedger?.entries ?? [])
+          .filter((entry) => entry.verification?.status === "VERIFIED" && entry.independentFromActionResult)
+          .map((entry) => ({ evidenceId: entry.evidenceId, source: entry.source, method: entry.verificationMethod })),
+        uncertain: evidenceCoverage?.criteria.filter((criterion) => !criterion.satisfied).map((criterion) => criterion.description) ?? [],
+        userActionNeeded
+      },
       summary: executionSummary,
       rollbackAvailable: (session.rollback?.records?.length ?? 0) > 0
     };

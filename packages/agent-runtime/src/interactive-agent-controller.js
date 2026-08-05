@@ -337,22 +337,22 @@ function normalizeBoundValue(value, normalization) {
   return text;
 }
 
-function inferCriterionIds(action, goalContract, actual = null) {
+function inferCriterionIds(action, goalContract, actual = null, finalRequestedStep = false) {
   if (Array.isArray(action?.criterionIds) && action.criterionIds.length) return action.criterionIds;
-  const evidence = JSON.stringify({
+  const evidence = `${JSON.stringify({
     capability: action?.capability,
     inputs: action?.inputs,
     subgoal: action?.subgoal,
     expectedEffect: action?.expectedEffect,
     actual
-  }).toLowerCase();
+  }).toLowerCase()} ${actual?.some?.((item) => item?.status === "VERIFIED") ? "verify verified" : ""} ${finalRequestedStep ? "final" : ""}`;
   const mutating = /^(?:filesystem\.write|filesystem\.create|ui\.action|ui\.navigate|pointer\.|keyboard\.|browser\.(?:click|type|select)|window\.(?:activate|moveResize)|process\.(?:start|stop))/.test(String(action?.capability ?? ""));
   return (goalContract?.criteria ?? []).filter((criterion) => {
-    if (criterion.kind === "PROHIBITION") return false;
+    if (criterion.kind === "PROHIBITION" || criterion.kind === "CONSTRAINT") return false;
     const requiresMutation = /\b(?:create|write|modify|update|enter|type|click|select|choose|toggle|enable|disable|close|open|navigate|save|persist)\b/i.test(criterion.description);
     if (requiresMutation && !mutating && !/(?:\.read$|\.verify|\.currentState$|\.find$)/.test(String(action?.capability ?? ""))) return false;
     if (criterion.anchors?.length && !criterion.anchors.every((anchor) => evidence.includes(String(anchor).toLowerCase()))) return false;
-    const informative = (criterion.tokens ?? []).filter((token) => token.length > 2);
+    const informative = (criterion.semanticTerms ?? criterion.tokens ?? []).filter((token) => token.length > 2);
     const overlap = informative.filter((token) => evidence.includes(token)).length;
     return overlap >= Math.min(2, Math.max(1, informative.length));
   }).map((criterion) => criterion.criterionId);
@@ -2340,6 +2340,7 @@ export class InteractiveAgentController {
           state.bindings[bindingSpec.name] = {
             bindingId,
             value: boundValue,
+            contentFingerprint: crypto.createHash("sha256").update(JSON.stringify(boundValue)).digest("hex"),
             type: actualType,
             sourceCapability: action.capability,
             sourceStep: state.steps,
@@ -2378,7 +2379,8 @@ export class InteractiveAgentController {
         const criterionIds = inferCriterionIds(
           action,
           initialContext.goalContract,
-          [outcome?.executionResult, outcome?.observation, verification]
+          [outcome?.executionResult, outcome?.observation, verification],
+          outstandingRequestedSteps(state, pendingActions).length === 0
         );
         evidenceEntry = appendEvidence(state.evidenceLedger, {
           taskId: action.nodeId ?? `step_${state.steps}`,
@@ -2388,6 +2390,28 @@ export class InteractiveAgentController {
           modality,
           observation: outcome?.observation ?? outcome?.executionResult,
           verification,
+          source: lastOutcome.resultEnvelope?.provenance?.source
+            ?? outcome?.observation?.source
+            ?? action.capability,
+          confidence: verification?.confidence ?? outcome?.observation?.confidence ?? 0.8,
+          verificationMethod: action.expectedPostcondition?.kind
+            ? `TYPED_POSTCONDITION:${action.expectedPostcondition.kind}`
+            : `${action.capability}:verify`,
+          identity: {
+            application: action.inputs?.application ?? null,
+            processId: action.inputs?.target?.windowIdentity?.processId ?? null,
+            windowId: action.inputs?.windowId ?? action.inputs?.target?.windowId ?? null,
+            pageId: outcome?.observation?.structuredState?.pageId ?? null,
+            url: outcome?.observation?.structuredState?.url ?? null
+          },
+          independentFromActionResult: predicateResult?.satisfied === true
+            || verification?.independentFromActionResult === true
+            || this.capabilityRegistry?.get?.(action.capability)?.permissionModel?.type === "READ"
+            || (verification?.evidence != null
+              && outcome?.observation != null
+              && verification.evidence !== outcome.executionResult
+              && verification.evidence !== outcome.observation
+              && verification.evidence !== outcome.observation?.structuredState),
           value: lastOutcome.resultEnvelope?.data?.value,
           provenance: lastOutcome.resultEnvelope?.provenance,
           producedBindings: action.bindOutput

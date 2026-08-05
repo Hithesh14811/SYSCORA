@@ -121,9 +121,11 @@ function stateCapability(state) {
       confidence: 1,
       trustLevel: "SYSTEM_TRUSTED"
     }),
-    verify: async (result) => ({
+    verify: async (observation) => ({
       status: "VERIFIED",
-      message: `state is ${result.value}`,
+      message: `state is ${observation.structuredState.value}`,
+      evidence: { value: observation.structuredState.value },
+      independentFromActionResult: true,
       confidence: 1
     }),
     timeout: 5000,
@@ -173,7 +175,7 @@ test("production free text routes into the adaptive controller and batches local
     );
     assert.equal(state.value, 3);
     assert.equal(session.interactiveController.steps, 3);
-    assert.equal(provider.interactiveCalls, 2, "strategic calls must be fewer than mechanical actions");
+    assert.equal(provider.interactiveCalls, 1, "independent local evidence must avoid a redundant completion model call");
     assert.ok(session.events.some((event) => event.eventType === "ADAPTIVE_CONTROLLER_STARTED"));
     assert.ok(session.events.some((event) => event.eventType === "INTERACTIVE_GOAL_VERIFIED"));
   } finally {

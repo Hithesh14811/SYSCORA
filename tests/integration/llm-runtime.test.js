@@ -207,7 +207,13 @@ describe("secret isolation through the runtime", () => {
         return { usedSecret: Boolean(inputs.apiKey) };
       },
       observe: okObserve("test.uses_secret"),
-      verify: async () => ({ status: "VERIFIED", message: "ok", confidence: 1 }),
+      verify: async () => ({
+        status: "VERIFIED",
+        message: "secret-dependent operation independently confirmed",
+        evidence: { secretWasAvailable: seenByCapability === SECRET_VALUE },
+        independentFromActionResult: true,
+        confidence: 1
+      }),
       rollback: null,
       timeout: 5000,
       retryPolicy: { maxAttempts: 1 }

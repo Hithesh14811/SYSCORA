@@ -418,7 +418,8 @@ describe("M2.1 replan re-enters the safety gate (HIGH 2)", () => {
     assert.ok(types.includes("REPLAN_GRANTS_INVALIDATED"), "material replan must invalidate prior grants");
     const audit = await auditRepository.readAll();
     assert.ok(audit.some((e) => e.eventType === "CAPABILITY_GRANTS_REVOKED"), "revocation is audited");
-    assert.equal(session.finalResponse.status, "COMPLETED");
+    assert.equal(session.finalResponse.status, "PARTIALLY_COMPLETED", "a replacement recovery cannot erase the failed alpha clause");
+    assert.deepEqual(session.finalResponse.evidenceCoverage.unsatisfiedCriteria, ["alpha"]);
     await fs.rm(tempRoot, { recursive: true, force: true });
   });
 });

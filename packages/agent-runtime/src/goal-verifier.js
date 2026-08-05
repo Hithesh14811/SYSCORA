@@ -18,6 +18,7 @@
 
 import { assessPlanGoalCoverage } from "../../planner/src/index.js";
 import { assessGoalContractEvidence } from "../../shared-types/src/goal-contract.js";
+import { evaluateEvidenceLedger } from "../../shared-types/src/evidence-ledger.js";
 
 export const GoalStatus = Object.freeze({
   COMPLETED: "COMPLETED",
@@ -87,6 +88,9 @@ export class GoalVerifier {
       : assessPlanGoalCoverage(intent, taskGraph, this.capabilityRegistry);
     evidence.push({ kind: "semantic_goal_coverage", ...semanticCoverage });
     const goalContract = input.goalContract ?? intent.goalContract ?? null;
+    const ledgerEvidence = goalContract?.enforceable && input.evidenceLedger
+      ? evaluateEvidenceLedger(goalContract, input.evidenceLedger, input.bindings)
+      : null;
     const contractEvidence = goalContract?.enforceable
       ? assessGoalContractEvidence(goalContract, {
           taskGraph,
@@ -95,6 +99,7 @@ export class GoalVerifier {
           observations
         }, this.capabilityRegistry)
       : null;
+    if (ledgerEvidence) evidence.push({ kind: "evidence_ledger", ...ledgerEvidence });
     if (contractEvidence) evidence.push({ kind: "goal_contract_evidence", ...contractEvidence });
 
     // 4. Mutation evidence: expected vs unexpected. Every task may declare
@@ -190,13 +195,14 @@ export class GoalVerifier {
         );
       }
 
-      if (contractEvidence && !contractEvidence.satisfied) {
-        const status = contractEvidence.satisfiedCount > 0
+      const authoritativeContractEvidence = ledgerEvidence ?? contractEvidence;
+      if (authoritativeContractEvidence && !authoritativeContractEvidence.satisfied) {
+        const status = authoritativeContractEvidence.satisfiedCount > 0
           ? GoalStatus.PARTIALLY_COMPLETED
           : GoalStatus.INCONCLUSIVE;
         return build(
           status,
-          `Tasks completed, but independent evidence satisfies only ${contractEvidence.satisfiedCount}/${contractEvidence.totalCriteria} original goal criteria. Missing: ${contractEvidence.unsatisfiedCriteria.join("; ") || "unspecified criteria"}.`,
+          `Tasks completed, but independent evidence satisfies only ${authoritativeContractEvidence.satisfiedCount}/${authoritativeContractEvidence.totalCriteria} original goal criteria. Missing: ${authoritativeContractEvidence.unsatisfiedCriteria.join("; ") || "unspecified criteria"}.`,
           0.9
         );
       }

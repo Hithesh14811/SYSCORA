@@ -44,7 +44,8 @@ test("developer workflow detects and runs a node project", async () => {
       { autoApprove: true }
     );
 
-    assert.equal(session.finalResponse.status, "COMPLETED");
+    assert.equal(session.finalResponse.status, "INCONCLUSIVE", "exit code zero without an independent running-state postcondition is not completion");
+    assert.match(session.finalResponse.message, /independent evidence/i);
     assert.equal(session.taskResults.length > 0, true);
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });

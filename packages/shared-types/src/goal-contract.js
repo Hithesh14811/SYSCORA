@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
 
 const STOP_WORDS = new Set([
-  "a", "an", "and", "are", "as", "at", "be", "both", "by", "do", "for", "from",
-  "in", "inside", "is", "it", "its", "me", "named", "of", "on", "or", "so",
-  "the", "then", "this", "to", "with"
+  "a", "about", "an", "and", "are", "as", "at", "be", "both", "by", "do", "for", "from",
+  "give", "in", "inside", "is", "it", "its", "me", "named", "of", "on", "or", "quick", "so",
+  "tell", "the", "then", "this", "to", "what", "whats", "with"
 ]);
 
 const READ_ONLY_CAPABILITIES = /^(?:system\.inspect|process\.list|filesystem\.read|filesystem\.inspect|application\.launch|window\.(?:enumerate|resolve|wait)|ui\.(?:inspect|find|extract|resolveTarget)|screen\.capture|ocr\.read|vision\.locate|browser\.(?:launch|navigate|currentState|inspect|find|read|extract|wait))$/;
@@ -26,6 +26,26 @@ function tokens(value) {
     ["controls", "control"],
     ["entered", "enter"],
     ["entry", "enter"],
+    ["booking", "book"],
+    ["sending", "send"],
+    ["purchasing", "purchase"],
+    ["computer", "system"],
+    ["machine", "system"],
+    ["pc", "system"],
+    ["box", "system"],
+    ["developer", "environment"],
+    ["development", "environment"],
+    ["tool", "environment"],
+    ["tools", "environment"],
+    ["tooling", "environment"],
+    ["installed", "environment"],
+    ["folders", "directory"],
+    ["folder", "directory"],
+    ["directories", "directory"],
+    ["repository", "repo"],
+    ["repositories", "repo"],
+    ["running", "process"],
+    ["rundown", "inspect"],
     ["inspected", "inspect"],
     ["reported", "report"],
     ["verified", "verify"],
@@ -72,9 +92,26 @@ function isStandaloneProhibition(value) {
   return /^\s*(?:do not|don't|must not|never|without (?:changing|modifying|editing)|no changes?)\b/i.test(String(value ?? ""));
 }
 
+function isBehavioralConstraint(value) {
+  return /\b(?:only|ask before|must|desktop app|without)\b/i.test(String(value ?? ""));
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+function criterionTerms(criterion) {
+  if (Array.isArray(criterion?.semanticTerms)) return criterion.semanticTerms;
+  if (Array.isArray(criterion?.tokens)) return criterion.tokens;
+  return tokens(criterion?.description);
+}
+
 function isVacuousCriterion(value) {
   const normalized = normalize(value);
   return /^(?:the )?(?:request|task|operation|action|goal) (?:is |was )?(?:processed |completed |performed |executed )?(?:successfully|correctly|as requested)$/.test(normalized)
+    || /^(?:the )?(?:request|task|operation|action|goal) (?:is |was )?completed and verified$/.test(normalized)
     || /^(?:request|task|operation|action|goal) (?:succeeds|is successful)$/.test(normalized);
 }
 
@@ -85,24 +122,34 @@ function fallbackCriteria(rawText) {
     .filter(Boolean);
 }
 
+function rawConstraintClauses(rawText) {
+  const text = String(rawText ?? "");
+  const clauses = [];
+  for (const match of text.matchAll(/\b(?:do not|don't|never|must not)\s+[^.;]+/gi)) clauses.push(match[0].trim());
+  for (const match of text.matchAll(/\b(?:only show results|use (?:the )?desktop app|ask before [^.;]+)/gi)) clauses.push(match[0].trim());
+  return clauses;
+}
+
 export function createGoalContract(intent = {}) {
   const originalRequest = String(intent.rawText ?? intent.normalizedGoal ?? "").trim();
   const originalTokens = new Set(tokens(originalRequest));
   const declared = Array.isArray(intent.successCriteria)
     ? intent.successCriteria.map(String).map((value) => value.trim()).filter((value) => value && !isVacuousCriterion(value))
     : [];
-  const constraintCriteria = [
-    ...(Array.isArray(intent.constraints) ? intent.constraints : []).filter((constraint) => {
+  const declaredConstraints = (Array.isArray(intent.constraints) ? intent.constraints : []).filter((constraint) => {
       const constraintTokens = tokens(constraint);
-      if (isProhibition(constraint)) return true;
+      if (isProhibition(constraint) || isBehavioralConstraint(constraint)) return true;
       if (constraintTokens.length === 0) return false;
       const overlap = constraintTokens.filter((token) => originalTokens.has(token)).length;
       return overlap / Math.min(constraintTokens.length, 5) >= 0.6;
-    }),
+    });
+  const constraintCriteria = [
+    ...declaredConstraints,
     // A mixed request such as "summarize X without changing anything" is not
     // itself a prohibition. Preserve only clauses that are independently
     // phrased as prohibitions; model-provided constraints are handled above.
-    ...fallbackCriteria(originalRequest).filter(isStandaloneProhibition)
+    ...fallbackCriteria(originalRequest).filter(isStandaloneProhibition),
+    ...rawConstraintClauses(originalRequest)
   ].map(String).map((value) => value.trim()).filter(Boolean);
   const rawClauses = fallbackCriteria(originalRequest);
   const declaredText = normalize(declared.join(" "));
@@ -115,30 +162,35 @@ export function createGoalContract(intent = {}) {
     ...preservedRawClauses,
     ...constraintCriteria
   ])];
+  const constraintSet = new Set(constraintCriteria.map(normalize));
   const criteria = descriptions.map((description, index) => ({
     criterionId: `criterion_${index + 1}`,
     description,
     required: true,
-    kind: isProhibition(description) ? "PROHIBITION" : "STATE",
+    kind: isProhibition(description)
+      ? "PROHIBITION"
+      : constraintSet.has(normalize(description)) ? "CONSTRAINT" : "STATE",
     anchors: literalAnchors(description),
-    tokens: tokens(description)
+    semanticTerms: tokens(description)
   }));
-  return {
+  return deepFreeze({
     contractId: `goal_${crypto.createHash("sha256").update(originalRequest).digest("hex").slice(0, 16)}`,
     version: 1,
     originalRequest,
-    enforceable: criteria.some((criterion) =>
-      criterion.kind === "PROHIBITION" || criterion.anchors.length > 0
-    ),
+    enforceable: criteria.length > 0,
     criteria
-  };
+  });
 }
 
 function taskEvidence(task, capabilityRegistry) {
   const capability = capabilityRegistry?.get?.(task?.capability);
   return normalize([
     task?.capability,
+    semanticName(task?.capability),
     JSON.stringify(task?.inputs ?? {}),
+    semanticName(JSON.stringify(task?.inputs ?? {})),
+    task?.goal,
+    task?.description,
     ...(task?.completionCriteria ?? []),
     ...(task?.verificationCriteria ?? []),
     capability?.description
@@ -166,15 +218,26 @@ function executionEvidence(input = {}) {
 
 function criterionMatch(criterion, evidence) {
   const evidenceTokens = new Set(tokens(evidence));
-  const matchedAnchors = criterion.anchors.filter((anchor) => evidence.includes(anchor));
-  const missingAnchors = criterion.anchors.filter((anchor) => !evidence.includes(anchor));
-  const matchedTokens = criterion.tokens.filter((token) => evidenceTokens.has(token));
-  const informativeTokenCount = Math.max(1, Math.min(criterion.tokens.length, 5));
+  const anchors = criterion.anchors ?? literalAnchors(criterion.description);
+  const criterionTokens = criterionTerms(criterion);
+  const matchedAnchors = anchors.filter((anchor) => evidence.includes(anchor));
+  const missingAnchors = anchors.filter((anchor) => !evidence.includes(anchor));
+  const matchedTokens = criterionTokens.filter((token) => evidenceTokens.has(token));
+  const informativeTokenCount = Math.max(1, Math.min(criterionTokens.length, 5));
   const tokenScore = matchedTokens.length / informativeTokenCount;
   const anchorsSatisfied = missingAnchors.length === 0;
   const covered = anchorsSatisfied &&
-    (criterion.anchors.length > 0 ? matchedTokens.length >= 1 : tokenScore >= 0.5);
+    (anchors.length > 0 ? matchedTokens.length >= 1 : tokenScore >= 0.5);
   return { covered, matchedAnchors, missingAnchors, matchedTokens, tokenScore };
+}
+
+export function matchGoalCriteriaForTask(goalContract, task, capabilityRegistry = null) {
+  const evidence = taskEvidence(task, capabilityRegistry);
+  const declaredIds = new Set(task?.goalCriterionIds ?? task?.criterionIds ?? []);
+  return (goalContract?.criteria ?? [])
+    .filter((criterion) => criterion.kind === "STATE" && criterionMatch(criterion, evidence).covered)
+    .map((criterion) => criterion.criterionId)
+    .concat([...declaredIds].filter((id) => (goalContract?.criteria ?? []).some((criterion) => criterion.criterionId === id)));
 }
 
 function planHasMutation(taskGraph, capabilityRegistry) {
@@ -192,7 +255,7 @@ export function assessGoalContractPlanCoverage(goalContract, taskGraph, capabili
   const evidence = (taskGraph?.tasks ?? []).map((task) => taskEvidence(task, capabilityRegistry)).join(" ");
   const mutates = planHasMutation(taskGraph, capabilityRegistry);
   const results = criteria.map((criterion) => {
-    if (criterion.kind === "PROHIBITION") {
+    if (criterion.kind === "PROHIBITION" || criterion.kind === "CONSTRAINT") {
       return {
         criterionId: criterion.criterionId,
         description: criterion.description,
@@ -225,14 +288,15 @@ export function assessGoalContractEvidence(goalContract, input = {}, capabilityR
   );
   const planMutates = planHasMutation(input.taskGraph, capabilityRegistry);
   const results = criteria.map((criterion) => {
-    if (criterion.kind === "PROHIBITION") {
-      const broadMutationBan = criterion.tokens.some((token) =>
+    if (criterion.kind === "PROHIBITION" || criterion.kind === "CONSTRAINT") {
+      const criterionTokens = criterionTerms(criterion);
+      const broadMutationBan = criterionTokens.some((token) =>
         ["change", "modify", "edit", "alter", "mutation"].includes(token)
       );
-      const forbiddenActions = criterion.tokens.filter((token) =>
-        ["add", "remove", "configure", "delete", "create", "write", "set", "toggle", "enable", "disable"].includes(token)
+      const forbiddenActions = criterionTokens.filter((token) =>
+        ["add", "remove", "configure", "delete", "create", "write", "set", "toggle", "enable", "disable", "book", "purchase", "pay", "send", "submit", "install"].includes(token)
       );
-      const scopeTokens = criterion.tokens.filter((token) =>
+      const scopeTokens = criterionTokens.filter((token) =>
         !["not", "change", "modify", "edit", "alter", "mutation", "any"].includes(token)
         && !forbiddenActions.includes(token)
       );
@@ -256,11 +320,23 @@ export function assessGoalContractEvidence(goalContract, input = {}, capabilityR
       });
       const unscopedMutationEvidence = mutatingChanges.length > 0
         && broadMutationBan
-        && criterion.tokens.every((token) =>
+        && criterionTokens.every((token) =>
           ["change", "modify", "edit", "alter", "mutation", "any"].includes(token)
         );
+      const constraintText = normalize(criterion.description);
+      const onlyShowResults = /\bonly show results\b/.test(constraintText);
+      const desktopRequired = /\b(?:use )?(?:the )?desktop app\b/.test(constraintText);
+      const confirmationRequired = /\bask before\b|\bconfirm before\b/.test(constraintText);
+      const tasks = input.taskGraph?.tasks ?? [];
+      const usesBrowser = tasks.some((task) => /^browser\./.test(String(task.capability ?? "")));
+      const usesDesktop = tasks.some((task) => /^(?:application|window|ui|media)\./.test(String(task.capability ?? "")));
+      const consequentialTask = tasks.some((task) => /(?:book|purchase|pay|send|submit|install)/i.test(`${task.capability} ${task.goal ?? ""} ${task.description ?? ""}`));
+      const approvalSatisfied = !consequentialTask || input.approvalGranted === true;
       const satisfied = !violatingTask && !unscopedMutationEvidence
-        && (!broadMutationBan || scopeTokens.length > 0 || !planMutates);
+        && (!broadMutationBan || scopeTokens.length > 0 || !planMutates)
+        && (!onlyShowResults || !planMutates)
+        && (!desktopRequired || (usesDesktop && !usesBrowser))
+        && (!confirmationRequired || approvalSatisfied);
       return {
         criterionId: criterion.criterionId,
         description: criterion.description,
@@ -277,7 +353,7 @@ export function assessGoalContractEvidence(goalContract, input = {}, capabilityR
       satisfied: match.covered,
       evidence: match.covered
         ? `Runtime evidence matched ${[...match.matchedAnchors, ...match.matchedTokens].slice(0, 8).join(", ")}.`
-        : `Missing evidence for ${[...match.missingAnchors, ...criterion.tokens.filter((token) => !match.matchedTokens.includes(token))].slice(0, 8).join(", ") || "criterion"}.`,
+        : `Missing evidence for ${[...match.missingAnchors, ...criterionTerms(criterion).filter((token) => !match.matchedTokens.includes(token))].slice(0, 8).join(", ") || "criterion"}.`,
       ...match
     };
   });
