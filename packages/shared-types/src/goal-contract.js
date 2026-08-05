@@ -163,21 +163,36 @@ export function createGoalContract(intent = {}) {
     ...constraintCriteria
   ])];
   const constraintSet = new Set(constraintCriteria.map(normalize));
-  const criteria = descriptions.map((description, index) => ({
-    criterionId: `criterion_${index + 1}`,
-    description,
-    required: true,
-    kind: isProhibition(description)
+  const rawClauseSet = new Set(rawClauses.map(normalize));
+  const criteria = descriptions.map((description, index) => {
+    const kind = isProhibition(description)
       ? "PROHIBITION"
-      : constraintSet.has(normalize(description)) ? "CONSTRAINT" : "STATE",
-    anchors: literalAnchors(description),
-    semanticTerms: tokens(description)
-  }));
+      : constraintSet.has(normalize(description)) ? "CONSTRAINT" : "STATE";
+    const anchors = literalAnchors(description);
+    // A criterion gates completion only when it is grounded in what the user
+    // actually said: a prohibition or constraint they stated, a clause of their
+    // own request, or a criterion carrying a literal anchor from it. An
+    // interpreting model may add plausible extras ("...and the version if
+    // available") that the user never asked for; recording those is useful, but
+    // letting them gate would both fail correct work and make the same request
+    // succeed or fail depending on how the model phrased itself that run.
+    const grounded = kind !== "STATE"
+      || anchors.length > 0
+      || rawClauseSet.has(normalize(description));
+    return {
+      criterionId: `criterion_${index + 1}`,
+      description,
+      required: grounded,
+      kind,
+      anchors,
+      semanticTerms: tokens(description)
+    };
+  });
   return deepFreeze({
     contractId: `goal_${crypto.createHash("sha256").update(originalRequest).digest("hex").slice(0, 16)}`,
     version: 1,
-    originalRequest,
     enforceable: criteria.length > 0,
+    originalRequest,
     criteria
   });
 }
@@ -250,8 +265,20 @@ function planHasMutation(taskGraph, capabilityRegistry) {
   });
 }
 
+// Only grounded criteria gate. Advisory ones are still carried on the contract
+// and reported, so nothing is hidden — they simply cannot fail a request the
+// user never made.
+export function requiredCriteria(goalContract) {
+  const all = goalContract?.criteria ?? [];
+  const grounded = all.filter((criterion) => criterion.required !== false);
+  // When nothing is grounded there is no stricter subset to check against, so
+  // the full set stands. Returning an empty set here would make coverage
+  // vacuously false and reject every plan.
+  return grounded.length > 0 ? grounded : all;
+}
+
 export function assessGoalContractPlanCoverage(goalContract, taskGraph, capabilityRegistry = null) {
-  const criteria = goalContract?.criteria ?? [];
+  const criteria = requiredCriteria(goalContract);
   const evidence = (taskGraph?.tasks ?? []).map((task) => taskEvidence(task, capabilityRegistry)).join(" ");
   const mutates = planHasMutation(taskGraph, capabilityRegistry);
   const results = criteria.map((criterion) => {
@@ -280,6 +307,8 @@ export function assessGoalContractPlanCoverage(goalContract, taskGraph, capabili
 }
 
 export function assessGoalContractEvidence(goalContract, input = {}, capabilityRegistry = null) {
+  // Completion stays strict: every criterion on the contract must be evidenced.
+  // Groundedness only relaxes the pre-execution relevance check below.
   const criteria = goalContract?.criteria ?? [];
   const evidence = executionEvidence(input);
   const detectedChanges = (input.observations ?? []).flatMap((observation) => observation?.detectedChanges ?? []);
