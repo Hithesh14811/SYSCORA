@@ -7,6 +7,7 @@ import { createRuntime, loadCapabilityPlugins } from "./runtime-factory.js";
 import { ValidationError } from "../../../packages/shared-types/src/domain.js";
 import { buildEnvelope, parseRequestBodyWithEnvelope } from "../../../packages/protocol/src/envelope.js";
 import { buildSessionResponse } from "../../../packages/protocol/src/session-protocol.js";
+import { projectSessionLifecycle } from "../../../packages/shared-types/src/session-lifecycle.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -159,11 +160,20 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         const persisted = await reconcilePersistedRun(sessionId, run);
         if (channel === "status") {
           const latestPersistedEvent = persisted?.events?.at?.(-1) ?? null;
+          // One authoritative, user-readable view of where the request stands.
+          // Clients render this rather than re-deriving "is it done?" from raw
+          // events, which is what previously let a stale "Working" survive a
+          // finished session and let an executed action read as a completed goal.
+          const currentSession = run.session ?? persisted ?? null;
+          const lifecycle = currentSession
+            ? projectSessionLifecycle(currentSession, { developerMode: requestUrl.searchParams.get("developer") === "1" })
+            : null;
           sendJson(response, 200, {
             sessionId,
             status: run.status,
             settled: run.settled,
             terminal: run.terminal,
+            lifecycle,
             eventCount: run.events.length,
             latestEvent: latestPersistedEvent ?? run.events.at(-1) ?? null,
             session: run.session
