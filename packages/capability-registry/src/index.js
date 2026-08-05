@@ -12,6 +12,12 @@ import {
   satisfiesVersion,
   validateCapabilityContract
 } from "./contract.js";
+import {
+  MediaProviderRegistry,
+  createSpotifyMediaProvider,
+  registerMediaCapabilities
+} from "./media-providers.js";
+export { MEDIA_CAPABILITIES, MediaProviderRegistry, createSpotifyMediaProvider, registerMediaCapabilities } from "./media-providers.js";
 export {
   PermissionScope,
   PermissionType,
@@ -3345,6 +3351,15 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     retryPolicy: { maxAttempts: 1 },
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
+
+  // Provider-neutral media contract. Planning targets `media.*`; Spotify is the
+  // first provider behind it. The `spotify.*` capabilities above stay registered
+  // so existing typed routes keep working while planning migrates.
+  const mediaProviders = new MediaProviderRegistry();
+  mediaProviders.register(createSpotifyMediaProvider(adapter ?? {}));
+  for (const provider of options.mediaProviders ?? []) mediaProviders.register(provider);
+  registerMediaCapabilities(registry, mediaProviders);
+  registry.mediaProviders = mediaProviders;
 
   return registry;
 }
