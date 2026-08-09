@@ -510,5 +510,22 @@ test("interactive controller rejects fabricated interaction targets", async () =
   });
   const result = await controller.run("click OK");
   assert.equal(result.status, "FAILED");
-  assert.equal(result.reason, "max-failed-actions");
+  // The property under test is that an invented target NEVER reaches execution
+  // (executeAction above fails the test if it does) and that the run terminates
+  // on a budget instead of looping.
+  //
+  // This asserted `max-failed-actions` when a rejected proposal was booked as an
+  // executed failure. Proposals the model wrote incorrectly are now counted
+  // separately from actions that ran and failed, because re-asking with the
+  // specific violation is the loop working as designed and should not spend the
+  // budget reserved for genuinely broken steps. A fabricated target is a
+  // malformed proposal, so whichever bound is reached first here, the reason is
+  // a budget — never an execution.
+  assert.match(result.reason, /^max-(model-calls|malformed-proposals|failed-actions|steps)$/);
+  assert.ok(
+    result.failedAttempts.some((attempt) =>
+      /was not present in runtime-observed state/.test(String(attempt.reason ?? ""))
+    ),
+    "the fabricated target must be rejected for not being runtime-observed"
+  );
 });

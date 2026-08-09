@@ -46,6 +46,30 @@ export class WindowsAutomationHostClient {
     });
   }
 
+  /**
+   * Bring the host up and prove it is answering, before anything needs it.
+   *
+   * The host is a PowerShell process that loads UI Automation, Windows Forms and
+   * the OCR engine on first use, and that startup costs several seconds. Started
+   * lazily, the bill always lands on the first real action of a session: the
+   * first window enumeration took 1.3s against 0.3s warm, and the first screen
+   * reading 11s against 1.2s — long enough that launching an application could
+   * exceed its own 24-second timeout and be recorded as a failure, on a machine
+   * where nothing was wrong.
+   *
+   * Warming is best-effort and never throws: a host that cannot start is a
+   * degraded desktop surface, not a reason to refuse to start the daemon.
+   */
+  async warm() {
+    try {
+      this.start();
+      await this.request("host.health", {}, { timeoutMs: 20000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   request(operation, params = {}, { timeoutMs = this.requestTimeoutMs } = {}) {
     this.start();
     const id = crypto.randomUUID();

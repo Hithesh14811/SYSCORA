@@ -22,11 +22,38 @@ import { evaluatePostcondition } from "../../shared-types/src/postconditions.js"
 import { diffScreenSnapshots } from "../../perception/src/vision-provider.js";
 
 const DEFAULT_BUDGETS = Object.freeze({
-  maxSteps: 24,
+  // The floor, not the ceiling — computeSessionStepBudget scales it by the shape
+  // of the request. Raised from 24 after watching a Calculator session spend its
+  // whole budget and die on `max-steps` having successfully typed "47": launch,
+  // ground, and roughly two steps per button press once perception and
+  // verification are counted. 24 could not hold one arithmetic expression.
+  maxSteps: 40,
   maxModelCalls: 8,
-  maxElapsedTime: 120000,
+  // Sized for a fast completion model, where a decision cost a second or two.
+  // A reasoning model spends 10-30s per decision, so 120s bought about four of
+  // them and multi-step GUI work died on the clock having done nothing wrong.
+  // The step, model-call and repetition budgets are what actually bound a
+  // runaway loop; this is the wall-clock backstop, so it should be generous
+  // enough that a legitimately slow task can finish.
+  // Raised again once the per-decision cost was actually measured at 10-36s
+  // (plus one retry on an aborted transport). 300s bought roughly four
+  // decisions, which is not enough for "open an app, write a program in it, and
+  // check what landed" — a task a person considers small.
+  maxElapsedTime: 420000,
   maxRepeatedActions: 2,
+  // Actions whose verification came back FAILED. Kept tight: a genuinely broken
+  // step repeated is a stuck agent.
   maxFailedActions: 5,
+  // Actions that were performed but could not be independently confirmed —
+  // typically a generic UI click with no declared postcondition. These are
+  // ordinary in GUI work (six button presses to enter "47 × 89 ="), so they need
+  // a ceiling that reflects a real interaction, not a failure budget.
+  maxUnconfirmedActions: 30,
+  // Calls the model wrote incorrectly and which were rejected before running.
+  // Re-asking with the specific violation is the loop working as designed, so
+  // this is generous — but bounded, because a model that cannot produce one
+  // valid call in twelve tries is not going to converge.
+  maxMalformedProposals: 12,
   recoveryBudget: 4
 });
 
@@ -66,7 +93,14 @@ export function compactObservationForModel(value, maxBytes = MAX_MODEL_OBSERVATI
   if (Buffer.byteLength(JSON.stringify(safe), "utf8") <= maxBytes) return safe;
   const fields = [
     "status", "message", "summary", "success", "result", "value", "data",
-    "application", "process", "window", "target", "targets", "verification"
+    "application", "process", "window", "target", "targets", "verification",
+    // A screen reading's whole point is the text on the screen. It was not on
+    // this list, so every screen.read large enough to need compacting had its
+    // one meaningful field dropped and came back to the model as
+    // "retained locally; size-limited" — leaving the agent to qualify an answer
+    // it had actually read correctly. The element list is what makes these
+    // observations large; the transcript is what makes them useful.
+    "visibleText", "title", "windowId"
   ];
   if (safe && typeof safe === "object" && !Array.isArray(safe)) {
     const selected = Object.fromEntries(
@@ -82,11 +116,38 @@ export function compactObservationForModel(value, maxBytes = MAX_MODEL_OBSERVATI
   };
 }
 
+// Identify an action by what it DOES, not by the bookkeeping ids attached to it.
+//
+// Every perception mints a fresh `targetId` UUID for each control it sees, and
+// hashing the raw inputs therefore gave the same click on the same button a
+// different signature every single time. Repetition detection — the defence that
+// exists to stop an agent doing the same useless thing forever — could not fire
+// at all. Live, that meant twenty-four consecutive clicks on an unrelated
+// WhatsApp window for a request to change the system volume, each one "new".
+//
+// `stableTargetKey` already describes a control by window, automation id, type
+// and name, which is stable across perceptions. Using it here is what makes the
+// budget mean something.
+function normalizeSignatureValue(value) {
+  if (Array.isArray(value)) return value.map(normalizeSignatureValue);
+  if (!value || typeof value !== "object") return value;
+  // A grounded target: collapse to its stable identity.
+  if (value.targetId !== undefined || value.automationId !== undefined || value.boundingRect !== undefined) {
+    return `target:${stableTargetKey(value)}`;
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      // Volatile per-observation identifiers say nothing about what the action does.
+      .filter(([key]) => !["targetId", "observationId", "snapshotId", "actionId", "timestamp"].includes(key))
+      .map(([key, child]) => [key, normalizeSignatureValue(child)])
+  );
+}
+
 function actionSignature(action, stateFingerprint) {
   return crypto.createHash("sha256")
     .update(JSON.stringify({
       capability: action?.capability,
-      inputs: action?.inputs,
+      inputs: normalizeSignatureValue(action?.inputs),
       stateFingerprint
     }))
     .digest("hex");
@@ -168,7 +229,28 @@ export function supportedUiActions(target) {
     actions.push(state.includes("expanded") ? "collapse" : "expand");
   }
   if (hasPattern(target, "ScrollItemPattern")) actions.push("scrollIntoView");
+  // Last resort: a control that is VISIBLE can be clicked the way a person
+  // clicks it, whether or not its accessibility implementation exposes a
+  // pattern. Deriving the whole action set from UIA patterns alone meant any
+  // application with thin accessibility support was untouchable — SYSCORA would
+  // report "the controls do not support standard click actions" about a window
+  // full of ordinary buttons a human clicks without difficulty.
+  //
+  // Requires a real on-screen rectangle, which is what makes the click
+  // groundable and verifiable; it is never a guessed coordinate.
+  if (hasClickableBounds(target)) actions.push("click");
   return [...new Set(actions)];
+}
+
+// A target is pointer-clickable when the runtime observed it occupying real
+// space on screen. Zero-area and missing rectangles are excluded so a stale or
+// collapsed element can never be clicked at an arbitrary point.
+export function hasClickableBounds(target) {
+  const rect = target?.boundingRect ?? target?.bounds;
+  return Boolean(rect) &&
+    Number.isFinite(Number(rect.width)) && Number(rect.width) > 0 &&
+    Number.isFinite(Number(rect.height)) && Number(rect.height) > 0 &&
+    Number.isFinite(Number(rect.x)) && Number.isFinite(Number(rect.y));
 }
 
 function actionPairKey(action) {
@@ -194,11 +276,59 @@ function normalizeUiAction(action) {
   return { ...action, inputs };
 }
 
+// Resolve a control the model NAMED to the control the runtime OBSERVED.
+//
+// The action schema requires a full observed target object, and the model
+// persistently writes what a person would — the control's name, as a string:
+// `target: "Four"`. Those calls were rejected ("Field target must be object, got
+// string", "Missing required field: target") and, driving Calculator, five of
+// roughly eight proposals died that way. The agent could see the buttons, knew
+// which ones it wanted, and could not say so in a form the runtime accepted.
+//
+// This does NOT relax grounding, which is the property that matters: the name is
+// looked up in the CURRENT perception, and an unmatched name stays unresolved so
+// validation still rejects it. It only removes the requirement that the model
+// echo back an opaque UUID it was shown one turn earlier.
+function resolveNamedTarget(name, perception) {
+  const wanted = String(name ?? "").trim().toLowerCase();
+  if (!wanted) return null;
+  const controls = collectGroundedControls(perception);
+  const nameOf = (control) => String(control?.name ?? "").trim().toLowerCase();
+  const automationOf = (control) => String(control?.automationId ?? "").trim().toLowerCase();
+  return controls.find((control) => nameOf(control) === wanted)
+    ?? controls.find((control) => automationOf(control) === wanted)
+    // A model asked for "7" when the button is named "Seven", or "Multiply" for
+    // "Multiply by". Containment either way catches both without matching
+    // something unrelated, and the first hit wins by perception order, which is
+    // already ranked by actionability.
+    ?? controls.find((control) => nameOf(control) && (nameOf(control).includes(wanted) || wanted.includes(nameOf(control))))
+    ?? null;
+}
+
 function hydrateGroundedActionTarget(action, perception) {
-  if (action?.capability !== "ui.action" || !action.inputs?.target?.targetId) return action;
-  const proposed = action.inputs.target;
+  if (action?.capability !== "ui.action") return action;
+  const proposed = action.inputs?.target;
+
+  if (typeof proposed === "string") {
+    const observed = resolveNamedTarget(proposed, perception);
+    if (!observed) return action;
+    return { ...action, inputs: { ...(action.inputs ?? {}), target: observed } };
+  }
+  // A target object carrying only a name is the same request in object form.
+  if (proposed && typeof proposed === "object" && !proposed.targetId && proposed.name) {
+    const observed = resolveNamedTarget(proposed.name, perception);
+    if (observed) return { ...action, inputs: { ...(action.inputs ?? {}), target: { ...proposed, ...observed } } };
+    return action;
+  }
+  if (!proposed?.targetId) return action;
   const observed = collectGroundedControls(perception)
-    .find((control) => control.targetId === proposed.targetId);
+    .find((control) => control.targetId === proposed.targetId)
+    // Every perception mints fresh targetIds, so an id the model saw two steps
+    // ago no longer exists and the call is rejected as "target was not present
+    // in runtime-observed state" — for a button that is still right there on
+    // screen. The name is the stable identity; re-resolving against the current
+    // perception re-grounds the same control rather than failing on bookkeeping.
+    ?? resolveNamedTarget(proposed.name, perception);
   if (!observed) return action;
   return {
     ...action,
@@ -337,7 +467,7 @@ function normalizeBoundValue(value, normalization) {
   return text;
 }
 
-function inferCriterionIds(action, goalContract, actual = null, finalRequestedStep = false) {
+export function inferCriterionIds(action, goalContract, actual = null, finalRequestedStep = false) {
   if (Array.isArray(action?.criterionIds) && action.criterionIds.length) return action.criterionIds;
   const evidence = `${JSON.stringify({
     capability: action?.capability,
@@ -1059,16 +1189,27 @@ export function buildGuiToInternalStrategy(goal) {
 // applies it to the *sub-steps* of an interactive session rather than only to
 // top-level intent routing.
 export const DETERMINISTIC_SUBGOAL_VERBS = Object.freeze(
-  new Set(["type", "click", "select", "screenshot", "scroll", "press"])
+  new Set(["type", "click", "select", "screenshot", "scroll", "press", "windowState"])
 );
 
 const COMPOUND_STEP_PATTERNS = Object.freeze([
   { verb: "launch", pattern: /^(?:please\s+)?(?:open|launch|start|run)\s+(?:the\s+)?(?:windows\s+)?(.+?)\s*$/i, field: "application" },
   { verb: "screenshot", pattern: /^(?:(?:take|capture|grab|get)\s+)?(?:a\s+|the\s+)?screen\s?shot(?:\s+(?:of|for)\s+(.+))?\s*$/i, field: "subject" },
   { verb: "screenshot", pattern: /^capture\s+the\s+screen\s*$/i },
-  { verb: "type", pattern: /^(?:type|enter|write|input)\s+(?:in\s+|into\s+)?(.+?)\s*$/i, field: "text" },
+  // "type exactly: X" means X is the payload; "exactly" is an instruction,
+  // not text to insert. Keeping it in the capture made the live probe type
+  // "exactly: SYSCORA live GUI probe" and then (correctly) fail an exact-value
+  // check for "SYSCORA live GUI probe".
+  { verb: "type", pattern: /^(?:type|enter|write|input)\s+(?:(?:exactly|verbatim)\s*:?\s*)?(?:in\s+|into\s+)?(.+?)\s*$/i, field: "text" },
   { verb: "press", pattern: /^press\s+((?:ctrl|control|alt|shift|win|enter|return|tab|escape|esc|backspace|delete|f\d{1,2})\b.*?)\s*$/i, field: "keys" },
   { verb: "scroll", pattern: /^scroll\s+(up|down|left|right)\b.*$/i, field: "direction" },
+  // Sizing a window is an ordinary clause in a spoken request ("open notepad and
+  // maximize the window"). Without a pattern here the whole compound parse
+  // returns null, so nothing tracks the clause as outstanding and the session
+  // could report the goal complete after only the launch had run. This must
+  // precede the `click` pattern, whose verb alternation includes "press" and
+  // would otherwise swallow "maximize" as a control name.
+  { verb: "windowState", pattern: /^(?:please\s+)?(maximi[sz]e|minimi[sz]e|restore)\b(?:\s+(?:the|this|it|its|that))?(?:\s+window)?\s*$/i, field: "state" },
   { verb: "click", pattern: /^(?:click|press|invoke|tap|push)\s+(?:on\s+)?(?:the\s+)?(.+?)(?:\s+(?:button|control|link|option|item))?\s*$/i, field: "targetName" },
   { verb: "select", pattern: /^(?:select|choose)\s+(?:the\s+)?(.+?)(?:\s+(?:tab|option|item|control|section))?\s*$/i, field: "targetName" }
 ]);
@@ -1200,6 +1341,18 @@ function compileDeterministicSubgoal(step, application, stepIndex) {
       subgoal: `Scroll ${step.direction}`
     })];
   }
+  if (step.verb === "windowState") {
+    const requested = String(step.state ?? "").toLowerCase();
+    const state = requested.startsWith("max") ? "maximize"
+      : requested.startsWith("min") ? "minimize"
+      : "restore";
+    return [tag({
+      capability: `window.${state}`,
+      inputs: { application },
+      subgoal: `${state[0].toUpperCase()}${state.slice(1)} the ${application} window`,
+      expectedEffect: `The grounded ${application} window enters the ${state} state.`
+    })];
+  }
   // click / select must consume a target the runtime actually grounded first.
   const verb = step.verb === "select" ? "select" : "click";
   return [
@@ -1228,10 +1381,38 @@ export function computeSessionModelCallBudget(goal, strategy, floor = DEFAULT_BU
   return Math.min(24, Math.max(floor, plannedSteps * 2));
 }
 
+// The step ceiling was flat at 24 while the model-call ceiling already scaled
+// with the shape of the request. Real GUI work does not fit a flat number:
+// driving a calculator is launch, inspect, six clicks, read the display, then
+// verify — and each click is preceded by a fresh perception, because acting on
+// stale state is what this controller exists to prevent. That is comfortably
+// past 24 for a request a person considers trivial, and the session died with
+// `max-steps` having done nothing wrong.
+//
+// Scales with observed complexity and stays hard-bounded: this is a limit on
+// runaway loops, not a limit on how much work a request may legitimately need.
+// Repetition detection and the elapsed-time ceiling remain the defences against
+// an agent that is genuinely stuck.
+export function computeSessionStepBudget(goal, strategy, floor = DEFAULT_BUDGETS.maxSteps) {
+  const strategySteps = strategy ? 1 + (strategy.localSteps?.length ?? 0) : 0;
+  const parsedSteps = parseCompoundDesktopRequest(goal)?.length ?? 0;
+  const plannedSteps = Math.max(strategySteps, parsedSteps, 1);
+  // Roughly six runtime steps per user-visible step: perceive, decide, act,
+  // observe, verify, plus headroom for one recovery.
+  return Math.min(72, Math.max(floor, plannedSteps * 6));
+}
+
 export function buildExplicitApplicationLaunchStrategy(goal) {
   const text = String(goal ?? "").trim();
   const match = text.match(/^\s*(?:please\s+)?(?:open|launch|start)\s+(.+?)(?=\s+(?:and|then|to)\b|[.,;]|$)/i);
   if (!match) return null;
+  // Deliberately keeps only the application name and lets the controller carry
+  // the rest of the sentence: this strategy is a SEED for the first action, not
+  // a claim to have understood the whole request. What makes that safe is
+  // parseCompoundDesktopRequest tracking every remaining clause as outstanding,
+  // so completion is deferred until they are attempted. Any verb it cannot
+  // parse silently disables that guard — which is why new spoken verbs belong in
+  // COMPOUND_STEP_PATTERNS at the same time as their capability.
   let application = match[1].replace(/^(?:the\s+)?windows\s+/i, "").trim();
   if (!application || /\b(?:file|folder|website|url)\b/i.test(application)) return null;
   return {
@@ -1402,6 +1583,9 @@ export class InteractiveAgentController {
     // An explicitly supplied ceiling is authoritative — the adaptive
     // per-session budget only applies when the caller left it to the default.
     this.explicitModelCallBudget = Object.hasOwn(budgets ?? {}, "maxModelCalls");
+    // A caller that pinned a step budget (a test, or a deliberately tight
+    // session) keeps exactly what it asked for.
+    this.explicitStepBudget = Object.hasOwn(budgets ?? {}, "maxSteps");
     this.now = now;
   }
 
@@ -1409,31 +1593,151 @@ export class InteractiveAgentController {
     await this.onEvent?.({ type, timestamp: new Date().toISOString(), ...details });
   }
 
-  _catalog(goal = "") {
+  // Changing what is VISIBLE is not changing anything. To answer a question a
+  // person may open the app, focus the window, make it bigger and scroll — and
+  // none of that alters a single byte. Separating these from real mutations is
+  // what lets an informational goal stay read-only without being blinded.
+  static VIEW_ONLY_CAPABILITIES = new Set([
+    "application.launch",
+    "window.activate", "window.maximize", "window.minimize", "window.restore", "window.moveResize",
+    "pointer.wheel", "pointer.move",
+    "ui.navigateSection",
+    "browser.scroll"
+  ]);
+
+  // A goal is informational when the classifier resolved it entirely to READ
+  // capabilities. Such a goal must never be planned as a mutation: asked which
+  // process used the most memory, the loop reached for `ui.action`, which the
+  // risk engine correctly scored as a PERSISTENT change with UNKNOWN
+  // reversibility — so a harmless question stopped and asked the user to approve
+  // a "persistent change without verified rollback".
+  //
+  // Fixing this by prompt did not work (twice). Removing the mutating verbs from
+  // what is offered does, because an action that was never offered cannot be
+  // chosen.
+  static isInformationalGoal(requiredCapabilities, registry, goal = "") {
+    const named = (requiredCapabilities ?? [])
+      .map((name) => registry?.get?.(name))
+      .filter(Boolean);
+    if (named.length === 0) return false;
+
+    // An instruction is not a question, however read-only its first step is.
+    //
+    // This test used to be "every named capability is READ", and it silently
+    // disarmed the agent for a whole class of requests. `application.launch` is
+    // typed READ (opening a window changes nothing), so "open Calculator and
+    // work out 47 times 89" looked purely informational, the loop was put in
+    // read-only mode, and every `ui.action` it correctly proposed came back
+    // "unknown capability" — the pointer and keyboard were never offered. It
+    // planned the right seven steps and was forbidden from taking any of them.
+    //
+    // Read-only mode exists so a QUESTION cannot be answered by mutating the
+    // machine. A sentence that tells the agent to do something is not that, so
+    // an imperative verb settles it regardless of capability typing.
+    if (/\b(?:open|launch|start|run|type|write|enter|click|press|select|choose|set|change|create|make|save|play|pause|close|move|drag|scroll|search for|navigate|compute|calculate|work out|fill|draw|send|install)\b/i
+      .test(String(goal))) {
+        return false;
+    }
+
+    // A capability that only changes what is VISIBLE says nothing either way —
+    // it is available in read-only mode anyway — so it must not be the evidence
+    // that a goal is informational.
+    const decisive = named.filter(
+      (capability) => !InteractiveAgentController.VIEW_ONLY_CAPABILITIES.has(capability.name)
+    );
+    if (decisive.length === 0) return false;
+    return decisive.every((capability) => capability.permissionModel?.type === "READ");
+  }
+
+  _catalog(goal = "", { readOnly = false } = {}) {
     const normalizedGoal = String(goal).toLowerCase();
     const goalTokens = new Set(
       String(goal).toLowerCase().match(/[a-z0-9]{3,}/g)?.filter((token) =>
         !["and", "the", "with", "from", "then", "open", "tell"].includes(token)
       ) ?? []
     );
-    const alwaysCore = /^(application\.launch|window\.(enumerate|resolve|wait|activate)|ui\.(inspect|find|extract|navigateSection|resolveTarget|verifyValue|action))$/;
-    const browserGoal = /\b(browser|website|web|url)\b|\.(?:org|com|net)\b/.test(normalizedGoal);
-    const modalityRelevant = (name) =>
-      (browserGoal && /^(browser\.(launch|navigate|currentState|inspect|find|read|extract|wait))$/.test(name)) ||
-      (browserGoal && /\b(click|submit|select|choose|fill|type)\b/.test(normalizedGoal) && /^(browser\.(click|type|select|scroll))$/.test(name)) ||
-      (browserGoal && /\b(download (?:the )?file|save (?:the )?file|download to)\b/.test(normalizedGoal) && name === "browser.download") ||
-      (name.startsWith("keyboard.") && /\b(type|enter|input|put|write|calculator|notepad)\b/.test(normalizedGoal)) ||
-      (name.startsWith("pointer.") && /\b(click|drag|move|scroll|pointer|mouse)\b/.test(normalizedGoal)) ||
-      (/^(screen|ocr|vision)\./.test(name) && /\b(visual|ocr|screen|screenshot|image)\b/.test(normalizedGoal)) ||
-      (name === "window.moveResize" && /\b(move|resize)\b/.test(normalizedGoal));
+    // THE DESKTOP INTERACTION TOOLKIT.
+    //
+    // Seeing a screen and acting on it is a general skill, not a set of
+    // specialised modalities to be unlocked by the words a person happened to
+    // use. Gating these by keyword produced an agent whose senses and limbs
+    // depended on phrasing: "open Paint and draw a line" was offered no pointer
+    // at all, so it could not draw; "turn on dark mode in Settings" was offered
+    // no way to scroll, so it could not reach a control below the fold; and the
+    // keyboard was unlocked by a list that literally named `calculator|notepad`,
+    // which is the definition of building skills around particular apps instead
+    // of a general capability.
+    //
+    // A person opening an unfamiliar window has their eyes, mouse and keyboard
+    // available before they know what the window contains — that is precisely
+    // what lets them work out what to do. The agent gets the same, always.
+    //
+    // This widens what the agent can do to a WINDOW. It deliberately does not
+    // widen what it can do to the SYSTEM: installs, process termination,
+    // filesystem writes and the like stay relevance-gated below, and every one
+    // of these actions still passes risk, policy and approval before it runs.
+    const desktopToolkit =
+      /^(window|ui|pointer|keyboard|screen|ocr|vision|clipboard)\.|^application\.launch$/;
+
+    // Running a command is the fastest correct route for a large share of real
+    // tasks, and the execution-priority guidance already tells the model to
+    // prefer an internal path over driving a GUI. It could not: no command verb
+    // was ever offered, so it invented `cli.exec` and was rejected as unknown.
+    //
+    // This is the single largest increase in what the agent can do, and it is
+    // deliberate. What keeps it bounded is not hiding it: `developer.command.run`
+    // is MEDIUM risk with confirmationPolicy POLICY_ENGINE, so every invocation
+    // is scored by the risk engine, decided by policy, and gated on approval
+    // before it executes — the same path an install or a file deletion takes.
+    // Concealing a capability from the model was never the control; the control
+    // is the authorization boundary.
+    const commandToolkit = /^(command\.run|developer\.command\.run)$/;
+
+    // The browser is a second surface with the same argument, but its verbs are
+    // only meaningful once a page is in play, and listing them for every desktop
+    // task is noise. Offer the whole browser toolkit whenever the goal involves
+    // the web at all — not one sub-verb at a time.
+    const browserGoal = /\b(browser|website|web|url|online|search|google|youtube|http)\b|\.(?:org|com|net|io|dev)\b/
+      .test(normalizedGoal);
+    const modalityRelevant = (name) => browserGoal && name.startsWith("browser.");
+    // A capability the model is never shown is a capability the agent does not
+    // have. Selecting by keyword means every goal phrased outside the keyword
+    // list loses access to primitives that exist and would have worked — the
+    // model then invents the name it needed ("system.inspect") and is told it is
+    // unknown. So relevance no longer decides what is REACHABLE, only what is
+    // worth listing beyond the safe baseline.
+    //
+    // The baseline is defined by capability metadata rather than by a second
+    // hand-maintained list: anything the registry marks LOW risk AND
+    // never-confirm is a read/observe primitive that cannot change the machine,
+    // so exposing it can widen what the agent knows but not what it can do.
+    // Everything that mutates, or that policy would gate, still has to earn its
+    // place through the relevance rules below — which keeps consequential verbs
+    // out of the model's reach unless the goal actually implies them.
+    const isSafeToObserve = (capability) =>
+      capability?.risk?.level === "LOW" && capability?.confirmationPolicy?.mode === "NEVER";
+
     return (this.capabilityRegistry?.getCatalog?.() ?? [])
       .filter((capability) => {
-        if (alwaysCore.test(capability.name) || modalityRelevant(capability.name)) return true;
+        // A question may look, open, focus and scroll — never change anything.
+        // Applied before every other rule so no toolkit below can reintroduce a
+        // mutating verb into a purely informational goal.
+        if (readOnly) {
+          return capability.permissionModel?.type === "READ"
+            || InteractiveAgentController.VIEW_ONLY_CAPABILITIES.has(capability.name);
+        }
+        if (isSafeToObserve(capability)) return true;
+        if (desktopToolkit.test(capability.name) || commandToolkit.test(capability.name)) return true;
+        if (modalityRelevant(capability.name)) return true;
         const explicitInternal =
           (/\b(file|directory|folder|save|store|persist|write)\b/.test(normalizedGoal) && capability.name.startsWith("filesystem.")) ||
           (/\b(process|executable|program)\b/.test(normalizedGoal) && capability.name.startsWith("process.")) ||
           (/\bclipboard\b/.test(normalizedGoal) && capability.name.startsWith("clipboard.")) ||
-          (/\bvolume\b/.test(normalizedGoal) && capability.name === "system.volume.adjust");
+          // Every volume verb, not one of them. This was pinned to
+          // `system.volume.adjust`, so adding a set/inspect pair would have left
+          // them invisible to the loop — the exact reachability failure where a
+          // capability exists, is correct, and is never offered.
+          (/\bvolume\b|\bmute\b|\bloud\b/.test(normalizedGoal) && capability.name.startsWith("system.volume."));
         const customNamespace = !/^(application|window|ui|browser|keyboard|pointer|screen|ocr|vision|filesystem|process|clipboard|system|gui)\./.test(capability.name);
         const customNameMatch = customNamespace && [...goalTokens].some((token) => capability.name.toLowerCase().includes(token));
         return explicitInternal || customNameMatch;
@@ -1441,6 +1745,18 @@ export class InteractiveAgentController {
       .map((capability) => ({
       name: capability.name,
       description: capability.description,
+      // Aliases must survive into the catalog the model is judged against.
+      //
+      // The registry defines a table of the names a model actually reaches for
+      // — keyboard.typeText, cli.exec, ui.getText, window.focus — precisely so
+      // that a correct action written under a synonym resolves instead of being
+      // refused. Resolution happens by looking up the alias IN THIS CATALOG, and
+      // this projection dropped the field, so not one of those aliases has ever
+      // resolved for an interactive decision. Live, a model that planned the
+      // right sequence emitted "keyboard.typeText", was told it was an unknown
+      // capability, and the session ended having launched Notepad and typed
+      // nothing. The alias table existed and was unreachable.
+      aliases: capability.aliases ?? [],
       inputs: Object.fromEntries(
         Object.entries(capability.inputSchema?.properties ?? {}).map(([name, schema]) => [
           name,
@@ -1540,6 +1856,13 @@ export class InteractiveAgentController {
       throw new Error("InteractiveAgentController requires perceive and executeAction");
     }
     const startedAt = this.now();
+    // Decided once, from the classifier's own resolution of the goal, so every
+    // decision in this session sees the same catalog.
+    const informationalGoal = InteractiveAgentController.isInformationalGoal(
+      initialContext.requiredCapabilities,
+      this.capabilityRegistry,
+      `${goal ?? ""} ${initialContext.normalizedGoal ?? ""}`
+    );
     const state = {
       goal: String(goal ?? "").trim(),
       status: "IN_PROGRESS",
@@ -1618,7 +1941,10 @@ export class InteractiveAgentController {
       ...this.budgets,
       maxModelCalls: this.explicitModelCallBudget
         ? this.budgets.maxModelCalls
-        : computeSessionModelCallBudget(state.goal, initialStrategy, this.budgets.maxModelCalls)
+        : computeSessionModelCallBudget(state.goal, initialStrategy, this.budgets.maxModelCalls),
+      maxSteps: this.explicitStepBudget
+        ? this.budgets.maxSteps
+        : computeSessionStepBudget(state.goal, initialStrategy, this.budgets.maxSteps)
     };
     state.budgets = budgets;
     await this.emit("ADAPTIVE_SESSION_BUDGET_RESOLVED", {
@@ -1669,9 +1995,30 @@ export class InteractiveAgentController {
         state.reason = elapsed >= this.budgets.maxElapsedTime ? "max-elapsed-time" : "max-steps";
         break;
       }
-      if (state.failedAttempts.length >= this.budgets.maxFailedActions) {
+      // Only attempts that actually RAN and failed count here. Proposals
+      // rejected before execution are the model mis-writing a call, and are
+      // bounded separately below — they cost nothing on the machine and the
+      // rejection text is fed back so the next proposal can be correct.
+      const executedFailures = state.failedAttempts.filter((entry) => entry.proposalOnly !== true);
+      if (executedFailures.length >= this.budgets.maxFailedActions) {
         state.status = "FAILED";
         state.reason = "max-failed-actions";
+        break;
+      }
+      if ((state.malformedProposals ?? 0) >= this.budgets.maxMalformedProposals) {
+        state.status = "FAILED";
+        state.reason = "max-malformed-proposals";
+        break;
+      }
+      // Unconfirmed actions get their own, far looser ceiling. Clicking six
+      // calculator buttons is normal; clicking thirty without ever confirming an
+      // effect means the agent is not getting anywhere and should stop. The
+      // tight failure budget above still applies to actions that genuinely
+      // FAILED, and repetition detection remains the primary guard against a
+      // loop that is stuck on one target.
+      if ((state.unconfirmedAttempts ?? 0) >= this.budgets.maxUnconfirmedActions) {
+        state.status = "FAILED";
+        state.reason = "max-unconfirmed-actions";
         break;
       }
 
@@ -1766,7 +2113,17 @@ export class InteractiveAgentController {
         }
       }
 
-      if (pendingActions.length === 0) {
+      // Never for a question. This picks a control by word-overlap between the
+      // goal text and whatever happens to be on screen, then clicks it — so
+      // "what is using the most memory on this computer?" clicked a control that
+      // merely shared a word with the question. The user was then asked to
+      // approve a "persistent change without verified rollback" to answer a
+      // question that changes nothing, and the click was arbitrary regardless.
+      //
+      // Word overlap is a reasonable tie-breaker when the goal is genuinely to
+      // interact with something; it is never a reason to touch the machine when
+      // the goal is only to find something out.
+      if (pendingActions.length === 0 && !informationalGoal) {
         const mechanical = chooseMechanicalContinuation(state.goal, lastPerception, exhaustedActionPairs);
         if (mechanical) {
           pendingActions = [mechanical];
@@ -1807,7 +2164,7 @@ export class InteractiveAgentController {
             },
             expectedPostcondition: candidate.expectedPostcondition
           })),
-          availableCapabilities: this._catalog(state.goal),
+          availableCapabilities: this._catalog(state.goal, { readOnly: informationalGoal }),
           remainingBudgets: {
             steps: this.budgets.maxSteps - state.steps,
             modelCalls: this.budgets.maxModelCalls - state.modelCalls,
@@ -1827,6 +2184,32 @@ export class InteractiveAgentController {
           decision: sanitizeInteractiveState(decision?.data ?? { error: decision?.error })
         });
         if (!decision?.ok) {
+          // A model that wrote one bad call is not a dead session.
+          //
+          // Every failed decision ended the run outright, including the ordinary
+          // case of the model naming a capability slightly wrong. Live, a
+          // session that had correctly launched Notepad and planned the right
+          // remaining steps was killed by a single "keyboard.typeText" in a
+          // local step — one word — and reported as though the task were
+          // impossible. maxMalformedProposals exists to bound exactly this, and
+          // the loop never reached it because it never got a second chance.
+          //
+          // A provider that did not answer at all is still terminal: re-asking
+          // an unreachable endpoint inside the same loop only spends the clock.
+          if (decision?.recoverable === true) {
+            state.malformedProposals = (state.malformedProposals ?? 0) + 1;
+            state.failedAttempts.push({
+              action: "DECISION",
+              reason: decision.error ?? "the decision did not satisfy the schema",
+              proposalOnly: true
+            });
+            await this.emit("ADAPTIVE_DECISION_REJECTED", {
+              step: state.steps,
+              error: decision.error ?? null,
+              malformedProposals: state.malformedProposals
+            });
+            continue;
+          }
           state.status = "FAILED";
           state.reason = decision?.error ?? "reasoning-unavailable";
           break;
@@ -1978,7 +2361,19 @@ export class InteractiveAgentController {
           });
           state.semanticState.interactiveConvergence = InteractiveConvergenceState.UNSUPPORTED_ACTION;
         } else {
-          state.failedAttempts.push({ action, reason: validation.errors.join(", ") });
+          // A proposal that failed VALIDATION never ran. Nothing was attempted
+          // on the machine, so it is a model output slip, not a failed action —
+          // and the loop's whole purpose is to re-ask with the specific
+          // violation, which it does via failedAttempts feeding the next prompt.
+          //
+          // Counting these against `maxFailedActions` (5) meant five malformed
+          // proposals ended the session. Driving Calculator, the model
+          // intermittently emitted `ui.action` with no `target`; five of those
+          // and the run was over, even though the actions in between had
+          // genuinely typed "47" into the display. The budget was being spent on
+          // the model's typos rather than on anything the computer did.
+          state.malformedProposals = (state.malformedProposals ?? 0) + 1;
+          state.failedAttempts.push({ action, reason: validation.errors.join(", "), proposalOnly: true });
         }
         pendingActions = [];
         await this.emit("ADAPTIVE_ACTION_REJECTED", {
@@ -2097,7 +2492,16 @@ export class InteractiveAgentController {
         outcome = await this.executeAction(action, {
           goal: state.goal,
           step: state.steps,
-          stateFingerprint: fingerprint
+          stateFingerprint: fingerprint,
+          // The executor needs to know which window this step was decided
+          // against, so an action that names only an application can be pinned
+          // to the window the loop is actually working in.
+          currentPerception: lastPerception,
+          // Once a launch has returned an exact HWND, keep every later action
+          // in this session on that window. Application names are not unique:
+          // modern Notepad may expose several documents in one process, and a
+          // fresh perception can legitimately foreground a different one.
+          groundedWindow: state.pinnedWindow ?? null
         });
       } catch (error) {
         outcome = {
@@ -2109,6 +2513,16 @@ export class InteractiveAgentController {
         state.status = "NEEDS_USER";
         state.reason = outcome.reason ?? "Approval or user input is required";
         break;
+      }
+      if (action.capability === "application.launch") {
+        const launchedWindow = outcome?.executionResult?.window
+          ?? outcome?.observation?.structuredState?.window
+          ?? outcome?.verification?.evidence?.window
+          ?? null;
+        const launchedWindowId = launchedWindow
+          ? String(launchedWindow.WindowHandle ?? launchedWindow.windowId ?? "")
+          : "";
+        if (launchedWindowId) state.pinnedWindow = launchedWindow;
       }
       if (isUiFacingAction(action) && typeof this.captureScreenSnapshot === "function") {
         try {
@@ -2314,9 +2728,31 @@ export class InteractiveAgentController {
       ));
       if (action.bindOutput) {
         const bindingSpec = typeof action.bindOutput === "string" ? { name: action.bindOutput } : action.bindOutput;
-        const requestedPath = bindingSpec.path ?? "output.text";
-        const rawValue = readPath(lastOutcome, requestedPath)
+        const explicitPath = typeof bindingSpec.path === "string" && bindingSpec.path.trim() !== "";
+        const requestedPath = explicitPath ? bindingSpec.path : "output.text";
+        let rawValue = readPath(lastOutcome, requestedPath)
           ?? extractResultValue(lastOutcome.resultEnvelope, requestedPath);
+        // No path was asked for, and the text-shaped default found nothing.
+        //
+        // `output.text` is the right default for a capability that returns a
+        // string, and wrong for every capability that returns structure. Asked
+        // "which processes are using the most memory", the model correctly ran
+        // `processes.list` and bound the result as `processList` — an array,
+        // with no `.text` anywhere in it. The binding came back empty, and the
+        // code below then marked the action FAILED. A read that ran, verified,
+        // and returned exactly the right data was recorded as a failure, so
+        // completion had "no runtime-verified action" to stand on and the loop
+        // burned its whole budget re-deciding before reporting the request
+        // impossible. That is a false FAILURE, and it is as damaging as a false
+        // success — the answer existed the entire time.
+        //
+        // When no path was requested, "bind the output" means the output.
+        if (!explicitPath && (rawValue === undefined || rawValue === null || rawValue === "")) {
+          rawValue = lastOutcome?.executionResult
+            ?? lastOutcome?.resultEnvelope?.raw
+            ?? lastOutcome?.observation?.structuredState
+            ?? null;
+        }
         const boundValue = normalizeBoundValue(rawValue, bindingSpec.normalize);
         if (bindingSpec.name && boundValue != null && boundValue !== "") {
           const actualType = typeof boundValue;
@@ -2385,7 +2821,21 @@ export class InteractiveAgentController {
         evidenceEntry = appendEvidence(state.evidenceLedger, {
           taskId: action.nodeId ?? `step_${state.steps}`,
           subgoalId: action.subgoalId ?? action.nodeId ?? `step_${state.steps}`,
-          criterionIds: predicateResult && !predicateResult.satisfied ? [] : criterionIds,
+          // Only a postcondition that was ACTUALLY CHECKED and did not hold may
+          // discard this action's evidence.
+          //
+          // The test was `predicateResult && !predicateResult.satisfied`, and
+          // `evaluatePostcondition` returns satisfied:false both when a predicate
+          // fails and when it cannot be evaluated at all. Models write
+          // postconditions as English sentences far more often than as typed
+          // predicates ("Visible text of window 7147166 includes 'Ultron online'
+          // and status bar shows 13 characters"), and every one of those was
+          // read as a violation. Live, that erased the criterion evidence from a
+          // keyboard.type that had been independently read back and a screen.read
+          // that showed the exact expected text, and the session — which had done
+          // the job perfectly — was reported as PARTIALLY_COMPLETED with "not
+          // independently confirmed" printed directly beneath the confirmation.
+          criterionIds: predicateResult?.evaluated === true && !predicateResult.satisfied ? [] : criterionIds,
           capability: action.capability,
           modality,
           observation: outcome?.observation ?? outcome?.executionResult,
@@ -2517,7 +2967,31 @@ export class InteractiveAgentController {
         });
         continue;
       }
-      state.failedAttempts.push({ action, verification });
+      // "Performed, but I could not independently confirm the effect" is not a
+      // failure, and counting it as one made multi-step GUI work impossible.
+      //
+      // A generic `ui.action` with no declared postcondition verifies as
+      // PARTIALLY_VERIFIED — "UI action completed; no explicit postcondition was
+      // supplied". Every such click landed in failedAttempts, and the budget is
+      // five, so the loop aborted after five clicks with `max-failed-actions`.
+      // Entering "47 × 89 =" is six. No task requiring more than five UI actions
+      // could ever finish, however correctly it was perceived and planned.
+      //
+      // The rule that PARTIALLY_VERIFIED must never certify COMPLETION is a
+      // separate thing and stays exactly as it is — `validateCompletionEvidence`
+      // and the evidence ledger still require real evidence for every criterion.
+      // This only stops an unconfirmed step being counted as a broken one.
+      const unconfirmed = verification.status !== "FAILED";
+      if (unconfirmed) {
+        state.unconfirmedAttempts = (state.unconfirmedAttempts ?? 0) + 1;
+        await this.emit("ADAPTIVE_ACTION_UNCONFIRMED", {
+          action: action.capability,
+          status: verification.status ?? "UNKNOWN",
+          unconfirmed: state.unconfirmedAttempts
+        });
+      } else {
+        state.failedAttempts.push({ action, verification });
+      }
       // Discarding the whole batch on one soft failure is what forces a fresh
       // model call per micro-step. Keep the tail when the remaining steps are
       // genuinely independent of the one that failed — no runtime reference to

@@ -58,7 +58,9 @@ function inferContentType(filePath) {
 export function startServer({ port = 4317, basePath = process.cwd(), runtime: injectedRuntime = null, warmHost = true } = {}) {
   const runtime = injectedRuntime ?? createRuntime(basePath);
   const intentRuns = new Map();
-  const terminalStates = new Set(["COMPLETED", "COMPLETED_WITH_WARNINGS", "FAILED", "TIMED_OUT", "CANCELLED", "ROLLED_BACK", "DENIED", "PLAN_REJECTED"]);
+  // "ANSWERED" belongs here: a conversational reply is a settled result the
+  // client should stop polling on, even though nothing was executed.
+  const terminalStates = new Set(["COMPLETED", "COMPLETED_WITH_WARNINGS", "ANSWERED", "FAILED", "TIMED_OUT", "CANCELLED", "ROLLED_BACK", "DENIED", "PLAN_REJECTED"]);
 
   const writeSse = (response, event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
   const publish = (sessionId, event) => {
@@ -112,6 +114,17 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
     if (terminal && (!run.terminal || !run.session)) settleRun(sessionId, persisted);
     return persisted;
   };
+  // Bring the Windows automation host up now rather than on the user's first
+  // request. `warmHost` has been a parameter of this function all along and was
+  // never read, so every session paid the host's several-second cold start
+  // inside its own first action — where it looks like the action being slow.
+  if (warmHost !== false && typeof runtime.adapter?.automationHost?.warm === "function") {
+    runtime.adapter.automationHost.warm()
+      .then((ready) => {
+        if (!ready) console.log("SYSCORA desktop automation host is unavailable; GUI actions will be degraded.");
+      })
+      .catch(() => {});
+  }
   // Opt-in signed capability plugins (SYSCORA_PLUGIN_DIR + trusted keys). Loading
   // is best-effort at startup and never blocks the server; a failure to load a
   // plugin leaves the built-in capabilities intact.
@@ -171,7 +184,12 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           const lifecycle = currentSession
             ? projectSessionLifecycle(
                 run.terminal && !terminalStates.has(currentSession.currentState)
-                  ? { ...currentSession, currentState: run.status === "COMPLETED" ? "COMPLETED" : "FAILED" }
+                  ? {
+                      ...currentSession,
+                      currentState: run.status === "COMPLETED" || run.status === "ANSWERED"
+                        ? "COMPLETED"
+                        : "FAILED"
+                    }
                   : currentSession,
                 { developerMode: requestUrl.searchParams.get("developer") === "1" }
               )
@@ -213,7 +231,19 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         }
         const runOptions = {
           workspacePath: basePath,
-          autoApprove: payload.autoApprove === true
+          autoApprove: payload.autoApprove === true,
+          // The prior turns of this conversation, oldest first. The client owns
+          // the transcript; the daemon stays stateless about it and simply
+          // forwards what was sent, bounded here so a client cannot grow the
+          // reasoning prompt without limit. It is context for resolving what the
+          // new message refers to — never authorization, which is why
+          // autoApprove above is read from THIS request only.
+          history: Array.isArray(payload.history)
+            ? payload.history.slice(-12).map((turn) => ({
+                role: String(turn?.role ?? "user"),
+                text: String(turn?.text ?? "").slice(0, 2000)
+              }))
+            : []
         };
         if (requestUrl.searchParams.get("sync") === "true") {
           const session = await runtime.submitIntent(payload.text, runOptions);
@@ -682,6 +712,11 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
 }
 
 if (process.argv[1] === __filename) {
-  const port = Number(process.env.SYSCORA_PORT ?? "4317");
+  // SYSCORA_PORT first: the Electron shell sets it explicitly and expects the
+  // daemon to bind exactly there. PORT next, which is how a supervising tool
+  // (the dev-preview harness) assigns a free port when 4317 is already taken —
+  // nothing external depends on 4317, so there is no callback or CORS origin to
+  // keep stable. 4317 remains the standalone default.
+  const port = Number(process.env.SYSCORA_PORT ?? process.env.PORT ?? "4317");
   startServer({ port });
 }

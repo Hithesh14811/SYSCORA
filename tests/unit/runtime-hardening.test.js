@@ -85,7 +85,10 @@ test("web outcomes route to semantic browser tools while installed apps stay app
   const flights = await engine.classify("Find the cheapest flight from Delhi to Mumbai next Friday, but do not book");
   assert.equal(flights.category, "BROWSER");
   assert.equal(flights.operation, "browser.research");
-  assert.match(flights.entities.url, /^https:\/\/www\.google\.com\/search\?/);
+  // The search host is an implementation detail (Google serves a bot-detection
+  // interstitial to the controlled browser, so research runs against Bing).
+  // What matters is that it stays a read-only search URL carrying the request.
+  assert.match(flights.entities.url, /^https:\/\/www\.bing\.com\/search\?/);
   assert.ok(flights.constraints.includes("NO_BOOKING"));
 
   const website = await engine.classify("Open YouTube");

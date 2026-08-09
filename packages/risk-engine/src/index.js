@@ -145,6 +145,7 @@ export class RiskEngine {
 
     let containsSensitiveValue = false;
     let hintRisk = RiskLevel.LOW;
+    let consequentialUiAutomationAction = false;
 
     // Start every dimension at its most-benign value; each task raises it.
     let merged = {};
@@ -191,10 +192,16 @@ export class RiskEngine {
         reasons.push({
           dimension: RiskDimension.EXTERNAL_EFFECT,
           value: consequential.externalEffect,
-          why: `Browser interaction targets a consequential control (${consequential.matched}); ` +
+          why: `${consequential.untypedClick ? "A UI-automation click" : "Browser interaction"} targets a consequential control (${consequential.matched}); ` +
             "submitting, purchasing, sending or deleting through a page is an external effect " +
             "this runtime cannot roll back."
         });
+        // A control discovered live by generic UI automation (ui.action /
+        // pointer.click) was never previewed in a plan the user reviewed before
+        // approving — unlike a typed browser.click task that shows up in the
+        // plan itself. Flag it distinctly so policy can require its own fresh,
+        // scoped approval instead of accepting a blanket session-level grant.
+        if (consequential.untypedClick) consequentialUiAutomationAction = true;
       }
 
       // Entering credentials, payment instruments or government identifiers into
@@ -303,7 +310,8 @@ export class RiskEngine {
         modifiesExistingEnvFile,
         containsSensitiveValue,
         highestRiskHint: hintRisk,
-        taskCount: tasks.length
+        taskCount: tasks.length,
+        consequentialUiAutomationAction
       },
       // Back-compat: existing callers/tests read `evidence` + these fields.
       evidence: {
@@ -325,7 +333,7 @@ export class RiskEngine {
   static CONSEQUENTIAL_BROWSER_VERBS = Object.freeze([
     {
       externalEffect: "FINANCIAL_OR_SECURITY",
-      pattern: /\b(buy|purchase|order|checkout|pay|payment|place\s+order|transfer|withdraw|deposit|subscribe|book\s+now|reserve)\b/i
+      pattern: /\b(buy|purchase|order|checkout|pay|payment|place\s+order|transfer|withdraw|deposit|subscribe|book\s+now|reserve|add\s+to\s+(?:cart|bag|basket)|select\s+(?:flight|fare|seat|ticket|room|plan|package|offer))\b/i
     },
     {
       externalEffect: "COMMUNICATION",
@@ -389,26 +397,39 @@ export class RiskEngine {
     return stage === BrowserStage.SENSITIVE_DATA_ENTRY || stage === BrowserStage.CONSEQUENTIAL_SUBMISSION;
   }
 
+  // Generic UI Automation ("ui.action", "pointer.click") is how the adaptive
+  // controller drives a browser window it doesn't have a typed browser.click
+  // primitive for, and its target is DISCOVERED live, mid-session — never
+  // previewed by the user before this exact commitment the way a typed
+  // browser.click task in an already-reviewed plan is. It gets the same
+  // label-based consequential-action detection as browser.*, but the caller
+  // (assess()) treats a match from this untyped path as needing its own fresh
+  // approval rather than one a blanket session-level grant can satisfy.
+  static UNTYPED_CLICK_CAPABILITIES = /^(?:ui\.action|pointer\.click)$/;
+
   _detectConsequentialBrowserAction(task) {
     const capability = String(task?.capability ?? task?.selectedCapability ?? "");
-    if (!/^browser\.(click|type|select|download)$/.test(capability)) return null;
+    const isTypedBrowserAction = /^browser\.(click|type|select|download)$/.test(capability);
+    const isUntypedClick = RiskEngine.UNTYPED_CLICK_CAPABILITIES.test(capability)
+      && /^(?:click|invoke|select)$/i.test(String(task?.inputs?.action ?? task?.action?.parameters?.action ?? ""));
+    if (!isTypedBrowserAction && !isUntypedClick) return null;
     const inputs = task?.inputs ?? task?.action?.parameters ?? {};
     const target = inputs.target ?? {};
     // Matched against the control's OWN label/type — never the user's phrasing —
     // so a benign request cannot talk a dangerous button into a lower tier.
-    const label = [target.text, target.name, target.controlType, target.role, target.id, inputs.value]
+    const label = [target.text, target.name, target.controlType, target.role, target.id, target.automationId, inputs.value]
       .filter((entry) => typeof entry === "string")
       .join(" ");
     for (const { externalEffect, pattern } of RiskEngine.CONSEQUENTIAL_BROWSER_VERBS) {
       const matched = label.match(pattern)?.[0];
-      if (matched) return { matched, capability, externalEffect };
+      if (matched) return { matched, capability, externalEffect, untypedClick: isUntypedClick };
     }
     // A submit-typed control is consequential regardless of its wording.
     if (String(target.type ?? "").toLowerCase() === "submit") {
-      return { matched: "submit-input", capability, externalEffect: "EXTERNAL_MUTATION" };
+      return { matched: "submit-input", capability, externalEffect: "EXTERNAL_MUTATION", untypedClick: isUntypedClick };
     }
     if (String(target.tag ?? "").toLowerCase() === "form") {
-      return { matched: "form", capability, externalEffect: "EXTERNAL_MUTATION" };
+      return { matched: "form", capability, externalEffect: "EXTERNAL_MUTATION", untypedClick: isUntypedClick };
     }
     return null;
   }

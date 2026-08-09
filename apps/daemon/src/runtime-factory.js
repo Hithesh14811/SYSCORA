@@ -147,7 +147,11 @@ export function createRuntime(basePath = process.cwd()) {
       auditRepository.append("external-ai", "EXTERNAL_AI_REQUEST", record).catch(() => {});
     }
   });
-  const reasoningEngine = new ReasoningEngine({ modelProvider, capabilityRegistry });
+  const reasoningEngine = new ReasoningEngine({
+    modelProvider,
+    capabilityRegistry,
+    minTimeoutMs: modelConfig.requestTimeoutMs
+  });
 
   const runtime = new AgentRuntime({
     sessionStore,

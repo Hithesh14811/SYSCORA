@@ -295,3 +295,156 @@ a failed UI interaction stops after one bounded attempt instead of replanning fo
 - `tests/integration/spotify-play.test.js` — mocked adapter through the real runtime:
   successful play, not-installed, result-not-found, UI timeout, playback-verification
   failure, and a bounded no-infinite-replan assertion.
+
+---
+
+## Phase M — Desktop senses: the agent could act but could not see
+
+### Finding: every visual subsystem was built, tested, and unreachable
+
+Measured on this machine, the visual stack works and always did: capturing a
+window takes ~0.4s, OCR of that capture ~0.2s and returns per-line text with
+absolute screen coordinates, and the UI Automation tree ~0.5s including each
+control's live `value`. None of it reached the agent loop.
+
+- `VisionProvider` was constructed only inside test files. `createDefaultProviders`
+  omitted it, so `PerceptionEngine.captureVisionSnapshot` returned
+  `vision-provider-not-registered` in every real session.
+- `InteractiveAgentController` accepts a `captureScreenSnapshot` callback and
+  contains a complete before/after screen-diff path built on
+  `diffScreenSnapshots`. The runtime never passed the callback, so that path was
+  dead code.
+- The loop's `perceive()` filtered visible windows down to those whose title or
+  process name shared a word with the user's request, then grounded only those.
+  A request that named no window grounded nothing and never called UI Automation
+  at all — the agent reasoned about an empty desktop with applications open in
+  front of it.
+- No capability answered "what is on the screen?". `screen.capture` writes a PNG
+  the agent cannot read; `ocr.read` needs a path it must have captured first.
+
+Live consequence, reproduced before the fix: asked to type "Ultron online" into
+Notepad, the agent typed "Ultron online into it", reported the keystroke
+`VERIFIED` because the keystroke was delivered, and then could not say what the
+document contained. UI Automation had `value: "Ultron online into it"` available
+the entire time.
+
+### Fixes
+
+- `VisionProvider` joins `createDefaultProviders`; the capability registry is
+  threaded through `PerceptionEngine.withDefaultProviders` so it can check
+  `screen.capture` / `ocr.read` / `ui.inspect` availability. It stays inert for an
+  ordinary perception sweep (`vision-not-requested`) and captures only when asked.
+- The runtime passes `captureScreenSnapshot`, so before/after screen diffing is
+  live. `ADAPTIVE_SCREEN_DIFF` now carries real pixel, text and element deltas.
+- `perceive()` ranks windows by goal match instead of filtering by it, always
+  grounds something, and attaches an OCR reading of the grounded window for
+  UI-facing work.
+- New `screen.read` capability: capture + OCR + UIA fused into one reading, with
+  every element's text and the exact screen coordinates of its clickable centre.
+  READ / LOW risk, so an informational goal may use it.
+- New `pointer.clickAt`: clicks a raw coordinate, which is the only way to reach
+  a canvas, map, video, game or remote session. Invented coordinates are refused
+  because the point must lie inside a window that exists at that moment.
+- `vision.locate` falls back to scored fuzzy matching (exact > prefix > substring
+  > token overlap, with one-character OCR tolerance), and a miss now reports what
+  WAS on screen instead of only "not found".
+- `keyboard.type` verifies by reading the window back. It reports `FAILED` with
+  the window's actual contents when the text is not there, and
+  `PARTIALLY_VERIFIED` when nothing can be read back (password boxes) rather than
+  claiming a verification that did not happen.
+
+### Finding: scrolling down had never worked
+
+`mouse_event`'s `dwData` is declared `uint`, and a downward wheel delta is
+negative. `[uint32]$delta` is a checked cast in PowerShell, so every downward
+scroll threw `Cannot convert value "-120" to type "System.UInt32"` before a
+single wheel event was sent. Scrolling up worked; scrolling down — the direction
+almost every real task needs — could not. Fixed by reinterpreting the bits
+(`BitConverter`) rather than converting the value.
+
+`pointer.wheel` was also posting the wheel event wherever the cursor happened to
+be resting rather than over the target window, and clamped to one burst. It now
+parks the pointer over the window, takes `notches` and a `speed`, and delivers
+one real wheel event per notch — so the agent can scroll slowly and read what
+goes past.
+
+### Finding: three more unreachable-by-wiring defects
+
+- **Aliases never resolved for interactive decisions.** The registry defines the
+  synonyms models actually reach for (`keyboard.typeText`, `cli.exec`,
+  `ui.getText`). Resolution looks the alias up in the catalog handed to the
+  model, and `_catalog()` dropped the `aliases` field — so not one alias had ever
+  resolved. Live, a session that had correctly launched Notepad was killed by the
+  single word `keyboard.typeText`.
+- **One malformed decision ended the session.** Any `ok:false` from the model was
+  terminal, so `maxMalformedProposals` was unreachable. `_reasonStructured` now
+  distinguishes "answered, but wrongly" (recoverable — re-ask with fresh
+  observations) from "never answered" (terminal), and the loop books the former
+  as a malformed proposal.
+- **The wall-clock budget could not interrupt a model call.** An interactive
+  decision is 70s × 2 transport attempts × 2 repair attempts, so one slow
+  endpoint could spend 280s of a 420s session inside a single `await`, and the
+  budget is only checked between steps. Reasoning calls now carry the caller's
+  remaining budget as a hard ceiling (half the remainder, capped at 150s).
+
+### Finding: the host was never warmed, and the bill landed on the first action
+
+`startServer` has accepted a `warmHost` parameter all along and never read it.
+The automation host loads UI Automation, WinForms and the OCR engine on first
+use, so every session paid several seconds of cold start inside its first real
+action — where it looks like that action being slow. Measured: first window
+enumeration 1.3s vs 0.3s warm; first screen reading 11s vs 1.2s warm, long enough
+that `application.launch` could exceed its own 24s timeout and be recorded as a
+failure on a healthy machine. The daemon now warms the host at startup,
+best-effort.
+
+A duplicate reading was also removed: the loop reads the screen at the top of
+each step and the controller then took a "before" reading of the same window,
+paying twice. A reading younger than 2.5s now serves as the before-state. The
+"after" reading is never served from that memo — seeing what changed is the whole
+point of taking it.
+
+### Evidence
+
+- `tests/unit/screen-perception.test.js` — 22 tests covering vision registration,
+  window resolution by application name, `screen.read` output shape and
+  coordinates, fuzzy visual matching, coordinate-click refusal, per-notch
+  scrolling, typed-text read-back in all three outcomes, window pinning, alias
+  survival, recoverable vs terminal decisions, reasoning budget enforcement, the
+  screen memo, and host warming.
+- `scripts/diag/desktop-senses.mjs` — live end-to-end check of all thirteen
+  senses against a real window. These defects were all in the wiring BETWEEN
+  subsystems that each passed their own tests; only a real desktop finds them.
+- Live, after the fixes: asked to type a sentence into Notepad and read it back,
+  the session completed with `ui.verifyValue` reporting "The control value
+  exactly matches the expected value", and an independent `screen.read` confirmed
+  the document contents matched the claim.
+
+### Finding: "could not confirm" was treated as "did not work"
+
+`_executeTaskGraph` gated on `verification.status !== "VERIFIED"`, so an action
+that PERFORMED but produced no independent evidence went into diagnosis,
+replanning and abort alongside genuine failures. The scheduler already drew the
+line correctly (UNCERTAIN, not FAILED) and the interactive loop budgets thirty
+unconfirmed actions per session, because a UI click with no declared
+postcondition is the ordinary case.
+
+Live: a session that had launched Notepad, found the document control and typed
+into it was aborted on `PARTIALLY_VERIFIED: "no explicit postcondition was
+supplied"` and reported to the user as "Did not work" — about work that had been
+done. The identical request had succeeded minutes earlier purely because the
+model happened to attach a postcondition that time.
+
+Unconfirmed steps now continue and are recorded as `VERIFICATION_UNCONFIRMED`.
+Nothing is claimed by this: the verification stays in the record, feeds the
+summary's remaining problems, and the goal contract — which requires evidence per
+criterion — remains the gate on completion. Only a genuine FAILED is handled as a
+failure.
+
+Fixing that exposed a latent deadlock. `getReadyTasks` required a dependency to
+be exactly VERIFIED, so an UNCERTAIN step left every dependent task PENDING
+forever — never ready, never skipped, never complete — and the scheduling loop
+spun on a graph that could not finish. The state had been unreachable only
+because the runtime aborted first. A dependency that ran but could not be
+confirmed now satisfies its dependents, which is what a person does after an
+action they could not verify: carry on, and judge by the outcome.

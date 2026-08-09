@@ -147,6 +147,76 @@ describe("Closed-Loop Intelligence", () => {
     assert.ok(types.includes("FINAL_VERIFICATION_COMPLETED"));
   });
 
+  it("continues after an action that ran but could not be independently confirmed", async () => {
+    // A GUI click with no declared postcondition is the ordinary case, not a
+    // fault: the action performed, and nothing external proved what it changed.
+    // This used to be routed into diagnosis and abort alongside real failures,
+    // so a session that had genuinely done the work was reported as "did not
+    // work" and stopped. It must carry on and let the goal decide.
+    let secondRan = false;
+    const { runtime } = await buildRuntime({
+      capabilities: [
+        {
+          name: "test.unconfirmable",
+          version: "1.0.0",
+          description: "performs, proves nothing",
+          inputSchema: { type: "object", properties: {}, required: [] },
+          riskMetadata: { level: "LOW" },
+          reversibility: "NOT_REQUIRED",
+          preconditions: () => true,
+          execute: async () => ({ performed: true }),
+          observe: okObserve("test.unconfirmable"),
+          verify: async () => ({
+            status: "PARTIALLY_VERIFIED",
+            message: "UI action completed; no explicit postcondition was supplied.",
+            confidence: 0.7
+          }),
+          rollback: null,
+          timeout: 5000,
+          retryPolicy: { maxAttempts: 1 }
+        },
+        {
+          name: "test.after",
+          version: "1.0.0",
+          description: "the step that depends on it",
+          inputSchema: { type: "object", properties: {}, required: [] },
+          riskMetadata: { level: "LOW" },
+          reversibility: "NOT_REQUIRED",
+          preconditions: () => true,
+          execute: async () => { secondRan = true; return { ok: true }; },
+          observe: okObserve("test.after"),
+          verify: async () => ({ status: "VERIFIED", message: "ok", confidence: 1 }),
+          rollback: null,
+          timeout: 5000,
+          retryPolicy: { maxAttempts: 1 }
+        }
+      ],
+      planFor: () => {
+        const first = task("test.unconfirmable", {}, { taskId: "step_one" });
+        const second = task("test.after", {}, { taskId: "step_two", dependencies: ["step_one"] });
+        return [first, second];
+      }
+    });
+
+    const session = await runtime.submitIntent("do the unconfirmable thing then the next one", {
+      autoApprove: true,
+      operation: "test.unconfirmable",
+      category: "SYSTEM",
+      normalizedGoal: "Do the unconfirmable thing then the next one"
+    });
+
+    const types = session.events.map((e) => e.eventType);
+    assert.ok(types.includes("VERIFICATION_UNCONFIRMED"), "the unconfirmed step must be recorded as such");
+    assert.ok(!types.includes("VERIFICATION_FAILED"), "an unconfirmed step is not a failure");
+    assert.ok(!types.includes("FAILURE_DIAGNOSED"), "an unconfirmed step must not trigger diagnosis");
+    assert.ok(secondRan, "execution must continue to the dependent step");
+    // The unconfirmed result is still carried, so nothing can silently claim it.
+    assert.ok(
+      session.verifications.some((verification) => verification?.status === "PARTIALLY_VERIFIED"),
+      "the unconfirmed verification stays in the record"
+    );
+  });
+
   it("loops through verification failure -> diagnosis -> recovery -> replan -> success", async () => {
     // A capability that FAILS verification the first time and SUCCEEDS after a
     // replan. The runtime must diagnose, decide to recover, replan, and re-run.

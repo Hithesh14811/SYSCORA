@@ -158,3 +158,55 @@ test("the same phase projected twice is identical, so one request yields one str
   const built = session({ currentState: "EXECUTING", plan: { taskGraph: { tasks: [{ capability: "x", goal: "Do the thing" }] } } });
   assert.deepEqual(projectSessionLifecycle(built), projectSessionLifecycle(built));
 });
+
+// A conversational reply is a first-class outcome. SYSCORA is meant to hold a
+// normal conversation as well as act on the computer, so answering a question
+// must not be projected as either a verified goal or a failed automation.
+
+test("a conversational answer is its own terminal phase, not a failure", () => {
+  const view = projectSessionLifecycle(session({
+    currentState: "COMPLETED",
+    finalResponse: {
+      status: "ANSWERED",
+      message: "I can inspect your system, manage files, and control installed apps.",
+      conversational: true
+    }
+  }));
+  assert.equal(view.phase, LifecyclePhase.ANSWERED);
+  assert.equal(view.terminal, true);
+  assert.equal(view.detail, "I can inspect your system, manage files, and control installed apps.");
+  assert.doesNotMatch(view.headline, /did not work|failed/i);
+});
+
+test("an answer never claims the computer was inspected or changed", () => {
+  const view = projectSessionLifecycle(session({
+    currentState: "COMPLETED",
+    finalResponse: { status: "ANSWERED", message: "Hello — what would you like me to do?", conversational: true }
+  }));
+  assert.equal(view.executionStarted, false);
+  assert.equal(view.verifiedCompletion, false);
+  assert.deepEqual(view.changed, []);
+  assert.deepEqual(view.completed, []);
+  assert.equal(view.progress.total, 0);
+});
+
+// Sessions persisted before answering settled as COMPLETED recorded FAILED with
+// an ANSWERED response. The declared status has to win, or replaying history
+// shows a red failure with the answer printed underneath it.
+test("a legacy session that answered from the FAILED state still reads as answered", () => {
+  const view = projectSessionLifecycle(session({
+    currentState: "FAILED",
+    finalResponse: { status: "ANSWERED", message: "I'm SYSCORA.", conversational: true }
+  }));
+  assert.equal(view.phase, LifecyclePhase.ANSWERED);
+  assert.doesNotMatch(view.headline, /did not work/i);
+});
+
+test("failing to understand a request stays a clarification, not an answer", () => {
+  const view = projectSessionLifecycle(session({
+    currentState: "FAILED",
+    finalResponse: { status: "NEEDS_CLARIFICATION", message: "I couldn't map that request." }
+  }));
+  assert.equal(view.phase, LifecyclePhase.AWAITING_USER_INPUT);
+  assert.notEqual(view.phase, LifecyclePhase.ANSWERED);
+});

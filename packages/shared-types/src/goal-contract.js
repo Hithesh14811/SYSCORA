@@ -6,7 +6,11 @@ const STOP_WORDS = new Set([
   "tell", "the", "then", "this", "to", "what", "whats", "with"
 ]);
 
-const READ_ONLY_CAPABILITIES = /^(?:system\.inspect|process\.list|filesystem\.read|filesystem\.inspect|application\.launch|window\.(?:enumerate|resolve|wait)|ui\.(?:inspect|find|extract|resolveTarget)|screen\.capture|ocr\.read|vision\.locate|browser\.(?:launch|navigate|currentState|inspect|find|read|extract|wait))$/;
+// Looking is not changing. screen.read belongs here for the same reason
+// ui.inspect does: it captures and transcribes a window and mutates nothing, and
+// leaving it out would mean a purely informational goal ("what does that dialog
+// say?") could not use the one capability that answers it.
+const READ_ONLY_CAPABILITIES = /^(?:system\.inspect|process\.list|filesystem\.read|filesystem\.inspect|application\.launch|window\.(?:enumerate|resolve|wait)|ui\.(?:inspect|find|extract|resolveTarget)|screen\.(?:capture|read)|ocr\.read|vision\.locate|browser\.(?:launch|navigate|currentState|inspect|find|read|extract|wait))$/;
 
 function normalize(value) {
   return String(value ?? "")
@@ -84,16 +88,133 @@ function literalAnchors(value) {
   return [...anchors].filter(Boolean);
 }
 
+// Actions a prohibition can forbid. A negation word only expresses a constraint
+// when it governs one of these — "never" in "Never Gonna Give You Up" is part of
+// a song title, not an instruction, and treating it as one turned a legitimate
+// playback request into a read-only constraint the plan could never satisfy.
+const PROHIBITED_ACTION_VERBS = "book|buy|purchase|order|reserve|rent|pay|send|submit|share|post|publish|install|uninstall|delete|remove|destroy|drop|modify|change|edit|alter|overwrite|rename|move|create|write|save|add|set|configure|enable|disable|toggle|update|upgrade|restart|reboot|shut\\s*down|kill|stop|open|launch|run|execute|click|navigate|download|upload|touch";
+
+// A negation followed, within a couple of words, by an action it forbids.
+const PROHIBITION_PATTERN = new RegExp(
+  `\\b(?:do not|do n't|don't|must not|mustn't|should not|shouldn't|never|no)\\s+(?:\\w+\\s+){0,2}(?:${PROHIBITED_ACTION_VERBS})\\b`,
+  "i"
+);
+// Phrasings that carry the constraint without a following verb.
+const PROHIBITION_PHRASE_PATTERN = /\b(?:without (?:changing|modifying|editing|installing|saving|booking|purchasing)|no changes?|read[- ]only)\b/i;
+
 function isProhibition(value) {
-  return /\b(?:do not|don't|must not|never|without (?:changing|modifying|editing)|no changes?)\b/i.test(String(value ?? ""));
+  const text = String(value ?? "");
+  return PROHIBITION_PATTERN.test(text) || PROHIBITION_PHRASE_PATTERN.test(text);
 }
 
 function isStandaloneProhibition(value) {
-  return /^\s*(?:do not|don't|must not|never|without (?:changing|modifying|editing)|no changes?)\b/i.test(String(value ?? ""));
+  const text = String(value ?? "").trimStart();
+  const startsWithNegation = /^(?:do not|do n't|don't|must not|mustn't|should not|shouldn't|never|no changes?|without (?:changing|modifying|editing|installing|saving|booking|purchasing))\b/i.test(text);
+  return startsWithNegation && isProhibition(text);
 }
 
+// A CONSTRAINT is something the run must be RESTRICTED by. Everywhere it is
+// consumed it is judged as a restriction: coverage marks it satisfied only when
+// the candidate plan does not mutate, and the evidence check looks for a task
+// whose verbs it forbids.
+//
+// A bare "must" does not mean that. Asked to set the volume to 26%, the model
+// wrote the constraint "Volume must be set to exactly 26%" — a REQUIREMENT to
+// act. Classified as a constraint it inverted: the only plan that could satisfy
+// the user (one that sets the volume) was the one guaranteed to violate it, so
+// coverage failed, the typed one-step route was discarded, and the request fell
+// through to the adaptive loop, which had no volume tool in reach and clicked
+// blindly on whatever window happened to be in front — twenty-four times.
+//
+// So "must" only marks a constraint when it governs a restriction: must not,
+// must only, must ask/confirm first. "must be set to X" is an outcome, and
+// outcomes are already carried as STATE criteria.
 function isBehavioralConstraint(value) {
-  return /\b(?:only|ask before|must|desktop app|without)\b/i.test(String(value ?? ""));
+  const text = String(value ?? "");
+  if (/\b(?:only|ask before|confirm before|desktop app)\b/i.test(text)) return true;
+  if (/\bwithout\s+\w+ing\b/i.test(text)) return true;
+  return /\bmust\s+(?:not|never|only|ask|confirm)\b/i.test(text);
+}
+
+// Words that describe HOW an answer is delivered to the person, rather than any
+// state of the machine. No observation will ever contain them: nothing the
+// runtime reads back from Windows says "presented", "ranked" or "to the user",
+// because those describe SYSCORA's own reply, which is composed after the work
+// finishes.
+//
+// Left in the token set they were pure noise that could only ever fail. A
+// criterion like "the processes using the most memory are identified and
+// presented in descending order" tokenises to eight terms of which five are
+// presentational, so it could not clear the matching threshold no matter what
+// the machine returned — and it was the SECOND criterion on nearly every
+// question, because that is simply how a model writes down "and tell me".
+const PRESENTATION_TOKENS = new Set([
+  "identified", "identify", "presented", "present", "reported", "report",
+  "displayed", "display", "shown", "show", "returned", "return", "listed",
+  "told", "informed", "summarized", "summarised", "summary", "described",
+  "ranked", "ranking", "ordered", "order", "descending", "ascending",
+  "sorted", "clearly", "user", "response", "answer", "output", "message"
+]);
+
+// Vocabulary that asserts something about the MACHINE — either a change made to
+// it or a condition holding on it. If a criterion says any of this, there is a
+// real fact to go and observe, and the evidence gate must hold.
+const MACHINE_STATE_PATTERN =
+  /\b(?:creat|delet|remov|writ|wrote|sav|instal|uninstal|modif|chang|edit|updat|renam|mov|copi|copy|set|configur|enabl|disabl|toggl|launch|open|clos|start|stopp?|kill|restart|maximiz|minimiz|resiz|focus|navigat|click|typ|play|paus|download|upload|send|submit|book|purchas)\w*\b|\b(?:exists?|running|installed|present on|visible|in the foreground|now playing)\b/i;
+
+// Vocabulary about DELIVERING an answer: what SYSCORA says back, and in what
+// shape. Nothing the machine reports will ever contain it.
+const DELIVERY_PATTERN =
+  // Each verb takes \w* so its inflections match. Without it `\breport\b` failed
+  // on "reported" — which is the form these criteria are always written in — and
+  // the criterion silently stayed STATE, which is the failure this whole
+  // distinction exists to prevent.
+  /\b(?:report\w*|present\w*|display\w*|shown|shows|list\w*|return\w*|tell\w*|told|inform\w*|summariz\w*|summaris\w*|identif\w*|rank\w*|sort\w*|order\w*|descending|ascending|highest first|lowest first|to the user|in the (?:answer|response|reply))\b/i;
+
+// A criterion about the answer rather than about the machine.
+//
+// "The processes are ranked by memory usage with the highest consumers shown
+// first" is a promise about how SYSCORA writes its reply. There is no place in
+// Windows to go and check it, and the reply does not exist yet when the gate
+// runs — so gating on machine evidence for it can only ever fail. It failed on
+// essentially every question a person asks, because "and tell me the answer" is
+// how models habitually write the second success criterion.
+//
+// "A folder named Reports exists on the Desktop and is shown to the user" also
+// mentions delivery, but it asserts a fact about the disk as well. That one
+// stays STATE and stays gated — which is the whole point of the evidence gate,
+// and is untouched here.
+// What is being REPORTED is not what is being ASSERTED.
+//
+// "The user is told clearly whether Git is installed" is a promise to answer a
+// question. The word "installed" in it names the subject of the answer; it does
+// not claim anything was installed. Testing the raw sentence for machine-state
+// vocabulary therefore misfires on almost every reporting criterion, because a
+// reporting criterion nearly always names the thing it reports on — and it
+// misfired here, so a correct, well-evidenced answer about Git was labelled
+// INCONCLUSIVE.
+//
+// Removing the subordinate clause leaves the main assertion, which is what the
+// criterion actually commits to:
+//   "...told clearly whether Git is installed"  -> "...told clearly"     REPORT
+//   "A folder is created and shown to the user" -> unchanged             STATE
+function mainAssertion(description) {
+  return String(description ?? "")
+    // A leading condition — "If installed, the version is reported" — qualifies
+    // the promise, it is not the promise.
+    .replace(/^\s*(?:if|when|where)\b[^,]{0,60},\s*/i, "")
+    // Reported content: everything from the clause marker onward.
+    .replace(/\b(?:whether|that|what|which|why|how (?:much|many|large|big)?|if)\b[\s\S]*$/i, "")
+    .trim();
+}
+
+function isReportCriterion(description) {
+  const text = String(description ?? "");
+  if (!DELIVERY_PATTERN.test(text)) return false;
+  const assertion = mainAssertion(text);
+  // Stripping left nothing to judge, so fall back to the whole sentence rather
+  // than treating an empty string as "no machine state".
+  return !MACHINE_STATE_PATTERN.test(assertion || text);
 }
 
 function deepFreeze(value) {
@@ -125,7 +246,12 @@ function fallbackCriteria(rawText) {
 function rawConstraintClauses(rawText) {
   const text = String(rawText ?? "");
   const clauses = [];
-  for (const match of text.matchAll(/\b(?:do not|don't|never|must not)\s+[^.;]+/gi)) clauses.push(match[0].trim());
+  // Only lift a clause when the negation actually governs an action (see
+  // isProhibition). Matching a bare "never" turned the title in "play Never
+  // Gonna Give You Up" into a binding constraint on the whole request.
+  for (const match of text.matchAll(/\b(?:do not|don't|never|must not)\s+[^.;]+/gi)) {
+    if (isProhibition(match[0])) clauses.push(match[0].trim());
+  }
   for (const match of text.matchAll(/\b(?:only show results|use (?:the )?desktop app|ask before [^.;]+)/gi)) clauses.push(match[0].trim());
   return clauses;
 }
@@ -143,8 +269,23 @@ export function createGoalContract(intent = {}) {
       const overlap = constraintTokens.filter((token) => originalTokens.has(token)).length;
       return overlap / Math.min(constraintTokens.length, 5) >= 0.6;
     });
+  // Only genuinely RESTRICTIVE entries become constraint criteria.
+  //
+  // `declaredConstraints` also keeps entries that merely overlap the request
+  // wording, which is how a restatement of the goal — "Volume must be set to
+  // exactly 45 percent" — was admitted as a constraint. Every consumer then
+  // judged it as a restriction and marked it violated by the one plan that
+  // actually does what the user asked. The overlap rule is still useful for
+  // keeping real user constraints that match no pattern, so those entries are
+  // kept as ordinary criteria (below) and simply not treated as prohibitions.
+  const restrictiveConstraints = declaredConstraints.filter(
+    (constraint) => isProhibition(constraint) || isBehavioralConstraint(constraint)
+  );
+  const advisoryConstraints = declaredConstraints.filter(
+    (constraint) => !restrictiveConstraints.includes(constraint)
+  );
   const constraintCriteria = [
-    ...declaredConstraints,
+    ...restrictiveConstraints,
     // A mixed request such as "summarize X without changing anything" is not
     // itself a prohibition. Preserve only clauses that are independently
     // phrased as prohibitions; model-provided constraints are handled above.
@@ -160,15 +301,31 @@ export function createGoalContract(intent = {}) {
   const descriptions = [...new Set([
     ...(declared.length ? declared : rawClauses),
     ...preservedRawClauses,
-    ...constraintCriteria
+    ...constraintCriteria,
+    // Non-restrictive entries from the model's constraints list. Recorded so
+    // nothing the model said is lost, but classified below like any other
+    // criterion rather than as a restriction.
+    ...advisoryConstraints
   ])];
   const constraintSet = new Set(constraintCriteria.map(normalize));
   const rawClauseSet = new Set(rawClauses.map(normalize));
   const criteria = descriptions.map((description, index) => {
     const kind = isProhibition(description)
       ? "PROHIBITION"
-      : constraintSet.has(normalize(description)) ? "CONSTRAINT" : "STATE";
-    const anchors = literalAnchors(description);
+      : constraintSet.has(normalize(description)) ? "CONSTRAINT"
+        : isReportCriterion(description) ? "REPORT" : "STATE";
+    // An anchor is a literal string the plan MUST contain, so it only counts
+    // when the user actually wrote it. Criteria are often authored by the
+    // model, and its prose routinely carries all-caps acronyms ("the name or
+    // PID of the process", "the CPU and RAM totals", "the PDF path") that
+    // literalAnchors cannot tell apart from a user-specified identifier.
+    // Treating those as mandatory rejects correct typed plans — a real
+    // process.port.inspect plan was thrown out for not containing the literal
+    // text "PID" — so anchors are kept only when they appear in the original
+    // request. Model-invented ones degrade to ordinary tokens, which still
+    // contribute to matching but cannot single-handedly fail a plan.
+    const normalizedRequest = normalize(originalRequest);
+    const anchors = literalAnchors(description).filter((anchor) => normalizedRequest.includes(anchor));
     // A criterion gates completion only when it is grounded in what the user
     // actually said: a prohibition or constraint they stated, a clause of their
     // own request, or a criterion carrying a literal anchor from it. An
@@ -176,16 +333,40 @@ export function createGoalContract(intent = {}) {
     // available") that the user never asked for; recording those is useful, but
     // letting them gate would both fail correct work and make the same request
     // succeed or fail depending on how the model phrased itself that run.
+    // A criterion gates only when it is grounded in what the user actually said.
+    //
+    // The original test — a literal anchor, or a verbatim clause of the request —
+    // was far too strict for an ordinary multi-clause sentence. "Open calculator
+    // and work out 47 times 89" produced the criterion "The expression 47 × 89
+    // has been entered into Calculator", which carries no ALL-CAPS anchor and is
+    // not a verbatim clause, so it was discarded as a model invention. Both
+    // substantive criteria were dropped, the only survivor was a REPORT
+    // criterion any plan satisfies, and a plan that merely LAUNCHED Calculator
+    // scored full goal coverage. The arithmetic half of the request evaporated
+    // and the request was reported as done.
+    //
+    // Sharing two or more distinctive terms with the request is real grounding:
+    // "47", "89" and "calculator" all came from the user. One shared term is
+    // not — "the volume is not muted" shares only "volume" with "set the volume
+    // to 45 percent", and that is exactly the invention that must not gate.
+    const substantiveTerms = tokens(description).filter((token) => !PRESENTATION_TOKENS.has(token));
+    const sharedWithRequest = substantiveTerms.filter((token) => originalTokens.has(token));
     const grounded = kind !== "STATE"
       || anchors.length > 0
-      || rawClauseSet.has(normalize(description));
+      || rawClauseSet.has(normalize(description))
+      || sharedWithRequest.length >= 2;
     return {
       criterionId: `criterion_${index + 1}`,
       description,
       required: grounded,
       kind,
       anchors,
-      semanticTerms: tokens(description)
+      // Match on substance only. A criterion is usually a mix — "the processes
+      // consuming the most memory are identified and reported in descending
+      // order" is half machine state and half delivery — and scoring the
+      // delivery half against machine output means a correct answer scores
+      // below threshold on words that could not possibly appear in it.
+      semanticTerms: tokens(description).filter((token) => !PRESENTATION_TOKENS.has(token))
     };
   });
   return deepFreeze({
@@ -197,7 +378,7 @@ export function createGoalContract(intent = {}) {
   });
 }
 
-function taskEvidence(task, capabilityRegistry) {
+function taskEvidence(task, capabilityRegistry, executionResult = null) {
   const capability = capabilityRegistry?.get?.(task?.capability);
   return normalize([
     task?.capability,
@@ -208,7 +389,15 @@ function taskEvidence(task, capabilityRegistry) {
     task?.description,
     ...(task?.completionCriteria ?? []),
     ...(task?.verificationCriteria ?? []),
-    capability?.description
+    capability?.description,
+    // What the task PRODUCED, not only what it was asked to do. Criteria for a
+    // read describe the answer ("the total count of files in the Downloads
+    // folder is returned"), and that wording overlaps the output far more than
+    // the command line that produced it. Judging only the inputs meant a task
+    // that returned exactly the right number scored below the coverage
+    // threshold, the criterion was left unsatisfied, and a correct answer was
+    // reported to the user as inconclusive and thrown away.
+    executionResult ? evidenceObject(executionResult) : null
   ].filter(Boolean).join(" "));
 }
 
@@ -246,11 +435,19 @@ function criterionMatch(criterion, evidence) {
   return { covered, matchedAnchors, missingAnchors, matchedTokens, tokenScore };
 }
 
-export function matchGoalCriteriaForTask(goalContract, task, capabilityRegistry = null) {
-  const evidence = taskEvidence(task, capabilityRegistry);
+export function matchGoalCriteriaForTask(goalContract, task, capabilityRegistry = null, executionResult = null) {
+  const evidence = taskEvidence(task, capabilityRegistry, executionResult);
   const declaredIds = new Set(task?.goalCriterionIds ?? task?.criterionIds ?? []);
   return (goalContract?.criteria ?? [])
-    .filter((criterion) => criterion.kind === "STATE" && criterionMatch(criterion, evidence).covered)
+    .filter((criterion) => {
+      // A REPORT criterion is carried by whichever task produced the data the
+      // answer will be built from. It has to be attached to a task like any
+      // other criterion, because the evidence ledger only recognises criteria
+      // that some task claimed — leaving them unclaimed made every session
+      // carrying one finish INCONCLUSIVE despite having done the work.
+      if (criterion.kind === "REPORT") return executionResult != null;
+      return criterion.kind === "STATE" && criterionMatch(criterion, evidence).covered;
+    })
     .map((criterion) => criterion.criterionId)
     .concat([...declaredIds].filter((id) => (goalContract?.criteria ?? []).some((criterion) => criterion.criterionId === id)));
 }
@@ -288,6 +485,18 @@ export function assessGoalContractPlanCoverage(goalContract, taskGraph, capabili
         description: criterion.description,
         covered: !mutates,
         reason: mutates ? "candidate-plan-contains-mutation" : "candidate-plan-is-read-only"
+      };
+    }
+    if (criterion.kind === "REPORT") {
+      // A plan cannot show its answer in advance. Any plan that gathers
+      // something can be reported on; whether it gathered the RIGHT thing is
+      // what the STATE criteria alongside this one are for.
+      const gathers = (taskGraph?.tasks ?? []).length > 0;
+      return {
+        criterionId: criterion.criterionId,
+        description: criterion.description,
+        covered: gathers,
+        reason: gathers ? "plan-produces-results-to-report" : "plan-has-no-tasks"
       };
     }
     return {
@@ -373,6 +582,25 @@ export function assessGoalContractEvidence(goalContract, input = {}, capabilityR
         evidence: satisfied
           ? "No action matching the prohibited mutation scope was recorded."
           : `Mutation evidence: ${mutatingChanges.join(", ") || "prohibited mutating capability executed"}`
+      };
+    }
+    if (criterion.kind === "REPORT") {
+      // This criterion is about SYSCORA answering, and the answer is composed
+      // from the evidence below after this assessment runs — so demanding
+      // machine evidence for it asks the run to prove something that has not
+      // happened yet and never will happen on the machine. It is satisfied when
+      // the work that the answer will be built from actually ran and was
+      // verified. Nothing is weakened: if no read succeeded there is nothing to
+      // report and this correctly stays unsatisfied.
+      const verifiedWork = (input.verifications ?? []).some((verification) => verification?.status === "VERIFIED")
+        || (input.taskResults ?? []).some((result) => result?.executionResult != null);
+      return {
+        criterionId: criterion.criterionId,
+        description: criterion.description,
+        satisfied: verifiedWork && evidence.length > 0,
+        evidence: verifiedWork
+          ? "Verified observations are available for the answer."
+          : "No verified observation was produced, so there is nothing to report."
       };
     }
     const match = criterionMatch(criterion, evidence);

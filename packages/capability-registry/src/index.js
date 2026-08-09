@@ -2,6 +2,7 @@ import { RiskLevel } from "../../shared-types/src/domain.js";
 import { ExecutionModality, modalityProfile, validateInteractionTarget } from "../../shared-types/src/execution.js";
 import { redactSensitiveData } from "../../shared-types/src/redaction.js";
 import { PRIVILEGED_OPERATIONS } from "../../privileged-helpers/src/index.js";
+import { captureScreenSnapshotViaAdapter } from "../../perception/src/vision-provider.js";
 import crypto from "crypto";
 import {
   CAPABILITY_CONTRACT_VERSION,
@@ -80,6 +81,45 @@ export function matchesMediaQuery(title, query) {
   const titleTokens = new Set(trackTokens(title));
   const hits = q.filter((token) => titleTokens.has(token)).length;
   return hits >= Math.max(1, Math.ceil(q.length / 2));
+}
+
+// Text as it appears on screen, reduced to what a person would consider "the
+// same label". OCR routinely returns doubled spaces from letter-spaced UI fonts,
+// smart quotes and ellipses from the app's own typography, and a trailing "…"
+// on any truncated menu item; none of those are differences a user would name.
+export function normalizeVisualText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[‘’“”]/g, "'")
+    .replace(/[…]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+// How well an on-screen label answers a request for a target, 0 (no) to 1
+// (exactly). Ordered so a genuine exact match always outranks a prefix, and a
+// prefix always outranks a scattered token overlap — "Save" prefers "Save" over
+// "Save As", and prefers "Save As" over "Autosave settings".
+export function scoreVisualMatch(query, candidate) {
+  if (!query || !candidate) return 0;
+  if (candidate === query) return 1;
+  if (candidate.startsWith(query) || candidate.endsWith(query)) return 0.9;
+  if (candidate.includes(query)) return 0.8;
+  const queryTokens = query.split(" ").filter(Boolean);
+  const candidateTokens = new Set(candidate.split(" ").filter(Boolean));
+  if (!queryTokens.length || !candidateTokens.size) return 0;
+  const hits = queryTokens.filter((token) =>
+    candidateTokens.has(token) ||
+    // One-character tolerance absorbs the OCR confusions that make an otherwise
+    // perfect label unreachable: O/0, l/1/I, rn/m.
+    [...candidateTokens].some((other) =>
+      token.length >= 3 && Math.abs(other.length - token.length) <= 1 && tokenDistance(other, token) <= 1
+    )
+  ).length;
+  const coverage = hits / queryTokens.length;
+  // Below half the requested words matched, this is a different label that
+  // happens to share a word. Refusing to guess is the correct answer.
+  return coverage >= 0.5 ? 0.4 + coverage * 0.3 : 0;
 }
 
 export const LifecycleStatus = {
@@ -466,6 +506,104 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     },
     rollback: null,
     timeout: 15000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // application.listInstalled — what software is actually on THIS machine.
+  //
+  // The nearest thing that existed was `package.winget.search`, which queries the
+  // winget repository. That answers "does this software exist in the world", not
+  // "do I have it", so every "what's installed", "do I have Docker", "is Spotify
+  // on here" question either got a repository answer dressed up as a local one or
+  // no route at all. Reading the local install state is a different question and
+  // needs its own primitive.
+  registry.register({
+    name: "application.listInstalled",
+    version: "1.0.0",
+    description:
+      "List the applications installed on this computer, with name, version and publisher, " +
+      "from the Windows uninstall registry and the Microsoft Store package list",
+    aliases: ["application.installed", "applications.list", "software.list"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number" },
+        // A name fragment to look for. Present so "is Docker installed" is one
+        // filtered read rather than pulling several hundred entries into the
+        // prompt and asking the model to scan them.
+        nameContains: { type: "string" }
+      },
+      required: []
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    // Scope deliberately left to default, exactly like `processes.list` and
+    // `system.services.list`, which read the same breadth of machine state.
+    // Declaring ["SYSTEM"] set blastRadius to SYSTEM_WIDE, which alone scored
+    // the whole capability HIGH and sent a read-only inventory to an approval
+    // prompt — for a question ("what's installed?") that changes nothing.
+    // Blast radius describes what an action can affect, and a read affects
+    // nothing.
+    permissionModel: { type: "READ" },
+    // Declared explicitly because the derivation is name-driven: anything under
+    // `application.` is assumed to start an external process, which would mark
+    // this PERSISTENT/SCRIPT_EXECUTION and hand it a POLICY_ENGINE confirmation.
+    // It would then be excluded from the always-offered read baseline, so the
+    // model would never be shown the one capability that answers "what is
+    // installed" — the exact reachability failure this capability exists to end.
+    // Reading an inventory launches nothing.
+    security: {
+      filesystem: "NONE", registry: "READ", network: "NONE", browser: "NONE",
+      clipboard: "NONE", windowAutomation: "NONE", externalProcesses: "NONE"
+    },
+    reversibility: "NOT_REQUIRED",
+    preconditions: () => true,
+    execute: async (args = {}) => {
+      const listed = await adapter.listInstalledApplications({ limit: args.limit ?? 400 });
+      const needle = String(args.nameContains ?? "").trim().toLowerCase();
+      if (!needle) return listed;
+      const applications = listed.applications.filter((app) =>
+        String(app.name ?? "").toLowerCase().includes(needle)
+      );
+      return {
+        applications,
+        count: applications.length,
+        truncated: false,
+        // Reported so a zero count reads as "searched 812 and found none" rather
+        // than an empty result that could equally mean the read failed.
+        searched: listed.count,
+        nameContains: args.nameContains
+      };
+    },
+    observe: async (result) => ({
+      observationId: createId(),
+      source: "application.listInstalled",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      detectedChanges: [],
+      confidence: 1,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const state = observation?.structuredState ?? {};
+      // A filtered read that matches nothing is a correct, verified answer —
+      // "Docker is not installed" is exactly what the user asked for. Only a
+      // read that surfaced no installed software AT ALL is suspect, since no
+      // Windows machine has zero applications.
+      const searchedSomething = Number(state.searched ?? state.count ?? 0) > 0;
+      return {
+        status: searchedSomething ? "VERIFIED" : "UNCERTAIN",
+        message: searchedSomething
+          ? `${state.count} installed application(s) matched`
+          : "Could not read the installed-application list",
+        evidence: state,
+        confidence: searchedSomething ? 1 : 0
+      };
+    },
+    rollback: null,
+    timeout: 65000,
     retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
@@ -1029,6 +1167,75 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
+  // filesystem.list (real, read-only) - what is IN a directory.
+  //
+  // `filesystem.search` answers "where is the file called X". This answers "what
+  // is here", which is a different and far more common question, and nothing
+  // could answer it: "show me the folder structure of this project" and "what's
+  // in my Downloads folder" had no route and were refused.
+  registry.register({
+    name: "filesystem.list",
+    version: "1.0.0",
+    description:
+      "List the contents of a directory, optionally descending several levels to show a folder tree. " +
+      "Use this to see what is in a folder; use filesystem.search to find a file by name.",
+    aliases: ["filesystem.tree", "filesystem.listDirectory", "directory.list"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        directoryPath: { type: "string" },
+        depth: { type: "number", description: "How many levels to descend, 1-6. Default 1." },
+        maxEntries: { type: "number" },
+        includeHidden: { type: "boolean" }
+      },
+      required: ["directoryPath"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["WORKSPACE"], type: "READ" },
+    security: {
+      filesystem: "READ", registry: "NONE", network: "NONE", browser: "NONE",
+      clipboard: "NONE", windowAutomation: "NONE", externalProcesses: "NONE"
+    },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.directoryPath === "string" && args.directoryPath.trim() !== "",
+    execute: async (args) => adapter.listDirectory(args.directoryPath, {
+      depth: args.depth ?? 1,
+      maxEntries: args.maxEntries ?? 500,
+      includeHidden: args.includeHidden === true
+    }),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "filesystem.list",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: [],
+      confidence: 1,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      // An empty directory is a real, correct answer. A directory that does not
+      // exist is not — saying "it's empty" about a path that isn't there is the
+      // kind of confidently wrong answer that is worse than no answer.
+      if (result.exists === false) {
+        return { status: "FAILED", message: `No such directory: ${result.root}`, evidence: result, confidence: 1 };
+      }
+      return {
+        status: "VERIFIED",
+        message: `Listed ${result.count ?? 0} entr${result.count === 1 ? "y" : "ies"} under ${result.root}` +
+          (result.truncated ? " (truncated)" : ""),
+        evidence: { root: result.root, count: result.count, truncated: result.truncated },
+        confidence: 1
+      };
+    },
+    timeout: 30000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
   // filesystem.delete (real, MUTATING) - delete a file. MEDIUM risk so policy
   // routes it through CONFIRM. Rollback restores the captured contents.
   registry.register({
@@ -1185,6 +1392,98 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
+  // system.volume.inspect — what IS the volume right now.
+  //
+  // There was no way to ask. `system.volume.adjust` can nudge up and down and
+  // reports only that it dispatched a keystroke, so "what's the volume of the
+  // system?" had no capability behind it at all.
+  registry.register({
+    name: "system.volume.inspect",
+    version: "1.0.0",
+    description: "Read the current Windows master volume percentage and mute state",
+    aliases: ["system.volume.get", "system.volume.read", "volume.inspect"],
+    inputSchema: { type: "object", properties: {}, required: [] },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["SESSION"], type: "READ" },
+    reversibility: "NOT_REQUIRED",
+    preconditions: () => true,
+    execute: async () => adapter.readSystemVolume(),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "system.volume.inspect", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId, detectedChanges: [],
+      confidence: result?.available ? 1 : 0, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      return {
+        status: result.available ? "VERIFIED" : "FAILED",
+        message: result.available
+          ? `Master volume is ${result.percent}%${result.muted ? " (muted)" : ""}.`
+          : "Could not read the audio endpoint volume.",
+        evidence: result, confidence: result.available ? 1 : 0
+      };
+    },
+    rollback: null,
+    timeout: 25000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // system.volume.set — put the volume AT a level.
+  //
+  // "Reduce it to 26%" names a destination, not a direction. Expressed as
+  // media-key steps it is unrepresentable, which is why the planner produced a
+  // call with no inputs at all and the session failed on a precondition check
+  // rather than doing the obvious thing.
+  registry.register({
+    name: "system.volume.set",
+    version: "1.0.0",
+    description: "Set the Windows master volume to a specific percentage (0-100), and optionally mute or unmute",
+    aliases: ["system.volume.setLevel", "volume.set"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        percent: { type: "number", description: "Target volume, 0 to 100" },
+        mute: { type: "boolean" }
+      },
+      required: ["percent"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["SESSION"], type: "WRITE" },
+    reversibility: "FULLY_REVERSIBLE",
+    preconditions: (args) => Number.isFinite(Number(args?.percent)),
+    execute: async (args) => adapter.setSystemVolume(args.percent, {
+      mute: typeof args.mute === "boolean" ? args.mute : null
+    }),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "system.volume.set", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId, detectedChanges: ["system.volume"],
+      confidence: result?.applied ? 1 : 0, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      // The evidence is the endpoint's own read-back after the write, not the
+      // fact that a command was sent. Asking for 26% and being told "done"
+      // because a keystroke was dispatched is precisely the false success this
+      // whole verification layer exists to prevent.
+      const result = observation?.structuredState ?? {};
+      return {
+        status: result.applied ? "VERIFIED" : "FAILED",
+        message: result.applied
+          ? `Master volume is now ${result.percent}%${result.muted ? " (muted)" : ""}.`
+          : `Asked for ${result.requestedPercent}% but the endpoint reports ${result.percent ?? "an unreadable level"}.`,
+        evidence: result, confidence: result.applied ? 1 : 0
+      };
+    },
+    rollback: null,
+    timeout: 25000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
   // application.close (real, MUTATING) - stop a process by name. MEDIUM risk.
   registry.register({
     name: "application.close",
@@ -1227,6 +1526,36 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
+  // Names a model actually reaches for, mapped to the name the registry uses.
+  //
+  // A capability the model cannot NAME is a capability the agent does not have.
+  // Live, the loop asked for `ui.getValue` to read back what it had just typed,
+  // was told it was an unknown capability, and burned the rest of its budget
+  // retrying — with the text sitting correctly in the window the whole time.
+  // The registry's own resolver already honours aliases; the ui/keyboard/window
+  // family simply never declared any.
+  //
+  // These are exact synonyms only. An alias that resolves ambiguously would be
+  // worse than none, because it would silently run something the model did not
+  // ask for. Alias keys are normalised (case and separators are ignored), so
+  // `ui.typeText` already covers `ui.type_text` — listing both is a duplicate.
+  const M4_ALIASES = {
+    "ui.extract": ["ui.getValue", "ui.readValue", "ui.getText", "ui.readText"],
+    "ui.inspect": ["ui.describe", "ui.tree", "ui.elements"],
+    "ui.find": ["ui.locate", "ui.findElement", "ui.search"],
+    "ui.type": ["ui.typeText", "ui.enterText", "ui.input"],
+    "ui.setValue": ["ui.setText", "ui.fill"],
+    "ui.click": ["ui.tap"],
+    "keyboard.type": ["keyboard.typeText", "keyboard.write", "keyboard.input"],
+    "keyboard.press": ["keyboard.key", "keyboard.hotkey", "keyboard.sendKeys", "keyboard.shortcut"],
+    "window.enumerate": ["window.list", "windows.list"],
+    "window.activate": ["window.focus", "window.bringToFront", "window.raise"],
+    "clipboard.read": ["clipboard.get"],
+    "clipboard.write": ["clipboard.set"],
+    "screen.capture": ["screen.screenshot", "screenshot.take", "screen.grab"],
+    "command.run": ["cli.exec", "cli.execute", "shell.run", "shell.exec", "powershell.run", "terminal.run"]
+  };
+
   const registerM4Primitive = ({
     name, description, inputSchema, execute, modality = ExecutionModality.OS_API, modalities = null,
     risk = RiskLevel.LOW, permissionType = "READ", verify = null,
@@ -1235,6 +1564,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     name,
     version: "1.0.0",
     description,
+    aliases: M4_ALIASES[name] ?? [],
     inputSchema,
     outputSchema: { type: "object" },
     requiredContext: [],
@@ -1279,6 +1609,297 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     recoveryHints: ["REFRESH_STATE", "ABORT_ON_FAILURE"],
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
+
+  // One fused look at a window: pixels (OCR) + accessibility tree (UIA),
+  // normalized through the same VisionProvider shape the perception layer
+  // persists, so what a capability returns and what the world model stores are
+  // the same object.
+  const readScreen = async (args = {}) => {
+    const snapshot = await captureScreenSnapshotViaAdapter(adapter, {
+      windowId: args.windowId,
+      application: args.application,
+      maxElements: args.maxElements ?? 240,
+      includeVision: true,
+      force: true
+    });
+    if (!snapshot) {
+      return { read: false, reason: "The screen could not be captured (no window resolved, or capture unavailable).", elements: [] };
+    }
+    const elements = (snapshot.elements ?? [])
+      .filter((element) => element.bbox ?? element.boundingRect)
+      .slice(0, Math.max(1, Number(args.maxElements ?? 240)))
+      .map((element) => {
+        const bounds = element.bbox ?? element.boundingRect;
+        return {
+          targetId: element.targetId ?? element.id,
+          source: element.source,
+          role: element.role,
+          text: String(element.text ?? element.name ?? "").slice(0, 200),
+          bounds,
+          // The point a click would land on. Stated explicitly so the agent
+          // never has to compute geometry — or invent it.
+          center: { x: Math.round(bounds.x + bounds.width / 2), y: Math.round(bounds.y + bounds.height / 2) },
+          clickable: element.clickable === true,
+          enabled: element.enabled !== false,
+          focused: element.focused === true,
+          value: element.value ?? null,
+          automationId: element.automationId ?? null
+        };
+      });
+    return {
+      read: true,
+      snapshotId: snapshot.snapshotId,
+      windowId: snapshot.windowId,
+      application: snapshot.application,
+      title: snapshot.title,
+      capturedAt: snapshot.capturedAt,
+      capturePath: snapshot.capturePath,
+      visibleText: args.includeText === false ? null : String(snapshot.ocrText ?? "").slice(0, 8000),
+      elements
+    };
+  };
+
+  // Ground a raw coordinate in a window that exists RIGHT NOW. This is what
+  // replaces "the model must quote an observation back to us" as the defence
+  // against invented coordinates: an invented point does not lie inside any live
+  // window, and the call fails before anything is clicked.
+  const resolveWindowContaining = async ({ x, y, windowId = null, application = null }) => {
+    const windows = await adapter.listWindows();
+    const identify = (window) => ({
+      windowId: String(window.WindowHandle ?? window.windowId),
+      processName: window.ProcessName ?? window.processName ?? null,
+      title: window.MainWindowTitle ?? window.title ?? null,
+      bounds: window.Bounds ?? window.bounds ?? null
+    });
+    const contains = (bounds) => bounds
+      && x >= bounds.x && x <= bounds.x + bounds.width
+      && y >= bounds.y && y <= bounds.y + bounds.height;
+
+    if (windowId || application) {
+      const named = windows.map(identify).find((window) =>
+        (windowId && window.windowId === String(windowId)) ||
+        (application && String(window.processName ?? "").toLowerCase() === String(application).toLowerCase()) ||
+        (application && String(window.title ?? "").toLowerCase().includes(String(application).toLowerCase()))
+      );
+      if (!named) throw new Error(`No live window matches ${windowId ?? application}`);
+      if (!contains(named.bounds)) {
+        throw new Error(
+          `(${x}, ${y}) is outside ${named.title ?? named.processName} ` +
+          `(${named.bounds?.x}, ${named.bounds?.y}) ${named.bounds?.width}x${named.bounds?.height}. ` +
+          "Read the screen again and use a coordinate inside the window."
+        );
+      }
+      return named;
+    }
+    // Topmost live window containing the point. listWindows returns z-order.
+    const hit = windows.map(identify).find((window) => contains(window.bounds));
+    if (!hit) throw new Error(`(${x}, ${y}) is not inside any visible window. Read the screen again for current coordinates.`);
+    return hit;
+  };
+
+  // Did the text actually land? Ask UI Automation first (exact, instant, and how
+  // every ordinary edit control exposes its value), then fall back to OCR for
+  // surfaces UIA cannot describe. Returns `readable:false` only when neither
+  // could see anything at all, which is the honest "cannot tell" case.
+  const readBackTypedText = async ({ windowId, application, expected }) => {
+    const needle = normalizeVisualText(expected);
+    const contains = (value) => {
+      const haystack = normalizeVisualText(value);
+      return Boolean(haystack) && haystack.includes(needle);
+    };
+    // When the window is known, name ONLY the window. Passing the application
+    // alongside it re-opens the ambiguity the handle already resolved: three
+    // Notepad windows all match "Notepad", and the read-back landed on a
+    // different one than the keystrokes did, reporting a correct typing action
+    // as failed against another document's contents.
+    const where = windowId ? { windowId } : { application };
+    try {
+      const ui = await adapter.inspectUi({ ...where, maxElements: 200 });
+      const elements = ui?.elements ?? ui?.targets ?? [];
+      const hit = elements.find((element) => contains(element.value) || contains(element.name));
+      if (hit) {
+        return { confirmed: true, readable: true, where: "the accessible control", sample: String(hit.value ?? hit.name ?? "").slice(0, 200) };
+      }
+      // Not found. Report what the TEXT SURFACE holds — the focused editable
+      // control, or failing that the largest body of text in the window. Taking
+      // the first element with any value at all reported a URL or a tab label as
+      // "what the window currently shows", which is a misleading diagnosis of a
+      // real failure.
+      const textSurfaces = elements
+        .filter((element) => typeof element.value === "string" && element.value.trim())
+        .sort((left, right) =>
+          (right.focused === true) - (left.focused === true) ||
+          String(right.value).length - String(left.value).length
+        );
+      if (textSurfaces.length) {
+        return { confirmed: false, readable: true, where: "the accessible control", sample: String(textSurfaces[0].value).slice(0, 200) };
+      }
+    } catch { /* UIA unavailable for this surface; try pixels below */ }
+
+    try {
+      const screen = await readScreen({ ...where, maxElements: 200 });
+      if (screen.read && String(screen.visibleText ?? "").trim()) {
+        return contains(screen.visibleText)
+          ? { confirmed: true, readable: true, where: "the visible screen text", sample: String(screen.visibleText).slice(0, 200) }
+          : { confirmed: false, readable: true, where: "the visible screen text", sample: String(screen.visibleText).slice(0, 200) };
+      }
+    } catch { /* nothing readable by either route */ }
+    return { confirmed: false, readable: false, reason: "neither UI Automation nor OCR could read this control" };
+  };
+
+  const SCROLL_SETTLE_MS = { slow: 220, normal: 90, fast: 25 };
+  const scrollWindow = async (args = {}) => {
+    // A caller may say notches (preferred) or a raw wheel delta (legacy). One
+    // notch is WHEEL_DELTA (120), which is what every Windows app treats as
+    // "one click of the wheel".
+    const requested = Number.isFinite(Number(args.notches))
+      ? Number(args.notches)
+      : Number(args.delta ?? 0) / 120;
+    const notches = Math.max(-120, Math.min(120, Math.trunc(requested) || 0));
+    if (notches === 0) return { performed: false, reason: "Nothing to scroll: notches was zero." };
+
+    const window = args.windowId || args.application
+      ? await (async () => {
+          const windows = await adapter.listWindows();
+          const found = windows.find((candidate) =>
+            (args.windowId && String(candidate.WindowHandle ?? candidate.windowId) === String(args.windowId)) ||
+            (args.application && String(candidate.ProcessName ?? candidate.processName ?? "").toLowerCase() === String(args.application).toLowerCase())
+          );
+          if (!found) throw new Error(`No live window matches ${args.windowId ?? args.application}`);
+          return {
+            windowId: String(found.WindowHandle ?? found.windowId),
+            processName: found.ProcessName ?? found.processName ?? null,
+            title: found.MainWindowTitle ?? found.title ?? null,
+            bounds: found.Bounds ?? found.bounds ?? null
+          };
+        })()
+      : null;
+
+    // Put the pointer over the content before turning the wheel. Windows sends
+    // wheel input to the window under the CURSOR, not to the focused window, so
+    // without this the scroll silently went wherever the mouse was last left.
+    const bounds = window?.bounds ?? null;
+    const at = {
+      x: Math.round(args.x ?? (bounds ? bounds.x + bounds.width / 2 : Number.NaN)),
+      y: Math.round(args.y ?? (bounds ? bounds.y + bounds.height / 2 : Number.NaN))
+    };
+    if (Number.isFinite(at.x) && Number.isFinite(at.y)) {
+      await adapter.pointerAction("move", { x: at.x, y: at.y, windowId: window?.windowId });
+    }
+
+    const settleMs = SCROLL_SETTLE_MS[String(args.speed ?? "normal")] ?? SCROLL_SETTLE_MS.normal;
+    const observe = args.observe === true || Boolean(String(args.untilText ?? "").trim());
+    // Reading the screen after every notch gives the closest useful equivalent
+    // to continuous perception available to an action/observation agent.  For
+    // very long bursts, bound a single result to 30 frames unless the caller
+    // explicitly asks for a larger interval; the agent may immediately carry
+    // on with another burst using the last fresh frame.
+    const observeEvery = Math.max(
+      1,
+      Math.trunc(Number(args.observeEvery)) || Math.ceil(Math.abs(notches) / 30) || 1
+    );
+    const untilText = normalizeVisualText(args.untilText);
+    const frames = [];
+    const observeFrame = async (afterNotch) => {
+      const reading = await readScreen({
+        ...(window?.windowId ? { windowId: window.windowId } : { application: args.application }),
+        maxElements: 120
+      });
+      const frame = {
+        afterNotch,
+        timestamp: reading.timestamp ?? new Date().toISOString(),
+        visibleText: String(reading.visibleText ?? "").slice(0, 4000),
+        elements: (reading.elements ?? []).slice(0, 120),
+        title: reading.title ?? window?.title ?? null
+      };
+      frames.push(frame);
+      return untilText && normalizeVisualText(frame.visibleText).includes(untilText);
+    };
+
+    let matchedUntilText = false;
+    if (observe) matchedUntilText = await observeFrame(0);
+    const direction = Math.sign(notches);
+    let delivered = 0;
+    for (let step = 0; step < Math.abs(notches) && !matchedUntilText; step += 1) {
+      await adapter.pointerAction("wheel", {
+        delta: direction * 120,
+        // Foreground is acquired on the first notch only. Re-acquiring it before
+        // every notch turns a smooth scroll into a slideshow, and the window
+        // cannot lose focus mid-scroll without the wheel events stopping anyway.
+        ...(window && step === 0 ? { windowId: window.windowId } : {})
+      });
+      delivered += 1;
+      if (settleMs > 0 && step < Math.abs(notches) - 1) {
+        await new Promise((resolve) => setTimeout(resolve, settleMs));
+      }
+      if (observe && (delivered % observeEvery === 0 || delivered === Math.abs(notches))) {
+        matchedUntilText = await observeFrame(delivered);
+      }
+    }
+    return {
+      performed: true,
+      notches,
+      delivered,
+      direction: direction > 0 ? "up" : "down",
+      speed: args.speed ?? "normal",
+      observing: observe,
+      observeEvery: observe ? observeEvery : null,
+      frames,
+      stoppedOnText: matchedUntilText,
+      untilText: args.untilText ?? null,
+      at: Number.isFinite(at.x) ? at : null,
+      window
+    };
+  };
+
+  // Matching what a person means by "the Save button" against what OCR actually
+  // produced. The host matched with an escaped whole-word regex, which is exact
+  // string equality wearing a costume: "Sign in" never matched the OCR line
+  // "Sign  in" (double space from letter spacing), "OK" never matched "0K"
+  // (a classic OCR confusion), and asking for "Save" could not find "Save As…".
+  // A visual target the agent can see and cannot name is a target it does not
+  // have, so matching is scored rather than binary.
+  const locateVisualTargetFuzzily = async (args = {}) => {
+    const exact = await adapter.locateVisualTarget(args);
+    if (exact?.found) return exact;
+
+    const query = normalizeVisualText(args.query);
+    if (!query) return exact ?? { found: false, reason: "visual-target-not-found", target: null, matches: [] };
+    const candidates = exact?.matches?.length ? exact.matches : (exact?.targets ?? []);
+    const pool = candidates.length ? candidates : (await readScreen({
+      windowId: args.windowId,
+      application: args.application,
+      maxElements: 300,
+      includeText: false
+    })).elements ?? [];
+
+    const scored = pool
+      .map((candidate) => ({ candidate, score: scoreVisualMatch(query, normalizeVisualText(candidate.name ?? candidate.text)) }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score);
+    if (!scored.length) {
+      return {
+        found: false,
+        reason: exact?.reason ?? "visual-target-not-found",
+        target: null,
+        matches: [],
+        ocrText: exact?.ocrText ?? null,
+        // Say what WAS visible. "Not found" with no alternatives gives the agent
+        // nothing to reconsider; a list of what is actually on screen does.
+        visibleCandidates: pool.slice(0, 40).map((candidate) => String(candidate.name ?? candidate.text ?? "")).filter(Boolean)
+      };
+    }
+    const best = scored[0].candidate;
+    return {
+      found: true,
+      matchQuality: scored[0].score,
+      matchedText: String(best.name ?? best.text ?? ""),
+      target: best,
+      matches: scored.slice(0, 8).map((entry) => entry.candidate),
+      ocrText: exact?.ocrText ?? null,
+      capturePath: exact?.capturePath ?? null
+    };
+  };
 
   const refreshVisualTarget = async (target) => {
     const validation = validateInteractionTarget(target);
@@ -1366,6 +1987,53 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     inputSchema: { type: "object", properties: { windowId: { type: "string" }, application: { type: "string" }, x: { type: "number" }, y: { type: "number" }, width: { type: "number" }, height: { type: "number" } }, required: ["x", "y", "width", "height"] },
     execute: async (args) => adapter.manageWindow("moveResize", args),
     permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["window.bounds"]
+  });
+  // Maximising is not the same as resizing to the screen bounds: it is a
+  // distinct window state that applications lay out for, and it is one of the
+  // ordinary decisions a person makes before working in a window ("this is too
+  // small to see the whole list"). The host has implemented minimize/maximize/
+  // restore all along; without a registered capability the agent could not ask
+  // for it, and would fake it with moveResize or simply fail to see content
+  // that was scrolled out of a small window.
+  // One capability per verb rather than a single window.state({state}) with a
+  // nested enum. Models name these actions directly — asked to maximize a
+  // window, the planner reached for "window.maximize" and was rejected as an
+  // unknown capability, because the only spelling available required knowing to
+  // call a different verb and pass the real one as an argument. Naming the
+  // catalog the way the task is spoken removes a whole class of vocabulary drift,
+  // and three entries cost nothing.
+  for (const [verb, summary] of [
+    ["maximize", "Maximize one identified window to fill the screen"],
+    ["minimize", "Minimize one identified window to the taskbar"],
+    ["restore", "Restore one identified window to its pre-maximized size"]
+  ]) {
+    registerM4Primitive({
+      name: `window.${verb}`,
+      description: summary,
+      inputSchema: {
+        type: "object",
+        properties: { windowId: { type: "string" }, application: { type: "string" } },
+        required: []
+      },
+      execute: async (args) => adapter.manageWindow("state", { ...args, state: verb }),
+      modality: ExecutionModality.UI_AUTOMATION,
+      permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["window.state"]
+    });
+  }
+  // Hovering is how a person opens a submenu, reveals a tooltip, or triggers a
+  // hover state before deciding whether to click. Without it the agent can only
+  // click, which commits to an action where a human would have looked first.
+  registerM4Primitive({
+    name: "pointer.move",
+    description: "Move the pointer onto a fresh runtime-observed target without clicking",
+    inputSchema: {
+      type: "object",
+      properties: { target: { type: "object" }, windowId: { type: "string" }, application: { type: "string" } },
+      required: ["target"]
+    },
+    execute: async (args) => adapter.pointerAction("move", args),
+    modality: ExecutionModality.POINTER,
+    permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["pointer.position"]
   });
   registerM4Primitive({
     name: "ui.inspect",
@@ -1748,6 +2416,26 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     description: "Perform a bounded action against a runtime-observed unified UI target",
     inputSchema: { type: "object", properties: { application: { type: "string" }, windowId: { type: "string" }, target: { type: "object" }, action: { type: "string", enum: ["invoke", "click", "focus", "setValue", "type", "select", "expand", "collapse", "toggle", "scrollIntoView", "nextSection", "selectAccessibleChild"] }, text: { type: "string" }, expectedAfter: { type: "object" } }, required: ["target", "action"] },
     execute: async (args) => {
+      // A UIA target whose accessibility implementation exposes no usable
+      // pattern is still a real control occupying real pixels. Clicking it the
+      // way a person does is the correct fallback, not a failure — without this,
+      // any application with thin UIA support was untouchable even though every
+      // button on screen was perfectly clickable.
+      //
+      // Only for an explicit "click", and only using the rectangle the runtime
+      // actually observed, so this never becomes a guessed coordinate.
+      if (args.target?.source === "UIA" && args.action === "click") {
+        const rect = args.target.boundingRect ?? args.target.bounds;
+        if (rect && Number(rect.width) > 0 && Number(rect.height) > 0) {
+          const click = await adapter.pointerAction("click", {
+            windowId: args.target.windowId ?? args.windowId,
+            x: Math.round(Number(rect.x) + Number(rect.width) / 2),
+            y: Math.round(Number(rect.y) + Number(rect.height) / 2),
+            button: "left"
+          });
+          return { ...click, method: "uia-pointer-fallback", target: args.target };
+        }
+      }
       if (args.target?.source === "UIA") return adapter.performUiAction(args);
       const target = await refreshVisualTarget(args.target);
       if (!["click", "type"].includes(args.action)) throw new Error(`Visual fallback does not support ${args.action}`);
@@ -1781,6 +2469,93 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       return { status: "PARTIALLY_VERIFIED", message: "UI action completed; no explicit postcondition was supplied.", evidence: result, confidence: 0.7 };
     }
   });
+  // The verbs a request is actually phrased in. `ui.action({action})` is the one
+  // general primitive, but models do not reach for it: asked to type into a
+  // field the planner emitted `ui.type`, and before that `ui.type_text`, and was
+  // rejected as an unknown capability every time. That is the single most
+  // frequently observed failure in this system.
+  //
+  // These are not new abilities — each delegates straight to ui.action with the
+  // verb filled in, so the grounding, postcondition and verification rules are
+  // exactly the same. They only remove the requirement that the model guess a
+  // spelling. Naming the catalog the way tasks are spoken is cheaper than
+  // teaching every model the internal spelling.
+  for (const [verb, summary] of [
+    ["click", "Click a runtime-observed UI control"],
+    ["type", "Type text into a runtime-observed UI control"],
+    ["setValue", "Set the exact value of a runtime-observed UI control"],
+    ["select", "Select a runtime-observed UI option or item"],
+    ["toggle", "Toggle a runtime-observed checkbox or switch"]
+  ]) {
+    registerM4Primitive({
+      name: `ui.${verb}`,
+      description: summary,
+      inputSchema: {
+        type: "object",
+        properties: {
+          application: { type: "string" }, windowId: { type: "string" },
+          target: { type: "object" }, text: { type: "string" }, expectedAfter: { type: "object" }
+        },
+        required: ["target"]
+      },
+      execute: async (args) => registry.get("ui.action").execute({ ...args, action: verb }),
+      modality: ExecutionModality.UI_AUTOMATION, permissionType: "WRITE",
+      resources: ["desktop"], detectedChanges: ["application.ui"],
+      verify: async (observation, args) => registry.get("ui.action").verify(observation, { ...args, action: verb })
+    });
+  }
+  // "Run a command" under the name it is reached for. `developer.command.run`
+  // exists and does exactly this, but it reads as developer tooling, so the
+  // planner kept emitting `cli.exec` / `cli.execute` and being rejected. Same
+  // executor, same MEDIUM risk and POLICY_ENGINE confirmation — only the name
+  // is different, and the name is what the model has to guess.
+  registerM4Primitive({
+    name: "command.run",
+    description:
+      "Run a Windows shell command (PowerShell) and return its stdout, stderr and exit code. " +
+      "Put the whole command line in `command`, exactly as you would type it in a terminal " +
+      "(for example \"git --version\" or \"Get-PSDrive C | Select-Object Used,Free\"), and leave " +
+      "`args` empty. This is usually the fastest and most reliable way to read or change system " +
+      "state — prefer it over driving a GUI.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: {
+          type: "string",
+          description: "The full command line to run, e.g. \"Get-Process | Sort-Object WS -Descending\""
+        },
+        // Kept for the typed callers that already separate executable from
+        // arguments. When supplied, `command` must be a bare executable name and
+        // nothing is shell-parsed.
+        args: { type: "array" },
+        workspacePath: { type: "string" }
+      },
+      required: ["command"]
+    },
+    execute: async (args) => adapter.executeCommand(
+      args.workspacePath ?? process.cwd(),
+      args.command,
+      args.args ?? [],
+      { timeoutMs: 90000 }
+    ),
+    permissionType: "WRITE",
+    resources: ["workspace"],
+    detectedChanges: ["workspace"],
+    verify: async (observation) => {
+      const state = observation?.structuredState ?? {};
+      const ok = state.exitCode === 0 && !state.timedOut;
+      return {
+        status: ok ? "VERIFIED" : "FAILED",
+        // A nonzero exit code is the command reporting its own failure. Saying
+        // so plainly stops a failed command reading as a completed step.
+        message: ok
+          ? "Command completed successfully"
+          : `Command exited with code ${state.exitCode ?? "unknown"}${state.timedOut ? " (timed out)" : ""}`,
+        evidence: state,
+        confidence: 1
+      };
+    }
+  });
   registerM4Primitive({
     name: "screen.capture",
     description: "Capture a bounded screen, window, or region to a local PNG",
@@ -1799,8 +2574,58 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     name: "vision.locate",
     description: "Capture a window and locate visible text as a confidence-scored unified target",
     inputSchema: { type: "object", properties: { application: { type: "string" }, windowId: { type: "string" }, query: { type: "string" }, path: { type: "string" } }, required: ["query"] },
-    execute: async (args) => adapter.locateVisualTarget(args),
+    execute: async (args) => locateVisualTargetFuzzily(args),
     modality: ExecutionModality.VISION_GUI, resources: ["desktop"]
+  });
+  // LOOKING AT THE SCREEN.
+  //
+  // screen.capture writes a PNG the agent cannot read, ocr.read needs a path it
+  // has to have captured first, and ui.inspect sees only what UI Automation
+  // chooses to expose. Each is a fragment; none of them is the verb "look".
+  // Nothing in the catalog answered "what is on the screen right now?", so the
+  // loop acted, could not check, and reported delivered keystrokes as success.
+  //
+  // This is that verb. One call captures the window, OCRs it, inspects it, and
+  // returns every visible element with its text and the exact screen
+  // coordinates of its centre — the UIA tree and the OCR transcript fused into
+  // one list, so text that only exists as pixels (custom-drawn canvases, web
+  // views, games, remote desktops, screenshots inside a viewer) is reachable by
+  // the same means as an accessible button.
+  //
+  // It is READ-only and LOW risk: looking changes nothing.
+  registerM4Primitive({
+    name: "screen.read",
+    description:
+      "Look at the screen and read it. Captures a window (or the whole desktop when no window is named), " +
+      "runs OCR, and inspects its accessible controls, returning the visible text plus every element with " +
+      "its role, text, and exact screen coordinates (bounds and clickable centre). Use this to find out what " +
+      "is actually on screen, to locate something to click, and to CHECK WHAT AN ACTION ACTUALLY DID — " +
+      "delivering a keystroke or a click is not evidence that the screen changed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        windowId: { type: "string" },
+        application: { type: "string" },
+        maxElements: { type: "number" },
+        // Full text can be long; the caller may ask for only the elements.
+        includeText: { type: "boolean" }
+      },
+      required: []
+    },
+    execute: async (args = {}) => readScreen(args),
+    modality: ExecutionModality.VISION_GUI,
+    resources: ["desktop"],
+    verify: async (observation) => {
+      const state = observation?.structuredState ?? {};
+      return state.read === true
+        ? {
+            status: "VERIFIED",
+            message: `Read ${state.elements?.length ?? 0} visible elements from ${state.title ?? state.application ?? "the screen"}.`,
+            evidence: { visibleText: String(state.visibleText ?? "").slice(0, 500) },
+            confidence: 0.9
+          }
+        : { status: "FAILED", message: state.reason ?? "The screen could not be read.", confidence: 1 };
+    }
   });
   registerM4Primitive({
     name: "pointer.click",
@@ -1818,11 +2643,94 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     },
     modality: ExecutionModality.VISION_GUI, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"]
   });
+  // CLICKING A PLACE, not only a named control.
+  //
+  // pointer.click requires a target object minted by a prior perception, which
+  // is the right default — it is what stops a model inventing coordinates. But
+  // it made whole surfaces unreachable: a canvas in Paint, a point on a map, a
+  // cell in a remote-desktop session, a spot in a game, anything drawn rather
+  // than declared. A person can click there; the agent could not click there at
+  // all.
+  //
+  // The safety property is preserved without the restriction, by requiring the
+  // coordinate to be justified by a FRESH observation rather than by an
+  // observation-shaped object: the point must fall inside the bounds of a window
+  // that exists right now, and the click is delivered to that window after
+  // bringing it to the foreground. A hallucinated coordinate lands nowhere,
+  // because no current window contains it.
+  registerM4Primitive({
+    name: "pointer.clickAt",
+    description:
+      "Click an exact screen coordinate inside a named window. Use this when the thing to click is not an " +
+      "accessible control — a drawing canvas, a map, a video, a game, a remote session — or when screen.read " +
+      "gave you an element's centre. The coordinate must lie inside the target window's current bounds.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number" }, y: { type: "number" },
+        windowId: { type: "string" }, application: { type: "string" },
+        button: { type: "string", enum: ["left", "right"] },
+        doubleClick: { type: "boolean" }
+      },
+      required: ["x", "y"]
+    },
+    execute: async (args) => {
+      const window = await resolveWindowContaining(args);
+      const result = await adapter.pointerAction("click", {
+        windowId: window.windowId,
+        x: Math.round(args.x),
+        y: Math.round(args.y),
+        button: args.button ?? "left"
+      });
+      if (args.doubleClick === true) {
+        await adapter.pointerAction("click", {
+          windowId: window.windowId, x: Math.round(args.x), y: Math.round(args.y), button: args.button ?? "left"
+        });
+      }
+      return { ...result, window, x: Math.round(args.x), y: Math.round(args.y) };
+    },
+    modality: ExecutionModality.VISION_GUI, permissionType: "WRITE",
+    resources: ["desktop"], detectedChanges: ["application.ui"]
+  });
+  // SCROLLING LIKE A PERSON.
+  //
+  // Three separate things were wrong with one-shot `delta`. The wheel event was
+  // posted at wherever the cursor happened to be resting — often another
+  // monitor, or the window the agent had just moved away from — so the scroll
+  // frequently went somewhere else entirely while reporting performed:true. The
+  // delta was clamped to a single +/-1200 burst, roughly ten notches, which is
+  // not "scroll to the bottom of a long settings page". And there was no way to
+  // scroll gently: a burst jumps, which matters when the agent has to watch
+  // content go past to find something.
+  //
+  // So: park the cursor over the target window first, then deliver `notches` as
+  // a sequence of real wheel steps with a settle delay between them. `speed`
+  // chooses the pause, because reading while scrolling is exactly the case that
+  // needs a slow one.
   registerM4Primitive({
     name: "pointer.wheel",
-    description: "Scroll the wheel in an identified application window",
-    inputSchema: { type: "object", properties: { delta: { type: "number" }, windowId: { type: "string" }, application: { type: "string" } }, required: ["delta"] },
-    execute: async (args) => adapter.pointerAction("wheel", args),
+    description:
+      "Scroll inside a window with the mouse wheel. Give `notches` (positive scrolls up, negative scrolls " +
+      "down) and optionally `speed` (\"slow\" to let content settle so you can read it while it moves, " +
+      "\"fast\" to cover a long page). The cursor is moved over the window first, so the scroll lands there " +
+      "and not wherever the pointer was left. Set `observe:true` to capture fresh screen text and element " +
+      "coordinates throughout the scroll, or give `untilText` to stop as soon as that visible text appears.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        notches: { type: "number" },
+        // Retained so existing typed callers and plans keep working.
+        delta: { type: "number" },
+        speed: { type: "string", enum: ["slow", "normal", "fast"] },
+        observe: { type: "boolean" },
+        observeEvery: { type: "number" },
+        untilText: { type: "string" },
+        windowId: { type: "string" }, application: { type: "string" },
+        x: { type: "number" }, y: { type: "number" }
+      },
+      required: []
+    },
+    execute: async (args = {}) => scrollWindow(args),
     modality: ExecutionModality.VISION_GUI, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.viewport"]
   });
   registerM4Primitive({
@@ -1848,7 +2756,60 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     description: "Type bounded text into the current focused control",
     inputSchema: { type: "object", properties: { text: { type: "string" }, windowId: { type: "string" }, application: { type: "string" } }, required: ["text"] },
     execute: async (args) => adapter.keyboardAction("type", args),
-    modality: ExecutionModality.UI_AUTOMATION, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"]
+    modality: ExecutionModality.UI_AUTOMATION, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"],
+    // DELIVERING A KEYSTROKE IS NOT EVIDENCE THAT TEXT ARRIVED.
+    //
+    // The default verifier returned VERIFIED for performed:true, so every typing
+    // action succeeded by definition. That is not a theoretical gap: SendKeys
+    // silently drops characters on long bursts and mangles punctuation, the
+    // clipboard-paste path fails outright if another process holds the
+    // clipboard, and a mistargeted window swallows the text entirely — all of
+    // them reporting performed:true. The one live check that matters is whether
+    // the text is now visible in the window, and that check was available the
+    // whole time.
+    verify: async (observation, args) => {
+      const state = observation?.structuredState ?? {};
+      if (state.performed === false) {
+        return { status: "FAILED", message: state.reason ?? "keyboard.type did not complete", evidence: state, confidence: 1 };
+      }
+      const expected = String(args?.text ?? "");
+      if (!expected.trim()) {
+        return { status: "VERIFIED", message: "keyboard.type completed", evidence: state, confidence: 0.9 };
+      }
+      const landed = await readBackTypedText({
+        windowId: args?.windowId ?? state.windowId,
+        application: args?.application,
+        expected
+      });
+      if (landed.confirmed) {
+        return {
+          status: "VERIFIED",
+          message: `Typed text is present in ${landed.where}.`,
+          evidence: { method: state.method, matchedIn: landed.where, sample: landed.sample },
+          confidence: 0.95
+        };
+      }
+      if (landed.readable) {
+        return {
+          status: "FAILED",
+          message:
+            `The text was sent but is not in the window. Expected "${expected.slice(0, 60)}"; ` +
+            `the window currently shows "${String(landed.sample ?? "").slice(0, 120)}". ` +
+            "Focus the correct control and type again.",
+          evidence: { method: state.method, sample: landed.sample },
+          confidence: 0.9
+        };
+      }
+      // Password boxes and custom-drawn editors legitimately expose nothing to
+      // read back. Say so, rather than claiming a verification that did not
+      // happen or failing an action that probably worked.
+      return {
+        status: "PARTIALLY_VERIFIED",
+        message: "Keystrokes were delivered, but this control does not expose its contents, so the text could not be read back.",
+        evidence: { method: state.method, reason: landed.reason },
+        confidence: 0.5
+      };
+    }
   });
   registerM4Primitive({
     name: "keyboard.press",
@@ -2206,6 +3167,16 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
           evidence: { title: live.title }, confidence: 0.9
         };
       }
+      // Confirmed playing (live Pause-button evidence) but no reliable track
+      // title was available to check — this is NOT the same as confirming the
+      // wrong track is playing, and must not be reported as such.
+      if (live.playing && !live.nowPlaying) {
+        return {
+          status: "PARTIALLY_VERIFIED",
+          message: `Spotify is playing, but I could not independently confirm the track title; it is likely "${query}".`,
+          evidence: { title: live.title ?? null }, confidence: 0.6
+        };
+      }
       if (live.playing && !matched) {
         return {
           status: "FAILED",
@@ -2254,6 +3225,19 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       const query = String(args?.query ?? result.query ?? "").trim();
       if (result.available === false) {
         return { status: "FAILED", message: "Spotify was not available, so the track could not be queued.", evidence: result, confidence: 1 };
+      }
+      // "Spotify's search returned no such track" and "the track exists but the
+      // queue action didn't take" are different problems with different user
+      // fixes (retype the title vs retry the interaction). The execution result
+      // already distinguishes them, so say which one happened instead of
+      // collapsing both into a vague "couldn't confirm".
+      if (result.queued === false && result.reason === "matching-track-not-found") {
+        return {
+          status: "FAILED",
+          message: `Spotify's search returned no track matching "${query}", so there was nothing to queue. Check the spelling, or try just the song title.`,
+          evidence: result,
+          confidence: 1
+        };
       }
       const live = typeof adapter.readSpotifyQueue === "function"
         ? await adapter.readSpotifyQueue(query)
@@ -2748,7 +3732,11 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
   registry.register({
     name: "git.repository.inspect",
     version: "1.0.0",
-    description: "Inspect git repository state",
+    // Names both claims this capability can prove — installed/available AND
+    // repository state — so goal-contract criterion matching (which reads
+    // this static description, not the runtime verify() message) can anchor
+    // an "is Git installed" goal to it before execution even runs.
+    description: "Check whether Git is installed and available on this system, and inspect the git repository state of the workspace",
     inputSchema: {
       type: "object",
       properties: { workspacePath: { type: "string" } },
@@ -2758,6 +3746,11 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     requiredContext: [],
     riskMetadata: { level: RiskLevel.LOW },
     permissions: ["workspace:read"],
+    // Read-only inspection: no mutation, nothing to roll back. Declaring this
+    // is what lets the runtime's evidence ledger recognize this capability's
+    // verify() as INDEPENDENT evidence (see verificationIsIndependent in
+    // agent-runtime) rather than discarding it as unverified action-trust.
+    permissionModel: { scope: ["SESSION"], type: "READ" },
     reversibility: "NOT_REQUIRED",
     preconditions: (args) => !!args.workspacePath,
     execute: async (args) => {
@@ -2777,10 +3770,16 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       const result = observation.structuredState ?? {};
       const valid = typeof result.isRepository === "boolean"
         && ["REPOSITORY", "NOT_A_REPOSITORY"].includes(result.status);
+      // Installed/available is its own claim, stated explicitly so a goal that
+      // only asks whether Git is installed has literal evidence to anchor to —
+      // "is this workspace a repository" alone does not answer that question.
+      const installedNote = result.gitInstalled
+        ? `Git is installed and available on this system${result.gitVersion ? ` (${result.gitVersion})` : ""}.`
+        : "Git is not installed or not available on this system.";
       return {
         status: valid ? "VERIFIED" : "FAILED",
         message: valid
-          ? (result.isRepository ? "Git repository state inspected." : "Workspace is not a Git repository.")
+          ? `${installedNote} ${result.isRepository ? "Git repository state inspected." : "Workspace is not a Git repository."}`
           : "Git repository probe failed.",
         evidence: result,
         confidence: valid ? 1 : 0

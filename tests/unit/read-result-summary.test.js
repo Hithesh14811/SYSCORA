@@ -49,3 +49,19 @@ test("read-result summaries fail closed for mutating capabilities", () => {
     { capability: "filesystem.write", executionResult: { filePath: "x.txt" } }
   ], registry), null);
 });
+
+test("directory summaries report the exact file count rather than total entries", () => {
+  const summary = summarizeReadOnlyResults([{
+    capability: "filesystem.list",
+    executionResult: {
+      root: "C:\\Users\\Example\\Downloads",
+      exists: true,
+      fileCount: 372,
+      directoryCount: 4,
+      count: 376,
+      entries: []
+    }
+  }], readRegistry);
+  assert.match(summary, /contains 372 files and 4 directories/);
+  assert.doesNotMatch(summary, /376/);
+});

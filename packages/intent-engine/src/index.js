@@ -48,6 +48,10 @@ const USER_INTENT_SCHEMA = {
     normalizedGoal: { type: "string" },
     category: { type: "string" },
     operation: { type: "string" },
+    // Present only for category CONVERSATION — the reply that answers the
+    // request outright. See ReasoningEngine.understandIntent.
+    directAnswer: { type: "string" },
+    answerableWithoutInspecting: { type: "boolean" },
     entities: { type: "object" },
     constraints: { type: "array", items: { type: "string" } },
     preferences: { type: "array", items: { type: "string" } },
@@ -202,27 +206,117 @@ export class IntentEngine {
     // strictly a post-model availability fallback: they must never decide an
     // intent while a model has supplied a usable interpretation.  This matters
     // for arbitrary desktop work where a keyword list can never be complete.
+    // Whether a REAL model supplied an interpretation at all. Note this is not
+    // the same as "the model routed the request": the block below returns early
+    // whenever the model names a usable typed operation, so any code reached
+    // after it is, by definition, the model-did-not-route case — which is
+    // precisely when the deterministic extractors are meant to run.
     const llmFirst = Boolean(modelResult);
     // Outcome classification of the request itself. It is computed for every
     // request — including the LLM-first path — because it is the only signal
     // that can contradict a model routing a web destination into a desktop
     // application launch.
     const webOutcome = this.extractWebOutcome(lower, text);
+
+    // Committing money or a reservation on the user's behalf is a boundary, not
+    // a routing preference, so it is checked regardless of what the model chose.
+    // No registered capability books, buys or pays for anything; without this
+    // guard such a request falls through to generic UI automation, which drives
+    // a real checkout flow it cannot safely finish and then reports a vague
+    // "encountered a problem" — the worst of both outcomes. Say plainly that it
+    // won't be done, and point at the read-only research route that IS
+    // supported. A request that already classified as read-only research
+    // (webOutcome) is not a transaction and is left alone.
+    const unsupportedTransaction = webOutcome ? null : this.detectUnsupportedTransaction(text);
+    if (unsupportedTransaction) {
+      const intent = {
+        intentId, rawText: text,
+        normalizedGoal: unsupportedTransaction.normalizedGoal,
+        category: "BROWSER",
+        entities: { workspacePath: context.workspacePath ?? process.cwd() },
+        constraints: [], preferences: [], assumptions: [], unknowns: [],
+        successCriteria: [unsupportedTransaction.message],
+        requiredContext: [], requiredCapabilities: [],
+        confidence: 1,
+        ambiguity: true,
+        clarificationQuestions: [unsupportedTransaction.message],
+        sensitivityFlags: ["TRANSACTIONAL_ACTION_NOT_SUPPORTED"],
+        unsupportedAction: unsupportedTransaction
+      };
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
     if (modelResult) {
       const chosen = typeof modelResult.operation === "string" ? modelResult.operation.trim() : "";
-      // A website is not an installed application. When the request classifies
-      // as a web outcome and the model chose a local launch, take the web route
-      // and record the override so the correction stays auditable.
-      if (webOutcome && DESKTOP_LAUNCH_OPERATIONS.has(chosen)) {
+      // The model left the operation empty, reached for generic UI automation,
+      // or invented a plausible-sounding operation name (e.g. "play_and_queue")
+      // that isn't actually in the registered set — none of these name a real,
+      // executable typed workflow. Falling through with any of them leaves the
+      // raw taskGraph composer free to decompose a goal a typed capability
+      // already covers exactly into brittle ui.action steps, so all three are
+      // treated the same as no choice at all, and a confident deterministic
+      // match below is preferred over them.
+      const modelOperationIsUntyped = !chosen || chosen === "ui.action" || !KNOWN_OPERATION_SET.has(chosen);
+      // A local inventory question has a typed, read-only route whose scope is
+      // completely determined by the user's words.  Real-model runs showed the
+      // classifier sometimes leaving these untyped, after which the planner
+      // spent its full budget despite processes.list/filesystem.list already
+      // being present.  Prefer the bounded read when the model did not name a
+      // usable operation; this does not grant shell execution or mutation.
+      const typedLocalRead = this.extractLocalInventoryRead(lower, text, context);
+      if (typedLocalRead) {
+        // This also canonicalizes entities when the model chose the right
+        // operation but used plausible schema aliases such as `path` or
+        // `directory`.  OPERATION_PLANS consumes `directoryPath`; accepting the
+        // aliases unchanged silently listed the workspace instead of Downloads
+        // and then failed goal-coverage checks after a long planning fallback.
+        const intent = this._buildOperationIntent(intentId, text, typedLocalRead.operation, {
+          ...modelResult,
+          normalizedGoal: typedLocalRead.normalizedGoal,
+          category: "SYSTEM",
+          entities: typedLocalRead.entities,
+          successCriteria: typedLocalRead.successCriteria
+        }, context);
+        intent.routingOverride = {
+          from: chosen || "(none)",
+          reason: chosen === typedLocalRead.operation
+            ? "CANONICALIZED_TYPED_LOCAL_READ_ENTITIES"
+            : "TYPED_LOCAL_READ_PREFERRED_OVER_UNTYPED_OR_MISMATCHED_CHOICE"
+        };
+        const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+        if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+        return intent;
+      }
+      // webOutcome only fires for a couple of narrow, high-precision patterns
+      // (YouTube playback, flight research) and grounds its entities — the
+      // search URL, the track/topic query, the result selectors — directly in
+      // the raw request text. It therefore wins outright, including when the
+      // model picked the SAME operation: agreement on the operation says
+      // nothing about the entities, and this model routinely returns an empty
+      // entities object, which would leave browser.media.play with no URL and
+      // no query and send the request back into generic UI automation. A
+      // website is also not an installed application, so a local-launch choice
+      // is overridden here too. The correction is recorded for audit.
+      if (webOutcome) {
         const intent = this._buildWebOutcomeIntent(intentId, text, webOutcome, context, {
-          from: chosen,
-          reason: "WEB_DESTINATION_IS_NOT_AN_INSTALLED_APPLICATION"
+          from: chosen || "(none)",
+          reason: DESKTOP_LAUNCH_OPERATIONS.has(chosen)
+            ? "WEB_DESTINATION_IS_NOT_AN_INSTALLED_APPLICATION"
+            : "TYPED_WEB_CAPABILITY_PREFERRED_OVER_LESS_SPECIFIC_OR_UNTYPED_CHOICE"
         });
         const validation = validateSchema(intent, USER_INTENT_SCHEMA);
         if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
         return intent;
       }
-      if (chosen && KNOWN_OPERATION_SET.has(chosen)) {
+      // "ui.action" IS a KNOWN_OPERATION (the planner has a builder for it), but
+      // accepting it here — before the untyped-fallback checks below run — would
+      // let generic UI automation win over a typed extractor purely because the
+      // model named it explicitly instead of leaving the field blank. Treat it
+      // the same as no choice: fall through so a confident deterministic match
+      // (e.g. the compound Spotify play+queue extractor below) gets first say.
+      if (chosen && !modelOperationIsUntyped && KNOWN_OPERATION_SET.has(chosen)) {
         let operationResult = modelResult;
         // A model may correctly choose Spotify playback while omitting the
         // concrete track entities. Recover only those bounded entities from the
@@ -237,13 +331,11 @@ export class IntentEngine {
             const hasTrack = ["query", "trackQuery", "track", "trackTitle", "song", "songTitle", "title"]
               .some((key) => typeof modelEntities[key] === "string" && modelEntities[key].trim());
             operationResult = {
-              ...modelResult,
-              entities: {
-                ...modelEntities,
-                ...(!hasTrack ? { query: extracted.query } : {}),
-                ...(extracted.queueQuery ? { queueQuery: extracted.queueQuery } : {})
-              }
+              ...modelEntities,
+              ...(!hasTrack ? { query: extracted.query } : {}),
+              ...(extracted.queueQuery ? { queueQuery: extracted.queueQuery } : {})
             };
+            operationResult = { ...modelResult, entities: operationResult };
           }
         }
         const intent = this._buildOperationIntent(intentId, text, chosen, operationResult, context);
@@ -251,29 +343,41 @@ export class IntentEngine {
         if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
         return intent;
       }
+      // Same reasoning as the web-outcome override above: a compound Spotify
+      // "play X and queue Y" request has an exact typed-capability chain
+      // (spotify.track.play -> spotify.track.queue). Don't let an untyped model
+      // operation fall through to raw UI automation — which historically hit an
+      // ambiguous-target error clicking Spotify's Play button and burned the
+      // adaptive controller's whole model-call budget — when the deterministic
+      // extractor already confidently recognizes this exact pattern.
+      if (modelOperationIsUntyped) {
+        const extracted = this.extractSpotifyTrackRequest(lower, text);
+        if (extracted) {
+          const intent = this._buildSpotifyIntent(intentId, text, extracted, context);
+          const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+          if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+          return intent;
+        }
+      }
     }
 
-    const spotifyRequest = llmFirst ? null : this.extractSpotifyTrackRequest(lower, text);
+    const spotifyRequest = this.extractSpotifyTrackRequest(lower, text);
     if (spotifyRequest) {
-      const { query, queueQuery, operation } = spotifyRequest;
-      const playing = operation === "spotify.track.play";
-      const queued = playing && Boolean(queueQuery);
-      const intent = {
-        intentId, rawText: text,
-        normalizedGoal: queued
-          ? `Play ${query} in Spotify and queue ${queueQuery}`
-          : (playing ? `Play ${query} in Spotify` : `Open Spotify results for ${query}`),
-        category: "APPLICATION",
-        operation,
-        entities: { workspacePath: context.workspacePath ?? process.cwd(), query, ...(queueQuery ? { queueQuery } : {}) },
-        constraints: [], preferences: [], assumptions: [], unknowns: [],
-        successCriteria: [
-          playing ? `Spotify is playing ${query}` : `Spotify opens results for ${query}`,
-          ...(queueQuery ? [`${queueQuery} is in the Spotify queue`] : [])
-        ],
-        requiredContext: [], requiredCapabilities: [operation, ...(queueQuery ? ["spotify.track.queue"] : [])],
-        confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
-      };
+      const intent = this._buildSpotifyIntent(intentId, text, spotifyRequest, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    const localInventoryRead = this.extractLocalInventoryRead(lower, text, context);
+    if (localInventoryRead) {
+      const intent = this._buildOperationIntent(intentId, text, localInventoryRead.operation, {
+        normalizedGoal: localInventoryRead.normalizedGoal,
+        category: "SYSTEM",
+        entities: localInventoryRead.entities,
+        successCriteria: localInventoryRead.successCriteria,
+        confidence: 1
+      }, context);
       const validation = validateSchema(intent, USER_INTENT_SCHEMA);
       if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
       return intent;
@@ -282,7 +386,7 @@ export class IntentEngine {
     // Direct desktop controls are intentionally recognized before any model
     // call. They are bounded, local operations with no planning benefit: the
     // user expects "open Calculator" or "turn the volume down" to happen now.
-    const directDesktopAction = llmFirst ? null : this.extractDirectDesktopAction(lower, text);
+    const directDesktopAction = this.extractDirectDesktopAction(lower, text);
     if (directDesktopAction) {
       const { operation, entities, normalizedGoal, successCriteria } = directDesktopAction;
       const intent = {
@@ -300,7 +404,7 @@ export class IntentEngine {
     // Package discovery is read-only and must stay distinct from both an
     // installed-state inspection and an install mutation. Hypothetical wording
     // such as "what would be installed" must never become either of those.
-    const packageSearchQuery = llmFirst ? null : this.extractPackageSearchQuery(lower, text);
+    const packageSearchQuery = this.extractPackageSearchQuery(lower, text);
     if (packageSearchQuery) {
       const intent = {
         intentId, rawText: text, normalizedGoal: `Find ${packageSearchQuery} with Windows Package Manager`, category: "SYSTEM",
@@ -316,15 +420,15 @@ export class IntentEngine {
       return intent;
     }
 
-    if (!llmFirst && webOutcome) {
+    if (webOutcome) {
       const intent = this._buildWebOutcomeIntent(intentId, text, webOutcome, context);
       const validation = validateSchema(intent, USER_INTENT_SCHEMA);
       if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
       return intent;
     }
 
-    const knownInstallId = llmFirst ? null : this.extractKnownInstallTarget(lower);
-    if (!llmFirst && /\binstall\b/.test(lower) && knownInstallId && !/\b(dependenc|project)\b/.test(lower)) {
+    const knownInstallId = this.extractKnownInstallTarget(lower);
+    if (/\binstall\b/.test(lower) && knownInstallId && !/\b(dependenc|project)\b/.test(lower)) {
       const intent = {
         intentId, rawText: text, normalizedGoal: `Install ${knownInstallId}`, category: "SYSTEM",
         operation: "package.winget.install",
@@ -339,7 +443,7 @@ export class IntentEngine {
       return intent;
     }
 
-    if (!llmFirst && /\b(system info|computer info|system details|computer details|specs|specifications)\b/.test(lower)) {
+    if (/\b(system info|computer info|system details|computer details|specs|specifications)\b/.test(lower)) {
       const intent = {
         intentId, rawText: text, normalizedGoal: "Show system information", category: "SYSTEM",
         operation: "system.inspect", entities: { workspacePath: context.workspacePath ?? process.cwd() },
@@ -355,7 +459,7 @@ export class IntentEngine {
     // Installed-package status is a read-only, well-scoped question. Handle it
     // deterministically so it cannot degrade into a generic system inspection
     // when a model omits the required capability.
-    const installedPackageId = llmFirst ? null : this.extractInstalledPackageId(lower);
+    const installedPackageId = this.extractInstalledPackageId(lower);
     if (installedPackageId) {
       const intent = {
         intentId,
@@ -397,6 +501,14 @@ export class IntentEngine {
       rawText: text,
       normalizedGoal: modelResult?.normalizedGoal || this.getNormalizedGoal(lower, text),
       category: modelResult?.category || this.getCategory(lower),
+      // Only ever set by the model, and only alongside category CONVERSATION;
+      // the deterministic classifier has no opinion to offer here.
+      ...(typeof modelResult?.directAnswer === "string" && modelResult.directAnswer.trim()
+        ? { directAnswer: modelResult.directAnswer.trim() }
+        : {}),
+      ...(typeof modelResult?.answerableWithoutInspecting === "boolean"
+        ? { answerableWithoutInspecting: modelResult.answerableWithoutInspecting }
+        : {}),
       entities: {
         // Always guarantee a workspacePath so every intent satisfies domain
         // validation; model/deterministic entities override the default.
@@ -470,6 +582,56 @@ export class IntentEngine {
     };
   }
 
+  // High-precision typed reads for machine-local inventories.  These are
+  // semantic families rather than application scripts: one process snapshot
+  // covers ranking/listing questions, and one directory primitive covers any
+  // named standard folder or explicit path.
+  extractLocalInventoryRead(lower, rawText, context = {}) {
+    const processQuestion = /\bprocess(?:es)?\b/i.test(rawText) && (
+      /\b(?:most|highest|top)\b[\s\S]{0,40}\bmemory\b/i.test(rawText) ||
+      /\bmemory\b[\s\S]{0,40}\b(?:most|highest|top)\b/i.test(rawText) ||
+      /\b(?:list|show|which|what)\b[\s\S]{0,35}\brunning\s+process(?:es)?\b/i.test(rawText)
+    );
+    if (processQuestion) {
+      return {
+        operation: "processes.list",
+        entities: {},
+        normalizedGoal: /\bmemory\b/i.test(rawText)
+          ? "Identify the running process using the most memory"
+          : "List the running processes",
+        successCriteria: [/\bmemory\b/i.test(rawText)
+          ? "Report the live highest-memory process and its memory usage"
+          : "Report the live running processes"]
+      };
+    }
+
+    const folderQuestion = /\b(?:folder|directory|downloads|documents|desktop)\b/i.test(rawText) &&
+      /\b(?:how many|count|list|show|what(?:'s| is)|contents?|files?)\b/i.test(rawText);
+    if (!folderQuestion) return null;
+
+    const quoted = rawText.match(/["']([^"']+)["']/)?.[1];
+    const absolute = rawText.match(/\b[A-Za-z]:\\[^\r\n,;]+/)?.[0]?.trim();
+    let directoryPath = quoted || absolute || null;
+    if (!directoryPath) {
+      if (/\bdownloads?\b/i.test(rawText)) directoryPath = "%USERPROFILE%\\Downloads";
+      else if (/\bdocuments?\b/i.test(rawText)) directoryPath = "%USERPROFILE%\\Documents";
+      else if (/\bdesktop\b/i.test(rawText)) directoryPath = "%USERPROFILE%\\Desktop";
+      else if (/\b(?:project|workspace|current)\b/i.test(rawText)) directoryPath = context.workspacePath ?? process.cwd();
+    }
+    if (!directoryPath) return null;
+    const countFiles = /\b(?:how many|count|number of)\b/i.test(rawText);
+    return {
+      operation: "filesystem.list",
+      entities: { directoryPath, depth: 1, maxEntries: 2000, countFiles },
+      normalizedGoal: countFiles
+        ? `Count files in ${directoryPath}`
+        : `List the contents of ${directoryPath}`,
+      successCriteria: [countFiles
+        ? "Report the exact number of files in the requested directory"
+        : "Report the requested directory contents"]
+    };
+  }
+
   // Build a BROWSER intent from a classified web outcome. Shared by the
   // deterministic path and by the LLM-first override so both produce exactly the
   // same typed intent.
@@ -491,6 +653,32 @@ export class IntentEngine {
       preferences: [], assumptions: [], unknowns: [],
       successCriteria: webOutcome.successCriteria,
       requiredContext: [], requiredCapabilities: webOutcome.requiredCapabilities ?? [operation],
+      confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
+    };
+  }
+
+  // Build an APPLICATION intent from a deterministically classified Spotify
+  // track/queue request. Shared by the LLM-first override (model left the
+  // operation untyped) and the offline deterministic path so both produce
+  // exactly the same typed intent.
+  _buildSpotifyIntent(intentId, text, spotifyRequest, context) {
+    const { query, queueQuery, operation } = spotifyRequest;
+    const playing = operation === "spotify.track.play";
+    const queued = playing && Boolean(queueQuery);
+    return {
+      intentId, rawText: text,
+      normalizedGoal: queued
+        ? `Play ${query} in Spotify and queue ${queueQuery}`
+        : (playing ? `Play ${query} in Spotify` : `Open Spotify results for ${query}`),
+      category: "APPLICATION",
+      operation,
+      entities: { workspacePath: context.workspacePath ?? process.cwd(), query, ...(queueQuery ? { queueQuery } : {}) },
+      constraints: [], preferences: [], assumptions: [], unknowns: [],
+      successCriteria: [
+        playing ? `Spotify is playing ${query}` : `Spotify opens results for ${query}`,
+        ...(queueQuery ? [`${queueQuery} is in the Spotify queue`] : [])
+      ],
+      requiredContext: [], requiredCapabilities: [operation, ...(queueQuery ? ["spotify.track.queue"] : [])],
       confidence: 1, ambiguity: false, clarificationQuestions: [], sensitivityFlags: []
     };
   }
@@ -651,10 +839,19 @@ export class IntentEngine {
     const youtube = /\byoutube\b/i.test(text);
     if (youtube) {
       const mediaMatch = text.match(/\b(?:play|watch|put\s+on|turn\s+on|find|search(?:\s+for)?)\s+(.+?)(?:\s+(?:video\s+)?on\s+youtube|\s+youtube\s+video|$)/i);
-      const query = mediaMatch?.[1]?.trim()
+      let query = mediaMatch?.[1]?.trim()
         .replace(/\s+(?:a\s+)?video$/i, "")
         .replace(/^(?:a|an|the|some|any)\b\s*/i, "")
         .trim();
+      // "Play a video on YouTube about X" names the subject AFTER "on YouTube",
+      // not before it, so the match above captured only the generic "a video"
+      // placeholder and stripped it to empty. Recover the trailing topic clause
+      // instead of falling back to "no subject named" for a request that did
+      // name one.
+      if (!query) {
+        const topicMatch = text.match(/\byoutube\b\s*(?:video\s*)?(?:about|on|regarding|for|of)\s+(.+?)[.?!]?$/i);
+        if (topicMatch?.[1]?.trim()) query = topicMatch[1].trim();
+      }
       // "Play a YouTube video" names no subject. Opening the site is the honest
       // reading; searching for the leftover article would not be.
       if (!query && PLAYBACK_VERBS.test(text)) {
@@ -666,6 +863,8 @@ export class IntentEngine {
         };
       }
       if (query && PLAYBACK_VERBS.test(text)) {
+        const openedCriterion = `A YouTube result for ${query} is opened`;
+        const playingCriterion = "Video playback is independently observed as playing";
         return {
           operation: "browser.media.play",
           url: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
@@ -673,15 +872,18 @@ export class IntentEngine {
             query,
             resultSelector: "a#video-title",
             mediaSelector: "video",
-            blockedStateSelector: ".ad-showing"
+            blockedStateSelector: ".ad-showing",
+            // Echoed onto the task so the plan's own evidence covers these in
+            // the request's wording. The percent-encoded search URL alone does
+            // not: "Rick%20Astley" shares no tokens with "Rick Astley", so the
+            // relevance check saw an uncovered goal and diverted a correct
+            // browser.media.play plan into generic UI automation.
+            completionCriteria: [openedCriterion, playingCriterion]
           },
           requiredCapabilities: ["browser.media.play"],
           normalizedGoal: `Play ${query} on YouTube`,
           constraints: negative,
-          successCriteria: [
-            `A YouTube result for ${query} is opened`,
-            "Video playback is independently observed as playing"
-          ]
+          successCriteria: [openedCriterion, playingCriterion]
         };
       }
       if (/^\s*(?:please\s+)?(?:open|go\s+to|visit|launch)\s+(?:the\s+)?youtube(?:\s+website)?\s*[.!?]*$/i.test(text)) {
@@ -697,21 +899,102 @@ export class IntentEngine {
     const flightResearch = /\b(?:find|search|compare|show)\b[\s\S]*\bflights?\b/i.test(text)
       || /\b(?:cheapest|lowest|best)\b[\s\S]*\bflights?\b/i.test(text);
     if (flightResearch) {
+      // Echo the "prices reported with source" success criterion into the
+      // task's own completionCriteria (the planner's browser.research builder
+      // passes entities.completionCriteria straight through). Without this,
+      // the plan's static pre-execution evidence (goal/description) doesn't
+      // share enough wording with that criterion, so the pre-execution
+      // goal-contract coverage check rejects an otherwise-correct single-task
+      // plan and falls back to the adaptive controller's raw UI automation —
+      // exactly the unsupervised-booking-progression risk this typed route
+      // exists to avoid. Phrasing the no-booking constraint as "Do not ..."
+      // (rather than "No ... occurs") is what the goal-contract's prohibition
+      // detector recognizes, so it is verified as a behavioral constraint
+      // against the plan's mutation shape instead of requiring literal text
+      // evidence a read-only research task would never naturally produce.
+      const pricesCriterion = "Prices and relevant itinerary details are reported with their source";
       return {
         operation: "browser.research",
-        url: `https://www.google.com/search?q=${encodeURIComponent(text)}`,
-        entities: { goal: "Compare read-only flight options", limit: 12 },
+        // Google serves its bot-detection interstitial (/sorry/index) to this
+        // controlled browser instead of results, so research against it always
+        // came back empty. Bing returns real result markup to the same browser.
+        url: `https://www.bing.com/search?q=${encodeURIComponent(text)}`,
+        entities: {
+          goal: "Compare read-only flight options",
+          // The generic "any anchor in main" default sweeps up the sponsored
+          // block first, returning ad-redirect URLs with no route or price.
+          // Bing's organic result headings carry the substance ("$254 Flights
+          // from Tokyo (TYOA) to Sydney (SYD)").
+          resultSelector: "#b_results li.b_algo h2 a",
+          limit: 12,
+          completionCriteria: [pricesCriterion]
+        },
         requiredCapabilities: ["browser.research"],
         normalizedGoal: "Research and compare flight options without booking",
         constraints: [...new Set([...negative, "NO_BOOKING"])],
         successCriteria: [
           "Flight options are observed from browser results",
-          "Prices and relevant itinerary details are reported with their source",
-          "No booking, purchase, passenger-data, or payment action occurs"
+          pricesCriterion,
+          "Do not book, purchase, submit passenger data, or make any payment."
         ]
       };
     }
     return null;
+  }
+
+  // Detect a request to commit money or a reservation. Nothing in the registry
+  // books, buys, pays, or checks out, so this is not "a capability we haven't
+  // routed yet" — it is outside what the runtime will do on the user's behalf.
+  // Deliberately narrow: a transactional VERB aimed at a purchasable OBJECT, so
+  // "order the files by name", "reserve memory" or "find me a book" are not
+  // caught. Returns a refusal descriptor, or null.
+  detectUnsupportedTransaction(rawText) {
+    const text = String(rawText ?? "");
+    // Explicitly hypothetical or read-only framings are questions, not requests.
+    if (/\b(?:how (?:do|would|can) i|what would it cost|don't|do not|without)\b/i.test(text)) return null;
+    const purchasable = /\b(flight|flights|ticket|tickets|hotel|hostel|room|rooms|seat|seats|table|cab|taxi|ride|rental|car|appointment|reservation|subscription|delivery|takeaway|meal|food|pizza|groceries|item|items|product|products)\b/i;
+    // Buying is unambiguous on its own — there is no benign reading of "buy X"
+    // or "check out" — so it needs no object to qualify.
+    const purchaseVerb = /\b(buy|purchase|pay\s+for|place\s+an?\s+order|check\s*out|checkout)\b/i;
+    // "order" and "book"/"reserve"/"rent" all have common non-commercial senses
+    // ("order the files by name", "reserve memory", "find me a book"), so they
+    // only count as transactional against a purchasable object.
+    const orderVerb = /\border(?:s|ing|ed)?\b/i;
+    const bookingVerb = /\b(book|reserve|rent)(?:s|ing|ed)?\b/i;
+    const isBooking = bookingVerb.test(text) && purchasable.test(text);
+    const isPurchase = purchaseVerb.test(text) || (orderVerb.test(text) && purchasable.test(text));
+    // A bare payment instruction needs no object to be unmistakably financial.
+    const isPayment = /\b(pay|send money|transfer (?:money|funds)|make a payment|complete (?:the )?(?:purchase|payment|checkout))\b/i.test(text);
+    // Sending a message as the user is the same shape of problem: nothing in
+    // the registry sends mail or posts anywhere, and it reaches other people
+    // irreversibly. Without this the request drifts into UI automation and
+    // stalls on a generic "this action requires approval", which tells the
+    // user nothing about what went wrong or what to do instead.
+    const isCommunication = /\b(?:send|write|reply\s+to|respond\s+to|forward|post|tweet|dm|message)\b/i.test(text)
+      && /\b(?:email|e-mail|mail|message|text|sms|slack|teams|whatsapp|tweet|post|dm)\b/i.test(text);
+    if (!isBooking && !isPurchase && !isPayment && !isCommunication) return null;
+    const kind = isCommunication && !isBooking && !isPurchase && !isPayment
+      ? "COMMUNICATION"
+      : (isBooking && !isPurchase && !isPayment ? "BOOKING" : "PURCHASE");
+    if (kind === "COMMUNICATION") {
+      return {
+        kind,
+        message: "I can't send messages or email on your behalf — anything sent reaches another person and " +
+          "can't be taken back, so it stays yours to send. I can draft the text for you to review and send yourself.",
+        normalizedGoal: "Declined: sending messages on the user's behalf is not a supported action"
+      };
+    }
+    const researchable = /\b(flight|flights|hotel|hostel|room|rooms|car|rental|ticket|tickets)\b/i.test(text);
+    const message = `I can't ${kind === "BOOKING" ? "book or reserve" : "buy, pay for, or check out"} anything for you — ` +
+      "that commits real money or a reservation, and I have no way to undo it, so it stays a decision you make yourself" +
+      (researchable
+        ? ". I can look up and compare the options for you instead, with prices and sources, and you complete the final step."
+        : ". I can research the options and report back instead.");
+    return {
+      kind,
+      message,
+      normalizedGoal: `Declined: ${kind === "BOOKING" ? "booking" : "purchasing"} on the user's behalf is not a supported action`
+    };
   }
 
   // Deterministically detect a direct Spotify track request and classify it as
@@ -732,14 +1015,42 @@ export class IntentEngine {
       /\b(?:play|listen to)\s+["“]?(.+?)["”]?\s+on\s+spotify\s+(?:and\s+then|then|and)\s+(?:put|add)\s+["“]?(.+?)["”]?\s+(?:on|to)\s+(?:the\s+)?queue\s*$/i,
       /\b(?:play|listen to)\s+["“]?(.+?)["”]?\s+on\s+spotify\s+(?:and\s+then|then|and)\s+queue(?:\s+up)?\s+["“]?(.+?)["”]?\s*$/i
     ];
+    const clean = (value) => String(value ?? "")
+      .trim()
+      .replace(/^["“]+|["”]+$/g, "")
+      // A trailing "on Spotify" names the app, never the track.
+      .replace(/\s+on\s+spotify\s*$/i, "")
+      // "...on the queue" / "...to the queue" is queue phrasing, not a title.
+      .replace(/\s+(?:on|to)\s+(?:the\s+)?queue\s*$/i, "")
+      .trim();
     for (const pattern of compoundPatterns) {
       const match = normalizedRaw.match(pattern);
       if (match?.[1] && match?.[2]) {
         return {
-          query: match[1].trim().replace(/^["“]+|["”]+$/g, "").trim(),
-          queueQuery: match[2].trim().replace(/^["“]+|["”]+$/g, "").trim(),
+          query: clean(match[1]),
+          queueQuery: clean(match[2]),
           operation: "spotify.track.play"
         };
+      }
+    }
+    // A second track can be requested with any add/queue wording, not just the
+    // two shapes above ("...and add Jagave Neenu", "...then queue up X"). Split
+    // the request at that connector FIRST so the play clause is bounded: the
+    // single-track patterns below are anchored to end-of-string, so without
+    // this they swallow the entire follow-up clause into the track name and
+    // Spotify gets searched for one long nonsense string.
+    const queueConnector = /\s+(?:and\s+then|,\s*then|then|and|,)\s+(?:also\s+)?(?:put|add|queue)\s+(?:up\s+)?/i;
+    let playClause = normalizedRaw;
+    let queueQuery = "";
+    const connectorMatch = queueConnector.exec(normalizedRaw);
+    if (connectorMatch && connectorMatch.index > 0) {
+      const head = normalizedRaw.slice(0, connectorMatch.index);
+      const tail = normalizedRaw.slice(connectorMatch.index + connectorMatch[0].length);
+      // Only treat it as a queue clause when both halves carry real content;
+      // otherwise fall back to reading the whole request as one track.
+      if (/\b(?:play|listen to|open|search)\b/i.test(head) && clean(tail).length >= 2) {
+        playClause = head;
+        queueQuery = clean(tail);
       }
     }
     // Pull the track name out of the common phrasings, e.g.
@@ -753,13 +1064,16 @@ export class IntentEngine {
     ];
     let query = "";
     for (const re of patterns) {
-      const m = normalizedRaw.match(re);
-      if (m && m[1]) { query = m[1].trim().replace(/^["“]+|["”]+$/g, "").trim(); break; }
+      const m = playClause.match(re);
+      if (m && m[1]) { query = clean(m[1]); break; }
     }
     // Trim a trailing "by <artist>" so the search query is the track name; the
     // artist stays useful context but the desktop search matches on the track.
     query = query.replace(/\s+by\s+.+$/i, "").trim();
     if (query.length < 2 || query.length > 160) return null;
+    if (queueQuery) {
+      return { query, queueQuery, operation: "spotify.track.play" };
+    }
     return { query, operation: wantsPlay ? "spotify.track.play" : "spotify.track.open" };
   }
 
@@ -770,7 +1084,12 @@ export class IntentEngine {
     const volume = lower.match(/\b(increase|raise|turn up|up|lower|decrease|turn down|down)\b.*\bvolume\b|\bvolume\b.*\b(increase|raise|turn up|up|lower|decrease|turn down|down)\b/);
     if (volume) {
       const verb = `${volume[1] ?? ""} ${volume[2] ?? ""}`.trim();
-      const direction = /lower|decrease|turn down/.test(verb) ? "down" : "up";
+      // The match above accepts a bare "down" ("turn the volume down" captures
+      // just "down", since "turn" and "down" sit either side of "volume"), so
+      // the direction test has to recognize it too — checking only for the
+      // "turn down" phrasing silently fell through to the "up" default and
+      // raised the volume when the user asked to lower it.
+      const direction = /\b(?:lower|decrease|reduce|down|quieter|softer)\b/.test(verb) ? "down" : "up";
       const steps = /\b(a lot|much|significantly)\b/.test(lower) ? 5 : /\b(slightly|a little)\b/.test(lower) ? 1 : 2;
       return {
         operation: "system.volume.adjust",

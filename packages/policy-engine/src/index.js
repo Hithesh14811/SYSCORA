@@ -133,6 +133,23 @@ export class PolicyEngine {
       }
     }
 
+    // Rule 6b — a transactional/booking-labeled control clicked through
+    // generic UI automation (ui.action / pointer.click) was discovered live,
+    // mid-session, by the adaptive controller — never shown to the user in a
+    // plan they reviewed before approving, the way a typed browser.click task
+    // would be. A single blanket session-level autoApprove must not be able to
+    // satisfy it: require REAUTHENTICATE, a control this runtime has no wired
+    // mechanism for (see DEFAULT_CONTROL_AVAILABILITY), so it fails closed and
+    // forces its own scoped stop rather than silently progressing a purchase
+    // or booking flow.
+    if (riskAssessment?.contextEvidence?.consequentialUiAutomationAction) {
+      raise(
+        ConfirmationLevel.REAUTHENTICATE,
+        "A UI-automation click targets a transactional/booking control discovered during adaptive execution; " +
+          "it requires its own fresh, scoped approval and cannot proceed on a prior blanket approval."
+      );
+    }
+
     // Rule 7 — high overall risk that has not already triggered a stronger
     // control still requires, at minimum, explicit confirmation. This is the
     // floor that replaces the old blanket "HIGH => DENY": high risk is allowed

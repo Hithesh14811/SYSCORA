@@ -547,6 +547,65 @@ function Invoke-UiAction($params) {
   } catch { return @{ performed=$false; reason=$_.Exception.Message; target=$found.target; foreground=$foreground; reGrounded=$true; geometryChanged=$geometryChanged; groundingAttempts=($groundAttempt+1) } }
 }
 
+# Escape text for SendKeys.
+#
+# SendKeys does not send text — it interprets a small language. `+ ^ % ~` are
+# Shift/Ctrl/Alt/Enter, `( )` group, `{ }` delimit key names and `[ ]` are
+# reserved. Passing raw text straight into SendWait therefore corrupts anything
+# with punctuation, silently and unpredictably: typing "// syscora typing probe"
+# into Notepad produced "typing pre", and asking for a C++ program — which is
+# almost entirely braces, parentheses and angle brackets — produced garbage or
+# nothing at all, while the capability cheerfully reported performed=$true.
+#
+# Every special character is sent as its literal form `{c}`, and real newlines
+# and tabs become the key names SendKeys understands. Text typed through here
+# arrives as written.
+# Returns one SendKeys-safe string. Built with a StringBuilder and returned as a
+# plain string on purpose: returning a collection from a PowerShell function
+# invites the pipeline to unroll or re-wrap it, which produced the literal text
+# "System.Object[]" being typed into Notepad.
+function ConvertTo-SendKeysLiteral([string]$text) {
+  if ([string]::IsNullOrEmpty($text)) { return "" }
+  $builder = New-Object System.Text.StringBuilder
+  foreach ($ch in $text.ToCharArray()) {
+    switch ($ch) {
+      "`r" { }                                   # CRLF arrives as CR+LF; the LF emits the ENTER
+      "`n" { [void]$builder.Append("{ENTER}") }
+      "`t" { [void]$builder.Append("{TAB}") }
+      "+"  { [void]$builder.Append("{+}") }
+      "^"  { [void]$builder.Append("{^}") }
+      "%"  { [void]$builder.Append("{%}") }
+      "~"  { [void]$builder.Append("{~}") }
+      "("  { [void]$builder.Append("{(}") }
+      ")"  { [void]$builder.Append("{)}") }
+      "{"  { [void]$builder.Append("{{}") }
+      "}"  { [void]$builder.Append("{}}") }
+      "["  { [void]$builder.Append("{[}") }
+      "]"  { [void]$builder.Append("{]}") }
+      default { [void]$builder.Append($ch) }
+    }
+  }
+  return $builder.ToString()
+}
+
+# Split an escaped string into chunks WITHOUT ever cutting inside a `{...}`
+# escape — half of "{ENTER}" is the literal text "{ENT". SendKeys drops
+# characters on very long bursts, so chunking with a short pause is what makes a
+# full source file arrive intact.
+function Split-SendKeysChunks([string]$literal, [int]$size) {
+  $matches = [regex]::Matches($literal, '\{[^}]*\}|.', 'Singleline')
+  $chunks = New-Object System.Collections.ArrayList
+  $current = New-Object System.Text.StringBuilder
+  $count = 0
+  foreach ($m in $matches) {
+    [void]$current.Append($m.Value)
+    $count++
+    if ($count -ge $size) { [void]$chunks.Add($current.ToString()); $current = New-Object System.Text.StringBuilder; $count = 0 }
+  }
+  if ($current.Length -gt 0) { [void]$chunks.Add($current.ToString()) }
+  return ,$chunks.ToArray()
+}
+
 function Invoke-Operation($operation, $params) {
   switch ($operation) {
     "host.health" { return @{ ok=$true; pid=$PID; protocol="m4-windows-host/1"; sta=([Threading.Thread]::CurrentThread.ApartmentState.ToString()) } }
@@ -569,7 +628,19 @@ function Invoke-Operation($operation, $params) {
     "pointer.wheel" {
       if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}
       $delta=[Math]::Max(-1200,[Math]::Min(1200,[int]$params.delta))
-      [M4Native]::mouse_event(0x0800,0,0,[uint32]$delta,[UIntPtr]::Zero)
+      # SCROLLING DOWN.
+      #
+      # mouse_event's dwData is declared uint, and WHEEL_DELTA is signed: a
+      # scroll down is a NEGATIVE delta. `[uint32]$delta` is a checked cast in
+      # PowerShell, so every downward scroll ever attempted threw
+      # "Cannot convert value -120 to type System.UInt32" before a single wheel
+      # event was sent. Scrolling up worked, scrolling down could not — which is
+      # the direction almost every real task needs.
+      #
+      # Reinterpret the bits instead of converting the value, which is what the
+      # Win32 API expects: -120 must arrive as 0xFFFFFF88, not be rejected.
+      $wheelData=[BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$delta),0)
+      [M4Native]::mouse_event(0x0800,0,0,$wheelData,[UIntPtr]::Zero)
       return @{performed=$true;delta=$delta;windowId=if($w){$w.windowId}else{$null}}
     }
     "pointer.drag" {
@@ -587,7 +658,48 @@ function Invoke-Operation($operation, $params) {
     }
     "keyboard.type" {
       if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}
-      [System.Windows.Forms.SendKeys]::SendWait([string]$params.text);$inputWindowId=if($w){$w.windowId}else{$null};return @{performed=$true;length=([string]$params.text).Length;windowId=$inputWindowId;foreground=$focus}
+      # Typed in bounded chunks. SendKeys drops characters on long bursts, which
+      # is the other half of why typed text arrived incomplete; a short pause
+      # between chunks lets the target window's message queue keep up.
+      # Type via the clipboard, not via SendKeys.
+      #
+      # SendKeys does not transmit text, it interprets a keystroke language, and
+      # no amount of escaping makes it faithful: driven with a short C++ program
+      # it dropped every newline, turned `<iostream>` into `,iostream>` and one
+      # `}` into `]`. Text arriving subtly wrong is worse than text not arriving,
+      # because the action still reports success.
+      #
+      # Setting the clipboard and pasting is exact for any content — newlines,
+      # tabs, quotes, braces, unicode — in one operation rather than hundreds of
+      # simulated keystrokes. The previous clipboard is captured and restored, so
+      # borrowing it is not something the user is left to discover.
+      $text=[string]$params.text
+      $pasted=$false
+      $previousClipboard=$null
+      try{ $previousClipboard=[System.Windows.Forms.Clipboard]::GetText() }catch{ $previousClipboard=$null }
+      if($text.Length -gt 0){
+        try{
+          [System.Windows.Forms.Clipboard]::SetText($text)
+          Start-Sleep -Milliseconds 60
+          [System.Windows.Forms.SendKeys]::SendWait("^v")
+          Start-Sleep -Milliseconds 120
+          $pasted=$true
+        }catch{ $pasted=$false }
+      }
+      if(-not $pasted){
+        # Clipboard unavailable (locked by another process, or a session with no
+        # clipboard). Fall back to escaped, chunked SendKeys — imperfect, but
+        # better than typing nothing.
+        $literal=ConvertTo-SendKeysLiteral $text
+        foreach($chunk in @(Split-SendKeysChunks $literal 60)){
+          [System.Windows.Forms.SendKeys]::SendWait([string]$chunk)
+          Start-Sleep -Milliseconds 40
+        }
+      }
+      if($null -ne $previousClipboard){
+        try{ if($previousClipboard -eq ""){[System.Windows.Forms.Clipboard]::Clear()}else{[System.Windows.Forms.Clipboard]::SetText($previousClipboard)} }catch{}
+      }
+      $inputWindowId=if($w){$w.windowId}else{$null};return @{performed=$true;method=if($pasted){"clipboard-paste"}else{"sendkeys"};length=$text.Length;windowId=$inputWindowId;foreground=$focus}
     }
     "keyboard.press" {
       if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}

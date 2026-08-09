@@ -7,9 +7,13 @@
 import { readIntentSession } from "./intent-client.js";
 
 const TOKEN_STORAGE_KEY = "syscora_token";
+// Matches .claude/launch.json's SYSCORA_API_TOKEN, so a plain browser launch
+// doesn't need a manual paste for local dev. The Connect panel below only
+// appears if this gets rejected (e.g. the daemon used a different token).
+const DEV_FALLBACK_TOKEN = "syscora-dev-local-token-do-not-use-in-prod";
 let apiToken = (window.syscora && window.syscora.apiToken)
   || sessionStorage.getItem(TOKEN_STORAGE_KEY)
-  || null;
+  || DEV_FALLBACK_TOKEN;
 
 const connectPanel = document.getElementById("connectPanel");
 const connectForm = document.getElementById("connectForm");
@@ -44,7 +48,6 @@ connectForm.addEventListener("submit", (e) => {
   connectToken.value = "";
   hideConnect();
 });
-if (!apiToken) showConnect();
 
 const nativeFetch = window.fetch.bind(window);
 window.fetch = async (input, init = {}) => {
@@ -63,11 +66,25 @@ debugToggle.addEventListener("change", () => { debug = debugToggle.checked; docu
 
 // Map a raw event to a human line. Unknown/internal events return null (hidden
 // unless debug mode). This is presentation only — the runtime is authoritative.
+// A capability identifier is an internal name ("processes.list", "ui.action").
+// Falling back to it produced progress lines like "Working: processes.list" and
+// "Ran: step" — which tell a normal user nothing and read like debug output.
+// Prefer whatever describes the step in words; when nothing does, say something
+// plainly true rather than exposing the identifier.
+function stepWords(details, fallback) {
+  const described = details?.goal || details?.description || details?.subgoal;
+  return typeof described === "string" && described.trim() ? described.trim() : fallback;
+}
+
 function humanizeEvent(ev) {
   const t = ev.eventType;
   const d = ev.details ?? {};
   switch (t) {
-    case "VERIFICATION_UNCERTAIN": return { icon: "!", text: `Not verified: ${d.message || d.capability || "step"}` };
+    case "VERIFICATION_UNCERTAIN": return { icon: "!", text: `Could not confirm: ${d.message || stepWords(d, "that step")}` };
+    // The step ran; nothing independent proved what it changed. Distinct from a
+    // failure, and shown as such — the runtime no longer aborts on these, so
+    // rendering one as "Did not work" would contradict the run that continues.
+    case "VERIFICATION_UNCONFIRMED": return { icon: "!", text: `Done, but unconfirmed: ${d.message || stepWords(d, "that step")}` };
     case "INTENT_RECEIVED": return { icon: "•", text: "Understanding your request…" };
     case "INTENT_CLASSIFIED": return { icon: "•", text: `Understood: ${d.normalizedGoal ?? "request"}` };
     case "CONTEXT_COLLECTED": return { icon: "•", text: "Inspecting relevant system state…" };
@@ -76,10 +93,10 @@ function humanizeEvent(ev) {
       return { icon: "•", text: "Creating a plan…", plan: tasks.map((x) => x.goal || x.capability) };
     }
     case "RISK_ASSESSED": return { icon: "•", text: `Assessed risk: ${d.overallRisk ?? "?"}` };
-    case "TASK_STARTING": return { icon: "▶", text: `Working: ${d.goal || d.capability || "step"}` };
-    case "TASK_EXECUTED": return { icon: "✓", text: `Ran: ${d.capability || "step"}` };
-    case "VERIFICATION_COMPLETED": return { icon: "✓", text: `Verified: ${d.message || d.capability || "step"}` };
-    case "VERIFICATION_FAILED": return { icon: "✗", text: `Verification failed: ${d.message || "step"}` };
+    case "TASK_STARTING": return { icon: "▶", text: stepWords(d, "Working on it…") };
+    case "TASK_EXECUTED": return { icon: "✓", text: `Done: ${stepWords(d, "that step")}` };
+    case "VERIFICATION_COMPLETED": return { icon: "✓", text: `Checked: ${d.message || stepWords(d, "the result")}` };
+    case "VERIFICATION_FAILED": return { icon: "✗", text: `Did not work: ${d.message || stepWords(d, "that step")}` };
     case "FAILURE_DIAGNOSED": return { icon: "⚠", text: `Diagnosed problem: ${d.rootCause || d.category || "issue"}` };
     case "RECOVERY_DECIDED": return { icon: "↻", text: `Recovery: ${d.action}` };
     case "STARTING_REPLANNING": return { icon: "↻", text: `Re-planning (attempt ${d.attempt})…` };
@@ -241,9 +258,30 @@ function acknowledgement() {
   return "…";
 }
 
+// The conversation so far, oldest first. SYSCORA used to treat every message as
+// a first message: "open Notepad" then "now maximize it" classified the second
+// one with no idea what "it" was, so the most ordinary thing anyone does in a
+// chat did not work. The client owns this transcript and sends it with each
+// request; the daemon bounds and forwards it.
+//
+// Only what was actually SAID goes in here — the user's words and the reply they
+// saw. Internal events, plans and evidence stay out: they are large, they are
+// already in the session, and they are not what a follow-up refers to.
+const conversation = [];
+function remember(role, text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return;
+  conversation.push({ role, text: trimmed });
+  if (conversation.length > 24) conversation.splice(0, conversation.length - 24);
+}
+
 let reqId = 0;
 async function submit(text) {
   addBubble("user", textNode(text));
+  // Captured BEFORE this turn is appended: history means the turns before this
+  // one, and including the current message would duplicate it in the prompt.
+  const history = conversation.slice();
+  remember("user", text);
   const thinking = addBubble("assistant", textNode(acknowledgement(text)));
   // The acknowledgement is an independent LLM request. Do not await it before
   // submitting the work: both requests start together, so model latency never
@@ -263,8 +301,14 @@ async function submit(text) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        envelope: { protocolVersion: "1.0.0", type: "intent_request", requestId: `demo-${reqId++}`, payload: { text, autoApprove: Boolean(autoApprove?.checked) } },
+        envelope: {
+          protocolVersion: "1.0.0",
+          type: "intent_request",
+          requestId: `demo-${reqId++}`,
+          payload: { text, history, autoApprove: Boolean(autoApprove?.checked) }
+        },
         text,
+        history,
         autoApprove: Boolean(autoApprove?.checked)
       })
     });
@@ -277,10 +321,19 @@ async function submit(text) {
     });
     thinking.remove();
     renderSession(session);
+    remember("assistant", replyTextOf(session));
   } catch (err) {
     thinking.remove();
     addBubble("assistant", textNode(`SYSCORA encountered a problem while performing this step. ${debug ? err.message : ""}`));
   }
+}
+
+// What the user was actually told, which is the only part of a turn a follow-up
+// can refer to. A failure is recorded too — "why did that not work?" is a
+// perfectly ordinary next message.
+function replyTextOf(session) {
+  const fr = session?.finalResponse ?? {};
+  return fr.summary?.summary || fr.summary?.text || fr.message || fr.status || "";
 }
 
 async function resume(sessionId, approve) {

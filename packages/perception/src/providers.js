@@ -23,6 +23,7 @@ import {
   entityId,
   normalizePath
 } from "./entities.js";
+import { VisionProvider } from "./vision-provider.js";
 
 class PerceptionProvider {
   constructor(name, adapter, { cost = 1, confidence = 1.0 } = {}) {
@@ -275,13 +276,27 @@ export class DeveloperProvider extends PerceptionProvider {
   }
 }
 
-export function createDefaultProviders(adapter, developerIntelligence = null) {
+// The default provider set. VisionProvider is part of it: a perception layer
+// that can enumerate processes and services but cannot look at the screen is not
+// perceiving the machine a person actually uses. It was written, tested and
+// never once constructed outside a test file, which meant
+// PerceptionEngine.captureVisionSnapshot returned
+// "vision-provider-not-registered" in every real session — the eyes existed and
+// were never opened.
+//
+// It stays inert unless asked: VisionProvider.collect() returns
+// "vision-not-requested" for an ordinary perceive() sweep, so adding it here
+// costs a routine perception pass nothing. It only captures when a caller
+// explicitly requests vision, and only if screen.capture / ocr.read / ui.inspect
+// are all available in the registry.
+export function createDefaultProviders(adapter, developerIntelligence = null, { capabilityRegistry = null } = {}) {
   return [
     new SystemProvider(adapter),
     new ProcessProvider(adapter),
     new ServiceProvider(adapter),
     new EnvironmentProvider(adapter),
     new FilesystemProvider(adapter),
-    new DeveloperProvider(adapter, developerIntelligence)
+    new DeveloperProvider(adapter, developerIntelligence),
+    new VisionProvider(adapter, { capabilityRegistry })
   ];
 }

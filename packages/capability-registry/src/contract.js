@@ -239,7 +239,15 @@ export function deriveRiskProfile(name, capability, security, permissionModel) {
   let blastRadius = "SINGLE_RESOURCE";
   if (scopes.has("PROJECT") || scopes.has("WORKSPACE")) blastRadius = "PROJECT";
   if (scopes.has("USER")) blastRadius = "USER_ACCOUNT";
-  if (scopes.has("SYSTEM") || elevated || isService) blastRadius = "SYSTEM_WIDE";
+  // Blast radius is how much an action can AFFECT. A capability that mutates
+  // nothing affects nothing, so a system-wide READ scope must not by itself
+  // produce a system-wide blast — that single dimension is enough to score a
+  // capability HIGH and route it to an approval prompt, which is how "list the
+  // applications installed on this computer" ended up asking the user to
+  // authorise a question. The breadth of what it can SEE is carried by
+  // dataSensitivity; elevation and services still escalate, because those are
+  // real authority rather than a declared reading scope.
+  if ((scopes.has("SYSTEM") && mutates) || elevated || isService) blastRadius = "SYSTEM_WIDE";
   if (network !== "NONE" || browser !== "NONE" || scopes.has("NETWORK")) blastRadius = maxRiskValue(RiskDimension.BLAST_RADIUS, blastRadius, "EXTERNAL_SYSTEM");
 
   // --- data sensitivity --- (name-driven; refined further by RiskEngine at runtime)

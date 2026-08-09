@@ -1,0 +1,11 @@
+import { createRuntime } from "../../apps/daemon/src/runtime-factory.js";
+import path from "node:path";
+const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\//, "")), "..", "..");
+const rt = createRuntime(repo);
+const session = await rt.submitIntent(process.argv.slice(2).join(" "), { autoApprove: true, workspacePath: repo, interactiveBudgets: { maxSteps: 4, maxModelCalls: 2 } });
+console.log("STATUS:", session.finalResponse?.status);
+const seen = [];
+for (const ev of session.events ?? []) seen.push(ev.eventType);
+console.log(seen.join(" -> ").slice(0, 1200));
+console.log("\nMESSAGE:", (session.finalResponse?.message ?? "").slice(0,300));
+process.exit(0);

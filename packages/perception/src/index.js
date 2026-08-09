@@ -63,10 +63,14 @@ export class PerceptionEngine {
       : undefined;
   }
 
-  static withDefaultProviders({ semanticState, adapter, developerIntelligence = null, onEvent = null }) {
+  // capabilityRegistry is what lets the VisionProvider check that screen.capture,
+  // ocr.read and ui.inspect are actually available before it looks at anything.
+  // Without it the provider is registered but permanently reports the visual
+  // surface unavailable, which is the same blindness by a different route.
+  static withDefaultProviders({ semanticState, adapter, developerIntelligence = null, onEvent = null, capabilityRegistry = null }) {
     return new PerceptionEngine({
       semanticState,
-      providers: createDefaultProviders(adapter, developerIntelligence),
+      providers: createDefaultProviders(adapter, developerIntelligence, { capabilityRegistry }),
       onEvent
     });
   }

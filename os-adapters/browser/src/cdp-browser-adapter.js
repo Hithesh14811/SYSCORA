@@ -236,6 +236,41 @@ export class CdpBrowserAdapter {
       this.target = { targetId: target.targetId, url: target.url };
       this._transition(BrowserLifecycleState.READY, { targetId: target.targetId });
       throwIfAborted(signal);
+      // The requested URL was passed to Chrome on the command line, but the
+      // target picked above is simply the first page target reported — which,
+      // on a cold start, is usually Chrome's initial blank tab rather than the
+      // one loading that URL. Attaching there leaves every later read looking
+      // at about:blank (browser.research then reports "results not found" for
+      // a page it never opened). Navigate the attached session explicitly, the
+      // same way the reuse branch above already does, so the target this
+      // adapter controls is always the requested page.
+      // Trust the live page, not the target's reported URL: Target.getTargets
+      // reports the URL Chrome was asked to open, while the attached session
+      // can still be sitting on the initial blank document.
+      //
+      // Chrome is already loading the command-line URL at this point, so give
+      // that a moment to land before intervening — issuing Page.navigate into
+      // an in-flight navigation is what made it hang. Only drive the navigation
+      // ourselves if the page is still blank after that grace period, and treat
+      // a failure there as non-fatal: the caller's own wait/read steps report
+      // the real state, and killing a usable session over a corrective step
+      // would be worse than the blank page it was meant to fix.
+      if (url && url !== "about:blank") {
+        const settleDeadline = Date.now() + 3000;
+        let live = null;
+        do {
+          live = await this.currentState().catch(() => null);
+          if (live?.url && live.url !== "about:blank") break;
+          await delay(150);
+        } while (Date.now() < settleDeadline);
+        if (!live?.url || live.url === "about:blank") {
+          try {
+            await this.navigate({ url, signal });
+          } catch (navigationError) {
+            if (navigationError?.name === "AbortError") throw navigationError;
+          }
+        }
+      }
       return { launched: true, executable, target: this.target, lifecycle: structuredClone(this.lifecycle) };
     } catch (error) {
       if (this.connection !== browserConnection) browserConnection.close();

@@ -138,9 +138,24 @@ class TaskGraphScheduler {
       const currentState = this.taskStates.get(task.taskId)
       if (currentState !== TaskState.PENDING && currentState !== TaskState.READY) continue
 
-      const allDependenciesVerified = task.dependencies.every(depId => 
-        this.taskStates.get(depId) === TaskState.VERIFIED
-      )
+      // A dependency that RAN but could not be independently confirmed must not
+      // block the rest of the plan forever.
+      //
+      // This required VERIFIED exactly, so a step left UNCERTAIN — a GUI click
+      // with no declared postcondition, the ordinary case — left every dependent
+      // task PENDING for good: never ready, never skipped, and never complete.
+      // The runtime used to abort on any non-VERIFIED step, so the state was
+      // unreachable; once unconfirmed steps were allowed to continue, the
+      // scheduling loop spun on a graph that could never finish.
+      //
+      // Proceeding is what a person does after an action they could not confirm:
+      // carry on, and judge by the outcome. Nothing is claimed by this — the
+      // task keeps its UNCERTAIN state, getFinalStatus still reports it, and the
+      // goal contract remains the gate on whether the goal was actually met.
+      const allDependenciesVerified = task.dependencies.every(depId => {
+        const state = this.taskStates.get(depId)
+        return state === TaskState.VERIFIED || state === TaskState.UNCERTAIN
+      })
 
       const anyDependencyFailed = task.dependencies.some(depId => 
         this.taskStates.get(depId) === TaskState.FAILED

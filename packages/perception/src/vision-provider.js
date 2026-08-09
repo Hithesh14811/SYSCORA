@@ -202,17 +202,35 @@ export class VisionProvider {
       };
     }
     const windows = await this.adapter?.listWindows?.();
-    const foreground = Array.isArray(windows)
-      ? windows.find((window) => value(window, "foreground", "Foreground") === true)
-      : null;
-    if (!foreground) return null;
-    return {
-      windowId: String(value(foreground, "windowId", "WindowHandle")),
-      processName: value(foreground, "processName", "ProcessName"),
-      title: value(foreground, "title", "MainWindowTitle"),
-      bounds: normalizeBbox(value(foreground, "bounds", "Bounds")),
-      foreground: true
-    };
+    if (!Array.isArray(windows) || windows.length === 0) return null;
+    const describe = (window) => ({
+      windowId: String(value(window, "windowId", "WindowHandle")),
+      processName: value(window, "processName", "ProcessName"),
+      title: value(window, "title", "MainWindowTitle"),
+      bounds: normalizeBbox(value(window, "bounds", "Bounds")),
+      foreground: value(window, "foreground", "Foreground") === true
+    });
+
+    // An application NAME is a window identifier, and ignoring it was silently
+    // wrong rather than merely incomplete: asked to look at Notepad, this
+    // resolved the foreground window instead and returned a confident, fully
+    // grounded reading — of the wrong application. Every consumer then compared
+    // Notepad's expected text against another program's screen. A capture of the
+    // wrong window is worse than no capture, because it looks like evidence.
+    if (application) {
+      const needle = String(application).toLowerCase().replace(/\.exe$/, "");
+      const named = windows.map(describe).filter((window) =>
+        String(window.processName ?? "").toLowerCase().replace(/\.exe$/, "") === needle ||
+        String(window.processName ?? "").toLowerCase().includes(needle) ||
+        String(window.title ?? "").toLowerCase().includes(needle)
+      );
+      // Prefer the one the user is actually looking at when several match.
+      if (named.length) return named.find((window) => window.foreground) ?? named[0];
+      return null;
+    }
+
+    const foreground = windows.map(describe).find((window) => window.foreground);
+    return foreground ?? null;
   }
 
   async collect(request = {}) {
@@ -350,6 +368,29 @@ export class VisionProvider {
     const raw = await this.collect(request);
     return this.normalize(raw, { now, request });
   }
+}
+
+/**
+ * Capture one fused screen snapshot straight from an adapter, without a
+ * PerceptionEngine or a world model behind it.
+ *
+ * The capability-availability check a VisionProvider normally performs exists so
+ * that PERCEPTION never implicitly uses a visual surface the installation has
+ * disabled. This path is for a caller that has already decided to look — the
+ * runtime taking before/after evidence around its own action — and that must not
+ * be blinded because SemanticState is unavailable. It shares VisionProvider's
+ * collect/normalize so the snapshot is byte-identical in shape to the persisted
+ * one, and therefore directly comparable with diffScreenSnapshots.
+ */
+export async function captureScreenSnapshotViaAdapter(adapter, request = {}, { now = new Date().toISOString() } = {}) {
+  if (!adapter) return null;
+  const provider = new VisionProvider(adapter, {
+    capabilityRegistry: { isAvailable: () => true },
+    ttlMs: DEFAULT_TTL_MS
+  });
+  const raw = await provider.collect({ ...request, includeVision: true, forceVision: request.force === true });
+  const { snapshot } = provider.normalize(raw, { now });
+  return snapshot ?? null;
 }
 
 export { DEFAULT_TTL_MS as VISION_SNAPSHOT_TTL_MS };

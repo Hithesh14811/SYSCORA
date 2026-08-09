@@ -144,6 +144,7 @@ export function correlateLaunchWindow({
     const processId = Number(window.Id ?? window.processId);
     const processName = String(window.ProcessName ?? window.processName ?? "");
     const title = String(window.MainWindowTitle ?? window.title ?? "");
+    const className = String(window.ClassName ?? window.className ?? "");
     const foreground = Boolean(window.Foreground ?? window.foreground);
     const signals = [];
     let score = 0;
@@ -158,6 +159,24 @@ export function correlateLaunchWindow({
     if (titleSimilarity >= 0.5) { score += 30; signals.push("title-similarity"); }
     if (foreground && String(beforeForeground?.WindowHandle ?? beforeForeground?.windowId) !== windowId) {
       score += 15; signals.push("foreground-transition");
+    }
+    // Packaged Windows applications commonly publish two top-level windows:
+    // the app-owned Windows.UI.Core.CoreWindow and an ApplicationFrameWindow
+    // owned by ApplicationFrameHost.  The former often wins PID correlation,
+    // but exposes only a handful of chrome nodes; the latter is the surface a
+    // person can actually see and the one UI Automation can operate.  Prefer
+    // the frame when both appear as candidates for the same launch.  This is a
+    // class-semantic signal, not a hard-coded application name, so it applies
+    // to Calculator, Settings and other packaged apps alike.
+    if (/applicationframewindow/i.test(className)) {
+      // Only make this decisive when the frame title identifies the requested
+      // app.  An unrelated ApplicationFrameHost window must not beat a real
+      // process match merely because it happens to be new.
+      score += titleSimilarity >= 0.5 ? 90 : 10;
+      signals.push("interactive-application-frame");
+    }
+    if (/windows\.ui\.core\.corewindow/i.test(className)) {
+      score -= 20; signals.push("packaged-core-window");
     }
     return { window, score, signals, titleSimilarity };
   }).sort((left, right) => right.score - left.score);
@@ -194,9 +213,38 @@ export class WindowsAdapter {
     return this.automationHost.request(operation, params, options);
   }
 
+  // Run a command and capture its output.
+  //
+  // Two shapes are supported, and the distinction matters:
+  //
+  //   executeCommand(cwd, "git", ["--version"])   -> spawned directly, no shell
+  //   executeCommand(cwd, "git --version")        -> run as a command LINE
+  //
+  // The first is the typed form every internal caller uses (winget, git, docker),
+  // where the executable and its arguments are already separated and must never
+  // be re-parsed by a shell. That path is unchanged.
+  //
+  // The second is how a language model writes a command, every time — one string,
+  // the way a person types it into a terminal. It used to be passed straight to
+  // `spawn(..., { shell: false })`, which looks for an executable literally named
+  // `git --version` and fails with ENOENT and exit code -1. So `command.run`, the
+  // single most general capability in the system and the fastest correct route
+  // for a large share of real tasks, failed on essentially every model-authored
+  // call — and failed QUIETLY, as a nonzero exit rather than an error, which is
+  // how "check whether Git is installed" reported Done with exitCode -1.
+  //
+  // A bare line with no arguments goes through PowerShell rather than cmd.exe: it
+  // runs cmd-style lines (`dir`, `git --version`, `echo hi`) as well as real
+  // PowerShell (`Get-Process | Sort-Object WS`), so one route covers both instead
+  // of asking the model to declare which dialect it wrote.
   async executeCommand(workingDirectory, command, args = [], options = {}) {
+    const commandLine = String(command ?? "");
+    const usesShell = args.length === 0 && /[\s|&<>^"']/.test(commandLine.trim());
+    const [spawnCommand, spawnArgs] = usesShell
+      ? ["powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", commandLine]]
+      : [command, args];
     return new Promise((resolve) => {
-      const child = spawn(command, args, {
+      const child = spawn(spawnCommand, spawnArgs, {
         cwd: workingDirectory,
         stdio: ["ignore", "pipe", "pipe"],
         shell: false
@@ -284,7 +332,16 @@ export class WindowsAdapter {
       "$os = Get-CimInstance Win32_OperatingSystem; " +
       "$cs = Get-CimInstance Win32_ComputerSystem; " +
       "$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1 Name,NumberOfCores,NumberOfLogicalProcessors; " +
-      "[pscustomobject]@{caption=$os.Caption;version=$os.Version;build=$os.BuildNumber;hostname=$env:COMPUTERNAME;username=$env:USERNAME;architecture=$env:PROCESSOR_ARCHITECTURE;totalMemory=$cs.TotalPhysicalMemory;cpuName=$cpu.Name;cpuCores=$cpu.NumberOfCores;cpuLogical=$cpu.NumberOfLogicalProcessors} | ConvertTo-Json -Compress"
+      // Disk volumes. "How much free disk space do I have" is one of the most
+      // ordinary questions anyone asks their computer, and it was unanswerable:
+      // this call reported OS, CPU and RAM and no storage at all, so the runtime
+      // dutifully ran system.inspect and then had to answer a disk question from
+      // data containing no disks. The result read as a canned spec sheet that
+      // never mentioned the thing that was asked about.
+      "$disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | " +
+      "ForEach-Object { [pscustomobject]@{drive=$_.DeviceID;label=$_.VolumeName;" +
+      "totalBytes=$_.Size;freeBytes=$_.FreeSpace;fileSystem=$_.FileSystem} }); " +
+      "[pscustomobject]@{caption=$os.Caption;version=$os.Version;build=$os.BuildNumber;hostname=$env:COMPUTERNAME;username=$env:USERNAME;architecture=$env:PROCESSOR_ARCHITECTURE;totalMemory=$cs.TotalPhysicalMemory;freePhysicalMemoryKb=$os.FreePhysicalMemory;cpuName=$cpu.Name;cpuCores=$cpu.NumberOfCores;cpuLogical=$cpu.NumberOfLogicalProcessors;disks=$disks} | ConvertTo-Json -Compress -Depth 4"
     );
     let parsed = null;
     try {
@@ -292,6 +349,28 @@ export class WindowsAdapter {
     } catch {
       parsed = null;
     }
+    // Promoted to a top-level field, in readable units, rather than left nested
+    // inside windowsDetails. Whatever answers the user's question has to be easy
+    // to find in this object — both for the summariser and for the model.
+    const disks = (Array.isArray(parsed?.disks) ? parsed.disks : [])
+      .filter((disk) => Number(disk?.totalBytes) > 0)
+      .map((disk) => {
+        const totalBytes = Number(disk.totalBytes);
+        const freeBytes = Number(disk.freeBytes);
+        const gib = (bytes) => Math.round((bytes / 1024 ** 3) * 10) / 10;
+        return {
+          drive: disk.drive,
+          label: disk.label || null,
+          fileSystem: disk.fileSystem || null,
+          totalBytes,
+          freeBytes,
+          usedBytes: totalBytes - freeBytes,
+          totalGb: gib(totalBytes),
+          freeGb: gib(freeBytes),
+          usedGb: gib(totalBytes - freeBytes),
+          percentFree: Math.round((freeBytes / totalBytes) * 1000) / 10
+        };
+      });
     return {
       platform: process.platform,
       release: os.release(),
@@ -301,9 +380,46 @@ export class WindowsAdapter {
       totalMemory: os.totalmem(),
       freeMemory: os.freemem(),
       cpus: os.cpus().length,
+      disks,
       windowsDetails: parsed,
       rawCommand: ps
     };
+  }
+
+  // Applications installed on THIS machine, from both registry uninstall hives
+  // (per-machine and per-user, 32- and 64-bit) plus Store packages.
+  //
+  // Recorded as missing in the architecture notes and it stayed missing:
+  // `package.winget.search` queries the winget REPOSITORY, which answers "does
+  // this software exist" and not "do I have it", so "what's installed on this
+  // computer" had no honest route and was served by whatever deterministic plan
+  // happened to be nearest.
+  async listInstalledApplications({ limit = 400 } = {}) {
+    const script =
+      "$paths = @(" +
+      "'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'," +
+      "'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'," +
+      "'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); " +
+      "$apps = foreach ($p in $paths) { " +
+      "Get-ItemProperty $p -ErrorAction SilentlyContinue | " +
+      "Where-Object { $_.DisplayName -and -not $_.SystemComponent } | " +
+      "ForEach-Object { [pscustomobject]@{name=$_.DisplayName;version=$_.DisplayVersion;" +
+      "publisher=$_.Publisher;source='registry'} } }; " +
+      "$store = Get-AppxPackage -ErrorAction SilentlyContinue | " +
+      "ForEach-Object { [pscustomobject]@{name=$_.Name;version=$_.Version;" +
+      "publisher=$_.Publisher;source='store'} }; " +
+      "@($apps) + @($store) | Sort-Object name -Unique | ConvertTo-Json -Compress -Depth 3";
+    const ps = await this.runPowerShell(script, { timeoutMs: 60000 });
+    let parsed = [];
+    try {
+      parsed = JSON.parse(ps.stdout || "[]");
+    } catch {
+      parsed = [];
+    }
+    const applications = (Array.isArray(parsed) ? parsed : [parsed])
+      .filter((app) => app?.name)
+      .slice(0, limit);
+    return { applications, count: applications.length, truncated: applications.length >= limit };
   }
 
   async listProcesses() {
@@ -389,9 +505,25 @@ export class WindowsAdapter {
     const previous = await this.getUserPath();
     const escapedValue = escapePowerShellSingleQuoted(nextPathValue);
     const ps = await this.runPowerShell(
+      `$ErrorActionPreference='Stop'; ` +
       `[Environment]::SetEnvironmentVariable('Path','${escapedValue}','User'); ` +
       `[Environment]::GetEnvironmentVariable('Path','User') | ConvertTo-Json -Compress`
     );
+    // PowerShell method-invocation failures can be non-terminating and still
+    // leave the host process at exit code 0. Never report a durable OS mutation
+    // as successful when the registry write was denied (or any diagnostic was
+    // emitted). This is especially important for rollback: a false success here
+    // means the session claims it restored PATH while the machine stayed changed.
+    if (ps.exitCode !== 0 || String(ps.stderr ?? "").trim()) {
+      const error = new Error(
+        `Unable to update the Windows user PATH: ${String(ps.stderr || `PowerShell exited with code ${ps.exitCode}`).trim()}`
+      );
+      error.code = /registry access is not allowed|access.*denied|securityexception/i.test(String(ps.stderr ?? ""))
+        ? "USER_PATH_PERMISSION_DENIED"
+        : "USER_PATH_UPDATE_FAILED";
+      error.commandResult = ps;
+      throw error;
+    }
     let parsed = null;
     try {
       parsed = JSON.parse(ps.stdout || "null");
@@ -711,14 +843,23 @@ export class WindowsAdapter {
   }
 
   async inspectGitRepository(workspacePath) {
+    // Installation is a distinct question from "is this workspace a repo" —
+    // a workspace with no .git folder never even runs `git`, so isRepository
+    // alone cannot answer "is Git installed". Probe it explicitly so a request
+    // that only asks about installation has real evidence to anchor to.
+    const versionProbe = await this.executeCommand(workspacePath, "git", ["--version"], { timeoutMs: 6000 });
+    const gitInstalled = versionProbe.exitCode === 0;
+    const gitVersion = gitInstalled ? versionProbe.stdout.trim() : null;
     try {
       await fs.access(path.join(workspacePath, ".git"));
     } catch {
-      return { workspacePath, isRepository: false, status: "NOT_A_REPOSITORY", probeMethod: "filesystem" };
+      return { workspacePath, gitInstalled, gitVersion, isRepository: false, status: "NOT_A_REPOSITORY", probeMethod: "filesystem" };
     }
     const probeResult = await this.executeCommand(workspacePath, "git", ["status", "--short", "--branch"], { timeoutMs: 6000 });
     return {
       workspacePath,
+      gitInstalled,
+      gitVersion,
       isRepository: probeResult.exitCode === 0,
       status: probeResult.exitCode === 0 ? "REPOSITORY" : "PROBE_FAILED",
       branchStatus: probeResult.stdout,
@@ -784,6 +925,74 @@ export class WindowsAdapter {
       parsed = [];
     }
     return { root, pattern, files: Array.isArray(parsed) ? parsed : [parsed].filter(Boolean), commandResult: ps };
+  }
+
+  // List what is in a directory, optionally descending a bounded number of
+  // levels. This is the most basic filesystem question there is — "what's in my
+  // Downloads folder", "show me the structure of this project" — and there was
+  // no primitive for it: `filesystem.search` requires a name pattern, which
+  // answers "where is X", not "what is here". So directory questions had no
+  // route at all and were refused after ~50s of trying.
+  //
+  // Done in Node rather than PowerShell: no shell start-up, no quoting surface,
+  // and the traversal bound is enforced in code instead of trusted to a script.
+  async listDirectory(directoryPath, { depth = 1, maxEntries = 500, includeHidden = false } = {}) {
+    const root = path.resolve(expandWindowsEnvironmentPath(directoryPath ?? process.cwd()));
+    const maxDepth = Math.min(6, Math.max(1, Math.trunc(Number(depth)) || 1));
+    const limit = Math.min(2000, Math.max(1, Math.trunc(Number(maxEntries)) || 500));
+    // Walking into these answers no question anyone asked and can be enormous.
+    const skip = new Set(["node_modules", ".git", "$RECYCLE.BIN", "System Volume Information"]);
+    const entries = [];
+    let truncated = false;
+
+    const walk = async (directory, level, relative) => {
+      if (truncated || level > maxDepth) return;
+      let dirents;
+      try {
+        dirents = await fs.readdir(directory, { withFileTypes: true });
+      } catch (error) {
+        // An unreadable subdirectory is a fact about that subdirectory, not a
+        // failure of the listing. Record it and carry on.
+        entries.push({ path: relative || ".", type: "unreadable", reason: error.code ?? "EACCES" });
+        return;
+      }
+      for (const dirent of dirents.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (entries.length >= limit) { truncated = true; return; }
+        if (!includeHidden && dirent.name.startsWith(".")) continue;
+        const childRelative = relative ? `${relative}/${dirent.name}` : dirent.name;
+        const childAbsolute = path.join(directory, dirent.name);
+        if (dirent.isDirectory()) {
+          entries.push({ path: childRelative, name: dirent.name, type: "directory", depth: level });
+          if (!skip.has(dirent.name)) await walk(childAbsolute, level + 1, childRelative);
+        } else {
+          let size = null;
+          try { size = (await fs.stat(childAbsolute)).size; } catch { /* size is a nicety */ }
+          entries.push({ path: childRelative, name: dirent.name, type: "file", depth: level, sizeBytes: size });
+        }
+      }
+    };
+
+    let rootExists = true;
+    try {
+      const stat = await fs.stat(root);
+      if (!stat.isDirectory()) {
+        return { root, exists: true, isDirectory: false, entries: [], count: 0, truncated: false, depth: maxDepth };
+      }
+    } catch {
+      rootExists = false;
+    }
+    if (rootExists) await walk(root, 1, "");
+    return {
+      root,
+      exists: rootExists,
+      isDirectory: rootExists,
+      depth: maxDepth,
+      entries,
+      count: entries.length,
+      directoryCount: entries.filter((entry) => entry.type === "directory").length,
+      fileCount: entries.filter((entry) => entry.type === "file").length,
+      truncated
+    };
   }
 
   async createDirectory(directoryPath) {
@@ -859,7 +1068,40 @@ export class WindowsAdapter {
   // starting anything. Read-only by construction, so an unknown name is a
   // truthful "not installed" answer rather than a failed launch — which is what
   // the prerequisite/install-and-resume workflow needs to distinguish.
+  // People name applications the way they speak, not the way Windows registers
+  // them: "the calculator app", "the notepad app", "the Chrome browser". None of
+  // those resolve, so a perfectly present application is reported as not
+  // installed — which then reads to the user as "SYSCORA can't open Calculator".
+  // Produce the spoken form first, then progressively plainer ones, so the exact
+  // name a caller supplied always wins and the fallbacks only ever ADD reach.
+  static applicationNameVariants(application) {
+    const original = String(application ?? "").trim();
+    const variants = [original];
+    const stripArticle = original.replace(/^(?:the|a|an)\s+/i, "").trim();
+    variants.push(stripArticle);
+    // Trailing generic nouns describe the KIND of thing, never its identity.
+    const stripNoun = stripArticle.replace(/\s+(?:app|application|program|software|browser|editor|window)$/i, "").trim();
+    variants.push(stripNoun);
+    return [...new Set(variants.filter(Boolean))];
+  }
+
   async resolveApplicationTarget(application, executable = application) {
+    const variants = WindowsAdapter.applicationNameVariants(application);
+    if (variants.length > 1) {
+      for (const variant of variants) {
+        const attempt = await this._resolveApplicationTargetExact(
+          variant,
+          variant === application ? executable : variant
+        );
+        // Report the resolution under the name the caller asked for, so audit
+        // and error messages still say what the user actually said.
+        if (attempt.resolved) return { ...attempt, application, requestedApplication: application, resolvedVia: variant };
+      }
+    }
+    return this._resolveApplicationTargetExact(application, executable);
+  }
+
+  async _resolveApplicationTargetExact(application, executable = application) {
     const escapedApplication = escapePowerShellSingleQuoted(application);
     const escapedExe = escapePowerShellSingleQuoted(executable);
     // App Paths and Get-Command register browsers and many desktop programs
@@ -1098,6 +1340,107 @@ export class WindowsAdapter {
   // Dispatch bounded Windows media-key events. Windows has no simple
   // permissionless master-volume read API, so callers are told that the command
   // was sent rather than being given an invented final percentage.
+  // The Windows Core Audio endpoint, as an inline C# shim.
+  //
+  // Volume used to be media-key simulation only: it could nudge up or down and
+  // could not read anything. So "what's the volume?" had no capability at all,
+  // and "set it to 26%" had no way to express an absolute level — the planner
+  // emitted an empty-input call and the session died on a precondition check.
+  // Nudging is not the same skill as knowing and setting a value, and a person
+  // asking for 26% means 26%.
+  //
+  // IAudioEndpointVolume is declared by vtable order, so every method above the
+  // one being called must be present and correctly shaped even though it is
+  // unused — a missing slot silently calls the wrong function. (Getting this
+  // wrong is what made an earlier attempt return "value does not fall within
+  // the expected range".)
+  static AUDIO_ENDPOINT_SHIM = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume {
+  int RegisterControlChangeNotify(IntPtr n);
+  int UnregisterControlChangeNotify(IntPtr n);
+  int GetChannelCount(out uint c);
+  int SetMasterVolumeLevel(float l, ref Guid ctx);
+  int SetMasterVolumeLevelScalar(float l, ref Guid ctx);
+  int GetMasterVolumeLevel(out float l);
+  int GetMasterVolumeLevelScalar(out float l);
+  int SetChannelVolumeLevel(uint ch, float l, ref Guid ctx);
+  int SetChannelVolumeLevelScalar(uint ch, float l, ref Guid ctx);
+  int GetChannelVolumeLevel(uint ch, out float l);
+  int GetChannelVolumeLevelScalar(uint ch, out float l);
+  int SetMute(bool mute, ref Guid ctx);
+  int GetMute(out bool mute);
+}
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice { int Activate(ref Guid id, int ctx, IntPtr p, out IAudioEndpointVolume ep); }
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator { int EnumAudioEndpoints(int f, int m, IntPtr c); int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice dev); }
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject { }
+public static class SyscoraAudio {
+  static IAudioEndpointVolume Endpoint() {
+    IMMDeviceEnumerator e = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+    IMMDevice dev; e.GetDefaultAudioEndpoint(0, 1, out dev);
+    Guid id = typeof(IAudioEndpointVolume).GUID; IAudioEndpointVolume ep;
+    dev.Activate(ref id, 23, IntPtr.Zero, out ep); return ep;
+  }
+  public static float Get() { float v; Endpoint().GetMasterVolumeLevelScalar(out v); return v; }
+  public static bool GetMute() { bool m; Endpoint().GetMute(out m); return m; }
+  public static void Set(float v) { Guid g = Guid.Empty; Endpoint().SetMasterVolumeLevelScalar(v, ref g); }
+  public static void Mute(bool m) { Guid g = Guid.Empty; Endpoint().SetMute(m, ref g); }
+}
+'@
+`;
+
+  async readSystemVolume() {
+    const ps = await this.runPowerShell(
+      `${WindowsAdapter.AUDIO_ENDPOINT_SHIM}
+[pscustomobject]@{ percent = [math]::Round([SyscoraAudio]::Get()*100,1); muted = [SyscoraAudio]::GetMute() } | ConvertTo-Json -Compress`,
+      { timeoutMs: 20000 }
+    );
+    let parsed = null;
+    try { parsed = JSON.parse(ps.stdout || "null"); } catch { parsed = null; }
+    if (parsed == null || !Number.isFinite(Number(parsed.percent))) {
+      return { available: false, percent: null, muted: null, commandResult: ps };
+    }
+    return {
+      available: true,
+      percent: Number(parsed.percent),
+      muted: parsed.muted === true,
+      commandResult: ps
+    };
+  }
+
+  // Set the master volume to an absolute percentage, then read it back. The
+  // read-back is the evidence: the capability's verify() compares what was asked
+  // for against what the endpoint actually reports, so "set to 26%" can only be
+  // reported as done when the device really is at 26%.
+  async setSystemVolume(percent, { mute = null } = {}) {
+    const target = Math.min(100, Math.max(0, Number(percent)));
+    if (!Number.isFinite(target)) throw new Error("A volume percentage between 0 and 100 is required");
+    const muteClause = mute === null ? "" : `[SyscoraAudio]::Mute($${mute === true ? "true" : "false"});`;
+    const ps = await this.runPowerShell(
+      `${WindowsAdapter.AUDIO_ENDPOINT_SHIM}
+[SyscoraAudio]::Set(${(target / 100).toFixed(4)}); ${muteClause}
+[pscustomobject]@{ percent = [math]::Round([SyscoraAudio]::Get()*100,1); muted = [SyscoraAudio]::GetMute() } | ConvertTo-Json -Compress`,
+      { timeoutMs: 20000 }
+    );
+    let parsed = null;
+    try { parsed = JSON.parse(ps.stdout || "null"); } catch { parsed = null; }
+    const observed = Number(parsed?.percent);
+    return {
+      requestedPercent: target,
+      percent: Number.isFinite(observed) ? observed : null,
+      muted: parsed?.muted === true,
+      // Endpoints quantise, so an exact match is not always achievable. One
+      // percentage point is close enough to call the request honoured.
+      applied: Number.isFinite(observed) && Math.abs(observed - target) <= 1,
+      commandResult: ps
+    };
+  }
+
   async adjustSystemVolume(direction, steps = 2) {
     const down = String(direction).toLowerCase() === "down";
     const count = clampInt(steps, 1, 10, 2);
@@ -1152,21 +1495,46 @@ export class WindowsAdapter {
     // authoritative signal that audio is playing; a stale now-playing label on
     // its own only means a track is loaded/paused.
     const handle = Number(window.WindowHandle);
-    const ui = await this.runPowerShell([
+    const script = [
       "Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes;",
       `$root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]${handle});`,
       "$all=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);",
       "$playing=$false;$nowPlaying=$null;",
       "foreach($el in $all){try{$name=$el.Current.Name;$type=$el.Current.ControlType.ProgrammaticName;if(-not $nowPlaying -and -not $el.Current.IsOffscreen -and $name -like 'Now playing:*'){$nowPlaying=$name};if($type -eq 'ControlType.Group' -and $name -eq 'Player controls'){$buttons=$el.FindAll([System.Windows.Automation.TreeScope]::Descendants,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button)));foreach($button in $buttons){if($button.Current.Name -eq 'Pause'){$playing=$true;break}}}}catch{}};",
       "[pscustomobject]@{playing=$playing;nowPlaying=$nowPlaying}|ConvertTo-Json -Compress"
-    ].join(" "), { timeoutMs: 5000 });
+    ].join(" ");
+    let ui = await this.runPowerShell(script, { timeoutMs: 5000 });
     let state = null;
     try { state = JSON.parse(ui.stdout || "null"); } catch { state = null; }
-    const accessibleLabel = String(state?.nowPlaying ?? "").replace(/^Now playing:\s*/i, "").trim();
+    let accessibleLabel = String(state?.nowPlaying ?? "").replace(/^Now playing:\s*/i, "").trim();
+    // Playing but the accessible label wasn't on screen at read time — it can
+    // appear a beat later as the UI settles. Retry once before falling back to
+    // the window title, which is a known-unreliable signal (Spotify shows the
+    // idle "Spotify Free" title even during genuine playback).
+    if (state?.playing === true && !accessibleLabel) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const retry = await this.runPowerShell(script, { timeoutMs: 5000 });
+      let retryState = null;
+      try { retryState = JSON.parse(retry.stdout || "null"); } catch { retryState = null; }
+      const retryLabel = String(retryState?.nowPlaying ?? "").replace(/^Now playing:\s*/i, "").trim();
+      if (retryLabel) {
+        ui = retry;
+        state = retryState;
+        accessibleLabel = retryLabel;
+      }
+    }
     const fallback = this.interpretSpotifyPlayback(window.MainWindowTitle);
     const playing = state?.playing === true || (state == null && fallback.playing);
-    const title = playing && accessibleLabel ? accessibleLabel : fallback.title;
-    return { running: true, window, playing, title, nowPlaying: playing ? title : null, accessibilityLabel: accessibleLabel || null, commandResult: ui };
+    // A fallback title that is itself one of Spotify's known-idle strings
+    // ("Spotify" / "Spotify Free" / "Spotify Premium") is not evidence of what
+    // is playing, even while playback is confirmed live — it commonly shows
+    // during genuine playback too. Report unknown rather than asserting it.
+    const IDLE_TITLES = new Set(["spotify", "spotify free", "spotify premium"]);
+    const fallbackIsIdle = IDLE_TITLES.has(fallback.title.trim().toLowerCase());
+    const title = playing && accessibleLabel
+      ? accessibleLabel
+      : (playing && !fallbackIsIdle ? fallback.title : null);
+    return { running: true, window, playing, title, nowPlaying: title, accessibilityLabel: accessibleLabel || null, commandResult: ui };
   }
 
   // Bounded wait for an application's main window to appear. NEVER waits

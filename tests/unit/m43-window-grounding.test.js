@@ -2,13 +2,29 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { correlateLaunchWindow, WindowsAdapter } from "../../os-adapters/windows/src/windows-adapter.js";
 
-const window = (windowId, processId, processName, title, foreground = false) => ({
+const window = (windowId, processId, processName, title, foreground = false, className = null) => ({
   WindowHandle: windowId,
   Id: processId,
   ProcessName: processName,
   MainWindowTitle: title,
   Foreground: foreground,
+  ClassName: className,
   Bounds: { x: 0, y: 0, width: 800, height: 600 }
+});
+
+test("prefers the interactive application frame over a packaged app CoreWindow", () => {
+  const result = correlateLaunchWindow({
+    application: "Calculator",
+    beforeWindows: [window(1, 10, "explorer", "Desktop", true)],
+    afterWindows: [
+      window(2, 42, "CalculatorApp", "Calculator", false, "Windows.UI.Core.CoreWindow"),
+      window(3, 77, "ApplicationFrameHost", "Calculator", true, "ApplicationFrameWindow")
+    ],
+    launch: { processId: 42 }
+  });
+  assert.equal(result.grounded, true);
+  assert.equal(result.window.WindowHandle, 3);
+  assert.ok(result.signals.includes("interactive-application-frame"));
 });
 
 test("grounds a delayed new window by launch PID despite title mismatch", () => {

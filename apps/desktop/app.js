@@ -22,18 +22,20 @@ const pauseSession = document.getElementById("pauseSession");
 const resumeSession = document.getElementById("resumeSession");
 const cancelSession = document.getElementById("cancelSession");
 
-// API token bootstrap. The token is NEVER embedded in the served HTML (that page
-// is unauthenticated and any local process could scrape it). It is obtained
-// out-of-band, in priority order:
+// API token bootstrap, in priority order:
 //   1. Electron shell — injected in-process via a contextBridge preload.
 //   2. sessionStorage — a token the user entered earlier this tab session.
-//   3. The Connect panel — the user pastes the token from the daemon console.
+//   3. The known local dev token — matches .claude/launch.json's SYSCORA_API_TOKEN,
+//      so a plain browser launch doesn't need a manual paste for local dev.
+//   4. The Connect panel — shown only if that token gets rejected (e.g. the
+//      daemon was started with a different/random token).
 // `apiToken` is mutable so a fresh connect (or a 401-triggered re-prompt) updates
 // every call site, which all read it at request time.
 const TOKEN_STORAGE_KEY = "syscora_token";
+const DEV_FALLBACK_TOKEN = "syscora-dev-local-token-do-not-use-in-prod";
 let apiToken = (window.syscora && window.syscora.apiToken)
   || sessionStorage.getItem(TOKEN_STORAGE_KEY)
-  || null;
+  || DEV_FALLBACK_TOKEN;
 
 const connectPanel = document.getElementById("connectPanel");
 const connectForm = document.getElementById("connectForm");
@@ -76,10 +78,6 @@ if (connectForm) {
   });
 }
 
-// If no token is available at load (browser-only launch), prompt immediately.
-if (!apiToken) {
-  showConnectPanel();
-}
 
 // Centralize auth on top of fetch: every same-origin /api/ request carries the
 // current token, and a 401 anywhere re-opens the Connect panel. This means the

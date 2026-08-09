@@ -23,7 +23,16 @@ const SEMANTIC_STOP_WORDS = new Set([
   "its", "me", "my", "of", "on", "only", "or", "out", "please", "put", "read", "show", "something", "tell",
   "that", "the", "then", "this", "to", "use", "using", "via", "what", "with",
   "quick", "request", "processed", "success", "successful", "successfully", "whats",
-  "task", "complete", "completed", "completion", "done", "verify", "verified"
+  "task", "complete", "completed", "completion", "done", "verify", "verified",
+  // Generic instruction verbs and auxiliaries, alongside the "get"/"show"/"could"
+  // already here. They say what the user wants done, never WHAT it is done to,
+  // so counting them against a plan measures phrasing rather than relevance.
+  "find", "would", "should",
+  // The platform every task on this agent runs on. "Windows Package Manager"
+  // scored two unmatchable tokens against a correct WinGet plan and pushed it
+  // just under the coverage threshold, so a request naming the tool by its full
+  // name was refused while the same request naming it "winget" passed.
+  "windows"
 ]);
 
 const SEMANTIC_ALIASES = new Map([
@@ -58,7 +67,29 @@ function semanticTokens(value) {
  */
 export function assessPlanGoalCoverage(intent = {}, taskGraph = {}, capabilityRegistry = null) {
   const goalContract = intent.goalContract ?? null;
-  if (goalContract?.enforceable && goalContract?.criteria?.length > 0) {
+  // Judge against the contract only when at least one criterion is anchored in
+  // what the user actually said.
+  //
+  // `requiredCriteria` falls back to the WHOLE set when none is grounded, so a
+  // request whose criteria are entirely model-authored is judged against model
+  // inventions. Asked to "set the system volume to 45 percent", the model added
+  // "the volume is not muted as a result of the change" — nobody mentioned
+  // muting — and the correct one-step plan was rejected for not covering it,
+  // then handed to the adaptive loop, which has no volume tool and clicks at
+  // whatever is on screen. An invention must never be able to veto the plan.
+  //
+  // With nothing grounded there is no contract worth enforcing, so coverage
+  // falls through to the original request text below, which is the authority.
+  //
+  // "Grounded" is also not enough on its own: a REPORT criterion is satisfied by
+  // any plan that gathers anything, so a contract whose only grounded criterion
+  // is a REPORT one certifies every plan equally. That is how a plan which only
+  // LAUNCHED Calculator scored 1.0 against "open calculator and work out 47
+  // times 89". The contract is authoritative only when something in it can
+  // actually discriminate between plans.
+  const groundedCriteria = (goalContract?.criteria ?? []).filter((criterion) => criterion.required !== false);
+  const hasDiscriminatingCriteria = groundedCriteria.some((criterion) => criterion.kind !== "REPORT");
+  if (goalContract?.enforceable && goalContract?.criteria?.length > 0 && hasDiscriminatingCriteria) {
     const contractCoverage = assessGoalContractPlanCoverage(goalContract, taskGraph, capabilityRegistry);
     return {
       covered: contractCoverage.covered,
@@ -79,10 +110,24 @@ export function assessPlanGoalCoverage(intent = {}, taskGraph = {}, capabilityRe
   // successCriteria are useful only when no original text exists; a malformed
   // interpretation must not make an otherwise correct deterministic route fail
   // (or make an irrelevant one pass).
-  const requestSource = String(intent.rawText ?? "").trim() || [
-    intent.normalizedGoal,
-    ...(intent.successCriteria ?? [])
-  ].filter(Boolean).join(" ");
+  //
+  // A conversational follow-up breaks that assumption. "Bump it up to 55" is the
+  // user's own words and carries almost no matchable content — the subject lives
+  // in the previous turn. Judged on rawText alone it matched one token of a
+  // perfectly correct volume plan, coverage failed, and the request was handed to
+  // the adaptive loop, which hand-wrote broken COM code instead of using the
+  // typed capability that was sitting right there.
+  //
+  // When the turn was resolved against conversation history, the resolved goal is
+  // part of the request, so both are used. rawText still contributes, so a
+  // misinterpretation cannot quietly replace what the user actually said.
+  const resolvedFromConversation = intent.resolvedFromConversation === true && intent.normalizedGoal;
+  const requestSource = resolvedFromConversation
+    ? `${String(intent.rawText ?? "").trim()} ${intent.normalizedGoal}`.trim()
+    : (String(intent.rawText ?? "").trim() || [
+        intent.normalizedGoal,
+        ...(intent.successCriteria ?? [])
+      ].filter(Boolean).join(" "));
   const requestTokens = semanticTokens(requestSource);
   const tasks = Array.isArray(taskGraph?.tasks) ? taskGraph.tasks : [];
   if (requestTokens.size === 0) {
@@ -153,6 +198,39 @@ function spotifyQuery(entities = {}) {
   return artist && !title.toLowerCase().includes(artist.toLowerCase()) ? `${title.trim()} ${artist}` : title.trim();
 }
 
+// Pull a value out of `entities` when the model may have named the key anything
+// reasonable.
+//
+// Classification is explicitly told to give each concrete value "its own
+// descriptive key", so it does exactly that — asked to set the volume to 26% it
+// returned `targetVolumePercent`, while the compiler below read `percent`. The
+// value was present and correct, the plan was built with `undefined`, the
+// capability failed its precondition, and the request fell through to generic UI
+// automation. Matching on a single exact key is too brittle for an input the
+// model is free to name.
+//
+// Exact matches win; otherwise the first key containing a candidate name (case-
+// and separator-insensitive) is taken, which catches targetVolumePercent,
+// volume_percent, volumeLevel and the rest without enumerating them.
+function pickEntity(entities = {}, names = [], { numeric = false } = {}) {
+  const keys = Object.keys(entities ?? {});
+  const canon = (value) => String(value).toLowerCase().replace(/[^a-z0-9]/g, "");
+  let raw;
+  for (const name of names) {
+    if (entities[name] !== undefined && entities[name] !== null && entities[name] !== "") { raw = entities[name]; break; }
+  }
+  if (raw === undefined) {
+    const wanted = names.map(canon);
+    const key = keys.find((candidate) => wanted.some((name) => canon(candidate).includes(name)));
+    if (key !== undefined) raw = entities[key];
+  }
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (!numeric) return raw;
+  // "26", "26%", 26 all mean 26.
+  const parsed = Number(String(raw).replace(/[^\d.-]/g, ""));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 // Operation-driven deterministic plans. Each entry maps a named operation to a
 // task graph built directly from structured entities. Compatibility wrappers
 // set intent.operation to one of these keys, giving a reliable 1:1 mapping from
@@ -195,6 +273,23 @@ export const OPERATION_PLANS = {
       description: "List running processes",
       completionCriteria: ["Got process list"],
       timeout: 15000
+    })
+  ],
+  "filesystem.list": (e, ws) => [
+    buildTask("filesystem.list", {
+      directoryPath: e.directoryPath ?? ws,
+      depth: e.depth ?? 1,
+      maxEntries: e.maxEntries ?? 2000,
+      includeHidden: e.includeHidden === true
+    }, {
+      goal: e.countFiles === true ? "Count files in directory" : "List directory contents",
+      description: e.countFiles === true
+        ? "Read the directory and report its exact file count"
+        : "Read and report the directory contents",
+      completionCriteria: [e.countFiles === true
+        ? "The exact number of files in the requested directory is reported"
+        : "The requested directory contents are reported"],
+      timeout: 30000
     })
   ],
   "process.port.inspect": (e) => [
@@ -372,7 +467,14 @@ export const OPERATION_PLANS = {
       goal: `Play browser media matching ${e.query}`,
       description: "Open a structured media result and verify live playback state",
       expectedStateChanges: ["browser.location", "browser.media.playback"],
-      completionCriteria: [`Requested media matching ${e.query} is independently observed as playing`],
+      // Caller-supplied criteria are carried onto the task so the plan's
+      // pre-execution evidence states, in the request's own words, what this
+      // capability will establish. Without them the relevance check rejects a
+      // correct single-task plan and falls back to generic UI automation.
+      completionCriteria: [
+        `Requested media matching ${e.query} is independently observed as playing`,
+        ...(e.completionCriteria ?? [])
+      ],
       timeout: 90000, retryBudget: 0, idempotency: false
     })
   ],
@@ -418,13 +520,87 @@ export const OPERATION_PLANS = {
   "vision.locate": (e) => [
     buildTask("vision.locate", { application: e.application, windowId: e.windowId, query: e.query }, { goal: "Locate visible target", completionCriteria: ["Visual target grounded"], timeout: 20000, retryBudget: 0 })
   ],
-  "system.volume.adjust": (e) => [
-    buildTask("system.volume.adjust", { direction: e.direction, steps: e.steps }, {
-      goal: `${e.direction === "down" ? "Decrease" : "Increase"} system volume`,
-      description: "Send bounded Windows media-volume key commands",
-      completionCriteria: [`Volume ${e.direction} command sent`], timeout: 5000, retryBudget: 0
+  "system.volume.adjust": (e) => {
+    // Same lesson as the percentage below: the model names this key whatever it
+    // likes ("direction", "volumeDirection", "change"), and a miss here produced
+    // a task with no direction at all, which failed its precondition.
+    const raw = String(pickEntity(e, ["direction", "change", "adjustment"]) ?? "").toLowerCase();
+    const direction = /\b(down|lower|decrease|reduce|quieter|softer)\b/.test(raw) ? "down"
+      : /\b(up|raise|increase|louder)\b/.test(raw) ? "up"
+      : "down";
+    const steps = pickEntity(e, ["steps", "amount", "count"], { numeric: true });
+    return [
+      buildTask("system.volume.adjust", { direction, ...(steps ? { steps } : {}) }, {
+        goal: `${direction === "down" ? "Decrease" : "Increase"} system volume`,
+        description: "Send bounded Windows media-volume key commands",
+        completionCriteria: [`Volume ${direction} command sent`], timeout: 5000, retryBudget: 0
+      }),
+      // The keystroke is not the outcome; the resulting level is. Reading it back
+      // as a separate task is what makes "turn it down" verifiable at all.
+      buildTask("system.volume.inspect", {}, {
+        goal: "Confirm the resulting system volume",
+        description: "Independently re-read the master volume after the adjustment",
+        completionCriteria: ["Resulting volume percentage read"], timeout: 25000, retryBudget: 0
+      })
+    ];
+  },
+  // "Is X installed?" / "what's installed?" — answered from THIS machine.
+  //
+  // These questions used to route to `package.winget.inspect`, which queries the
+  // winget repository and needs a precise package id nobody supplies in
+  // conversation. Asked "is python installed? and is tensorflow installed?" it
+  // produced a call with no id and died on a precondition check.
+  "application.listInstalled": (e) => {
+    const needle = pickEntity(e, ["nameContains", "application", "name", "software", "package", "query"]);
+    return [
+      buildTask("application.listInstalled", needle ? { nameContains: String(needle) } : {}, {
+        goal: needle ? `Check whether ${needle} is installed` : "List installed applications",
+        description: "Read installed software from the Windows uninstall registry and Store package list",
+        completionCriteria: [needle ? `Installation state of ${needle} determined` : "Installed applications listed"],
+        timeout: 65000, retryBudget: 0
+      })
+    ];
+  },
+  "system.volume.inspect": () => [
+    buildTask("system.volume.inspect", {}, {
+      goal: "Read the current system volume",
+      description: "Read the Windows master volume percentage and mute state",
+      completionCriteria: ["Current volume percentage read"], timeout: 25000, retryBudget: 0
     })
   ],
+  "system.volume.set": (e) => {
+    const percent = pickEntity(e, ["percent", "volume", "level", "value"], { numeric: true });
+    const mute = pickEntity(e, ["mute", "muted"]);
+    return [
+      // Read first. "What's the volume? Set it to 26%" asks two things, and the
+      // before-reading is the answer to the first one.
+      buildTask("system.volume.inspect", {}, {
+        goal: "Read the system volume before changing it",
+        description: "Read the current Windows master volume percentage and mute state",
+        completionCriteria: ["Current volume percentage read"], timeout: 25000, retryBudget: 0
+      }),
+      buildTask("system.volume.set", {
+        percent,
+        ...(typeof mute === "boolean" ? { mute } : {})
+      }, {
+        goal: `Set system volume to ${percent}%`,
+        description: "Set the Windows master volume to an absolute level",
+        completionCriteria: [`Master volume reads ${percent}%`], timeout: 25000, retryBudget: 0
+      }),
+      // Read back as its OWN task, not as something folded into the write.
+      //
+      // The write already re-reads the endpoint internally, but evidence taken
+      // from inside the action is not independent of the action — the runtime
+      // deliberately refuses to count it, which is the rule that stops "I sent
+      // the command" being reported as "it worked". A separate read is a real
+      // second observation and is accepted as the proof it actually is.
+      buildTask("system.volume.inspect", {}, {
+        goal: `Confirm the system volume is now ${percent}%`,
+        description: "Independently re-read the master volume after the change",
+        completionCriteria: [`Master volume reads ${percent}%`], timeout: 25000, retryBudget: 0
+      })
+    ];
+  },
   "spotify.track.open": (e) => [
     buildTask("spotify.track.open", { query: spotifyQuery(e) }, {
       goal: `Open Spotify results for ${spotifyQuery(e)}`,
@@ -497,7 +673,7 @@ export class PlanValidator {
     this.capabilityRegistry = capabilityRegistry;
   }
 
-  validatePlan(taskGraph) {
+  validatePlan(taskGraph, { includeAvailability = true } = {}) {
     const errors = [];
     const visited = new Set();
     const taskMap = new Map(taskGraph.tasks.map(t => [t.taskId, t]));
@@ -521,7 +697,7 @@ export class PlanValidator {
         errors.push(`Unknown capability ${task.capability} for task ${task.taskId}`);
       } else {
         cap = this.capabilityRegistry.get(task.capability);
-        if (!this.capabilityRegistry.isAvailable(task.capability, { platform: process.platform })) {
+        if (includeAvailability && !this.capabilityRegistry.isAvailable(task.capability, { platform: process.platform })) {
           errors.push(`Capability ${task.capability} is unavailable or unhealthy for task ${task.taskId}`);
         }
         const inputValidation = validateSchema(task.inputs, cap.inputSchema);
@@ -647,9 +823,35 @@ export class GeneralPlanner {
     // contract and fall back deterministically if it still cannot validate.
     plan = this._mergeCompletedTasks(plan, previousExecutionState);
     plan = this._normalizePlan(plan);
-    if (!new PlanValidator(this.capabilityRegistry).validatePlan(plan.taskGraph).valid) {
+    const validator = new PlanValidator(this.capabilityRegistry);
+    // Planning validates identity, schemas, dependency structure, budgets, and
+    // rollback declarations. Live availability belongs to the runtime's
+    // authorization gate, which refreshes the catalog immediately before use
+    // and can return an honest PLAN_REJECTED response naming the unavailable
+    // capability. Treating availability as a structural planner error erased a
+    // perfectly valid typed plan and degraded "WinGet is unavailable" into
+    // "I couldn't map that request" (or a futile generic-UI loop).
+    if (!validator.validatePlan(plan.taskGraph, { includeAvailability: false }).valid) {
       plan = this._normalizePlan(this.fallbackPlan(userIntent, resolvedContext));
       plannerSource = "DETERMINISTIC_FALLBACK";
+      // The fallback is frequently the SAME plan that just failed — for a typed
+      // operation, fallbackPlan is where the original came from. Handing it back
+      // unchecked meant a plan already known to be invalid was executed anyway,
+      // and the user's answer became whatever internal error the capability
+      // raised first.
+      //
+      // An invalid plan is not a plan. Emptying the graph routes the request to
+      // the runtime's own no-route handling — the adaptive loop, or an honest
+      // "I could not work out how to do this" — instead of running something
+      // that cannot work.
+      const revalidation = validator.validatePlan(plan.taskGraph, { includeAvailability: false });
+      if (!revalidation.valid) {
+        plan = {
+          ...plan,
+          taskGraph: { ...plan.taskGraph, tasks: [] },
+          plannerRejection: { reason: "PLAN_FAILED_VALIDATION", errors: revalidation.errors.slice(0, 5) }
+        };
+      }
     }
 
     // Ensure all required fields exist

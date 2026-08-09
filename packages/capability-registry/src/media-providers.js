@@ -186,6 +186,16 @@ export function registerMediaCapabilities(registry, providerRegistry) {
       if (live?.playing && matched) {
         return { status: "VERIFIED", message: `Playing "${live.nowPlaying}" in ${provider.applicationName}.`, evidence: live, confidence: 0.9 };
       }
+      // Confirmed playing but no reliable track title was available to check —
+      // distinct from confirming the wrong track is playing.
+      if (live?.playing && !live?.nowPlaying) {
+        return {
+          status: "PARTIALLY_VERIFIED",
+          message: `${provider.applicationName} is playing, but I could not independently confirm the track title; it is likely "${query}".`,
+          evidence: live,
+          confidence: 0.6
+        };
+      }
       if (live?.playing && !matched) {
         return {
           status: "FAILED",

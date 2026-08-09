@@ -30,8 +30,15 @@ function text(actual) {
   return values(actual).filter((value) => typeof value === "string").join(" ");
 }
 
+// `evaluated` distinguishes "this predicate was checked and did not hold" from
+// "this predicate could not be checked at all". Both used to return
+// satisfied:false, and callers read the pair as identical — so a postcondition
+// the model wrote as an English sentence ("Visible text includes 'Ultron
+// online'") became indistinguishable from a genuine violation, and was used to
+// discard the evidence of an action that had in fact succeeded. An unevaluatable
+// predicate refutes nothing.
 export function evaluatePostcondition(predicate, actual = {}) {
-  if (!predicate?.kind) return { satisfied: false, reason: "postcondition-kind-missing" };
+  if (!predicate?.kind) return { satisfied: false, evaluated: false, reason: "postcondition-kind-missing" };
   const expected = predicate.expected ?? predicate.value;
   const observed = predicate.path
     ? String(predicate.path).split(".").filter(Boolean).reduce((current, key) => current?.[key], actual)
@@ -60,7 +67,7 @@ export function evaluatePostcondition(predicate, actual = {}) {
       satisfied = observed?.exists === true || observed?.found === true || Boolean(observed?.filePath ?? observed?.path);
       break;
     default:
-      return { satisfied: false, reason: `unsupported-postcondition:${predicate.kind}` };
+      return { satisfied: false, evaluated: false, reason: `unsupported-postcondition:${predicate.kind}` };
   }
-  return { satisfied, kind: predicate.kind, expected, observed };
+  return { satisfied, evaluated: true, kind: predicate.kind, expected, observed };
 }

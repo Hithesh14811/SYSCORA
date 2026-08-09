@@ -31,7 +31,16 @@ export function validateSchema(data, schema) {
   const errors = [];
   const required = schema.required || [];
   for (const key of required) {
-    if (!(key in data)) {
+    // `key in data` is true for `{ id: undefined }`, so a required field whose
+    // value was never resolved passed validation. Deterministic plans are built
+    // as `{ id: entities.id }`, which is exactly that shape whenever the model
+    // named the entity something else — so a task with no usable input at all
+    // validated cleanly, reached the capability, and died there as
+    // "Capability package.winget.inspect preconditions failed", an internal
+    // string shown to the user as the whole answer.
+    //
+    // A field that is present but undefined is not supplied.
+    if (!(key in data) || data[key] === undefined || data[key] === null) {
       errors.push(`Missing required field: ${key}`);
     }
   }
@@ -54,6 +63,16 @@ export function validateSchema(data, schema) {
         errors.push(`Field ${key} must be ${expectedType}, got ${actualType}`);
       } else if (expectedType && actualType !== expectedType) {
         errors.push(`Field ${key} must be ${expectedType}, got ${actualType}`);
+      }
+
+      // A closed value set is only a constraint if something checks it. Without
+      // this, a schema enum is documentation the model is free to ignore — and a
+      // model that answers an enum field with a word of its own invention routes
+      // the request nowhere, silently. Reporting it as an error lets the bounded
+      // repair in _reasonStructured re-ask with the allowed values.
+      const allowed = properties[key].enum;
+      if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(data[key])) {
+        errors.push(`Field ${key} must be one of ${allowed.join(", ")}, got ${JSON.stringify(data[key])}`);
       }
     }
   }
@@ -453,18 +472,34 @@ export class OpenAIModelProvider extends LanguageModelProvider {
     this.name = "openai";
   }
 
-  async healthCheck() {
+  // A reachability probe, nothing more. It carries its own abort so a hung
+  // socket cannot outlive the caller's bound, and it distinguishes "the gateway
+  // answered and said no" (ok: false — real evidence) from "the probe itself
+  // did not complete" (unknown — no evidence either way). ReasoningEngine treats
+  // those two very differently: only the first can gate a request.
+  async healthCheck({ timeoutMs = 8000 } = {}) {
     if (!this.apiKey) {
       return { ok: false, error: "No OpenAI API key" };
     }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(`${this.baseUrl}/models`, {
         method: "GET",
-        headers: { Authorization: `Bearer ${this.apiKey}` }
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal: controller.signal
       });
+      // A 5xx says the gateway is up and the upstream is busy or restarting —
+      // this endpoint scales to zero and answers 503 "overflow" while it wakes.
+      // That is a reason to retry, not a reason to declare the model gone for
+      // the whole cache TTL and refuse every request in it. Only a definite
+      // negative (auth, bad route) is evidence the provider cannot serve us.
+      if (response.status >= 500) return { unknown: true, status: response.status };
       return { ok: response.ok, status: response.status };
     } catch (e) {
-      return { ok: false, error: e.message };
+      return { unknown: true, error: e.message };
+    } finally {
+      clearTimeout(timeout);
     }
   }
 

@@ -5,10 +5,12 @@
 // (desktop shell, CLI, daemon) describes a request the same way and none of them
 // re-derive "is it done?" from raw events.
 //
-// Two rules shape the wording:
+// Three rules shape the wording:
 //   1. Having run an action is not having achieved the goal. Only verified
 //      evidence produces a COMPLETED phase or a "done" headline.
 //   2. Nothing is described as happening until execution has actually begun.
+//   3. A question answered in words is its own outcome. It is neither a
+//      verified goal nor a failure, because there was nothing to execute.
 
 export const LifecyclePhase = Object.freeze({
   UNDERSTANDING: "UNDERSTANDING",
@@ -21,6 +23,7 @@ export const LifecyclePhase = Object.freeze({
   AWAITING_USER_INPUT: "AWAITING_USER_INPUT",
   COMPLETED: "COMPLETED",
   PARTIALLY_COMPLETED: "PARTIALLY_COMPLETED",
+  ANSWERED: "ANSWERED",
   FAILED: "FAILED",
   CANCELLED: "CANCELLED",
   TIMED_OUT: "TIMED_OUT"
@@ -60,6 +63,7 @@ const STATE_TO_PHASE = Object.freeze({
 const TERMINAL_PHASES = new Set([
   LifecyclePhase.COMPLETED,
   LifecyclePhase.PARTIALLY_COMPLETED,
+  LifecyclePhase.ANSWERED,
   LifecyclePhase.FAILED,
   LifecyclePhase.CANCELLED,
   LifecyclePhase.TIMED_OUT
@@ -83,6 +87,7 @@ const HEADLINES = Object.freeze({
   [LifecyclePhase.AWAITING_USER_INPUT]: "Waiting for something only you can do.",
   [LifecyclePhase.COMPLETED]: "Finished — everything you asked for was confirmed.",
   [LifecyclePhase.PARTIALLY_COMPLETED]: "Finished part of this. Some of what you asked for was not confirmed.",
+  [LifecyclePhase.ANSWERED]: "Answered. Nothing on your computer was inspected or changed.",
   [LifecyclePhase.FAILED]: "This did not work, and nothing further was attempted.",
   [LifecyclePhase.CANCELLED]: "Cancelled.",
   [LifecyclePhase.TIMED_OUT]: "Stopped because it ran past its time limit."
@@ -115,6 +120,10 @@ export function projectSessionLifecycle(session, { developerMode = false } = {})
     else if (final?.status === "COMPLETED") phase = LifecyclePhase.COMPLETED;
     else if (final?.status === "AWAITING_APPROVAL") phase = LifecyclePhase.AWAITING_APPROVAL;
     else if (final?.status === "NEEDS_CLARIFICATION") phase = LifecyclePhase.AWAITING_USER_INPUT;
+    // A conversational reply is the whole deliverable. It overrides the internal
+    // state unconditionally, including the FAILED that older sessions recorded
+    // when the answer arrived only after planning produced no task graph.
+    else if (final?.status === "ANSWERED") phase = LifecyclePhase.ANSWERED;
   }
   // Completion is a claim about evidence, not about having reached the end of
   // the pipeline. Unverified criteria demote it.
@@ -137,7 +146,10 @@ export function projectSessionLifecycle(session, { developerMode = false } = {})
   return {
     phase,
     terminal,
-    executionStarted: EXECUTION_STARTED_PHASES.has(phase) || terminal,
+    // Answering in words touches nothing, so it is the one terminal phase that
+    // must not imply the request started acting on the computer.
+    executionStarted: EXECUTION_STARTED_PHASES.has(phase)
+      || (terminal && phase !== LifecyclePhase.ANSWERED),
     verifiedCompletion,
     headline: HEADLINES[phase],
     detail: final?.message ?? null,

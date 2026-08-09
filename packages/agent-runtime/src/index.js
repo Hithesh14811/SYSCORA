@@ -14,6 +14,7 @@ import { GeneralPlanner, OPERATION_PLANS, PlanValidator, assessPlanGoalCoverage 
 import { MockModelProvider, validateSchema } from "../../model-providers/src/index.js";
 import { TaskGraphScheduler } from "../../task-graph-scheduler/src/index.js";
 import { PerceptionEngine } from "../../perception/src/index.js";
+import { captureScreenSnapshotViaAdapter } from "../../perception/src/vision-provider.js";
 import { ReasoningEngine } from "../../reasoning-engine/src/index.js";
 import { GoalVerifier } from "./goal-verifier.js";
 import { RollbackManager } from "./rollback-manager.js";
@@ -33,7 +34,8 @@ import {
   measureUiProgress,
   buildCrossModalTransferStrategy,
   buildInternalToGuiTransferStrategy,
-  buildExplicitApplicationLaunchStrategy
+  buildExplicitApplicationLaunchStrategy,
+  isUiFacingAction
 } from "./interactive-agent-controller.js";
 import {
   assessGoalContractEvidence,
@@ -68,6 +70,12 @@ export {
 const RECOVERY_VOLATILE_KEYS = new Set([
   "at", "timestamp", "observedAt", "capturedAt", "createdAt", "updatedAt", "elapsedMs"
 ]);
+
+// How long a reading of a window may stand in for "what is on screen right
+// now". Deliberately short: it exists to stop the same picture being taken twice
+// within one step, not to let the agent act on a stale view. Anything the agent
+// itself just did invalidates it, because a post-action reading never uses it.
+const SCREEN_MEMO_TTL_MS = 2500;
 
 function stableRecoveryFingerprint(value) {
   const normalize = (item) => {
@@ -162,6 +170,7 @@ export class AgentRuntime {
           semanticState,
           adapter,
           developerIntelligence: null,
+          capabilityRegistry: this.capabilityRegistry,
           onEvent: (event) => {
             // Best-effort audit of perception events (fire-and-forget).
             this.auditRepository?.append?.("perception", event.type, event).catch?.(() => {});
@@ -197,6 +206,7 @@ export class AgentRuntime {
           semanticState: this.semanticState,
           adapter: this.adapter,
           developerIntelligence: this.developerIntelligence,
+          capabilityRegistry: this.capabilityRegistry,
           onEvent: (event) => {
             this.auditRepository?.append?.("perception", event.type, event).catch?.(() => {});
           }
@@ -356,6 +366,10 @@ export class AgentRuntime {
       session.intent.operationProvenance = options.operation
         ? "EXPLICIT_CONTEXT"
         : (session.intent.operation ? "NATURAL_LANGUAGE_ROUTED" : null);
+      // Whether this turn's meaning depends on what was said before. Goal
+      // coverage reads it: a follow-up like "bump it up to 55" cannot be judged
+      // against its own words, because its subject is in the previous turn.
+      session.intent.resolvedFromConversation = Array.isArray(options.history) && options.history.length > 0;
       session.goalContract = createGoalContract(session.intent);
       session.intent.goalContract = session.goalContract;
       await this.addSessionEvent(session, "INTENT_CLASSIFIED", session.intent);
@@ -363,6 +377,70 @@ export class AgentRuntime {
         await this.addSessionEvent(session, "GOAL_CONTRACT_CREATED", session.goalContract);
       }
       await this.persistSession(session);
+
+      // The request asks the runtime to commit money or a reservation. No
+      // capability does that, so there is nothing to plan: answer plainly and
+      // stop here rather than composing UI automation that would drive a real
+      // checkout flow it cannot safely finish. Nothing has run at this point,
+      // so no state was touched.
+      if (session.intent.unsupportedAction) {
+        session.currentState = RuntimeState.COMPLETED;
+        session.finalResponse = {
+          status: "DECLINED",
+          message: session.intent.unsupportedAction.message,
+          reason: session.intent.unsupportedAction.kind,
+          rawText
+        };
+        await this.addSessionEvent(session, "UNSUPPORTED_ACTION_DECLINED", {
+          kind: session.intent.unsupportedAction.kind,
+          rawText
+        });
+        session.plan = null;
+        await this.persistSession(session);
+        return session;
+      }
+
+      // 1a. CONVERSATION. The model classified this as a message that asks
+      // nothing of the computer and answered it in the same call. Talking is a
+      // first-class outcome, not the thing left over when planning finds no
+      // task, so it settles here — before context collection and planning —
+      // rather than after paying for both and discovering there was nothing to
+      // plan. Nothing has executed at this point, so nothing was touched.
+      //
+      // The model decides this, not a keyword list: an intent that carries a
+      // concrete operation is a task whatever its category says, so the typed
+      // route always wins over a conversational classification.
+      //
+      // Two independent signals must agree that there is nothing to do. Naming a
+      // typed operation, or naming the capabilities the request needs, both mean
+      // the model already decided this is work — and answering work with words
+      // is the expensive failure: the task silently never happens and the user
+      // is told something reassuring. Classification is nondeterministic enough
+      // that the same request has come back CONVERSATION on one call and
+      // APPLICATION on the next, so this check is load-bearing, not belt-and-braces.
+      const directAnswer = String(session.intent.directAnswer ?? "").trim();
+      const namesWork = Boolean(session.intent.operation)
+        || (session.intent.requiredCapabilities ?? []).length > 0
+        // The classifier said answering needs something read from this machine.
+        // That is a task however it labelled itself.
+        || session.intent.answerableWithoutInspecting === false;
+      if (
+        String(session.intent.category ?? "").toUpperCase() === "CONVERSATION" &&
+        directAnswer &&
+        !namesWork
+      ) {
+        session.currentState = RuntimeState.COMPLETED;
+        session.finalResponse = {
+          status: "ANSWERED",
+          message: directAnswer,
+          rawText,
+          conversational: true
+        };
+        await this.addSessionEvent(session, "CONVERSATIONAL_REPLY", { rawText, source: "INTENT_CLASSIFICATION" });
+        session.plan = null;
+        await this.persistSession(session);
+        return session;
+      }
 
       // Direct commands do not wait for a model plan, but they do not bypass the
       // LLM. Start a non-authoritative interpretation in parallel with the typed
@@ -409,6 +487,7 @@ export class AgentRuntime {
         "system.inspect",
         "system.summary",
         "processes.list",
+        "filesystem.list",
         "process.port.inspect",
         "environment.user.inspect",
         "application.launch",
@@ -515,21 +594,7 @@ export class AgentRuntime {
       ) {
         const interactive = await this._runInteractiveController(session, rawText, options);
         if (interactive.status === "COMPLETE" || interactive.status === "NEEDS_USER") return session;
-        session.currentState = RuntimeState.FAILED;
-        session.finalResponse = {
-          status: "FAILED",
-          message: `Adaptive reasoning could not complete the request safely: ${interactive.reason ?? "reasoning unavailable"}.`,
-          reason: interactive.reason ?? "INTERACTIVE_REASONING_FAILED",
-          interactive: true,
-          metrics: interactive.metrics
-        };
-        await this.addSessionEvent(session, "INTERACTIVE_REASONING_FAILED", {
-          reason: interactive.reason,
-          metrics: interactive.metrics
-        });
-        session.plan = null;
-        await this.persistSession(session);
-        return session;
+        return this._settleIncompleteInteractive(session, interactive, rawText);
       }
 
       // 3. Generate plan (memory + semantic state passed as planning inputs)
@@ -569,35 +634,43 @@ export class AgentRuntime {
           if (interactive.status === "COMPLETE" || interactive.status === "NEEDS_USER") {
             return session;
           }
-          session.currentState = RuntimeState.FAILED;
-          session.finalResponse = {
-            status: "FAILED",
-            message: `Adaptive reasoning could not complete the request safely: ${interactive.reason ?? "reasoning unavailable"}.`,
-            reason: interactive.reason ?? "INTERACTIVE_REASONING_FAILED",
-            interactive: true,
-            metrics: interactive.metrics
-          };
-          await this.addSessionEvent(session, "INTERACTIVE_REASONING_FAILED", {
-            reason: interactive.reason,
-            metrics: interactive.metrics
-          });
-          session.plan = null;
-          await this.persistSession(session);
-          return session;
+          return this._settleIncompleteInteractive(session, interactive, rawText);
         }
         // The request did not map to any capability. Before giving up, try a
         // pure conversational answer via the model (greetings, "what model are
         // you", capability questions). This performs NO actions and mutates NO
         // state — it only replies with text. If the model is unavailable or
         // declines, fall back to the honest clarification message.
+        // Only chat when there was genuinely nothing to do. A request the
+        // classifier resolved to real work is a TASK whose planning failed, and
+        // answering it conversationally produces the worst possible reply: "I
+        // can't check that from this reply, but I'd be happy to — just ask me to
+        // scan your Downloads folder", when scanning the Downloads folder is
+        // exactly what the user asked for. Saying plainly that it could not be
+        // planned is less friendly and far more honest.
+        // Category is deliberately NOT part of this test. The deterministic
+        // classifier used offline has no CONVERSATION category at all, so
+        // judging by category would block a genuine "what model are you" from
+        // ever being answered whenever the model is unavailable. Naming an
+        // operation or concrete capabilities is the signal that survives both
+        // paths, and it is the same one the conversation fast path uses.
+        const intentNamedWork = Boolean(session.intent?.operation)
+          || (session.intent?.requiredCapabilities ?? []).length > 0;
         let conversational = null;
-        try {
-          const catalog = (this.capabilityRegistry?.getCatalog?.() ?? []).map((c) => c.name);
-          const c = await this.reasoningEngine?.converse?.(rawText, { capabilities: catalog });
-          if (c?.ok) conversational = c.text;
-        } catch { /* conversational is best-effort; fall through to clarification */ }
+        if (!intentNamedWork) {
+          try {
+            const catalog = (this.capabilityRegistry?.getCatalog?.() ?? []).map((c) => c.name);
+            const c = await this.reasoningEngine?.converse?.(rawText, { capabilities: catalog });
+            if (c?.ok) conversational = c.text;
+          } catch { /* conversational is best-effort; fall through to clarification */ }
+        }
 
-        session.currentState = RuntimeState.FAILED;
+        // Answering a question is a real outcome, not a failed automation. Both
+        // conversational branches (this one and the offline fast path above)
+        // therefore settle identically; a session that produced an answer must
+        // never persist as FAILED, which is what previously made the desktop
+        // report "This did not work" directly above the answer itself.
+        session.currentState = conversational ? RuntimeState.COMPLETED : RuntimeState.FAILED;
         session.finalResponse = conversational
           ? { status: "ANSWERED", message: conversational, rawText, conversational: true }
           : {
@@ -625,7 +698,20 @@ export class AgentRuntime {
         : { covered: true };
       const needsClosedLoopInteraction =
         ["APPLICATION", "BROWSER"].includes(String(session.intent.category ?? "").toUpperCase()) ||
-        plannedCapabilities.some((name) => /^(ui|window|pointer|keyboard|browser)\./.test(name));
+        plannedCapabilities.some((name) => /^(ui|window|pointer|keyboard|browser)\./.test(name)) ||
+        // A candidate plan that does not cover the goal is not a plan — it is
+        // the planner having failed to find a route, which is exactly the case
+        // the adaptive controller exists to serve. Without this, a request whose
+        // primitives all exist ("list installed applications", "why is this
+        // computer slow") is refused on the strength of a fallback plan that was
+        // never going to be run anyway, because its category happened not to be
+        // APPLICATION or BROWSER. Coverage is the honest signal here; the
+        // category is a proxy that misses every non-GUI goal.
+        //
+        // This only ever converts a hard refusal into an attempt: if the
+        // controller does not complete, the static plan is restored below and
+        // the same coverage check still fails closed on it.
+        !inferredRouteCoverage.covered;
       if (
         options.interactive !== false &&
         (!session.intent.operation || !inferredRouteCoverage.covered) &&
@@ -656,10 +742,25 @@ export class AgentRuntime {
         await this.addSessionEvent(session, "DETERMINISTIC_PLAN_COVERAGE_CHECKED", coverage);
         if (!coverage.covered) {
           session.currentState = RuntimeState.FAILED;
+          // Say what actually happened.
+          //
+          // This message asserted that the language model was unavailable. It is
+          // the message a user sees whenever a plan misses goal coverage, and in
+          // every live case observed the model was up, had answered, and had
+          // classified the request correctly — so the one explanation offered was
+          // the one thing that was definitely not true, and it sent debugging
+          // (mine included) after the endpoint instead of the routing.
+          const attemptedAdaptive = (session.events ?? []).some(
+            (event) => event.eventType === "ADAPTIVE_CONTROLLER_STARTED"
+          );
+          const missing = (coverage.missingCriteria ?? coverage.missingTerms ?? []).slice(0, 3);
           session.finalResponse = {
             status: "FAILED",
             message:
-              "The language-model route is unavailable or could not produce a safe plan, and the deterministic fallback does not cover the requested goal. No unrelated actions were run.",
+              `I understood the request but could not put together a set of steps I could prove would achieve it` +
+              (missing.length ? `, so I stopped rather than guess. Unaddressed: ${missing.join("; ")}.` : `, so I stopped rather than guess.`) +
+              (attemptedAdaptive ? " I also tried working it out step by step from what is on screen, and that did not converge either." : "") +
+              " Nothing was changed.",
             reason: "IRRELEVANT_DETERMINISTIC_FALLBACK",
             coverage
           };
@@ -728,7 +829,236 @@ export class AgentRuntime {
       .catch(() => {});
   }
 
+  // Settle a session whose adaptive loop stopped without completing.
+  //
+  // Every such stop used to become a flat FAILED, which threw away whatever the
+  // loop had genuinely accomplished first. Asked to open Notepad and write a C++
+  // program, it launched Notepad, waited for the window, focused it and typed the
+  // program — then one model call hit the endpoint's timeout, and the user was
+  // told the request could not be completed safely, with a Notepad full of the
+  // requested code sitting on screen in front of them.
+  //
+  // That is a false FAILURE. It is the same defect as a false success with the
+  // sign flipped: the report does not match what happened. Verified actions are
+  // reported as what they are, the part that did not finish is named, and the
+  // status stays PARTIALLY_COMPLETED so nothing is overclaimed.
+  async _settleIncompleteInteractive(session, interactive, rawText) {
+    const successfulActions = (interactive.recentActions ?? []).filter((entry) => entry.succeeded);
+    const reason = interactive.reason ?? "INTERACTIVE_REASONING_FAILED";
+    // A provider timeout is an interruption, not a verdict on the request. Say
+    // so, because "reasoning could not complete the request safely" reads as a
+    // refusal and sends the user looking for what they did wrong.
+    const interrupted = /provider|aborted|timeout|timed out|unavailable|max-model-calls|max-elapsed-time|max-steps/i.test(String(reason));
+
+    if (successfulActions.length === 0) {
+      session.currentState = RuntimeState.FAILED;
+      session.finalResponse = {
+        status: "FAILED",
+        message: interrupted
+          ? `I was interrupted before I could do anything for this request (${reason}). Nothing was changed — worth trying again.`
+          : `I could not work out a safe way to do this (${reason}). Nothing was changed.`,
+        reason,
+        interactive: true,
+        metrics: interactive.metrics
+      };
+      await this.addSessionEvent(session, "INTERACTIVE_REASONING_FAILED", { reason, metrics: interactive.metrics });
+      session.plan = null;
+      await this.persistSession(session);
+      return session;
+    }
+
+    const readResults = successfulActions
+      .map((entry) => ({ capability: entry.action?.capability, executionResult: entry.executionResult }))
+      .filter((entry) => entry.capability && entry.executionResult);
+    const observedAnswer = await this._composeUserAnswer(
+      session,
+      readResults,
+      summarizeReadOnlyResults(readResults, this.capabilityRegistry)
+    );
+    const didList = successfulActions
+      .map((entry) => entry.action?.subgoal || entry.action?.capability)
+      .filter(Boolean)
+      .slice(0, 6);
+
+    session.currentState = RuntimeState.FAILED;
+    session.finalResponse = {
+      status: "PARTIALLY_COMPLETED",
+      message: [
+        observedAnswer,
+        `I got part of the way: ${didList.join("; ")}.`,
+        interrupted
+          ? `Then I was interrupted (${reason}), so I stopped there rather than guess at the rest. Anything already done is still in place.`
+          : `I could not confirm the remaining steps (${reason}), so I stopped there. Anything already done is still in place.`
+      ].filter(Boolean).join("\n\n"),
+      observedAnswer: observedAnswer ?? null,
+      reason,
+      interactive: true,
+      completedSteps: didList,
+      metrics: interactive.metrics
+    };
+    await this.addSessionEvent(session, "INTERACTIVE_PARTIAL_PROGRESS_PRESERVED", {
+      reason,
+      verifiedActions: didList,
+      metrics: interactive.metrics
+    });
+    session.plan = null;
+    await this.persistSession(session);
+    return session;
+  }
+
+  /**
+   * Keep a whole session working on the SAME window.
+   *
+   * A model naming its target as `{ application: "Notepad" }` is being perfectly
+   * reasonable — that is how a person refers to it. But an application name is
+   * not an identifier: with three Notepad windows open, window resolution scores
+   * all three equally and breaks the tie on area, so "launch Notepad", "activate
+   * Notepad" and "type into Notepad" could each land on a DIFFERENT document.
+   * Live, that produced a session that typed into one window and then read back
+   * another one's contents, and correctly reported the correct typing action as
+   * having failed.
+   *
+   * The window the loop has already grounded is the answer to which one is
+   * meant. So when an action names an application and not a window, and the
+   * grounded window belongs to that application, pin the action to its handle.
+   * A model that names an explicit windowId keeps it; nothing is overridden.
+   */
+  _pinActionToGroundedWindow(action, controllerContext = {}) {
+    const inputs = action?.inputs;
+    if (!inputs || typeof inputs !== "object") return action;
+    if (inputs.windowId) return action;
+    const application = inputs.application;
+    if (!application) return action;
+
+    // An explicitly pinned session window is more authoritative than the most
+    // recent ambient perception. A background/foreground transition can make a
+    // different document from the same application look current between steps.
+    const grounded = controllerContext.groundedWindow
+      ?? controllerContext.currentPerception?.groundedWindow
+      ?? null;
+    const windowId = grounded ? String(grounded.WindowHandle ?? grounded.windowId ?? "") : "";
+    if (!windowId) return action;
+
+    const identity = `${grounded.ProcessName ?? grounded.processName ?? ""} ${grounded.MainWindowTitle ?? grounded.title ?? ""}`.toLowerCase();
+    const needle = String(application).toLowerCase().replace(/\.exe$/, "");
+    if (!needle || !identity.includes(needle)) return action;
+    return { ...action, inputs: { ...inputs, windowId } };
+  }
+
+  /**
+   * Look at a window: capture it, OCR it, inspect it, and return one fused
+   * screen snapshot with absolute screen coordinates for everything on it.
+   *
+   * This is the runtime's single visual-perception entry point. It prefers the
+   * PerceptionEngine's VisionProvider so the snapshot and its elements are
+   * durably written to SemanticState (queryable later, visible to audit and
+   * rollback like any other observation). If the world model is unavailable it
+   * falls back to the adapter directly, because being unable to PERSIST what
+   * was seen is not a reason to stop seeing.
+   *
+   * Returns { available, snapshot, summary, targets }. `snapshot` is the full
+   * ScreenSnapshot the controller diffs across an action; `summary` and
+   * `targets` are the bounded projection handed to the model.
+   */
+  async _captureScreenEvidence(request = {}) {
+    // The controller asks for a snapshot around its own action and supplies the
+    // perception it already has. Reuse the window it grounded rather than
+    // re-enumerating every top-level window (a measured 2.3s) twice per action.
+    const grounded = request.groundedWindow
+      ?? request.currentPerception?.groundedWindow
+      ?? request.currentPerception?.foregroundWindow
+      ?? null;
+    const resolved = {
+      ...request,
+      includeVision: true,
+      windowId: request.windowId
+        ?? (grounded ? String(grounded.WindowHandle ?? grounded.windowId) : undefined),
+      application: request.application
+        ?? grounded?.ProcessName ?? grounded?.processName ?? undefined,
+      groundedWindow: grounded ?? undefined
+    };
+
+    // Looking at a window costs about 7 seconds (capture, OCR, then the UIA
+    // tree). The loop takes a reading at the top of every step and then the
+    // controller immediately takes a "before" reading for the same window
+    // before acting — the same picture, twice, for fourteen seconds a step.
+    //
+    // A reading taken moments ago IS the before-state, so serve it from the
+    // memo. The "after" reading is never served this way: seeing what actually
+    // changed is the entire reason it is taken, and a cached answer there would
+    // be worse than none.
+    const memoKey = resolved.windowId ?? "foreground";
+    const reusable = resolved.phase !== "after"
+      && this._screenMemo?.key === memoKey
+      && Date.now() - this._screenMemo.at <= SCREEN_MEMO_TTL_MS;
+    if (reusable) return this._screenMemo.evidence;
+
+    let snapshot = null;
+    try {
+      const captured = await this.perception?.captureVisionSnapshot?.(
+        resolved,
+        { force: resolved.force === true }
+      );
+      if (captured?.available) snapshot = captured.snapshot;
+    } catch { /* fall through to the direct adapter path below */ }
+
+    if (!snapshot) {
+      try {
+        snapshot = await captureScreenSnapshotViaAdapter(this.adapter, resolved);
+      } catch { /* a window that cannot be captured is observed as unavailable */ }
+    }
+    if (!snapshot) {
+      this._screenMemo = null;
+      return { available: false, snapshot: null, summary: null, targets: [] };
+    }
+
+    const elements = Array.isArray(snapshot.elements) ? snapshot.elements : [];
+    // Every visible element the agent could point at, with the coordinates it
+    // would point at. OCR lines are included deliberately: they are the only
+    // evidence for anything UI Automation does not expose.
+    const targets = elements
+      .filter((element) => element.bbox ?? element.boundingRect)
+      .slice(0, 120)
+      .map((element) => {
+        const bbox = element.bbox ?? element.boundingRect;
+        return {
+          targetId: element.targetId ?? element.id,
+          source: element.source,
+          role: element.role,
+          text: String(element.text ?? element.name ?? "").slice(0, 120),
+          bounds: bbox,
+          center: { x: Math.round(bbox.x + bbox.width / 2), y: Math.round(bbox.y + bbox.height / 2) },
+          clickable: element.clickable === true,
+          enabled: element.enabled !== false,
+          value: element.value ?? null
+        };
+      });
+    const evidence = {
+      available: true,
+      snapshot,
+      summary: {
+        snapshotId: snapshot.snapshotId,
+        windowId: snapshot.windowId,
+        application: snapshot.application,
+        title: snapshot.title,
+        capturedAt: snapshot.capturedAt,
+        // The screen as readable text. This is what lets the loop answer
+        // "what does it say now?" — the question a blind agent cannot ask.
+        visibleText: String(snapshot.ocrText ?? "").slice(0, 4000),
+        elementCount: elements.length
+      },
+      targets
+    };
+    this._screenMemo = { key: memoKey, at: Date.now(), evidence };
+    return evidence;
+  }
+
   async _runInteractiveController(session, rawText, options = {}) {
+    // The controller supersedes any static plan: it decides each step from live
+    // observation and builds its own per-step graphs. An empty plan left behind
+    // by a planner that found no route is therefore stale, and carrying it into
+    // the controller's own persistence used to abort the run before it started.
+    if ((session.plan?.taskGraph?.tasks?.length ?? 0) === 0) session.plan = null;
     const remainingSessionMs = session.deadlineAt
       ? Math.max(1, Date.parse(session.deadlineAt) - Date.now())
       : null;
@@ -746,7 +1076,14 @@ export class AgentRuntime {
       },
       perceive: async (controllerState = {}) => {
         this._assertSessionActive(session, { deadlineAt: Date.parse(session.deadlineAt) });
-        const windows = await this.adapter.listWindows().catch(() => []);
+        // Window enumeration is an optional perception source, like the UIA and
+        // browser probes below. `.catch()` covers a rejected probe but not an
+        // adapter that does not implement one at all — which threw a TypeError
+        // out of perception and killed the whole session. Observing nothing is a
+        // valid observation; being unable to observe is not a failure of the task.
+        const windows = typeof this.adapter?.listWindows === "function"
+          ? await this.adapter.listWindows().catch(() => [])
+          : [];
         const rawForeground = windows.find((window) => window.Foreground ?? window.foreground) ?? null;
         const goalTokens = new Set(
           String(controllerState.goal ?? rawText)
@@ -763,9 +1100,36 @@ export class AgentRuntime {
           const titled = String(window.MainWindowTitle ?? window.title ?? "").trim();
           return titled && Number(bounds.width ?? 0) > 10 && Number(bounds.height ?? 0) > 10;
         });
-        const relevantWindows = visibleWindows.filter(matchesGoal).slice(0, 12);
-        const foreground = rawForeground && matchesGoal(rawForeground) ? rawForeground : null;
-        const groundedWindow = foreground ?? relevantWindows[0] ?? null;
+        // WHAT THE AGENT IS ALLOWED TO SEE.
+        //
+        // This used to be `visibleWindows.filter(matchesGoal)`, and the
+        // foreground window was discarded unless its title shared a word with
+        // the request. That is a blindfold: asked "what's on my screen" or "close
+        // whatever is covering my editor", the agent enumerated windows, matched
+        // none of them, grounded nothing, and never called UIA at all — so it
+        // reasoned about an empty desktop while three applications were open in
+        // front of it. A person does not stop seeing a window because its title
+        // does not quote the sentence they just spoke.
+        //
+        // Goal matching is retained, demoted to what it should always have been:
+        // a RANKING signal for which window to ground first, never a filter on
+        // what exists. The foreground window is always grounded when nothing
+        // matches, because that is what the user is looking at.
+        const rankedWindows = [...visibleWindows]
+          .map((window, index) => {
+            const bounds = window.Bounds ?? window.bounds ?? {};
+            const area = Number(bounds.width ?? 0) * Number(bounds.height ?? 0);
+            let score = 0;
+            if (matchesGoal(window)) score += 100;
+            if (window === rawForeground) score += 50;
+            score += Math.min(20, area / 100000);
+            return { window, score, index };
+          })
+          .sort((left, right) => right.score - left.score || left.index - right.index)
+          .map((entry) => entry.window);
+        const relevantWindows = rankedWindows.slice(0, 12);
+        const foreground = rawForeground;
+        const groundedWindow = rankedWindows.find(matchesGoal) ?? rawForeground ?? rankedWindows[0] ?? null;
         let ui = null;
         if (groundedWindow) {
           try {
@@ -775,6 +1139,31 @@ export class AgentRuntime {
               maxElements: 100
             });
           } catch { /* UIA is an optional perception source */ }
+        }
+        // VISUAL PERCEPTION.
+        //
+        // Capture + OCR were implemented, working (measured: 0.6s to capture a
+        // window, 0.6s to OCR it, returning per-line text with absolute screen
+        // coordinates) and reachable as capabilities — and the loop never once
+        // used them to look at the result of its own actions. Live, that produced
+        // the signature failure of a blind agent: told to type "Ultron online"
+        // into Notepad it typed "Ultron online into it", reported the keystroke
+        // as VERIFIED because the keystroke was delivered, and then could not say
+        // what was on the screen. UI Automation alone was never going to catch
+        // that; reading the window back is.
+        //
+        // Cost is why this is conditional rather than unconditional: it is ~1.2s
+        // per step and buys nothing on a step that runs a shell command. It runs
+        // whenever the work is actually happening on screen.
+        const uiFacingSession = /\b(open|launch|click|type|press|select|choose|scroll|drag|window|screen|see|look|read|show|display|button|menu|tab|dialog|app|application)\b/i
+          .test(String(controllerState.goal ?? rawText)) ||
+          (controllerState.recentActions ?? []).some((entry) => isUiFacingAction(entry?.action));
+        let screen = null;
+        if (groundedWindow && uiFacingSession) {
+          screen = await this._captureScreenEvidence({
+            windowId: String(groundedWindow.WindowHandle ?? groundedWindow.windowId),
+            application: groundedWindow.ProcessName ?? groundedWindow.processName
+          });
         }
         let browser = null;
         try {
@@ -799,24 +1188,70 @@ export class AgentRuntime {
           confidence: control.confidence,
           observedAt: control.observedAt
         }));
+        // Rank what the agent is shown by whether it can be USED, then by
+        // relevance — not the other way round.
+        //
+        // Scoring purely on goal-word overlap ranked window chrome to the top and
+        // cut the functional controls entirely. For "open calculator and work out
+        // 47 times 89" the three highest-scoring controls were "Minimize
+        // Calculator", "Maximize Calculator" and "Close Calculator", plus the
+        // "Calculator" header — every one of them containing the goal word — while
+        // "Multiply by", "Seven" and "Equals" scored zero and fell outside the
+        // 24-item cut. The loop then clicked the header repeatedly, because the
+        // buttons it needed were never in its field of view.
+        //
+        // The controls that matter are named in the APP's vocabulary ("Seven",
+        // "Multiply by"), which almost never overlaps the user's ("47 times 89").
+        // Lexical relevance is a tiebreak; being an enabled, actionable control is
+        // the signal.
+        // Things you can ACT on outrank things you can only read. Both are
+        // shown — the calculator's display is how the answer is read back — but
+        // ranking "Standard Calculator mode" and the window title above thirty
+        // buttons is what had the loop clicking headers.
+        const ACTIONABLE = /(Button|MenuItem|ListItem|Edit|ComboBox|CheckBox|RadioButton|TabItem|Hyperlink|Slider|Spinner|TreeItem)$/;
+        const READABLE = /(Text|Document|StatusBar)$/;
+        const CHROME = /^(minimize|maximize|restore|close|open navigation|system menu)\b/i;
         const scoredControls = compactControls
           .map((control, index) => {
-            const semantics = `${control.name ?? ""} ${control.automationId ?? ""} ${control.controlType ?? ""}`.toLowerCase();
-            const score = [...goalTokens].reduce((total, token) => total + (semantics.includes(token) ? 3 : 0), 0) +
-              (control.supportedPatterns?.length ? 1 : 0) +
-              (control.focused ? 1 : 0);
+            const name = String(control.name ?? "");
+            const type = String(control.controlType ?? "");
+            const semantics = `${name} ${control.automationId ?? ""} ${type}`.toLowerCase();
+            let score = 0;
+            if (ACTIONABLE.test(type)) score += 10;
+            else if (READABLE.test(type)) score += 5;
+            if (control.supportedPatterns?.length) score += 4;
+            if (control.enabled !== false) score += 2;
+            if (control.focused) score += 2;
+            if (name.trim()) score += 1;
+            // Title-bar controls are reachable when genuinely wanted, but they
+            // must never outrank the app's own controls.
+            if (CHROME.test(name)) score -= 12;
+            score += [...goalTokens].reduce((total, token) => total + (semantics.includes(token) ? 2 : 0), 0);
             return { control, score, index };
           })
           .sort((left, right) => right.score - left.score || left.index - right.index)
-          .slice(0, 24)
+          // Calculator alone exposes 34 buttons; a 24-item window could not hold
+          // one simple app's controls, let alone a real one.
+          .slice(0, 60)
           .map(({ control }) => control);
         return {
           foregroundWindow: foreground,
           groundedWindow,
           windows: relevantWindows,
           relevantControls: scoredControls,
+          // What the window actually LOOKS like: the OCR transcript of the
+          // grounded window plus any text-only regions UI Automation cannot
+          // see (custom-drawn canvases, web views, games, remote sessions).
+          // Present only when a visual capture was taken this step.
+          screen: screen?.available ? screen.summary : null,
+          screenTargets: screen?.available ? screen.targets : [],
           browser
         };
+      },
+      captureScreenSnapshot: async (request = {}) => {
+        this._assertSessionActive(session, { deadlineAt: Date.parse(session.deadlineAt) });
+        const evidence = await this._captureScreenEvidence(request);
+        return evidence?.available ? evidence.snapshot : null;
       },
       executeAction: async (action, controllerContext) =>
         (this._assertSessionActive(session, { deadlineAt: Date.parse(session.deadlineAt) }),
@@ -866,9 +1301,37 @@ export class AgentRuntime {
       const evidenceCoverage = evaluateEvidenceLedger(session.goalContract, session.evidenceLedger, result.bindings ?? {});
       if (!evidenceCoverage.satisfied) {
         session.currentState = RuntimeState.FAILED;
+        // Partial verification is a reason to QUALIFY an answer, not to withhold
+        // one. This branch used to replace whatever was found with a bare
+        // criteria count, so a session that read the Windows version or counted
+        // the files correctly told the user only that "independent evidence
+        // satisfies 0/2 goal criteria" — the measurement discarded, and nothing
+        // actionable in its place.
+        //
+        // Lead with what was actually observed, then say plainly what could not
+        // be confirmed. The status stays PARTIALLY_COMPLETED / INCONCLUSIVE, so
+        // nothing is overclaimed; only the wording the user reads changes.
+        const partialReads = (result.recentActions ?? [])
+          .filter((entry) => entry.succeeded)
+          .map((entry) => ({
+            capability: entry.action?.capability,
+            executionResult: entry.executionResult
+          }))
+          .filter((entry) => entry.capability && entry.executionResult);
+        const partialAnswer = await this._composeUserAnswer(
+          session,
+          partialReads,
+          summarizeReadOnlyResults(partialReads, this.capabilityRegistry)
+        );
+        const unverified = `Not independently confirmed: ${
+          (evidenceCoverage.unsatisfiedCriteria ?? []).join("; ") || "some of the requested outcome"
+        }.`;
         session.finalResponse = {
           status: evidenceCoverage.satisfiedCount > 0 ? "PARTIALLY_COMPLETED" : "INCONCLUSIVE",
-          message: `Interactive actions finished, but independent evidence satisfies only ${evidenceCoverage.satisfiedCount}/${evidenceCoverage.totalCriteria} goal criteria.`,
+          message: partialAnswer
+            ? `${partialAnswer}\n\n${unverified}`
+            : `Interactive actions finished, but independent evidence satisfies only ${evidenceCoverage.satisfiedCount}/${evidenceCoverage.totalCriteria} goal criteria.`,
+          observedAnswer: partialAnswer ?? null,
           interactive: true,
           evidenceCoverage,
           evidenceLedger: session.evidenceLedger
@@ -877,12 +1340,41 @@ export class AgentRuntime {
         await this.persistSession(session);
         return result;
       }
+      // A verified read is useful only when its observed VALUE reaches the user.
+      // The static task-graph path already does this in _finalizeSession; the
+      // adaptive controller sets its own response and so never did, which meant
+      // a session could inspect the machine, get the right answer, and reply
+      // "All original goal criteria were satisfied by locally verified
+      // evidence." — true, and completely useless. Asked which process used the
+      // most memory, it never said the name.
+      //
+      // Read the value back out of the actions the controller actually ran, in
+      // the same shape and through the same summariser the static path uses, so
+      // both routes answer a question the same way.
+      const readResults = successfulActions
+        .map((entry) => ({
+          capability: entry.action?.capability,
+          executionResult: entry.executionResult
+        }))
+        .filter((entry) => entry.capability && entry.executionResult);
+      const observedAnswer = await this._composeUserAnswer(
+        session,
+        readResults,
+        summarizeReadOnlyResults(readResults, this.capabilityRegistry)
+      );
+      const controllerSummary = typeof result.result === "string"
+        ? result.result
+        : result.result?.summary;
       session.currentState = RuntimeState.COMPLETED;
       session.finalResponse = {
         status: "COMPLETED",
-        message: typeof result.result === "string"
-          ? result.result
-          : (result.result?.summary ?? "The requested goal was completed and verified."),
+        // Prefer the observed value; keep the controller's own summary when it
+        // said something concrete, and fall back to the generic line only when
+        // there is genuinely nothing to report.
+        message: observedAnswer
+          ?? controllerSummary
+          ?? "The requested goal was completed and verified.",
+        observedAnswer: observedAnswer ?? null,
         interactive: true,
         result: result.result,
         verification: result.completionVerification,
@@ -920,6 +1412,7 @@ export class AgentRuntime {
   async _executeInteractiveAction(session, action, controllerContext = {}) {
     const taskId = createId("interactive_task");
     const capability = this.capabilityRegistry.get(action.capability);
+    action = this._pinActionToGroundedWindow(action, controllerContext);
     const plan = {
       planId: createId("interactive_plan"),
       planVersion: 1,
@@ -1449,7 +1942,7 @@ export class AgentRuntime {
 
         session.evidenceLedger ??= createEvidenceLedger();
         const criterionIds = verification.status === "VERIFIED"
-          ? matchGoalCriteriaForTask(session.goalContract, task, this.capabilityRegistry)
+          ? matchGoalCriteriaForTask(session.goalContract, task, this.capabilityRegistry, executionResult)
           : [];
         const evidenceEntry = appendEvidence(session.evidenceLedger, {
           taskId: task.taskId,
@@ -1543,7 +2036,37 @@ export class AgentRuntime {
 
         await this.persistSession(session);
 
-        if (verification.status !== "VERIFIED") {
+        // "Could not confirm" is not "did not work".
+        //
+        // This gate was `status !== "VERIFIED"`, which routed an action that
+        // PERFORMED but produced no independent evidence straight into
+        // diagnosis, replanning and abort. The scheduler already draws the line
+        // correctly — it marks these UNCERTAIN, not FAILED — and the interactive
+        // loop budgets thirty of them per session, because a UI click with no
+        // declared postcondition is the ordinary case, not a fault.
+        //
+        // Live, that cost a session that had launched Notepad, found the
+        // document control and typed into it: the typing returned
+        // PARTIALLY_VERIFIED with "no explicit postcondition was supplied", the
+        // runtime aborted, and the user was told "Did not work" about work that
+        // had in fact been done. The same request succeeded on a rerun purely
+        // because the model happened to attach a postcondition that time.
+        //
+        // Unconfirmed work still cannot CLAIM anything: these verifications are
+        // carried into the summary's remaining problems, and the goal contract
+        // — which requires evidence per criterion — remains the gate on whether
+        // the goal was met. Only a genuine FAILED is handled as a failure.
+        const performedButUnconfirmed = ["PARTIALLY_VERIFIED", "UNCERTAIN", "INCONCLUSIVE"]
+          .includes(verification.status);
+        if (performedButUnconfirmed) {
+          await this.addSessionEvent(session, "VERIFICATION_UNCONFIRMED", {
+            taskId: task.taskId,
+            capability: task.capability,
+            status: verification.status,
+            message: verification.message
+          });
+        }
+        if (verification.status !== "VERIFIED" && !performedButUnconfirmed) {
           await this.addSessionEvent(session, "VERIFICATION_FAILED", verification);
           const handleResult = await this.handleTaskFailure(session, task, verification, {
             replanAttempts,
@@ -1860,8 +2383,11 @@ export class AgentRuntime {
     // A verified read is useful only when its observed value reaches the user.
     // This also covers aggregate reads (for example a system snapshot made of
     // several independent tasks), without exposing raw command output.
-    const directAnswer = summarizeReadOnlyResults(session.taskResults, this.capabilityRegistry)
-      ?? (session.taskResults.length === 1 ? session.verifications.at(-1)?.message : null);
+    const directAnswer = await this._composeUserAnswer(
+      session,
+      session.taskResults,
+      summarizeReadOnlyResults(session.taskResults, this.capabilityRegistry)
+    ) ?? (session.taskResults.length === 1 ? session.verifications.at(-1)?.message : null);
     if (directAnswer) {
       executionSummary = { ...(executionSummary ?? {}), summary: directAnswer };
     }
@@ -1876,7 +2402,24 @@ export class AgentRuntime {
 
     session.finalResponse = {
       status: finalVerification.status,
-      message: finalVerification.message,
+      // When the request was a question, the ANSWER leads. The verification
+      // verdict — "All success criteria satisfied: scheduler reports every task
+      // verified" — is a statement about the runtime, not a reply to the user,
+      // and filing the answer under `summary` while showing that verdict as the
+      // message is why a session could measure the right thing and still tell
+      // the user nothing.
+      //
+      // But the answer must never REPLACE a caveat. When the outcome is not a
+      // clean completion, the verdict is the honest part — "exit code zero
+      // without an independent running-state postcondition is not completion" —
+      // so it stays, after the answer. Leading with the answer and following
+      // with what could not be confirmed is both useful and truthful; dropping
+      // either half is not.
+      message: directAnswer
+        ? (finalVerification.status === "COMPLETED"
+            ? directAnswer
+            : `${directAnswer}\n\n${finalVerification.message}`)
+        : finalVerification.message,
       taskResults: session.taskResults,
       verifications: session.verifications,
       finalStatus,
@@ -2643,7 +3186,63 @@ export class AgentRuntime {
     return target;
   }
 
+  // Turn verified read results into an answer to the question the user actually
+  // asked. `summarizeReadOnlyResults` gets the facts out of the capability
+  // results but phrases them as capability output ("processes.list: 25 items
+  // (first: Memory Compression, ...)"); this is the step that makes them read
+  // like an answer. Falls back to the deterministic summary whenever the model
+  // is unavailable, declines, or reports it could not answer from the data —
+  // a worse-phrased true answer always beats a well-phrased invented one.
+  async _composeUserAnswer(session, readResults, deterministicSummary) {
+    // Deliberately NOT gated on the deterministic summary existing. That
+    // summariser only speaks for capabilities whose permission model is READ,
+    // so a question answered by running a command — `command.run` is WRITE,
+    // because the runtime cannot know a given command only reads — produced
+    // nothing at all, and the user was told the request was inconclusive while
+    // the correct count sat in the command's output.
+    //
+    // Answering is safe here regardless of permission model: the model is given
+    // only observed data and must report when that data does not contain the
+    // answer. Permission classification governs what may RUN, not what may be
+    // reported once it has run.
+    if (!deterministicSummary && (readResults ?? []).length === 0) return null;
+    const question = session.intent?.rawText ?? session.intent?.normalizedGoal ?? "";
+    if (!question || typeof this.reasoningEngine?.answerFromObservations !== "function") {
+      return deterministicSummary;
+    }
+    try {
+      const answered = await this.reasoningEngine.answerFromObservations(
+        question,
+        readResults.map((entry) => ({ capability: entry.capability, result: entry.executionResult }))
+      );
+      // `grounded: false` is the model telling us the data did not contain the
+      // answer. Honour that rather than printing a confident non-answer.
+      if (answered?.ok && answered.grounded && answered.text) {
+        await this.addSessionEvent(session, "ANSWER_COMPOSED_FROM_OBSERVATIONS", {
+          question,
+          capabilities: readResults.map((entry) => entry.capability)
+        });
+        return answered.text;
+      }
+    } catch { /* answering is a presentation step; never fail the session for it */ }
+    return deterministicSummary;
+  }
+
   async persistSession(session) {
+    // A plan whose task graph is empty is not executable, and it is the only
+    // part of a session that can fail validation while the rest of the session
+    // is perfectly sound. Persisting is how a session survives; it must never
+    // be the thing that destroys one. Dropping the empty plan loses nothing
+    // (there were no tasks) and keeps a real record of what happened, instead
+    // of throwing out of whatever code path happened to be saving — including
+    // the error handler, where the throw escaped submitIntent entirely and the
+    // caller got a raw ValidationError instead of a session.
+    //
+    // Deliberately narrow: any other invalid session still throws, because
+    // those indicate a genuine bug that should not be quietly persisted.
+    if (session?.plan && (session.plan.taskGraph?.tasks?.length ?? 0) === 0) {
+      session.plan = null;
+    }
     validateExecutionSession(session);
     await this.sessionStore.save(session);
   }

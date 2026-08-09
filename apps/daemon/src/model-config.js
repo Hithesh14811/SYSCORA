@@ -36,6 +36,15 @@ export function loadModelConfig(basePath = process.cwd()) {
       null,
     model: process.env.SYSCORA_MODEL_NAME || fileConfig.model || undefined,
     baseUrl: process.env.SYSCORA_MODEL_BASE_URL || fileConfig.baseUrl || undefined,
+    // Floor under every reasoning call. Generous by design: a timeout is a
+    // CEILING, so raising it costs a fast model nothing — it returns in two
+    // seconds either way — while a reasoning model that thinks before emitting
+    // tokens was being aborted mid-call and reported as "all model providers
+    // failed". The session's own elapsed-time budget still bounds the request,
+    // so this cannot produce an unbounded run.
+    requestTimeoutMs: Number(
+      process.env.SYSCORA_MODEL_TIMEOUT_MS || fileConfig.requestTimeoutMs || 45000
+    ),
     fallbackProviders:
       process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS || fileConfig.fallbackProviders || "",
     externalAIConsent: {

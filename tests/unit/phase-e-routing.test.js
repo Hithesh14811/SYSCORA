@@ -4,6 +4,7 @@ import { IntentEngine } from "../../packages/intent-engine/src/index.js";
 import { TaskGraphScheduler } from "../../packages/task-graph-scheduler/src/index.js";
 import { CapabilityRegistry } from "../../packages/capability-registry/src/index.js";
 import { WindowsAdapter } from "../../os-adapters/windows/src/windows-adapter.js";
+import { OPERATION_PLANS } from "../../packages/planner/src/index.js";
 
 // A reasoning double that stands in for a REAL remote model. It deliberately
 // has no own `modelProvider` property, so IntentEngine treats its answer as
@@ -62,6 +63,38 @@ test("a genuine installed-application goal keeps the model's application.launch 
     assert.equal(intent.operation, "application.launch", text);
     assert.equal(intent.routingOverride, undefined, text);
   }
+});
+
+test("an untyped model answer cannot strand a live highest-memory process read", async () => {
+  const intent = await new IntentEngine(modelChoosing("", {}))
+    .classify("which process is using the most memory on this computer right now");
+  assert.equal(intent.operation, "processes.list");
+  assert.deepEqual(intent.requiredCapabilities, ["processes.list"]);
+  assert.equal(intent.routingOverride?.reason, "TYPED_LOCAL_READ_PREFERRED_OVER_UNTYPED_OR_MISMATCHED_CHOICE");
+});
+
+test("filesystem.list aliases from a model are canonicalized before deterministic planning", async () => {
+  const intent = await new IntentEngine(modelChoosing("filesystem.list", {
+    path: "%USERPROFILE%\\Downloads",
+    directory: "Downloads"
+  })).classify("how many files are in my Downloads folder");
+  assert.equal(intent.operation, "filesystem.list");
+  assert.equal(intent.entities.directoryPath, "%USERPROFILE%\\Downloads");
+  assert.equal(intent.entities.countFiles, true);
+  assert.equal(intent.routingOverride?.reason, "CANONICALIZED_TYPED_LOCAL_READ_ENTITIES");
+});
+
+test("an untyped Downloads count becomes a bounded read-only directory plan", async () => {
+  const intent = await new IntentEngine(modelChoosing("", {}))
+    .classify("how many files are in my Downloads folder");
+  assert.equal(intent.operation, "filesystem.list");
+  assert.equal(intent.entities.directoryPath, "%USERPROFILE%\\Downloads");
+  assert.equal(intent.entities.countFiles, true);
+
+  const tasks = OPERATION_PLANS["filesystem.list"](intent.entities, "C:\\unused");
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].capability, "filesystem.list");
+  assert.equal(tasks[0].inputs.maxEntries, 2000);
 });
 
 test("application launch resolves a real target and never blind-launches an unresolved literal", async () => {
