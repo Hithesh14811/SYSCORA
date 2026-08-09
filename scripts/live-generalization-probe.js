@@ -41,6 +41,12 @@ async function powershell(script) {
 
 const TASKS = [
   {
+    id: "calc-reported",
+    request: "open calculator and do 99 x 1124",
+    truth: async () => "111276",
+    matches: (answer, truth) => answer.replace(/[,\s]/g, "").includes(truth)
+  },
+  {
     id: "calc-arithmetic",
     // Requires real interaction: locate controls, click a sequence, read the
     // display, decide it is finished. Arithmetic makes the answer unambiguous.
@@ -140,7 +146,11 @@ async function main() {
       answer = `__ERROR__ ${e.message}`;
     }
     const elapsedMs = Date.now() - startedAt;
-    const correct = Boolean(truth) && task.matches(answer, String(truth));
+    // A failure message often repeats the expected value ("did not show
+    // 111276"). Matching that text is not success. The observed answer and the
+    // runtime's own terminal claim must agree.
+    const correct = ["COMPLETED", "COMPLETED_WITH_WARNINGS", "VERIFIED", "ANSWERED"].includes(claimed)
+      && Boolean(truth) && task.matches(answer, String(truth));
 
     results.push({ id: task.id, correct, truth, claimed, route, elapsedMs });
     console.log(

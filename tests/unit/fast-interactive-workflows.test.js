@@ -5,12 +5,21 @@ import { GeneralPlanner, PlanValidator } from "../../packages/planner/src/index.
 import { createDefaultCapabilityRegistry } from "../../packages/capability-registry/src/index.js";
 import { WindowsAdapter } from "../../os-adapters/windows/src/windows-adapter.js";
 
-const explodingReasoning = {
-  understandIntent: async () => { throw new Error("the model must not be on this fast path"); }
+let modelDecisions = 0;
+const decidingReasoning = {
+  async understandIntent(text, context) {
+    modelDecisions += 1;
+    // Deterministic test oracle standing in for a remote model response. The
+    // outer IntentEngine must still consult this decision before routing.
+    const parsed = await new IntentEngine(null).classify(text, context);
+    return { ok: true, data: parsed };
+  }
 };
 
-test("calculator phrasing routes immediately to one typed evaluation", async () => {
-  const intent = await new IntentEngine(explodingReasoning).classify("open calculator and do the math 39 x 17");
+test("the model selects calculator evaluation and it compiles to one typed task", async () => {
+  const before = modelDecisions;
+  const intent = await new IntentEngine(decidingReasoning).classify("open calculator and do the math 39 x 17");
+  assert.equal(modelDecisions, before + 1);
   assert.equal(intent.operation, "calculator.evaluate");
   assert.equal(intent.entities.expression, "39*17");
   assert.equal(intent.entities.expectedResult, "663");
@@ -21,13 +30,15 @@ test("calculator phrasing routes immediately to one typed evaluation", async () 
   assert.deepEqual(new PlanValidator(registry).validatePlan(plan.taskGraph), { valid: true, errors: [] });
 });
 
-test("Spotify queue continuation uses conversation context and needs no write approval", async () => {
-  const intent = await new IntentEngine(explodingReasoning).classify("now add cry for me to queue", {
+test("the model resolves a Spotify queue continuation from conversation context", async () => {
+  const before = modelDecisions;
+  const intent = await new IntentEngine(decidingReasoning).classify("now add cry for me to queue", {
     history: [
       { role: "user", text: "play Dracula on Spotify" },
       { role: "assistant", text: "Dracula is playing in Spotify." }
     ]
   });
+  assert.equal(modelDecisions, before + 1);
   assert.equal(intent.operation, "spotify.track.queue");
   assert.equal(intent.entities.query, "cry for me");
 
@@ -37,10 +48,12 @@ test("Spotify queue continuation uses conversation context and needs no write ap
   assert.equal(registry.get("spotify.track.queue").permissionModel.type, "READ");
 });
 
-test("explicit unsent WhatsApp request routes to the bounded draft capability", async () => {
-  const intent = await new IntentEngine(explodingReasoning).classify(
+test("the model routes an explicit unsent WhatsApp request to the bounded draft capability", async () => {
+  const before = modelDecisions;
+  const intent = await new IntentEngine(decidingReasoning).classify(
     "open whatsapp and types a message to Amma saying hi where are you, do not send it, just type and stop"
   );
+  assert.equal(modelDecisions, before + 1);
   assert.equal(intent.operation, "whatsapp.message.draft");
   assert.deepEqual(
     { contact: intent.entities.contact, message: intent.entities.message, send: intent.entities.send },
@@ -52,10 +65,12 @@ test("explicit unsent WhatsApp request routes to the bounded draft capability", 
   assert.equal(registry.get("whatsapp.message.draft").permissionModel.type, "READ");
 });
 
-test("creator latest request routes to channel-first YouTube playback", async () => {
-  const intent = await new IntentEngine(explodingReasoning).classify(
+test("the model routes a creator-latest request to channel-first YouTube playback", async () => {
+  const before = modelDecisions;
+  const intent = await new IntentEngine(decidingReasoning).classify(
     "play ashish chanchlani's latest video on youtube"
   );
+  assert.equal(modelDecisions, before + 1);
   assert.equal(intent.operation, "browser.youtube.latest");
   assert.equal(intent.entities.creator, "ashish chanchlani");
   assert.ok(intent.constraints.includes("REJECT_OPTIONAL_COOKIES"));
@@ -76,6 +91,16 @@ test("Calculator enters the whole expression in one foreground keyboard action",
   assert.equal(result.matched, true);
   assert.equal(keyboard.length, 1);
   assert.deepEqual(keyboard[0], { operation: "press", inputs: { application: "calculator", windowId: "42", keys: "{ESC}39*17{ENTER}" } });
+});
+
+test("Calculator verification accepts the locale thousands separator", async () => {
+  const adapter = new WindowsAdapter({ automationHost: false, browserAutomation: {} });
+  adapter.launchApplication = async () => ({ windowIdentity: { windowId: "42" } });
+  adapter.keyboardAction = async () => ({ performed: true });
+  adapter.inspectUi = async () => ({ elements: [{ name: "Display is 111,276" }] });
+  const result = await adapter.calculateWithUi("99*1124", "111276");
+  assert.equal(result.matched, true);
+  assert.equal(result.visibleResult, "Display is 111,276");
 });
 
 test("WhatsApp draft workflow never emits a send key after typing the message", async () => {
@@ -101,4 +126,26 @@ test("WhatsApp draft workflow never emits a send key after typing the message", 
   const keyboard = actions.filter((action) => action.kind === "keyboard");
   assert.equal(keyboard.at(-1).operation, "type");
   assert.equal(keyboard.at(-1).inputs.text, "hi where are you");
+});
+
+test("WhatsApp opens an already-visible chat without requiring a textual search control", async () => {
+  const adapter = new WindowsAdapter({ automationHost: false, browserAutomation: {} });
+  const actions = [];
+  adapter.launchApplication = async () => ({ windowIdentity: { windowId: "84" } });
+  adapter.manageWindow = async () => ({ performed: true });
+  adapter.pointerAction = async (operation, inputs) => { actions.push({ kind: "pointer", operation, inputs }); return { performed: true }; };
+  adapter.keyboardAction = async (operation, inputs) => { actions.push({ kind: "keyboard", operation, inputs }); return { performed: true }; };
+  let screenRead = 0;
+  const target = (name, y) => ({ name, boundingRect: { x: 100, y, width: 180, height: 30 } });
+  adapter._readApplicationOcr = async () => {
+    screenRead += 1;
+    if (screenRead === 1) return { readable: true, text: "Chats Amma", targets: [target("Amma", 180)] };
+    if (screenRead === 2) return { readable: true, text: "Amma Type a message", targets: [target("Type a message", 600)] };
+    return { readable: true, text: "Amma polite draft", targets: [] };
+  };
+  const result = await adapter.draftWhatsAppMessage("Amma", "polite draft");
+  assert.equal(result.drafted, true);
+  assert.equal(result.sent, false);
+  assert.equal(actions.some((action) => action.kind === "keyboard" && action.inputs.keys === "^f"), false);
+  assert.equal(actions.at(-1).inputs.text, "polite draft");
 });

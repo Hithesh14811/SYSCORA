@@ -106,6 +106,15 @@ export function summarizeReadOnlyResults(taskResults = [], capabilityRegistry = 
   const systemSummary = formatSystemSummary(systemResult);
   if (systemSummary) return systemSummary;
 
+  const calculatorResult = taskResults
+    .filter((result) => result.capability === "calculator.evaluate")
+    .map((result) => result.executionResult)
+    .filter((result) => result?.matched === true && result?.expectedResult != null)
+    .at(-1);
+  if (calculatorResult) {
+    return `${calculatorResult.expression} = ${calculatorResult.expectedResult}.`;
+  }
+
   // Research exists to hand back what was FOUND. The generic scalar summary
   // below would reduce it to "found: true, sourceUrl: ..., pageTitle: ..." —
   // technically accurate and completely useless, since the results the user

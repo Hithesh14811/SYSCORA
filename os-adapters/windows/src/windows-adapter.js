@@ -721,6 +721,24 @@ export class WindowsAdapter {
     return this.executeCommand(process.cwd(), "winget", ["install", "--id", id, "--source", "winget", "--accept-package-agreements", "--accept-source-agreements"], { timeoutMs: 300000 });
   }
 
+  async wingetUninstall(id) {
+    return this.executeCommand(
+      process.cwd(),
+      "winget",
+      ["uninstall", "--id", id, "--source", "winget", "--accept-source-agreements", "--disable-interactivity"],
+      { timeoutMs: 300000 }
+    );
+  }
+
+  async wingetReinstall(id) {
+    const uninstall = await this.wingetUninstall(id);
+    if (uninstall.exitCode !== 0) {
+      return { exitCode: uninstall.exitCode, stage: "uninstall", uninstall, install: null };
+    }
+    const install = await this.wingetInstall(id);
+    return { exitCode: install.exitCode, stage: "install", uninstall, install };
+  }
+
   async wingetList(id) {
     // Installation is explicitly sourced from the community WinGet repository.
     // Verify against that same source so `winget list` never probes `msstore`
@@ -1775,17 +1793,25 @@ public static class SyscoraAudio {
     // characters are literal Calculator keys. Escape first clears stale state.
     const keys = `{ESC}${normalized.replace(/\+/g, "{+}")}{ENTER}`;
     const input = await this.keyboardAction("press", { application: "calculator", windowId: String(windowId), keys });
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    const inspected = await this.inspectUi({ application: "calculator", windowId: String(windowId), maxElements: 160 });
     const expected = String(expectedResult ?? "").trim();
-    const visible = (inspected.elements ?? []).map((element) => String(element.name ?? element.value ?? "")).filter(Boolean);
-    const matched = expected && visible.some((value) => value === expected || value.includes(expected));
+    const compactNumber = (value) => String(value ?? "").replace(/[,\s]/g, "");
+    const deadline = Date.now() + 1500;
+    let inspected = { elements: [] };
+    let visible = [];
+    let matched = false;
+    do {
+      inspected = await this.inspectUi({ application: "calculator", windowId: String(windowId), maxElements: 160 });
+      visible = (inspected.elements ?? []).map((element) => String(element.name ?? element.value ?? "")).filter(Boolean);
+      matched = Boolean(expected && visible.some((value) => compactNumber(value).includes(compactNumber(expected))));
+      if (matched || Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } while (Date.now() < deadline);
     return {
       performed: input?.performed === true,
       expression: normalized,
       expectedResult: expected,
       matched,
-      visibleResult: visible.find((value) => value === expected || value.includes(expected)) ?? null,
+      visibleResult: visible.find((value) => compactNumber(value).includes(compactNumber(expected))) ?? null,
       windowId: String(windowId),
       input,
       launch,
@@ -1847,22 +1873,41 @@ public static class SyscoraAudio {
     // input is tied to that exact window and observed rectangle; there is no
     // fixed screen coordinate or minimize/maximize probing.
     const initialScreen = await this._readApplicationOcr("whatsapp", windowId);
-    const searchTarget = (initialScreen.targets ?? []).find((target) =>
-      /search.*(?:new\s+chat|chat)/i.test(String(target?.name ?? target?.text ?? ""))
-    );
-    if (!searchTarget) {
-      return { performed: false, drafted: false, sent: false, sendInvoked: false, reason: "whatsapp-search-not-visible", windowId: String(windowId), launch };
-    }
-    const searchOpened = await clickOcrTarget(searchTarget);
-    await this.keyboardAction("press", { ...pinned, keys: "^a" });
-    const contactTyped = await this.keyboardAction("type", { ...pinned, text: recipient });
-    await new Promise((resolve) => setTimeout(resolve, 450));
-    const resultsScreen = await this._readApplicationOcr("whatsapp", windowId);
-    const searchBottom = Number(searchTarget.boundingRect?.y ?? 0) + Number(searchTarget.boundingRect?.height ?? 0);
-    const contactTarget = (resultsScreen.targets ?? [])
+    const initialTargets = initialScreen.targets ?? [];
+    // If the requested chat is already visible, use the freshly observed row
+    // directly. The old implementation refused to continue unless a textual
+    // Search label was visible, even though the current WhatsApp build often
+    // presents Search as an icon while the desired chat row is plain OCR text.
+    let contactTarget = initialTargets
       .filter((target) => compact(target?.name ?? target?.text) === compact(recipient))
       .sort((left, right) => Number(left?.boundingRect?.y ?? 0) - Number(right?.boundingRect?.y ?? 0))
-      .find((target) => Number(target?.boundingRect?.y ?? 0) > searchBottom + 10);
+      .find((target) => Number(target?.boundingRect?.width ?? 0) > 0 && Number(target?.boundingRect?.height ?? 0) > 0);
+    let searchOpened = null;
+    let contactTyped = null;
+    if (!contactTarget) {
+      const searchTarget = initialTargets
+        .filter((target) => /search/i.test(String(target?.name ?? target?.text ?? "")))
+        .sort((left, right) => {
+          const score = (target) => /search.*(?:new\s+chat|chat)/i.test(String(target?.name ?? target?.text ?? "")) ? 1 : 0;
+          return score(right) - score(left);
+        })[0];
+      // Ctrl+F is WhatsApp's local chat-list search fallback. It does not
+      // minimize/maximize, move focus to another window, or send anything.
+      searchOpened = searchTarget
+        ? await clickOcrTarget(searchTarget)
+        : await this.keyboardAction("press", { ...pinned, keys: "^f" });
+      await this.keyboardAction("press", { ...pinned, keys: "^a" });
+      contactTyped = await this.keyboardAction("type", { ...pinned, text: recipient });
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      const resultsScreen = await this._readApplicationOcr("whatsapp", windowId);
+      const searchBottom = searchTarget
+        ? Number(searchTarget.boundingRect?.y ?? 0) + Number(searchTarget.boundingRect?.height ?? 0)
+        : 0;
+      contactTarget = (resultsScreen.targets ?? [])
+        .filter((target) => compact(target?.name ?? target?.text) === compact(recipient))
+        .sort((left, right) => Number(left?.boundingRect?.y ?? 0) - Number(right?.boundingRect?.y ?? 0))
+        .find((target) => Number(target?.boundingRect?.y ?? 0) > searchBottom + 10);
+    }
     if (!contactTarget) {
       return { performed: false, drafted: false, sent: false, sendInvoked: false, reason: "whatsapp-contact-not-visible", windowId: String(windowId), launch };
     }
@@ -1870,7 +1915,7 @@ public static class SyscoraAudio {
     await new Promise((resolve) => setTimeout(resolve, 450));
     const chatScreen = await this._readApplicationOcr("whatsapp", windowId);
     const composerTarget = (chatScreen.targets ?? []).find((target) =>
-      /(?:type|write)\s+(?:a\s+)?message/i.test(String(target?.name ?? target?.text ?? ""))
+      /(?:(?:type|write)\s+(?:a\s+)?message|^message$)/i.test(String(target?.name ?? target?.text ?? "").trim())
     );
     const composerFocused = composerTarget ? await clickOcrTarget(composerTarget) : { performed: true, method: "chat-default-focus" };
     const existingDraftSelected = await this.keyboardAction("press", { ...pinned, keys: "^a" });
@@ -1879,7 +1924,15 @@ public static class SyscoraAudio {
     const screen = await this._readApplicationOcr("whatsapp", windowId).catch((error) => ({ readable: false, text: "", error: error.message }));
     const visible = compact(screen.text);
     const contactVisible = visible.includes(compact(recipient));
-    const draftVisible = visible.includes(compact(body));
+    const messageTokens = [...new Set(compact(body).split(" ").filter((token) => token.length >= 3))];
+    const visibleTokens = new Set(visible.split(" ").filter(Boolean));
+    const draftCoverage = messageTokens.length
+      ? messageTokens.filter((token) => visibleTokens.has(token)).length / messageTokens.length
+      : 0;
+    // OCR commonly splits a long composer value across runs and drops
+    // punctuation/contractions. Full normalized equality is strongest; high
+    // unique-token coverage is accepted only in the requested contact's chat.
+    const draftVisible = visible.includes(compact(body)) || (contactVisible && draftCoverage >= 0.8);
     return {
       performed: draftTyped?.performed === true,
       drafted: draftTyped?.performed === true && (draftVisible || screen.readable === false),
@@ -1891,7 +1944,14 @@ public static class SyscoraAudio {
       draftVisible,
       windowId: String(windowId),
       steps: { searchOpened, contactTyped, chatOpened, composerFocused, existingDraftSelected, draftTyped },
-      screen: { readable: screen.readable === true, contactVisible, draftVisible, targetCount: (screen.targets ?? []).length },
+      screen: {
+        readable: screen.readable === true,
+        contactVisible,
+        draftVisible,
+        draftCoverage: Number(draftCoverage.toFixed(3)),
+        composerGrounded: Boolean(composerTarget),
+        targetCount: (screen.targets ?? []).length
+      },
       launch
     };
   }

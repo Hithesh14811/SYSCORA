@@ -368,6 +368,16 @@ export const OPERATION_PLANS = {
       timeout: 600000
     })
   ],
+  "package.winget.reinstall": (e) => [
+    buildTask("package.winget.reinstall", { id: e.id ?? e.key }, {
+      goal: "Reinstall package",
+      description: "Uninstall and reinstall an exact package via WinGet",
+      riskHints: "MEDIUM",
+      expectedStateChanges: ["system.packages"],
+      completionCriteria: ["Package was removed, installed again, and verified"],
+      timeout: 600000
+    })
+  ],
   "system.performance.analyze": () => [
     buildTask("system.performance.analyze", {}, {
       goal: "Analyze performance",
@@ -855,6 +865,15 @@ export class GeneralPlanner {
     if (userIntent.operation && OPERATION_PLANS[userIntent.operation]) {
       plan = this.fallbackPlan(userIntent, resolvedContext);
       plannerSource = "DIRECT_OPERATION";
+    } else if ((userIntent.requiredCapabilities ?? []).length > 0) {
+      // The classifier has already made the tool decision. If one registered
+      // typed workflow expands to exactly that complete capability set, compile
+      // it directly instead of paying for a second model call to rediscover the
+      // same graph. This is generic over OPERATION_PLANS: there is no request or
+      // application keyword here. Compound workflows (for example play+queue)
+      // are discovered from the capabilities their builders actually emit.
+      plan = this._compileExactCapabilityDecision(userIntent, resolvedContext);
+      if (plan) plannerSource = "MODEL_DECISION_COMPILED";
     } else if (this.reasoningEngine && this.reasoningEngine.hasModel()) {
       const healthy = await this.reasoningEngine.isModelHealthy();
       if (healthy) {
@@ -922,6 +941,39 @@ export class GeneralPlanner {
     // Record which planner produced this plan so the runtime can audit it.
     plan.plannerSource = plannerSource;
     return plan;
+  }
+
+  _compileExactCapabilityDecision(userIntent, resolvedContext) {
+    const required = [...new Set((userIntent.requiredCapabilities ?? []).filter((value) => typeof value === "string"))];
+    if (required.length === 0) return null;
+    const requiredSet = new Set(required);
+    const entities = userIntent.entities ?? {};
+    const workspacePath = entities.workspacePath ?? process.cwd();
+    const validator = new PlanValidator(this.capabilityRegistry);
+
+    for (const builder of Object.values(OPERATION_PLANS)) {
+      let tasks;
+      try {
+        tasks = builder(entities, workspacePath);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(tasks) || tasks.length === 0) continue;
+      const produced = new Set(tasks.map((task) => task.capability));
+      if (produced.size !== requiredSet.size || [...requiredSet].some((name) => !produced.has(name))) continue;
+      const taskGraph = { graphId: createId(), tasks };
+      if (!validator.validatePlan(taskGraph, { includeAvailability: false }).valid) continue;
+      return {
+        planId: createId(),
+        planVersion: 1,
+        parentPlanId: null,
+        goal: userIntent.normalizedGoal,
+        summary: userIntent.normalizedGoal,
+        finalSuccessCriteria: userIntent.successCriteria?.length ? userIntent.successCriteria : ["Tasks completed"],
+        taskGraph
+      };
+    }
+    return null;
   }
 
   _normalizePlan(plan) {

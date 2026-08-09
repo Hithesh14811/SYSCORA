@@ -90,83 +90,9 @@ export class IntentEngine {
     const lower = text.toLowerCase();
     let modelResult = null;
 
-    // High-confidence, bounded interactive workflows belong on the latency
-    // critical path.  Previously the model request below ran first, so even a
-    // completely typed command such as "open Calculator" sat idle for the full
-    // provider round trip before the local route was considered.  These routes
-    // do not execute arbitrary model text: each maps to one registered,
-    // schema-validated capability and independently verifies its outcome.
-    const fastSpotify = this.extractSpotifyTrackRequest(lower, text);
-    if (fastSpotify) {
-      const intent = this._buildSpotifyIntent(intentId, text, fastSpotify, context);
-      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
-      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
-      return intent;
-    }
-    const fastQueue = this.extractSpotifyQueueFollowup(text, context.history);
-    if (fastQueue) {
-      const intent = this._buildOperationIntent(intentId, text, "spotify.track.queue", {
-        category: "APPLICATION",
-        normalizedGoal: `Queue ${fastQueue.query} in Spotify`,
-        entities: { query: fastQueue.query },
-        successCriteria: [`${fastQueue.query} is in the Spotify queue`],
-        confidence: 1
-      }, context);
-      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
-      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
-      return intent;
-    }
-    const fastCalculator = this.extractCalculatorRequest(text);
-    if (fastCalculator) {
-      const intent = this._buildOperationIntent(intentId, text, "calculator.evaluate", {
-        category: "APPLICATION",
-        normalizedGoal: `Calculate ${fastCalculator.expression} in Calculator`,
-        entities: fastCalculator,
-        successCriteria: [`Calculator visibly shows ${fastCalculator.expectedResult}`],
-        confidence: 1
-      }, context);
-      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
-      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
-      return intent;
-    }
-    const fastDraft = this.extractWhatsAppDraft(text);
-    if (fastDraft) {
-      const intent = this._buildOperationIntent(intentId, text, "whatsapp.message.draft", {
-        category: "APPLICATION",
-        normalizedGoal: `Draft a WhatsApp message to ${fastDraft.contact} without sending it`,
-        entities: fastDraft,
-        constraints: ["DO_NOT_SEND"],
-        successCriteria: [`The ${fastDraft.contact} chat is open`, "The exact message is visible in the composer", "No message is sent"],
-        confidence: 1
-      }, context);
-      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
-      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
-      return intent;
-    }
-    const fastDesktop = this.extractDirectDesktopAction(lower, text);
-    if (fastDesktop) {
-      const intent = this._buildOperationIntent(intentId, text, fastDesktop.operation, {
-        category: "APPLICATION",
-        normalizedGoal: fastDesktop.normalizedGoal,
-        entities: fastDesktop.entities,
-        successCriteria: fastDesktop.successCriteria,
-        confidence: 1
-      }, context);
-      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
-      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
-      return intent;
-    }
-    const fastWebOutcome = this.extractWebOutcome(lower, text);
-    if (fastWebOutcome?.operation) {
-      const intent = this._buildWebOutcomeIntent(intentId, text, fastWebOutcome, context, {
-        from: "(fast-path)", reason: "HIGH_CONFIDENCE_TYPED_WEB_OUTCOME"
-      });
-      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
-      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
-      return intent;
-    }
-
-    // Open-ended language still goes through the single reasoning boundary.
+    // Every natural-language turn goes through the reasoning boundary first.
+    // Application-specific parsers below are an availability fallback only;
+    // they are executors' argument recovery, not the agent's decision-maker.
     // A caller-supplied structured operation is already schema-bounded and must
     // not pay for (or be reinterpreted by) a redundant model request.
     const modelUnderstanding = this.reasoningEngine && !context.operation
@@ -288,7 +214,6 @@ export class IntentEngine {
     // whenever the model names a usable typed operation, so any code reached
     // after it is, by definition, the model-did-not-route case — which is
     // precisely when the deterministic extractors are meant to run.
-    const llmFirst = Boolean(modelResult);
     // Outcome classification of the request itself. It is computed for every
     // request — including the LLM-first path — because it is the only signal
     // that can contradict a model routing a web destination into a desktop
@@ -327,28 +252,12 @@ export class IntentEngine {
 
     if (modelResult) {
       const chosen = typeof modelResult.operation === "string" ? modelResult.operation.trim() : "";
-      // The model left the operation empty, reached for generic UI automation,
-      // or invented a plausible-sounding operation name (e.g. "play_and_queue")
-      // that isn't actually in the registered set — none of these name a real,
-      // executable typed workflow. Falling through with any of them leaves the
-      // raw taskGraph composer free to decompose a goal a typed capability
-      // already covers exactly into brittle ui.action steps, so all three are
-      // treated the same as no choice at all, and a confident deterministic
-      // match below is preferred over them.
-      const modelOperationIsUntyped = !chosen || chosen === "ui.action" || !KNOWN_OPERATION_SET.has(chosen);
-      // A local inventory question has a typed, read-only route whose scope is
-      // completely determined by the user's words.  Real-model runs showed the
-      // classifier sometimes leaving these untyped, after which the planner
-      // spent its full budget despite processes.list/filesystem.list already
-      // being present.  Prefer the bounded read when the model did not name a
-      // usable operation; this does not grant shell execution or mutation.
+      // Validate the model's route against modality facts that are explicit in
+      // the request. A website cannot be launched as an installed executable,
+      // and a bounded local read should not be stranded by an empty tool choice.
+      // These are post-decision repairs with an audit trail, not pre-model routes.
       const typedLocalRead = this.extractLocalInventoryRead(lower, text, context);
-      if (typedLocalRead) {
-        // This also canonicalizes entities when the model chose the right
-        // operation but used plausible schema aliases such as `path` or
-        // `directory`.  OPERATION_PLANS consumes `directoryPath`; accepting the
-        // aliases unchanged silently listed the workspace instead of Downloads
-        // and then failed goal-coverage checks after a long planning fallback.
+      if (typedLocalRead && (!chosen || chosen === typedLocalRead.operation)) {
         const intent = this._buildOperationIntent(intentId, text, typedLocalRead.operation, {
           ...modelResult,
           normalizedGoal: typedLocalRead.normalizedGoal,
@@ -366,39 +275,24 @@ export class IntentEngine {
         if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
         return intent;
       }
-      // webOutcome only fires for a couple of narrow, high-precision patterns
-      // (YouTube playback, flight research) and grounds its entities — the
-      // search URL, the track/topic query, the result selectors — directly in
-      // the raw request text. It therefore wins outright, including when the
-      // model picked the SAME operation: agreement on the operation says
-      // nothing about the entities, and this model routinely returns an empty
-      // entities object, which would leave browser.media.play with no URL and
-      // no query and send the request back into generic UI automation. A
-      // website is also not an installed application, so a local-launch choice
-      // is overridden here too. The correction is recorded for audit.
-      if (webOutcome) {
+      if (webOutcome && (!chosen || DESKTOP_LAUNCH_OPERATIONS.has(chosen))) {
         const intent = this._buildWebOutcomeIntent(intentId, text, webOutcome, context, {
           from: chosen || "(none)",
-          reason: DESKTOP_LAUNCH_OPERATIONS.has(chosen)
-            ? "WEB_DESTINATION_IS_NOT_AN_INSTALLED_APPLICATION"
-            : "TYPED_WEB_CAPABILITY_PREFERRED_OVER_LESS_SPECIFIC_OR_UNTYPED_CHOICE"
+          reason: "WEB_DESTINATION_IS_NOT_AN_INSTALLED_APPLICATION"
         });
         const validation = validateSchema(intent, USER_INTENT_SCHEMA);
         if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
         return intent;
       }
-      // "ui.action" IS a KNOWN_OPERATION (the planner has a builder for it), but
-      // accepting it here — before the untyped-fallback checks below run — would
-      // let generic UI automation win over a typed extractor purely because the
-      // model named it explicitly instead of leaving the field blank. Treat it
-      // the same as no choice: fall through so a confident deterministic match
-      // (e.g. the compound Spotify play+queue extractor below) gets first say.
-      if (chosen && !modelOperationIsUntyped && KNOWN_OPERATION_SET.has(chosen)) {
+      // The model is authoritative for natural-language routing. A typed
+      // operation is merely a fast execution plan that the model may select;
+      // omitting it means the general planner must compose a multi-tool graph.
+      // In neither case may a downstream keyword extractor replace the model's
+      // decision.
+      if (chosen && chosen !== "ui.action" && KNOWN_OPERATION_SET.has(chosen)) {
         let operationResult = modelResult;
-        // A model may correctly choose Spotify playback while omitting the
-        // concrete track entities. Recover only those bounded entities from the
-        // original request, and preserve a second queue instruction when the
-        // user supplied a compound command.
+        // Recover literal arguments only after the model selected the tool.
+        // This cannot select a tool or widen its scope.
         if (chosen === "spotify.track.play" || chosen === "spotify.track.open") {
           const extracted = this.extractSpotifyTrackRequest(lower, text);
           if (extracted) {
@@ -408,11 +302,35 @@ export class IntentEngine {
             const hasTrack = ["query", "trackQuery", "track", "trackTitle", "song", "songTitle", "title"]
               .some((key) => typeof modelEntities[key] === "string" && modelEntities[key].trim());
             operationResult = {
-              ...modelEntities,
-              ...(!hasTrack ? { query: extracted.query } : {}),
-              ...(extracted.queueQuery ? { queueQuery: extracted.queueQuery } : {})
+              ...modelResult,
+              entities: {
+                ...modelEntities,
+                ...(!hasTrack ? { query: extracted.query } : {}),
+                ...(extracted.queueQuery ? { queueQuery: extracted.queueQuery } : {})
+              }
             };
-            operationResult = { ...modelResult, entities: operationResult };
+          }
+        }
+        if (chosen === "calculator.evaluate") {
+          const calculated = this.extractCalculatorRequest(text);
+          if (calculated) {
+            // The model decided to use Calculator; this only compiles the
+            // literal arithmetic into the executor's strict input contract.
+            // Human forms such as "99 x 1124" are not valid capability input,
+            // and expectedResult is required for independent UI verification.
+            operationResult = {
+              ...operationResult,
+              entities: { ...(operationResult.entities ?? {}), ...calculated }
+            };
+          }
+        }
+        if (chosen === "package.winget.reinstall") {
+          const exactId = this.extractKnownInstallTarget(lower);
+          if (exactId) {
+            operationResult = {
+              ...modelResult,
+              entities: { ...(modelResult.entities ?? {}), id: exactId }
+            };
           }
         }
         const intent = this._buildOperationIntent(intentId, text, chosen, operationResult, context);
@@ -420,27 +338,67 @@ export class IntentEngine {
         if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
         return intent;
       }
-      // Same reasoning as the web-outcome override above: a compound Spotify
-      // "play X and queue Y" request has an exact typed-capability chain
-      // (spotify.track.play -> spotify.track.queue). Don't let an untyped model
-      // operation fall through to raw UI automation — which historically hit an
-      // ambiguous-target error clicking Spotify's Play button and burned the
-      // adaptive controller's whole model-call budget — when the deterministic
-      // extractor already confidently recognizes this exact pattern.
-      if (modelOperationIsUntyped) {
-        const extracted = this.extractSpotifyTrackRequest(lower, text);
-        if (extracted) {
-          const intent = this._buildSpotifyIntent(intentId, text, extracted, context);
-          const validation = validateSchema(intent, USER_INTENT_SCHEMA);
-          if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
-          return intent;
-        }
+
+      const intent = this._buildModelIntent(intentId, text, modelResult, context);
+      if (intent.confidence < 0.6 && this.reasoningEngine) {
+        const clarification = await this.reasoningEngine.clarifyIntent(text, context);
+        intent.ambiguity = true;
+        intent.clarificationQuestions = clarification.ok && clarification.data.questions.length
+          ? clarification.data.questions
+          : ["Please provide the missing target or desired outcome before execution."];
       }
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+
     }
 
     const spotifyRequest = this.extractSpotifyTrackRequest(lower, text);
     if (spotifyRequest) {
       const intent = this._buildSpotifyIntent(intentId, text, spotifyRequest, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    // Provider-unavailable fallbacks. Each route is accepted only when it can
+    // satisfy the complete requested outcome with one bounded typed workflow.
+    const queueFallback = this.extractSpotifyQueueFollowup(text, context.history);
+    if (queueFallback) {
+      const intent = this._buildOperationIntent(intentId, text, "spotify.track.queue", {
+        category: "APPLICATION",
+        normalizedGoal: `Queue ${queueFallback.query} in Spotify`,
+        entities: { query: queueFallback.query },
+        successCriteria: [`${queueFallback.query} is in the Spotify queue`],
+        confidence: 1
+      }, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+    const calculatorFallback = this.extractCalculatorRequest(text);
+    if (calculatorFallback) {
+      const intent = this._buildOperationIntent(intentId, text, "calculator.evaluate", {
+        category: "APPLICATION",
+        normalizedGoal: `Calculate ${calculatorFallback.expression} in Calculator`,
+        entities: calculatorFallback,
+        successCriteria: [`Calculator visibly shows ${calculatorFallback.expectedResult}`],
+        confidence: 1
+      }, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+    const draftFallback = this.extractWhatsAppDraft(text);
+    if (draftFallback) {
+      const intent = this._buildOperationIntent(intentId, text, "whatsapp.message.draft", {
+        category: "APPLICATION",
+        normalizedGoal: `Draft a WhatsApp message to ${draftFallback.contact} without sending it`,
+        entities: draftFallback,
+        constraints: ["DO_NOT_SEND"],
+        successCriteria: [`The ${draftFallback.contact} chat is open`, "The exact message is visible in the composer", "No message is sent"],
+        confidence: 1
+      }, context);
       const validation = validateSchema(intent, USER_INTENT_SCHEMA);
       if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
       return intent;
@@ -505,6 +463,18 @@ export class IntentEngine {
     }
 
     const knownInstallId = this.extractKnownInstallTarget(lower);
+    if (knownInstallId && /\b(reinstall|remove\s+and\s+reinstall|uninstall\s+and\s+reinstall)\b/.test(lower)) {
+      const intent = this._buildOperationIntent(intentId, text, "package.winget.reinstall", {
+        normalizedGoal: `Reinstall ${knownInstallId}`,
+        category: "SYSTEM",
+        entities: { id: knownInstallId },
+        successCriteria: [`${knownInstallId} is reinstalled and verified`],
+        confidence: 1
+      }, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
     if (/\binstall\b/.test(lower) && knownInstallId && !/\b(dependenc|project)\b/.test(lower)) {
       const intent = {
         intentId, rawText: text, normalizedGoal: `Install ${knownInstallId}`, category: "SYSTEM",
@@ -576,6 +546,12 @@ export class IntentEngine {
     const intent = {
       intentId,
       rawText: text,
+      // Downstream must distinguish "the model decided SYSTEM" from "the
+      // model never answered and the offline classifier supplied SYSTEM". A
+      // synthetic health probe can still succeed during the latter.
+      modelDecisionStatus: modelResult
+        ? "MODEL"
+        : (modelUnderstanding ? "UNAVAILABLE" : "NOT_CONFIGURED"),
       normalizedGoal: modelResult?.normalizedGoal || this.getNormalizedGoal(lower, text),
       category: modelResult?.category || this.getCategory(lower),
       // Only ever set by the model, and only alongside category CONVERSATION;
@@ -620,6 +596,41 @@ export class IntentEngine {
     }
 
     return intent;
+  }
+
+  // Preserve the model's complete decision when no single typed operation can
+  // satisfy the turn. requiredCapabilities may contain several tools; the
+  // general planner uses them to build an ordered task graph.
+  _buildModelIntent(intentId, text, modelResult, context) {
+    return {
+      intentId,
+      rawText: text,
+      normalizedGoal: modelResult.normalizedGoal || text,
+      category: modelResult.category || "SYSTEM",
+      ...(typeof modelResult.directAnswer === "string" && modelResult.directAnswer.trim()
+        ? { directAnswer: modelResult.directAnswer.trim() }
+        : {}),
+      ...(typeof modelResult.answerableWithoutInspecting === "boolean"
+        ? { answerableWithoutInspecting: modelResult.answerableWithoutInspecting }
+        : {}),
+      entities: {
+        workspacePath: context.workspacePath ?? process.cwd(),
+        ...(modelResult.entities && typeof modelResult.entities === "object" ? modelResult.entities : {})
+      },
+      constraints: Array.isArray(modelResult.constraints) ? modelResult.constraints : [],
+      preferences: Array.isArray(modelResult.preferences) ? modelResult.preferences : [],
+      assumptions: Array.isArray(modelResult.assumptions) ? modelResult.assumptions : [],
+      unknowns: Array.isArray(modelResult.unknowns) ? modelResult.unknowns : [],
+      successCriteria: Array.isArray(modelResult.successCriteria) && modelResult.successCriteria.length
+        ? modelResult.successCriteria
+        : ["The requested outcome is completed and verified"],
+      requiredContext: Array.isArray(modelResult.requiredContext) ? modelResult.requiredContext : [],
+      requiredCapabilities: Array.isArray(modelResult.requiredCapabilities) ? modelResult.requiredCapabilities : [],
+      confidence: Number.isFinite(modelResult.confidence) ? modelResult.confidence : 0.7,
+      ambiguity: modelResult.ambiguity === true,
+      clarificationQuestions: Array.isArray(modelResult.clarificationQuestions) ? modelResult.clarificationQuestions : [],
+      sensitivityFlags: Array.isArray(modelResult.sensitivityFlags) ? modelResult.sensitivityFlags : []
+    };
   }
 
   // Build an operation-driven intent from a model-CHOSEN known operation. The
@@ -1092,9 +1103,9 @@ export class IntentEngine {
     };
   }
 
-  // Deterministically detect a direct Spotify track request and classify it as
-  // either PLAYBACK (play/listen) or OPEN (open/search results). Runs entirely
-  // before any model call so common desktop commands skip LLM planning latency.
+  // Provider-outage argument recovery for a direct Spotify request. This helper
+  // is consulted only after the model has failed to supply a usable decision;
+  // it never pre-empts the model or acts as the normal-language brain.
   // Returns { query, operation } or null.
   extractSpotifyTrackRequest(lower, rawText) {
     // Do not make a typo force a slow model round trip for a safe, named app.
@@ -1191,7 +1202,8 @@ export class IntentEngine {
   extractCalculatorRequest(rawText) {
     const text = String(rawText ?? "").trim();
     if (!/\b(?:calculator|calc)\b/i.test(text)) return null;
-    const body = text.match(/\b(?:calculate|compute|work\s+out|do\s+the\s+math(?:\s+for)?)\s+(.+?)(?:\s+and\s+leave\b|$)/i)?.[1]?.trim();
+    const body = text.match(/\b(?:calculate|compute|work\s+out|do\s+the\s+math(?:\s+for)?)\s+(.+?)(?:\s+and\s+leave\b|$)/i)?.[1]?.trim()
+      ?? text.match(/\b(?:calculator|calc)\b(?:\s+and)?\s+(?:do|evaluate|enter)\s+(.+?)(?:\s+and\s+leave\b|$)/i)?.[1]?.trim();
     if (!body) return null;
     const tokens = [...body.matchAll(/\d+(?:\.\d+)?|multiplied\s+by|times|plus|minus|divided\s+by|[x*+\u00f7/\-]/gi)]
       .map((part) => part[0].toLowerCase());

@@ -79,6 +79,7 @@ console.log(`\nExamining: ${target.MainWindowTitle} (${target.ProcessName})\n`);
 // SEEING: capture + OCR + accessibility tree, fused, with coordinates.
 const screen = await timed(() => registry.get("screen.read").execute({ windowId }));
 const elements = screen.value?.elements ?? [];
+if (screen.value?.capturePath) console.log(`Capture: ${screen.value.capturePath}`);
 const withCentres = elements.filter((element) => Number.isFinite(element.center?.x));
 report("read the screen", screen.value?.read === true, `${screen.ms}ms, ${elements.length} elements`);
 report("read visible text", String(screen.value?.visibleText ?? "").trim().length > 0,

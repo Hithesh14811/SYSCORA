@@ -2929,7 +2929,10 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       },
       required: ["url", "query"]
     },
-    operation: "playMedia", permissionType: "WRITE", risk: RiskLevel.MEDIUM,
+    // Playback changes only ephemeral tab/media state. Treating it as a
+    // persistent write escalated an ordinary play request to HIGH risk and
+    // forced an unnecessary approval/replan loop.
+    operation: "playMedia", permissionType: "READ", risk: RiskLevel.LOW,
     detectedChanges: ["browser.location", "browser.media.playback"],
     observeOperation: "mediaState", timeout: 90000,
     verifyResult: ({ actionResult = {}, observedState = {} }) => {
@@ -3257,7 +3260,10 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       const live = typeof adapter.inspectUi === "function"
         ? await adapter.inspectUi({ application: "calculator", windowId: result.windowId, maxElements: 160 })
         : result.inspected;
-      const matched = (live?.elements ?? []).some((element) => String(element?.name ?? element?.value ?? "").includes(expected));
+      const compactNumber = (value) => String(value ?? "").replace(/[,\s]/g, "");
+      const matched = (live?.elements ?? []).some((element) =>
+        compactNumber(element?.name ?? element?.value ?? "").includes(compactNumber(expected))
+      );
       return matched
         ? { status: "VERIFIED", message: `Calculator visibly shows ${expected}.`, evidence: { expected, windowId: result.windowId }, confidence: 0.99 }
         : { status: "FAILED", message: `Calculator did not visibly show the expected result ${expected}.`, evidence: { expected, visibleResult: result.visibleResult }, confidence: 1 };
@@ -3301,12 +3307,18 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
         : result.screen;
       const compact = (value) => String(value ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
       const visible = compact(live?.text);
-      const messageVisible = visible.includes(compact(args?.message));
       const contactVisible = visible.includes(compact(args?.contact));
+      const message = compact(args?.message);
+      const messageTokens = [...new Set(message.split(" ").filter((token) => token.length >= 3))];
+      const visibleTokens = new Set(visible.split(" ").filter(Boolean));
+      const messageCoverage = messageTokens.length
+        ? messageTokens.filter((token) => visibleTokens.has(token)).length / messageTokens.length
+        : 0;
+      const messageVisible = visible.includes(message) || (contactVisible && messageCoverage >= 0.8);
       const verified = result.sent === false && result.sendInvoked === false && messageVisible && contactVisible;
       return verified
-        ? { status: "VERIFIED", message: `The WhatsApp draft to ${args.contact} is visible and remains unsent.`, evidence: { contactVisible, messageVisible, sendInvoked: false }, confidence: 0.98 }
-        : { status: "FAILED", message: "The exact unsent WhatsApp draft could not be independently confirmed on screen.", evidence: { contactVisible, messageVisible, sendInvoked: result.sendInvoked }, confidence: 1 };
+        ? { status: "VERIFIED", message: `The WhatsApp draft to ${args.contact} is visible and remains unsent.`, evidence: { contactVisible, messageVisible, messageCoverage, sendInvoked: false }, confidence: 0.98 }
+        : { status: "FAILED", message: "The exact unsent WhatsApp draft could not be independently confirmed on screen.", evidence: { contactVisible, messageVisible, messageCoverage, sendInvoked: result.sendInvoked }, confidence: 1 };
     },
     timeout: 30000,
     retryPolicy: { maxAttempts: 1, backoffMs: 0 },
@@ -3800,6 +3812,53 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
         message: installed ? "Package installation verified" : "Failed to verify package installation",
         evidence: listAfter,
         confidence: installed ? 0.9 : 0
+      };
+    },
+    rollback: null,
+    timeout: 600000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 5000 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // A bounded reinstall is one atomic user outcome. Keeping both WinGet stages
+  // inside one capability prevents a planner/provider failure between removal
+  // and restoration from stranding the application in an uninstalled state.
+  registry.register({
+    name: "package.winget.reinstall",
+    version: "1.0.0",
+    description: "Uninstall and reinstall an exact Windows package via WinGet, then verify it is installed",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.MEDIUM },
+    permissions: ["system:write"],
+    reversibility: "PARTIAL",
+    availabilityCheck: checkWingetAvailability,
+    preconditions: (args) => typeof args.id === "string" && args.id.trim().length > 0,
+    execute: async (args) => adapter.wingetReinstall(args.id),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "package.winget.reinstall",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: ["system.packages"],
+      confidence: 0.95,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (_observation, args) => {
+      const listAfter = await adapter.wingetList(args.id);
+      const installed = listAfter.exitCode === 0 &&
+        (listAfter.stdout ?? "").toLowerCase().includes(String(args.id).toLowerCase());
+      return {
+        status: installed ? "VERIFIED" : "FAILED",
+        message: installed ? "Package reinstallation verified" : "Failed to verify package reinstallation",
+        evidence: listAfter,
+        confidence: installed ? 0.95 : 0
       };
     },
     rollback: null,

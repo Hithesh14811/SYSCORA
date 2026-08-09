@@ -268,7 +268,7 @@ test("provider outage plus a novel goal fails truthfully without executing an ir
     );
 
     assert.equal(session.finalResponse.status, "FAILED");
-    assert.equal(session.finalResponse.reason, "invalid-composition-graph");
+    assert.equal(session.finalResponse.reason, "MODEL_PROVIDER_UNAVAILABLE");
     assert.equal(executions, 0);
     assert.equal(session.taskResults.length, 0);
     assert.ok(session.events.some((event) =>

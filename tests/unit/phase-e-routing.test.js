@@ -44,10 +44,9 @@ test("a model that routes a web destination into application.launch is corrected
       `${text}: a website outcome must not be planned as a desktop application launch (got ${intent.operation})`
     );
     assert.equal(intent.category, "BROWSER", text);
-    // Typed playback is resolved before the remote model so it cannot add a
-    // provider round trip to an obvious browser task. A bare "open YouTube"
-    // still exercises the model-misroute correction path.
-    assert.equal(intent.routingOverride?.from, intent.operation === "browser.media.play" ? "(fast-path)" : "application.launch", text);
+    // The model decides first; the modality validator then repairs the invalid
+    // attempt to launch a website as an installed executable.
+    assert.equal(intent.routingOverride?.from, "application.launch", text);
   }
 });
 
@@ -56,7 +55,7 @@ test("a research goal on a different domain is also rerouted away from applicati
     .classify("Find the cheapest flight to Tokyo next month. Do not book anything.");
   assert.equal(intent.operation, "browser.research");
   assert.ok(intent.constraints.includes("NO_BOOKING"));
-  assert.equal(intent.routingOverride?.from, "(fast-path)");
+  assert.equal(intent.routingOverride?.from, "application.launch");
 });
 
 test("a genuine installed-application goal keeps the model's application.launch route", async () => {

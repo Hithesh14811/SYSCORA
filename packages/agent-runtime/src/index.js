@@ -442,12 +442,6 @@ export class AgentRuntime {
         return session;
       }
 
-      // Direct commands do not wait for a model plan, but they do not bypass the
-      // LLM. Start a non-authoritative interpretation in parallel with the typed
-      // execution lane. Its result is audited for context/diagnostics; it can
-      // never replace the already-validated capability or widen its scope.
-      if (session.intent.operation) this._startParallelIntentInterpretation(session, rawText);
-
       // 1b. CONVERSATIONAL FAST PATH (offline fallback only). When a REAL model is
       // healthy, every message goes through the LLM-first classifier + planner and
       // a greeting simply produces an empty plan → the model `converse` path below
@@ -459,11 +453,18 @@ export class AgentRuntime {
       const modelHealthyForConversational = this.reasoningEngine?.hasModel?.()
         ? await this._isModelHealthy()
         : false;
-      if (!modelHealthyForConversational && this._looksConversational(rawText)) {
+      const classificationUnavailable = session.intent.modelDecisionStatus === "UNAVAILABLE";
+      if (!namesWork && (!modelHealthyForConversational || classificationUnavailable) && this._looksConversational(rawText)) {
         let conversational = null;
         try {
           const catalog = (this.capabilityRegistry?.getCatalog?.() ?? []).map((c) => c.name);
-          const c = await this.reasoningEngine?.converse?.(rawText, { capabilities: catalog });
+          const c = await this.reasoningEngine?.converse?.(rawText, {
+            capabilities: catalog,
+            // Classification already spent its one bounded provider attempt.
+            // Do not make a second request to the same failing endpoint merely
+            // to phrase an outage fallback.
+            modelAllowed: !classificationUnavailable
+          });
           if (c?.ok) conversational = c.text;
         } catch { /* best-effort; fall through to clarification below */ }
         if (conversational) {
@@ -587,6 +588,7 @@ export class AgentRuntime {
           /\bread\b[\s\S]{0,120}\b(?:into|in)\b/i.test(rawText)
         );
       if (
+        options.preferImmediateInteractive === true &&
         options.interactive !== false &&
         earlyInteractiveGoal &&
         typeof this.reasoningEngine?.decideInteractiveAction === "function" &&
@@ -657,7 +659,7 @@ export class AgentRuntime {
         const intentNamedWork = Boolean(session.intent?.operation)
           || (session.intent?.requiredCapabilities ?? []).length > 0;
         let conversational = null;
-        if (!intentNamedWork) {
+        if (!intentNamedWork && this._looksConversational(rawText)) {
           try {
             const catalog = (this.capabilityRegistry?.getCatalog?.() ?? []).map((c) => c.name);
             const c = await this.reasoningEngine?.converse?.(rawText, { capabilities: catalog });
@@ -670,16 +672,22 @@ export class AgentRuntime {
         // therefore settle identically; a session that produced an answer must
         // never persist as FAILED, which is what previously made the desktop
         // report "This did not work" directly above the answer itself.
+        const modelUnavailable = !modelHealthyForConversational;
+        const conversationalShape = this._looksConversational(rawText);
         session.currentState = conversational ? RuntimeState.COMPLETED : RuntimeState.FAILED;
         session.finalResponse = conversational
           ? { status: "ANSWERED", message: conversational, rawText, conversational: true }
           : {
-              status: "NEEDS_CLARIFICATION",
-              message:
-                "I couldn't map that request to something I know how to do yet. Try rephrasing, " +
-                "or ask for one of my supported actions (inspect the system, list processes, " +
-                "check a port, read/write files, inspect a project, search or install a package).",
-              rawText
+              status: modelUnavailable
+                ? "RETRYABLE_UNAVAILABLE"
+                : (conversationalShape ? "NEEDS_CLARIFICATION" : "FAILED"),
+              message: modelUnavailable
+                ? "I understood this as a computer task, but every configured model provider is temporarily unavailable and no complete typed fallback covers the whole outcome. Nothing was changed; retrying this turn when the provider recovers is safe."
+                : (conversationalShape
+                    ? "I could not form a useful conversational reply. Could you rephrase that?"
+                    : "I understood the requested outcome, but could not build a capability plan that I could validate and verify. Nothing was changed."),
+              rawText,
+              reason: modelUnavailable ? "MODEL_PROVIDER_UNAVAILABLE" : "NO_VALIDATED_PLAN"
             };
         await this.addSessionEvent(session, conversational ? "CONVERSATIONAL_REPLY" : "PLAN_EMPTY_NEEDS_CLARIFICATION", { rawText });
         // Persist WITHOUT the full plan object (empty graph fails validation).
@@ -696,9 +704,12 @@ export class AgentRuntime {
       const inferredRouteCoverage = session.intent.operationProvenance !== "EXPLICIT_CONTEXT"
         ? assessPlanGoalCoverage(session.intent, session.plan.taskGraph, this.capabilityRegistry)
         : { covered: true };
+      const lowLevelInteractivePlan = plannedCapabilities.some((name) =>
+        /^(?:ui|window|pointer|keyboard)\./.test(name) ||
+        /^browser\.(?:click|type|select|find|inspect|scroll|currentState|read|extract)$/.test(name)
+      );
       const needsClosedLoopInteraction =
-        ["APPLICATION", "BROWSER"].includes(String(session.intent.category ?? "").toUpperCase()) ||
-        plannedCapabilities.some((name) => /^(ui|window|pointer|keyboard|browser)\./.test(name)) ||
+        lowLevelInteractivePlan ||
         // A candidate plan that does not cover the goal is not a plan — it is
         // the planner having failed to find a route, which is exactly the case
         // the adaptive controller exists to serve. Without this, a request whose
@@ -756,12 +767,15 @@ export class AgentRuntime {
           const missing = (coverage.missingCriteria ?? coverage.missingTerms ?? []).slice(0, 3);
           session.finalResponse = {
             status: "FAILED",
-            message:
-              `I understood the request but could not put together a set of steps I could prove would achieve it` +
-              (missing.length ? `, so I stopped rather than guess. Unaddressed: ${missing.join("; ")}.` : `, so I stopped rather than guess.`) +
-              (attemptedAdaptive ? " I also tried working it out step by step from what is on screen, and that did not converge either." : "") +
-              " Nothing was changed.",
-            reason: "IRRELEVANT_DETERMINISTIC_FALLBACK",
+            message: !modelHealthyForConversational
+              ? "Every configured model provider is temporarily unavailable, and the offline planner could not cover the complete requested outcome. I rejected the partial plan, so nothing was changed."
+              : (`I understood the request but could not put together a set of steps I could prove would achieve it` +
+                (missing.length ? `, so I stopped rather than guess. Unaddressed: ${missing.join("; ")}.` : `, so I stopped rather than guess.`) +
+                (attemptedAdaptive ? " I also tried working it out step by step from what is on screen, and that did not converge either." : "") +
+                " Nothing was changed."),
+            reason: !modelHealthyForConversational
+              ? "MODEL_PROVIDER_UNAVAILABLE"
+              : "IRRELEVANT_DETERMINISTIC_FALLBACK",
             coverage
           };
           await this.addSessionEvent(session, "IRRELEVANT_DETERMINISTIC_FALLBACK_REJECTED", coverage);
@@ -813,20 +827,6 @@ export class AgentRuntime {
       await this.persistSession(session);
       return session;
     }
-  }
-
-  _startParallelIntentInterpretation(session, rawText) {
-    if (!this.reasoningEngine?.hasModel?.()) return;
-    void this.reasoningEngine.understandIntent(rawText, { parallel: true })
-      .then(async (result) => {
-        await this.addSessionEvent(session, "LLM_PARALLEL_INTERPRETATION", {
-          status: result?.ok ? "COMPLETED" : "UNAVAILABLE",
-          normalizedGoal: result?.ok ? result.data?.normalizedGoal ?? null : null,
-          confidence: result?.ok ? result.data?.confidence ?? null : null,
-          authoritativeOperation: session.intent?.operation ?? null
-        });
-      })
-      .catch(() => {});
   }
 
   // Settle a session whose adaptive loop stopped without completing.
@@ -2124,12 +2124,14 @@ export class AgentRuntime {
     const text = String(rawText ?? "").trim().toLowerCase();
     if (!text) return false;
     // Any action-shaped word means it's a task, not small talk — let it plan.
-    const actionish = /\b(inspect|list|check|find|search|install|create|make|open|launch|close|run|read|write|delete|remove|set|add|kill|stop|start|restart|show|tell me about|what'?s using|port|folder|file|path|package|winget|process|service|project|docker|git|node|python|environment|env)\b/;
+    const actionish = /\b(inspect|list|check|find|search|install|create|make|open|launch|close|run|read|write|delete|remove|set|add|kill|stop|start|restart|show|play|queue|calculate|compute|type|draft|send|download|upload|move|copy|rename|what'?s using|port|folder|file|path|package|winget|process|service|project|docker|git|node|python|environment|env|calculator|spotify|whatsapp|youtube)\b/;
     if (actionish.test(text)) return false;
     // Greetings / thanks / meta-questions about the assistant itself.
     const greeting = /^(hi|hii+|hey|hello|yo|sup|howdy|greetings|good (morning|afternoon|evening)|thanks|thank you|ok|okay|cool|nice)\b/;
     const metaQuestion = /\b(what|which) (model|llm|ai) (are|r) (you|u)\b|\bwho are you\b|\byour name\b|\bwhat can you do\b|\bwhat do you do\b|\bhow do you work\b|\bare you (an? )?(ai|bot|model)\b|\bhelp\b/;
-    if (greeting.test(text) || metaQuestion.test(text)) return true;
+    const emotionalCheckIn = /\b(feel(?:ing)?|i(?:'m| am))\b[\s\S]{0,30}\b(low|sad|down|upset|overwhelmed|lonely|anxious)\b/;
+    const smallTalk = /\b(joke|chat|talk|fun fact|how are you|how'?s it going|story|riddle)\b/;
+    if (greeting.test(text) || metaQuestion.test(text) || emotionalCheckIn.test(text) || smallTalk.test(text)) return true;
     // Very short, question-like, no action word → treat as conversational.
     if (text.length <= 40 && /\?$/.test(text)) return true;
     return false;
@@ -2359,7 +2361,9 @@ export class AgentRuntime {
     // ReasoningEngine phrases them. It never fabricates outcomes, and always
     // returns a summary (deterministic template when no/failed model), so this
     // never blocks completion.
+    const deterministicReadSummary = summarizeReadOnlyResults(session.taskResults, this.capabilityRegistry);
     let executionSummary = null;
+    let executionSummaryPromise = null;
     try {
       const facts = {
         status: finalVerification.status,
@@ -2372,12 +2376,14 @@ export class AgentRuntime {
           .filter((v) => v && v.status !== "VERIFIED")
           .map((v) => v.message)
       };
-      const summaryResult = await this.reasoningEngine.summarizeExecution(facts);
-      if (summaryResult.ok) {
-        executionSummary = { ...summaryResult.data, source: summaryResult.source };
+      // Phrasing the run summary and grounding the direct user answer are
+      // independent presentation calls. Start them concurrently; running them
+      // serially doubled the post-action wait for every successful task.
+      if (!deterministicReadSummary && session.taskResults.length !== 1) {
+        executionSummaryPromise = this.reasoningEngine.summarizeExecution(facts).catch(() => null);
       }
     } catch {
-      executionSummary = null;
+      executionSummaryPromise = null;
     }
 
     // A verified read is useful only when its observed value reaches the user.
@@ -2386,8 +2392,12 @@ export class AgentRuntime {
     const directAnswer = await this._composeUserAnswer(
       session,
       session.taskResults,
-      summarizeReadOnlyResults(session.taskResults, this.capabilityRegistry)
+      deterministicReadSummary
     ) ?? (session.taskResults.length === 1 ? session.verifications.at(-1)?.message : null);
+    const summaryResult = executionSummaryPromise ? await executionSummaryPromise : null;
+    if (summaryResult?.ok) {
+      executionSummary = { ...summaryResult.data, source: summaryResult.source };
+    }
     if (directAnswer) {
       executionSummary = { ...(executionSummary ?? {}), summary: directAnswer };
     }
@@ -3206,6 +3216,13 @@ export class AgentRuntime {
     // answer. Permission classification governs what may RUN, not what may be
     // reported once it has run.
     if (!deterministicSummary && (readResults ?? []).length === 0) return null;
+    const fullyFormatted = new Set([
+      "calculator.evaluate", "browser.research", "filesystem.list", "system.inspect"
+    ]);
+    if (deterministicSummary && (readResults ?? []).length > 0 &&
+        readResults.every((entry) => fullyFormatted.has(entry.capability))) {
+      return deterministicSummary;
+    }
     const question = session.intent?.rawText ?? session.intent?.normalizedGoal ?? "";
     if (!question || typeof this.reasoningEngine?.answerFromObservations !== "function") {
       return deterministicSummary;

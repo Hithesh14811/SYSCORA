@@ -296,11 +296,19 @@ export class ReasoningEngine {
   // provider is treated as unusable. One failure is noise on an endpoint that
   // scales to zero; two in a row is a pattern.
   static UNHEALTHY_AFTER_LIVE_FAILURES = 2;
+  static PROVIDER_RECOVERY_COOLDOWN_MS = 15000;
 
   // Record the outcome of a REAL reasoning call. Any success clears the streak,
   // because the provider demonstrably works.
   _recordLiveOutcome(ok) {
-    this._liveFailures = ok ? 0 : this._liveFailures + 1;
+    if (ok) {
+      this._liveFailures = 0;
+      this._lastLiveFailureAt = null;
+      this._healthCache = { ok: true, at: this._nowMs() };
+      return;
+    }
+    this._liveFailures += 1;
+    this._lastLiveFailureAt = this._nowMs();
   }
 
   hasModel() {
@@ -333,7 +341,15 @@ export class ReasoningEngine {
     if (!this.modelProvider) return false;
     // Real calls are failing repeatedly. That is not a guess, so it stands
     // regardless of what a probe says.
-    if (this._liveFailures >= ReasoningEngine.UNHEALTHY_AFTER_LIVE_FAILURES) return false;
+    if (this._liveFailures >= ReasoningEngine.UNHEALTHY_AFTER_LIVE_FAILURES) {
+      const elapsed = this._nowMs() - Number(this._lastLiveFailureAt ?? 0);
+      if (elapsed < ReasoningEngine.PROVIDER_RECOVERY_COOLDOWN_MS) return false;
+      // Half-open the circuit for a real request. Reducing the streak by one
+      // allows exactly this recovery attempt; a failure closes it again and a
+      // success clears the circuit. Without this, two transient 503s made the
+      // provider unreachable until the whole daemon was restarted.
+      this._liveFailures = ReasoningEngine.UNHEALTHY_AFTER_LIVE_FAILURES - 1;
+    }
     if (typeof this.modelProvider.healthCheck !== "function") return true;
     const now = this._nowMs();
     if (this._healthCache && (now - this._healthCache.at) < ttlMs) {
@@ -375,7 +391,13 @@ export class ReasoningEngine {
     // reasoning timeout + retries on a dead gateway. `skipHealthGate` lets a
     // caller that has its own gating (or wants to force a probe) opt out.
     if (options.skipHealthGate !== true) {
-      const healthy = await this.isModelHealthy();
+      // Core decision calls are their own best reachability probe. They still
+      // honour an open circuit from repeated real failures, but do not wait up
+      // to eight seconds for /models before sending the actual request.
+      const healthy = options.probeHealth === false
+        ? (this._liveFailures < ReasoningEngine.UNHEALTHY_AFTER_LIVE_FAILURES ||
+          (this._nowMs() - Number(this._lastLiveFailureAt ?? 0)) >= ReasoningEngine.PROVIDER_RECOVERY_COOLDOWN_MS)
+        : await this.isModelHealthy();
       if (!healthy) return { ok: false, error: "provider-unhealthy" };
     }
     // Defensively redact anything secret-shaped before it can reach the model.
@@ -454,7 +476,7 @@ export class ReasoningEngine {
         // every following request in the TTL, turning one slow answer into a
         // string of refusals.
         const timedOut = /abort|timeout|timed out/i.test(lastError);
-        if (!timedOut) this._recordLiveOutcome(false);
+        if (!timedOut && options.recordHealth !== false) this._recordLiveOutcome(false);
         break;
       }
 
@@ -468,14 +490,14 @@ export class ReasoningEngine {
         ? extraValidate(candidate)
         : { valid: true, errors: [] };
       if (validation.valid && extra.valid) {
-        this._recordLiveOutcome(true);
+        if (options.recordHealth !== false) this._recordLiveOutcome(true);
         return { ok: true, data: candidate };
       }
       // The transport worked — the provider answered, the answer just did not
       // satisfy the schema. That is a content problem for the repair loop below,
       // not evidence the endpoint is unreachable, so it must not count toward
       // the unhealthy streak.
-      this._recordLiveOutcome(true);
+      if (options.recordHealth !== false) this._recordLiveOutcome(true);
 
       lastError = [...(validation.errors || []), ...(extra.errors || [])].join(", ");
       // Bounded repair: re-ask with the specific violations appended.
@@ -524,7 +546,15 @@ export class ReasoningEngine {
     const plannerCatalog = capabilityCatalog.map((capability) => ({
       name: capability.name,
       ...(capability.aliases?.length ? { aliases: capability.aliases } : {}),
-      description: capability.description
+      description: capability.description,
+      ...(knownOperations.includes(capability.name)
+        ? {
+            requiredInputs: capability.inputSchema?.required ?? [],
+            inputProperties: Object.fromEntries(Object.entries(capability.inputSchema?.properties ?? {}).map(
+              ([key, value]) => [key, { type: value?.type, description: value?.description }]
+            ))
+          }
+        : {})
     }));
     // A model that invents an operation name ("play_music_and_add_to_playlist")
     // routes the request nowhere: the runtime only trusts operations from this
@@ -548,8 +578,11 @@ export class ReasoningEngine {
         ` (the name only — never the description after the dash).` +
         ` If none of them fits the request, OMIT this field entirely.` +
         ` NEVER invent a new operation name, and never combine two names into one.` +
-        ` A multi-step request usually still maps to ONE operation whose workflow covers every step` +
-        ` (for example, playing a track and queueing a second one is a single Spotify playback operation).` +
+        ` Set operation ONLY when that one workflow satisfies EVERY requested outcome.` +
+        ` For a request that needs distinct tools or steps, OMIT operation and list every needed` +
+        ` capability in requiredCapabilities so the planner can build a real multi-tool graph.` +
+        ` A compound workflow may still use one operation only when its description explicitly says` +
+        ` it covers the complete compound outcome.` +
         ` Choose by what the operation DOES, not by which words it shares with the request: a question about` +
         ` which software is on this machine is answered by the installed-applications operation, not by a` +
         ` general system inspection that happens to contain the word "system".` +
@@ -614,12 +647,18 @@ Return JSON with:
   operation (for example a track to play AND a second track to queue), give each
   its own descriptive key such as "query" and "queueQuery". Do not return an
   empty entities object when the request names concrete values.
+  When the user asks for a draft in a particular tone or describes what it
+  should say, compose the final message text yourself and put that exact text in
+  entities.message; put the recipient in entities.contact and preserve any
+  do-not-send constraint. Do not defer wording to the executor.
 - constraints, preferences, assumptions, and unknowns: arrays of strings
 - successCriteria: array of strings to verify the goal is met
 - requiredContext: array of context types (system, processes, port, environment, workspace, filesystem)
 - requiredCapabilities: only capability names required to satisfy the goal, copied
   exactly from the catalog above. Use an EMPTY ARRAY when the goal needs none —
   never a placeholder like "none", "n/a" or "unknown", which are not capabilities.
+  Include EVERY distinct capability needed for a multi-step request. Do not drop
+  later steps merely because operation can name at most one optimized workflow.
 - confidence: number from 0 to 1
 - ambiguity: boolean (true if the request is unclear)
 - clarificationQuestions: array of strings if ambiguous
@@ -748,7 +787,12 @@ request, false for answerableWithoutInspecting, [] for requiredCapabilities.`.tr
       // so the time is spent thinking, not transferring — a bound below the
       // model's actual thinking time cannot be fixed by trimming the prompt.
       timeoutMs: 60000,
-      maxRetries: 2,
+      // One transport attempt. A second/third 60-second retry made an ordinary
+      // provider outage look like an agent that had frozen for several minutes.
+      // The runtime already has a validated local fallback and a half-open
+      // circuit, so retry on the next user turn instead of blocking this one.
+      maxRetries: 1,
+      probeHealth: false,
       dataCategories: [
         ExternalAIDataCategory.SANITIZED_TASK_TEXT,
         ExternalAIDataCategory.CAPABILITY_METADATA
@@ -1157,6 +1201,7 @@ Return JSON:
       validate,
       timeoutMs: planningContext.timeoutMs ?? 30000,
       maxRetries: 1,
+      probeHealth: false,
       dataCategories: [
         ExternalAIDataCategory.SANITIZED_TASK_TEXT,
         ExternalAIDataCategory.STRUCTURED_SEMANTIC_CONTEXT,
@@ -1255,14 +1300,14 @@ Return JSON: { "summary": string, "changesMade": [string], "recoveriesPerformed"
   // not map it to any capability, so instead of a canned NEEDS_CLARIFICATION we
   // let the model reply briefly. This performs NO actions and touches NO system
   // state — it is pure text. Returns { ok, text } | { ok: false }. Never throws.
-  async converse(rawText, { capabilities = [] } = {}) {
+  async converse(rawText, { capabilities = [], modelAllowed = true } = {}) {
     // A conversational reply must be RELIABLE and fast, so it does NOT depend on
     // the shared health cache (which the planner may have marked stale after a
     // slow compose call). It makes ONE bounded model call; if that fails for any
     // reason, it returns a deterministic answer so the user always gets a
     // sensible reply instead of a canned "I can't map that" clarification.
     const capList = capabilities.slice(0, 40).join(", ");
-    if (!this.modelProvider) {
+    if (!this.modelProvider || modelAllowed === false) {
       return { ok: true, text: this._deterministicConverse(rawText, capabilities), source: "deterministic" };
     }
     const prompt = `
@@ -1378,7 +1423,7 @@ Return JSON: { "reply": string }`.trim();
     const result = await this._reasonStructured(
       prompt,
       { type: "object", required: ["reply"], properties: { reply: { type: "string" } } },
-      { timeoutMs: 15000, skipHealthGate: true }
+      { timeoutMs: 15000, skipHealthGate: true, recordHealth: false }
     );
     if (result.ok && typeof result.data?.reply === "string" && result.data.reply.trim()) {
       return { ok: true, text: result.data.reply.trim(), source: "model" };
@@ -1398,6 +1443,15 @@ Return JSON: { "reply": string }`.trim();
   _deterministicConverse(rawText, capabilities = []) {
     const lower = String(rawText ?? "").toLowerCase();
     const examples = "inspect this computer, find what's using a port, create a folder and file, search WinGet for an app, or inspect a project";
+    // Bounded offline support for an emotional check-in. This is used only when
+    // every configured model is unavailable; it must be humane without posing
+    // as therapy or turning the person's words into an automation failure.
+    if (/\b(feel(?:ing)?|i(?:'m| am))\b[\s\S]{0,30}\b(low|sad|down|upset|overwhelmed|lonely|anxious)\b/.test(lower)) {
+      return "I'm sorry you're having a rough time. I'm here with you — we can talk about what happened, or I can help with something small and practical if that would make today easier.";
+    }
+    if (/\b(joke|riddle)\b/.test(lower)) {
+      return "Why did the computer take a break? It needed a little time to process.";
+    }
     if (/\bwhat.*(can|do) you (do|help)|help|capabilities?\b/.test(lower)) {
       return `I'm SYSCORA. I operate Windows for you — for example I can ${examples}. Just tell me what you want done.`;
     }

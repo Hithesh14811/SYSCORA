@@ -344,7 +344,15 @@ export class CdpBrowserAdapter {
       if(!media)return {found:false,playing:false,reason:"media-element-not-found",url:location.href,title:document.title};
       const blockedSelector=${blocked}; const visible=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);
         return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden"&&s.opacity!=="0"};
-      const blockedByPage=blockedSelector?[...document.querySelectorAll(blockedSelector)].some(visible):false;
+      const requestedBlock=blockedSelector?[...document.querySelectorAll(blockedSelector)].some(visible):false;
+      // YouTube does not consistently retain the ad-showing class on every player
+      // revision. Treat any visible ad UI as blocked playback so the verifier
+      // waits for the requested content rather than declaring a pre-roll ad to
+      // be the selected video.
+      const youtubeAd=/youtube\.com$/i.test(location.hostname)&&[...document.querySelectorAll(
+        '.ad-showing,.ytp-ad-player-overlay,.ytp-ad-text,.ytp-ad-skip-button-container,.video-ads [class*="ytp-ad"]'
+      )].some(visible);
+      const blockedByPage=requestedBlock||youtubeAd;
       return {found:true,playing:!blockedByPage&&!media.paused&&!media.ended&&media.readyState>=2,blockedByPage,paused:media.paused,
         ended:media.ended,currentTime:media.currentTime,duration:Number.isFinite(media.duration)?media.duration:null,
         readyState:media.readyState,muted:media.muted,volume:media.volume,url:location.href,title:document.title};
@@ -401,12 +409,31 @@ export class CdpBrowserAdapter {
       await this.navigate({ url: searchUrl, timeoutMs: Math.min(15000, deadline - Date.now()), signal });
       await this.dismissCookieNotice({ timeoutMs: 3000, signal });
     }
-    const channelReady = await this.wait({
+    let channelReady = await this.wait({
       condition: "selector",
       selector: "ytd-channel-renderer a#main-link, ytd-channel-renderer a[href], a[href^='/@']",
       timeoutMs: Math.min(15000, Math.max(500, deadline - Date.now())),
       signal
     });
+    if (!channelReady.matched && Date.now() < deadline - 5000) {
+      // A blank/partially hydrated search result is recoverable once. Reload
+      // the exact search page rather than abandoning the required channel-first
+      // workflow or clicking an arbitrary video result.
+      await this.connection.send("Page.reload", { ignoreCache: true });
+      await this.wait({
+        condition: "document.readyState",
+        value: "complete",
+        timeoutMs: Math.min(12000, Math.max(500, deadline - Date.now())),
+        signal
+      });
+      await this.dismissCookieNotice({ timeoutMs: Math.min(5000, Math.max(500, deadline - Date.now())), signal });
+      channelReady = await this.wait({
+        condition: "selector",
+        selector: "ytd-channel-renderer a#main-link, ytd-channel-renderer a[href], a[href^='/@']",
+        timeoutMs: Math.min(15000, Math.max(500, deadline - Date.now())),
+        signal
+      });
+    }
     if (!channelReady.matched) {
       return { performed: false, playing: false, creator: requestedCreator, reason: "youtube-channel-result-not-found", consent, state: await this.currentState() };
     }
@@ -466,10 +493,62 @@ export class CdpBrowserAdapter {
     })()`);
     if (!selected?.href) return { performed: false, playing: false, creator: requestedCreator, reason: "youtube-latest-video-not-grounded", channel, videosUrl, consent };
     await this.navigate({ url: selected.href, timeoutMs: Math.min(18000, Math.max(500, deadline - Date.now())), signal });
+    // YouTube may defer its consent interstitial until the first watch page.
+    // Handling only the search/channel pages leaves a <video> shell behind the
+    // dialog at readyState 0 forever. Reject optional cookies after the final
+    // navigation and fail honestly if the least-permissive control is absent.
+    const playbackConsent = await this.dismissCookieNotice({ timeoutMs: Math.min(8000, Math.max(500, deadline - Date.now())), signal });
+    if (playbackConsent?.consentVisible && !playbackConsent.handled) {
+      return { performed: false, playing: false, creator: requestedCreator, reason: playbackConsent.reason ?? "youtube-consent-blocked", selectedTitle: selected.title, channel, videosUrl, consent: playbackConsent };
+    }
     const mediaReady = await this.wait({ condition: "selector", selector: "video", timeoutMs: Math.max(500, deadline - Date.now()), signal });
     if (!mediaReady.matched) return { performed: false, playing: false, creator: requestedCreator, reason: "media-element-not-found", selectedTitle: selected.title, channel, videosUrl, consent };
-    const started = await this._evaluate(`(()=>{const video=document.querySelector('video');if(!video)return false;try{const p=video.play();if(p&&p.catch)p.catch(()=>{});return true}catch{return false}})()`);
+    let started = await this._evaluate(`(()=>{const video=document.querySelector('video');if(!video)return false;try{const p=video.play();if(p&&p.catch)p.catch(()=>{});return true}catch{return false}})()`);
     let observed = await this.mediaState({ selector: "video", blockedStateSelector: ".ad-showing" });
+    if (!observed.playing && Number(observed.currentTime) <= 0) {
+      const playControl = await this.find({ selector: "button.ytp-play-button,button[aria-label^='Play'],[role='button'][aria-label^='Play']", text: "Play" });
+      if (playControl.found) {
+        const clicked = await this.click({ target: playControl.target });
+        started = clicked.performed || started;
+        await delay(250);
+        observed = await this.mediaState({ selector: "video", blockedStateSelector: ".ad-showing" });
+      }
+    }
+    // Chromium can finish the SPA navigation with a visible YouTube player
+    // shell whose media element never receives a source (readyState 0,
+    // duration null). Waiting longer cannot heal that state. Reload the exact
+    // channel-grounded watch URL once, only after observing the stuck shell.
+    if (Number(observed.readyState) < 2 && Number(observed.currentTime) <= 0 && Date.now() < deadline - 3000) {
+      await delay(1200);
+      observed = await this.mediaState({ selector: "video", blockedStateSelector: ".ad-showing" });
+      if (Number(observed.readyState) < 2 && Number(observed.currentTime) <= 0) {
+        // A second Page.navigate to the same YouTube URL may be satisfied from
+        // the existing SPA document and preserve the source-less player. Force
+        // a real document reload so player scripts and the media source are
+        // initialized from scratch.
+        await this.connection.send("Page.reload", { ignoreCache: true });
+        await this.wait({
+          condition: "document.readyState",
+          value: "complete",
+          timeoutMs: Math.min(15000, Math.max(500, deadline - Date.now())),
+          signal
+        });
+        const reloadConsent = await this.dismissCookieNotice({ timeoutMs: Math.min(8000, Math.max(500, deadline - Date.now())), signal });
+        if (reloadConsent?.consentVisible && !reloadConsent.handled) {
+          return { performed: false, playing: false, creator: requestedCreator, reason: reloadConsent.reason ?? "youtube-consent-blocked", selectedTitle: selected.title, channel, videosUrl, consent: reloadConsent };
+        }
+        await this.wait({ condition: "selector", selector: "video", timeoutMs: Math.min(15000, Math.max(500, deadline - Date.now())), signal });
+        const replayControl = await this.find({ selector: "button.ytp-play-button,button[aria-label^='Play'],[role='button'][aria-label^='Play']", text: "Play" });
+        if (replayControl.found) {
+          const clicked = await this.click({ target: replayControl.target });
+          started = clicked.performed || started;
+        } else {
+          started = await this._evaluate(`(()=>{const video=document.querySelector('video');if(!video)return false;try{const p=video.play();if(p&&p.catch)p.catch(()=>{});return true}catch{return false}})()`) || started;
+        }
+        await delay(300);
+        observed = await this.mediaState({ selector: "video", blockedStateSelector: ".ad-showing" });
+      }
+    }
     let firstTime = null;
     while (Date.now() < deadline) {
       throwIfAborted(signal);
@@ -494,7 +573,7 @@ export class CdpBrowserAdapter {
       selectedTitle: selected.title,
       selectedUrl: selected.href,
       mediaState: observed,
-      consent,
+      consent: playbackConsent?.handled ? playbackConsent : consent,
       reason: playing ? null : "media-playback-not-observed"
     };
   }
@@ -511,7 +590,17 @@ export class CdpBrowserAdapter {
     if (!url) throw new Error("browser media playback requires an explicit URL");
     await this.launch({ url, signal });
     const deadline = Date.now() + Math.min(75000, Math.max(1000, Number(timeoutMs) || 75000));
+    const consent = await this.dismissCookieNotice({ timeoutMs: 5000, signal });
     let state = await this.currentState();
+    if (/consent\.youtube\.com|consent\.google\./i.test(state.url) && !consent.handled) {
+      return {
+        performed: false,
+        playing: false,
+        reason: consent.reason ?? "privacy-preserving-consent-control-not-found",
+        consent,
+        state
+      };
+    }
     let selectedTitle = null;
     if (!/\/(?:watch|video|shorts)\b/i.test(new URL(state.url).pathname)) {
       const ready = await this.wait({ condition: "selector", selector: resultSelector, timeoutMs: Math.min(10000, timeoutMs), signal });
@@ -531,12 +620,35 @@ export class CdpBrowserAdapter {
         if (/\/(?:watch|video|shorts)\b/i.test(new URL(state.url).pathname)) break;
       }
     }
+    // The first watch-page navigation is where YouTube frequently presents its
+    // cookie interstitial. Give that privacy-preserving rejection enough time
+    // to render; the old 2.5s fire-and-forget call returned before the button
+    // existed, then waited 75s on a video element stuck at readyState 0.
+    const playbackConsent = await this.dismissCookieNotice({ timeoutMs: Math.min(8000, Math.max(500, deadline - Date.now())), signal });
+    if (playbackConsent?.consentVisible && !playbackConsent.handled) {
+      return {
+        performed: false,
+        playing: false,
+        reason: playbackConsent.reason ?? "privacy-preserving-consent-control-not-found",
+        consent: playbackConsent,
+        state: await this.currentState()
+      };
+    }
     const mediaReady = await this.wait({ condition: "selector", selector: mediaSelector, timeoutMs: Math.max(500, deadline - Date.now()), signal });
     if (!mediaReady.matched) return { performed: false, playing: false, reason: "media-element-not-found", state };
     const selector = JSON.stringify(mediaSelector);
-    const started = await this._evaluate(`(()=>{const media=document.querySelector(${selector});if(!media)return false;
+    let started = await this._evaluate(`(()=>{const media=document.querySelector(${selector});if(!media)return false;
       try{const pending=media.play();if(pending&&typeof pending.catch==="function")pending.catch(()=>{});return true}catch{return false}})()`);
     let observed = await this.mediaState({ selector: mediaSelector, blockedStateSelector });
+    if (!observed.playing && Number(observed.currentTime) <= 0) {
+      const playControl = await this.find({ selector: "button.ytp-play-button,button[aria-label^='Play'],[role='button'][aria-label^='Play']", text: "Play" });
+      if (playControl.found) {
+        const clicked = await this.click({ target: playControl.target });
+        started = clicked.performed || started;
+        await delay(250);
+        observed = await this.mediaState({ selector: mediaSelector, blockedStateSelector });
+      }
+    }
     let firstPlayingTime = null;
     while (Date.now() < deadline) {
       throwIfAborted(signal);
@@ -549,15 +661,17 @@ export class CdpBrowserAdapter {
       await delay(250);
       observed = await this.mediaState({ selector: mediaSelector, blockedStateSelector });
     }
+    const playing = observed.playing === true || Boolean(selectedTitle && String(observed.title ?? "").toLowerCase().includes(String(selectedTitle).toLowerCase()) && !observed.paused && !observed.ended && observed.readyState >= 2);
     return {
       performed: started === true,
-      playing: observed.playing === true || Boolean(selectedTitle && String(observed.title ?? "").toLowerCase().includes(String(selectedTitle).toLowerCase()) && !observed.paused && !observed.ended && observed.readyState >= 2),
+      playing,
       query,
       selectedTitle,
       mediaState: observed,
       url: observed.url,
       title: observed.title,
-      reason: observed.playing ? null : "media-playback-not-observed"
+      consent: playbackConsent?.handled ? playbackConsent : consent,
+      reason: playing ? null : "media-playback-not-observed"
     };
   }
 
@@ -666,7 +780,22 @@ export class CdpBrowserAdapter {
 
   async click({ target } = {}) {
     const selector = this._targetSelector(target);
-    const performed = await this._evaluate(`(() => { const e=document.querySelector(${selector}); if(!e)return false; e.scrollIntoView({block:"center"}); e.click(); return true; })()`);
+    const point = await this._evaluate(`(() => { const e=document.querySelector(${selector}); if(!e)return null; e.scrollIntoView({block:"center"}); const r=e.getBoundingClientRect(); return r.width>0&&r.height>0?{x:r.x+r.width/2,y:r.y+r.height/2}:null; })()`);
+    if (!point) return { performed: false, target };
+    let performed = false;
+    try {
+      // A DOM e.click() event is synthetic and does not satisfy autoplay,
+      // popup, or other user-activation gates. Dispatch a real CDP mouse input
+      // at the centre of the freshly observed target so browser actions have
+      // the same trusted semantics as a physical click.
+      await this.connection.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", buttons: 1, clickCount: 1 });
+      await this.connection.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", buttons: 0, clickCount: 1 });
+      performed = true;
+    } catch {
+      // Older/restricted CDP endpoints may not expose the Input domain. Keep a
+      // bounded compatibility fallback for ordinary controls.
+      performed = await this._evaluate(`(() => { const e=document.querySelector(${selector}); if(!e)return false; e.click(); return true; })()`);
+    }
     return { performed, target };
   }
 
