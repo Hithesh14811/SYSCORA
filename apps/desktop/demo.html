@@ -16,6 +16,8 @@
         </div>
       </div>
       <label class="debug-toggle">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span>Ready</span>
         <input id="debugToggle" type="checkbox" />
         Developer mode
       </label>
@@ -39,8 +41,8 @@
       <section id="feed" class="feed" aria-live="polite">
         <div class="welcome">
           <h2>What would you like SYSCORA to do?</h2>
-          <p class="muted">Ask in plain English. SYSCORA inspects your machine, plans the work,
-            asks before anything risky, does it, and verifies the result.</p>
+          <p class="muted">Ask naturally. SYSCORA can answer, inspect, and act while keeping you
+            updated in the same conversation.</p>
           <div class="suggestions" id="suggestions">
             <button class="suggestion" data-text="Tell me about this computer and what development tools are installed.">Tell me about this computer</button>
             <button class="suggestion" data-text="What's using port 3000?">What's using port 3000?</button>
@@ -58,7 +60,7 @@
           <input id="autoApprove" type="checkbox" />
           Auto-approve
         </label>
-        <button id="sendButton" type="submit">Send</button>
+        <button id="sendButton" type="submit" aria-label="Send message" title="Send (Enter)">&#8593;</button>
       </form>
     </main>
 

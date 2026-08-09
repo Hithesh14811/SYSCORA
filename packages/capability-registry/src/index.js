@@ -2864,7 +2864,7 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     },
     security: {
       filesystem, registry: "NONE",
-      network: ["launch", "navigate", "playMedia", "research"].includes(operation) ? "OUTBOUND" : "NONE",
+      network: ["launch", "navigate", "playMedia", "playYouTubeLatest", "research"].includes(operation) ? "OUTBOUND" : "NONE",
       browser: permissionType === "WRITE" ? "CONTROLLED" : "READ",
       clipboard: "NONE", windowAutomation: "NONE", externalProcesses: operation === "launch" ? "BROWSER" : "NONE"
     },
@@ -2946,6 +2946,39 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
         message: verified ? "Requested browser media playback was independently observed" : (actionResult.reason ?? observedState.reason ?? (requestedMediaMatches ? "Browser media is not playing" : "Opened media does not match the request")),
         evidence: { actionResult, observedState, requestedMediaMatches, selectedIdentityObserved, independentlyProgressed },
         confidence: verified ? 0.99 : 0.99
+      };
+    }
+  });
+  registerBrowserPrimitive({
+    name: "browser.youtube.latest",
+    description: "Resolve a YouTube creator channel, open its Videos page, play the newest listed upload, and verify playback",
+    inputSchema: {
+      type: "object",
+      properties: { creator: { type: "string" }, url: { type: "string" }, timeoutMs: { type: "number" } },
+      required: ["creator"]
+    },
+    operation: "playYouTubeLatest",
+    // Playback and privacy-preserving cookie rejection are ephemeral navigation
+    // state, not an external mutation or account action.
+    permissionType: "READ", risk: RiskLevel.LOW,
+    detectedChanges: ["browser.location", "browser.media.playback"],
+    observeOperation: "mediaState", timeout: 90000,
+    verifyResult: ({ actionResult = {}, observedState = {} }) => {
+      const selectedIdentityObserved = matchesMediaQuery(observedState.title, actionResult.selectedTitle);
+      const independentlyProgressed = Number(observedState.currentTime) > Number(actionResult.mediaState?.currentTime ?? 0);
+      const activeMedia = observedState.playing === true || (
+        observedState.paused === false && observedState.ended === false && observedState.readyState >= 2
+      );
+      const verified = actionResult.performed === true && actionResult.channelMatched === true &&
+        Boolean(actionResult.videosUrl) && Boolean(actionResult.selectedTitle) && selectedIdentityObserved &&
+        observedState.found === true && activeMedia && independentlyProgressed;
+      return {
+        status: verified ? "VERIFIED" : "FAILED",
+        message: verified
+          ? `The newest listed video from ${actionResult.channelLabel || actionResult.creator} is playing.`
+          : (actionResult.reason ?? observedState.reason ?? "The creator's newest YouTube video was not independently observed playing"),
+        evidence: { actionResult, observedState, selectedIdentityObserved, independentlyProgressed },
+        confidence: 0.99
       };
     }
   });
@@ -3197,6 +3230,91 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
   });
 
   registry.register({
+    name: "calculator.evaluate",
+    version: "1.0.0",
+    description: "Enter one bounded arithmetic expression in Windows Calculator and verify the visible result",
+    inputSchema: {
+      type: "object",
+      properties: { expression: { type: "string" }, expectedResult: { type: "string" } },
+      required: ["expression", "expectedResult"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["SESSION"], type: "READ" },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => /^\d+(?:\.\d+)?(?:[+*/-]\d+(?:\.\d+)?)+$/.test(String(args?.expression ?? "")),
+    execute: async (args) => adapter.calculateWithUi(args.expression, args.expectedResult),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "calculator.evaluate", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId,
+      detectedChanges: result?.performed ? ["application.ui"] : [],
+      confidence: result?.matched ? 1 : 0.6, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation, args) => {
+      const result = observation?.structuredState ?? {};
+      const expected = String(args?.expectedResult ?? result.expectedResult ?? "");
+      const live = typeof adapter.inspectUi === "function"
+        ? await adapter.inspectUi({ application: "calculator", windowId: result.windowId, maxElements: 160 })
+        : result.inspected;
+      const matched = (live?.elements ?? []).some((element) => String(element?.name ?? element?.value ?? "").includes(expected));
+      return matched
+        ? { status: "VERIFIED", message: `Calculator visibly shows ${expected}.`, evidence: { expected, windowId: result.windowId }, confidence: 0.99 }
+        : { status: "FAILED", message: `Calculator did not visibly show the expected result ${expected}.`, evidence: { expected, visibleResult: result.visibleResult }, confidence: 1 };
+    },
+    timeout: 20000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    recoveryHints: ["ABORT_ON_FAILURE"],
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  registry.register({
+    name: "whatsapp.message.draft",
+    version: "1.0.0",
+    description: "Open a WhatsApp chat and leave exact text in the composer without sending it",
+    inputSchema: {
+      type: "object",
+      properties: { contact: { type: "string" }, message: { type: "string" }, send: { type: "boolean" } },
+      required: ["contact", "message"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    // An unsent draft is ephemeral local UI state. It never crosses the
+    // communication boundary, so it follows the same no-confirmation policy as
+    // local media playback; any future send capability must be separate.
+    permissionModel: { scope: ["SESSION"], type: "READ" },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.contact === "string" && args.contact.trim() &&
+      typeof args?.message === "string" && args.message.trim() && args?.send !== true,
+    execute: async (args) => adapter.draftWhatsAppMessage(args.contact, args.message),
+    observe: async (result, args) => ({
+      observationId: createId(), source: "whatsapp.message.draft", timestamp: new Date().toISOString(),
+      structuredState: result, relatedActionId: args?.actionId,
+      detectedChanges: result?.drafted ? ["application.ui"] : [],
+      confidence: result?.draftVisible && result?.contactVisible ? 0.98 : 0.6, trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation, args) => {
+      const result = observation?.structuredState ?? {};
+      const live = typeof adapter._readApplicationOcr === "function" && result.windowId
+        ? await adapter._readApplicationOcr("whatsapp", result.windowId).catch(() => null)
+        : result.screen;
+      const compact = (value) => String(value ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+      const visible = compact(live?.text);
+      const messageVisible = visible.includes(compact(args?.message));
+      const contactVisible = visible.includes(compact(args?.contact));
+      const verified = result.sent === false && result.sendInvoked === false && messageVisible && contactVisible;
+      return verified
+        ? { status: "VERIFIED", message: `The WhatsApp draft to ${args.contact} is visible and remains unsent.`, evidence: { contactVisible, messageVisible, sendInvoked: false }, confidence: 0.98 }
+        : { status: "FAILED", message: "The exact unsent WhatsApp draft could not be independently confirmed on screen.", evidence: { contactVisible, messageVisible, sendInvoked: result.sendInvoked }, confidence: 1 };
+    },
+    timeout: 30000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    recoveryHints: ["ABORT_ON_FAILURE"],
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  registry.register({
     name: "spotify.track.queue",
     version: "1.0.0",
     description: "Add a requested track to the Spotify playback queue through grounded accessible controls",
@@ -3208,7 +3326,10 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     outputSchema: { type: "object" },
     requiredContext: [],
     riskMetadata: { level: RiskLevel.LOW },
-    permissionModel: { scope: ["SESSION"], type: "WRITE" },
+    // Queueing is temporary playback state and never changes a file, account,
+    // purchase, or communication. Treat it like spotify.track.play so a normal
+    // follow-up does not get trapped in repeated approval/replan cycles.
+    permissionModel: { scope: ["SESSION"], type: "READ" },
     // Queue state is ephemeral playback state rather than a persistent account,
     // filesystem, or system mutation.
     reversibility: "NOT_REQUIRED",

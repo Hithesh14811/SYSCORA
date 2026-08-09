@@ -283,6 +283,8 @@ async function submit(text) {
   const history = conversation.slice();
   remember("user", text);
   const thinking = addBubble("assistant", textNode(acknowledgement(text)));
+  thinking.classList.add("thinking");
+  let progressStarted = false;
   // The acknowledgement is an independent LLM request. Do not await it before
   // submitting the work: both requests start together, so model latency never
   // delays opening an app or a safe typed UI workflow.
@@ -294,7 +296,7 @@ async function submit(text) {
     if (!response.ok || !thinking.isConnected) return;
     const json = await response.json();
     const reply = getPayload(json).acknowledgement ?? json.acknowledgement;
-    if (reply?.message && thinking.isConnected) thinking.replaceChildren(textNode(reply.message));
+    if (reply?.message && thinking.isConnected && !progressStarted) thinking.replaceChildren(textNode(reply.message));
   }).catch(() => {});
   try {
     const res = await fetch("/api/intents", {
@@ -316,7 +318,10 @@ async function submit(text) {
       onProgress: (status) => {
         if (!thinking.isConnected) return;
         const progress = humanizeEvent(status?.latestEvent ?? {});
-        if (progress?.text) thinking.replaceChildren(textNode(progress.text));
+        if (progress?.text) {
+          progressStarted = true;
+          thinking.replaceChildren(textNode(progress.text));
+        }
       }
     });
     thinking.remove();
@@ -364,6 +369,17 @@ chatForm.addEventListener("submit", (e) => {
   if (!text) return;
   chatInput.value = "";
   submit(text);
+});
+
+chatInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    chatForm.requestSubmit();
+  }
+});
+chatInput.addEventListener("input", () => {
+  chatInput.style.height = "auto";
+  chatInput.style.height = `${Math.min(chatInput.scrollHeight, 160)}px`;
 });
 
 suggestions.addEventListener("click", (e) => {

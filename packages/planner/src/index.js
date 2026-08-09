@@ -478,6 +478,23 @@ export const OPERATION_PLANS = {
       timeout: 90000, retryBudget: 0, idempotency: false
     })
   ],
+  "browser.youtube.latest": (e) => [
+    buildTask("browser.youtube.latest", {
+      creator: e.creator ?? e.query,
+      url: e.url,
+      timeoutMs: e.timeoutMs
+    }, {
+      goal: `Play the newest video from ${e.creator ?? e.query}'s YouTube channel`,
+      description: "Open the creator channel, open its Videos page, select the first newest upload, and verify playback",
+      expectedStateChanges: ["browser.location", "browser.media.playback"],
+      completionCriteria: [
+        `${e.creator ?? e.query}'s channel is opened`,
+        "The channel Videos page is opened",
+        "The newest listed video is independently observed as playing"
+      ],
+      timeout: 90000, retryBudget: 0, idempotency: false
+    })
+  ],
   "browser.research": (e) => [
     buildTask("browser.research", { url: e.url, resultSelector: e.resultSelector, limit: e.limit }, {
       goal: e.goal ?? "Research structured browser results",
@@ -641,6 +658,48 @@ export const OPERATION_PLANS = {
       })
     ];
   },
+  "spotify.track.queue": (e) => [
+    buildTask("spotify.track.queue", { query: spotifyQuery(e) }, {
+      goal: `Queue ${spotifyQuery(e)} in Spotify`,
+      description: "Search for the requested track and add it to the active Spotify playback queue",
+      riskHints: "LOW",
+      completionCriteria: [`${spotifyQuery(e)} is in the Spotify queue`],
+      verificationCriteria: [`Spotify queue contains ${spotifyQuery(e)}`],
+      timeout: 30000,
+      retryBudget: 0,
+      idempotency: false
+    })
+  ],
+  "calculator.evaluate": (e) => [
+    buildTask("calculator.evaluate", {
+      expression: e.expression,
+      expectedResult: e.expectedResult
+    }, {
+      goal: `Calculate ${e.expression} in Windows Calculator`,
+      description: "Open Calculator, enter the complete expression in one keyboard sequence, and read back the visible result",
+      riskHints: "LOW",
+      completionCriteria: [`Calculator visibly shows ${e.expectedResult}`],
+      verificationCriteria: [`Calculator display contains ${e.expectedResult}`],
+      timeout: 20000,
+      retryBudget: 0
+    })
+  ],
+  "whatsapp.message.draft": (e) => [
+    buildTask("whatsapp.message.draft", {
+      contact: e.contact,
+      message: e.message,
+      send: false
+    }, {
+      goal: `Draft a WhatsApp message to ${e.contact} without sending it`,
+      description: "Open WhatsApp once, search the contact with the app shortcut, open the chat, and leave the exact text unsent",
+      riskHints: "LOW",
+      completionCriteria: [`The ${e.contact} chat is open`, "The exact draft text is visible", "No send action occurs"],
+      verificationCriteria: [`WhatsApp visibly contains the unsent draft for ${e.contact}`],
+      timeout: 30000,
+      retryBudget: 0,
+      idempotency: false
+    })
+  ],
   // Developer workflow. The caller resolves ordered steps from the project
   // profile (install, run) into entities.steps; the planner turns them into a
   // linear dependency chain of developer.command.run tasks.

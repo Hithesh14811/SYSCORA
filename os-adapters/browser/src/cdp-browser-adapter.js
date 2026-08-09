@@ -351,6 +351,154 @@ export class CdpBrowserAdapter {
     })()`);
   }
 
+  // Continue through common consent interstitials with the least-permissive
+  // available choice. This never silently accepts optional tracking cookies.
+  async dismissCookieNotice({ timeoutMs = 6000, signal = null } = {}) {
+    const deadline = Date.now() + Math.max(500, Math.min(10000, Number(timeoutMs) || 6000));
+    let last = null;
+    while (Date.now() < deadline) {
+      throwIfAborted(signal);
+      last = await this._evaluate(`(() => {
+        const clean=v=>String(v||"").replace(/\\s+/g," ").trim();
+        const visible=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden"};
+        const controls=[...document.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"],a')].filter(visible);
+        const labels=[
+          /^reject all$/i,/^reject optional/i,/^only necessary$/i,/^necessary only$/i,
+          /^decline all$/i,/^decline$/i,/^continue without accepting$/i,/^no thanks$/i
+        ];
+        for(const pattern of labels){
+          const hit=controls.find(el=>pattern.test(clean(el.innerText||el.value||el.getAttribute('aria-label'))));
+          if(hit){const label=clean(hit.innerText||hit.value||hit.getAttribute('aria-label'));hit.click();return {handled:true,label,preference:'reject-optional',url:location.href};}
+        }
+        const text=clean(document.body?.innerText).slice(0,1200);
+        return {handled:false,consentVisible:/cookie|consent|before you continue/i.test(text),url:location.href};
+      })()`);
+      if (last?.handled) {
+        await delay(350);
+        return last;
+      }
+      if (!last?.consentVisible) return { handled: false, needed: false, url: last?.url };
+      await delay(200);
+    }
+    return { ...(last ?? {}), handled: false, reason: "privacy-preserving-consent-control-not-found" };
+  }
+
+  // A creator-latest request is not a generic keyword search. Resolve the
+  // creator's channel, visit its Videos page, select the first newest upload,
+  // and only then start/verify playback.
+  async playYouTubeLatest({ creator, url = null, timeoutMs = 75000, signal = null } = {}) {
+    const requestedCreator = String(creator ?? "").trim();
+    if (!requestedCreator) throw new Error("A YouTube creator name is required");
+    const searchUrl = url || `https://www.youtube.com/results?search_query=${encodeURIComponent(requestedCreator)}`;
+    const deadline = Date.now() + Math.min(90000, Math.max(5000, Number(timeoutMs) || 75000));
+    await this.launch({ url: searchUrl, signal });
+    const consent = await this.dismissCookieNotice({ timeoutMs: 5000, signal });
+    let state = await this.currentState();
+    if (/consent\.youtube\.com|consent\.google\./i.test(state.url) && !consent.handled) {
+      return { performed: false, playing: false, creator: requestedCreator, reason: consent.reason ?? "youtube-consent-blocked", consent, state };
+    }
+    if (!/youtube\.com\/results/i.test(state.url)) {
+      await this.navigate({ url: searchUrl, timeoutMs: Math.min(15000, deadline - Date.now()), signal });
+      await this.dismissCookieNotice({ timeoutMs: 3000, signal });
+    }
+    const channelReady = await this.wait({
+      condition: "selector",
+      selector: "ytd-channel-renderer a#main-link, ytd-channel-renderer a[href], a[href^='/@']",
+      timeoutMs: Math.min(15000, Math.max(500, deadline - Date.now())),
+      signal
+    });
+    if (!channelReady.matched) {
+      return { performed: false, playing: false, creator: requestedCreator, reason: "youtube-channel-result-not-found", consent, state: await this.currentState() };
+    }
+    const encodedCreator = JSON.stringify(requestedCreator);
+    const channel = await this._evaluate(`(() => {
+      const requested=${encodedCreator};
+      const norm=v=>String(v||"").toLowerCase().replace(/[^a-z0-9]+/g," ").trim();
+      const tokens=norm(requested).split(" ").filter(Boolean);
+      const links=[...document.querySelectorAll("ytd-channel-renderer a#main-link, ytd-channel-renderer a[href], a[href^='/@']")];
+      let best=null,bestScore=-1;
+      for(const link of links){
+        const box=link.getBoundingClientRect();if(box.width<=0||box.height<=0)continue;
+        const row=link.closest('ytd-channel-renderer')||link;
+        const label=String(link.innerText||link.getAttribute('aria-label')||row.innerText||"").trim();
+        const hay=norm(label);const hits=tokens.filter(t=>hay.includes(t)).length;
+        const score=(tokens.length&&hits===tokens.length?100:0)+hits*10-(hay.length/1000);
+        const href=link.href;if(href&&score>bestScore){best={href,label,score};bestScore=score;}
+      }
+      return best;
+    })()`);
+    if (!channel?.href || channel.score < 10) {
+      return { performed: false, playing: false, creator: requestedCreator, reason: "matching-youtube-channel-not-found", channel, consent };
+    }
+    await this.navigate({ url: channel.href, timeoutMs: Math.min(15000, Math.max(500, deadline - Date.now())), signal });
+    await this.dismissCookieNotice({ timeoutMs: 2500, signal });
+    state = await this.currentState();
+    const channelUrl = new URL(state.url);
+    const videosUrl = `${channelUrl.origin}${channelUrl.pathname.replace(/\/$/, "")}/videos`;
+    await this.navigate({ url: videosUrl, timeoutMs: Math.min(15000, Math.max(500, deadline - Date.now())), signal });
+    await this.dismissCookieNotice({ timeoutMs: 2500, signal });
+    // If YouTube exposes a Latest chip, select it explicitly. Channels whose
+    // Videos page is already newest-first simply continue unchanged.
+    await this._evaluate(`(() => {
+      const clean=v=>String(v||"").replace(/\\s+/g," ").trim();
+      const candidates=[...document.querySelectorAll('button,[role="tab"],yt-chip-cloud-chip-renderer,[role="button"]')];
+      const latest=candidates.find(el=>/^latest$/i.test(clean(el.innerText||el.getAttribute('aria-label'))));
+      if(latest){latest.click();return true}return false;
+    })()`);
+    await delay(250);
+    // YouTube's 2026 channel grid no longer assigns #video-title(-link) to
+    // every card, but each card still exposes a same-origin /watch anchor. The
+    // first unique watch URL is the first newest item after the Latest sort.
+    const videoSelector = "a[href*='/watch?v=']";
+    const videoReady = await this.wait({ condition: "selector", selector: videoSelector, timeoutMs: Math.min(18000, Math.max(500, deadline - Date.now())), signal });
+    if (!videoReady.matched) {
+      return { performed: false, playing: false, creator: requestedCreator, reason: "youtube-channel-has-no-visible-videos", channel, videosUrl, consent };
+    }
+    const selected = await this._evaluate(`(() => {
+      const links=[...document.querySelectorAll(${JSON.stringify(videoSelector)})].filter(link=>{const r=link.getBoundingClientRect();return r.width>0&&r.height>0&&link.href});
+      if(!links.length)return null;
+      const href=links[0].href;
+      const same=links.filter(link=>link.href===href);
+      const labels=same.map(link=>String(link.title||link.getAttribute('aria-label')||link.innerText||"").replace(/\\s+/g," ").trim())
+        .filter(label=>label&&!/^\\d{1,2}:\\d{2}(?::\\d{2})?$/.test(label));
+      const title=labels.sort((a,b)=>b.length-a.length)[0]||String(links[0].innerText||"").trim();
+      return {href,title};
+    })()`);
+    if (!selected?.href) return { performed: false, playing: false, creator: requestedCreator, reason: "youtube-latest-video-not-grounded", channel, videosUrl, consent };
+    await this.navigate({ url: selected.href, timeoutMs: Math.min(18000, Math.max(500, deadline - Date.now())), signal });
+    const mediaReady = await this.wait({ condition: "selector", selector: "video", timeoutMs: Math.max(500, deadline - Date.now()), signal });
+    if (!mediaReady.matched) return { performed: false, playing: false, creator: requestedCreator, reason: "media-element-not-found", selectedTitle: selected.title, channel, videosUrl, consent };
+    const started = await this._evaluate(`(()=>{const video=document.querySelector('video');if(!video)return false;try{const p=video.play();if(p&&p.catch)p.catch(()=>{});return true}catch{return false}})()`);
+    let observed = await this.mediaState({ selector: "video", blockedStateSelector: ".ad-showing" });
+    let firstTime = null;
+    while (Date.now() < deadline) {
+      throwIfAborted(signal);
+      if (!observed.paused && !observed.ended && observed.readyState >= 2 && Number(observed.currentTime) > 0) {
+        if (firstTime == null) firstTime = Number(observed.currentTime);
+        else if (Number(observed.currentTime) > firstTime) break;
+      }
+      await delay(250);
+      observed = await this.mediaState({ selector: "video", blockedStateSelector: ".ad-showing" });
+    }
+    const channelTokens = requestedCreator.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const channelMatched = channelTokens.every((token) => String(channel.label ?? "").toLowerCase().includes(token));
+    const playing = observed.playing === true || (!observed.paused && !observed.ended && observed.readyState >= 2 && Number(observed.currentTime) > 0);
+    return {
+      performed: started === true,
+      playing,
+      creator: requestedCreator,
+      channelMatched,
+      channelLabel: channel.label,
+      channelUrl: channel.href,
+      videosUrl,
+      selectedTitle: selected.title,
+      selectedUrl: selected.href,
+      mediaState: observed,
+      consent,
+      reason: playing ? null : "media-playback-not-observed"
+    };
+  }
+
   async playMedia({
     url,
     query = null,

@@ -90,9 +90,86 @@ export class IntentEngine {
     const lower = text.toLowerCase();
     let modelResult = null;
 
-    // One auditable ingress: all user text reaches the reasoning boundary before
-    // any trusted explicit operation or local fallback is considered.
-    const modelUnderstanding = this.reasoningEngine
+    // High-confidence, bounded interactive workflows belong on the latency
+    // critical path.  Previously the model request below ran first, so even a
+    // completely typed command such as "open Calculator" sat idle for the full
+    // provider round trip before the local route was considered.  These routes
+    // do not execute arbitrary model text: each maps to one registered,
+    // schema-validated capability and independently verifies its outcome.
+    const fastSpotify = this.extractSpotifyTrackRequest(lower, text);
+    if (fastSpotify) {
+      const intent = this._buildSpotifyIntent(intentId, text, fastSpotify, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+    const fastQueue = this.extractSpotifyQueueFollowup(text, context.history);
+    if (fastQueue) {
+      const intent = this._buildOperationIntent(intentId, text, "spotify.track.queue", {
+        category: "APPLICATION",
+        normalizedGoal: `Queue ${fastQueue.query} in Spotify`,
+        entities: { query: fastQueue.query },
+        successCriteria: [`${fastQueue.query} is in the Spotify queue`],
+        confidence: 1
+      }, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+    const fastCalculator = this.extractCalculatorRequest(text);
+    if (fastCalculator) {
+      const intent = this._buildOperationIntent(intentId, text, "calculator.evaluate", {
+        category: "APPLICATION",
+        normalizedGoal: `Calculate ${fastCalculator.expression} in Calculator`,
+        entities: fastCalculator,
+        successCriteria: [`Calculator visibly shows ${fastCalculator.expectedResult}`],
+        confidence: 1
+      }, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+    const fastDraft = this.extractWhatsAppDraft(text);
+    if (fastDraft) {
+      const intent = this._buildOperationIntent(intentId, text, "whatsapp.message.draft", {
+        category: "APPLICATION",
+        normalizedGoal: `Draft a WhatsApp message to ${fastDraft.contact} without sending it`,
+        entities: fastDraft,
+        constraints: ["DO_NOT_SEND"],
+        successCriteria: [`The ${fastDraft.contact} chat is open`, "The exact message is visible in the composer", "No message is sent"],
+        confidence: 1
+      }, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+    const fastDesktop = this.extractDirectDesktopAction(lower, text);
+    if (fastDesktop) {
+      const intent = this._buildOperationIntent(intentId, text, fastDesktop.operation, {
+        category: "APPLICATION",
+        normalizedGoal: fastDesktop.normalizedGoal,
+        entities: fastDesktop.entities,
+        successCriteria: fastDesktop.successCriteria,
+        confidence: 1
+      }, context);
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+    const fastWebOutcome = this.extractWebOutcome(lower, text);
+    if (fastWebOutcome?.operation) {
+      const intent = this._buildWebOutcomeIntent(intentId, text, fastWebOutcome, context, {
+        from: "(fast-path)", reason: "HIGH_CONFIDENCE_TYPED_WEB_OUTCOME"
+      });
+      const validation = validateSchema(intent, USER_INTENT_SCHEMA);
+      if (!validation.valid) throw new Error(`Invalid UserIntent: ${validation.errors.join(", ")}`);
+      return intent;
+    }
+
+    // Open-ended language still goes through the single reasoning boundary.
+    // A caller-supplied structured operation is already schema-bounded and must
+    // not pay for (or be reinterpreted by) a redundant model request.
+    const modelUnderstanding = this.reasoningEngine && !context.operation
       ? await this.reasoningEngine.understandIntent(text, {
           ...context,
           knownOperations: KNOWN_OPERATIONS
@@ -838,6 +915,24 @@ export class IntentEngine {
     }
     const youtube = /\byoutube\b/i.test(text);
     if (youtube) {
+      const latestCreator = text.match(
+        /\b(?:play|watch|put\s+on)\s+(.+?)(?:['\u2019]s)?\s+(?:most\s+recent|newest|latest)\s+(?:upload|video)(?:\s+on\s+youtube)?\s*[.!?]*$/i
+      )?.[1]?.trim().replace(/^(?:the\s+)?/i, "");
+      if (latestCreator && latestCreator.length >= 2 && latestCreator.length <= 120) {
+        return {
+          operation: "browser.youtube.latest",
+          url: `https://www.youtube.com/results?search_query=${encodeURIComponent(latestCreator)}`,
+          entities: { creator: latestCreator, query: latestCreator },
+          requiredCapabilities: ["browser.youtube.latest"],
+          normalizedGoal: `Play ${latestCreator}'s latest YouTube video`,
+          constraints: [...negative, "REJECT_OPTIONAL_COOKIES"],
+          successCriteria: [
+            `${latestCreator}'s channel is opened`,
+            "The channel Videos page is opened",
+            "The newest listed video is independently observed as playing"
+          ]
+        };
+      }
       const mediaMatch = text.match(/\b(?:play|watch|put\s+on|turn\s+on|find|search(?:\s+for)?)\s+(.+?)(?:\s+(?:video\s+)?on\s+youtube|\s+youtube\s+video|$)/i);
       let query = mediaMatch?.[1]?.trim()
         .replace(/\s+(?:a\s+)?video$/i, "")
@@ -1075,6 +1170,64 @@ export class IntentEngine {
       return { query, queueQuery, operation: "spotify.track.play" };
     }
     return { query, operation: wantsPlay ? "spotify.track.play" : "spotify.track.open" };
+  }
+
+  // Resolve the ordinary conversational continuation "now add X to queue" to
+  // Spotify only when the transcript establishes Spotify as the active media
+  // app.  This keeps the rule precise while avoiding a second model/planner
+  // round trip for a follow-up whose context is already known.
+  extractSpotifyQueueFollowup(rawText, history = []) {
+    const text = String(rawText ?? "").trim();
+    const match = text.match(/^\s*(?:now\s+|please\s+|also\s+)*(?:add|put)\s+(.+?)\s+(?:to|on)\s+(?:the\s+)?queue\s*[.!?]*$/i)
+      ?? text.match(/^\s*(?:now\s+|please\s+|also\s+)*queue(?:\s+up)?\s+(.+?)\s*[.!?]*$/i);
+    const query = match?.[1]?.trim().replace(/^['"\u201c]+|['"\u201d]+$/g, "");
+    if (!query || query.length < 2 || query.length > 160) return null;
+    const established = /\bspotify\b/i.test(text) || (Array.isArray(history) && history
+      .slice(-8)
+      .some((turn) => /\bspotify\b|\bplaying\b[\s\S]{0,80}\btrack\b/i.test(String(turn?.text ?? turn?.content ?? ""))));
+    return established ? { query } : null;
+  }
+
+  extractCalculatorRequest(rawText) {
+    const text = String(rawText ?? "").trim();
+    if (!/\b(?:calculator|calc)\b/i.test(text)) return null;
+    const body = text.match(/\b(?:calculate|compute|work\s+out|do\s+the\s+math(?:\s+for)?)\s+(.+?)(?:\s+and\s+leave\b|$)/i)?.[1]?.trim();
+    if (!body) return null;
+    const tokens = [...body.matchAll(/\d+(?:\.\d+)?|multiplied\s+by|times|plus|minus|divided\s+by|[x*+\u00f7/\-]/gi)]
+      .map((part) => part[0].toLowerCase());
+    if (tokens.length < 3 || !tokens.some((token) => /^\d/.test(token))) return null;
+    const normalized = tokens.map((token) => {
+      if (/^(?:times|multiplied\s+by|x|\*)$/.test(token)) return "*";
+      if (/^(?:plus|\+)$/.test(token)) return "+";
+      if (/^(?:minus|-)$/.test(token)) return "-";
+      if (/^(?:divided\s+by|\u00f7|\/)$/.test(token)) return "/";
+      return token;
+    });
+    if (!normalized.every((token, index) => index % 2 === 0 ? /^\d+(?:\.\d+)?$/.test(token) : /^[+*/-]$/.test(token))) return null;
+    let value = Number(normalized[0]);
+    for (let index = 1; index < normalized.length; index += 2) {
+      const operand = Number(normalized[index + 1]);
+      if (!Number.isFinite(operand)) return null;
+      if (normalized[index] === "*") value *= operand;
+      else if (normalized[index] === "+") value += operand;
+      else if (normalized[index] === "-") value -= operand;
+      else value /= operand;
+    }
+    if (!Number.isFinite(value)) return null;
+    return { expression: normalized.join(""), expectedResult: String(value) };
+  }
+
+  extractWhatsAppDraft(rawText) {
+    const text = String(rawText ?? "").trim();
+    if (!/\bwhats\s*app\b/i.test(text) || !/\b(?:do\s+not|don't|without)\s+send|\bjust\s+type\b/i.test(text)) return null;
+    const match = text.match(/\b(?:message|text)\s+to\s+(.+?)\s+(?:saying|that\s+says|with\s+the\s+text)\s+(.+?)(?=,?\s*(?:do\s+not|don't|without)\s+send|,?\s*just\s+type|$)/i)
+      ?? text.match(/\btype\s+(.+?)\s+(?:in|into)\s+(?:the\s+)?(?:chat\s+)?(?:with|for)\s+(.+?)(?=,?\s*(?:do\s+not|don't|without)\s+send|$)/i);
+    if (!match) return null;
+    const reversed = /^\s*type\b/i.test(match[0]);
+    const contact = String(reversed ? match[2] : match[1]).trim().replace(/^['"\u201c]+|['"\u201d]+$/g, "");
+    const message = String(reversed ? match[1] : match[2]).trim().replace(/^['"\u201c]+|['"\u201d]+$/g, "");
+    if (!contact || !message || contact.length > 100 || message.length > 4000) return null;
+    return { contact, message, send: false };
   }
 
   // A deliberately small, allow-listed fast-command vocabulary. This is not a

@@ -1758,6 +1758,144 @@ public static class SyscoraAudio {
     };
   }
 
+  // A complete calculator expression is a single bounded UI transaction.  The
+  // previous adaptive path located and clicked every key independently, paying
+  // UI inspection and model latency between each digit.  Calculator natively
+  // supports keyboard input, so use that advertised interaction surface and
+  // then read the display back from UI Automation.
+  async calculateWithUi(expression, expectedResult) {
+    const normalized = String(expression ?? "").trim();
+    if (!/^\d+(?:\.\d+)?(?:[+*/-]\d+(?:\.\d+)?)+$/.test(normalized)) {
+      throw new Error("A bounded arithmetic expression is required");
+    }
+    const launch = await this.launchApplication("calculator");
+    const windowId = launch?.windowIdentity?.windowId ?? launch?.window?.WindowHandle ?? null;
+    if (!windowId) return { performed: false, reason: "calculator-window-not-ready", expression: normalized, launch };
+    // SendKeys treats + as a modifier unless braced; all remaining admitted
+    // characters are literal Calculator keys. Escape first clears stale state.
+    const keys = `{ESC}${normalized.replace(/\+/g, "{+}")}{ENTER}`;
+    const input = await this.keyboardAction("press", { application: "calculator", windowId: String(windowId), keys });
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    const inspected = await this.inspectUi({ application: "calculator", windowId: String(windowId), maxElements: 160 });
+    const expected = String(expectedResult ?? "").trim();
+    const visible = (inspected.elements ?? []).map((element) => String(element.name ?? element.value ?? "")).filter(Boolean);
+    const matched = expected && visible.some((value) => value === expected || value.includes(expected));
+    return {
+      performed: input?.performed === true,
+      expression: normalized,
+      expectedResult: expected,
+      matched,
+      visibleResult: visible.find((value) => value === expected || value.includes(expected)) ?? null,
+      windowId: String(windowId),
+      input,
+      launch,
+      inspected
+    };
+  }
+
+  async _readApplicationOcr(application, windowId) {
+    const captured = await this.captureScreen({ application, windowId: String(windowId) });
+    if (!captured?.captured || !captured.path) {
+      return { readable: false, text: "", targets: [], captured };
+    }
+    const bounds = captured.bounds ?? {};
+    const ocr = await this.readOcr({
+      path: captured.path,
+      windowId: String(windowId),
+      originX: Number(bounds.x ?? 0),
+      originY: Number(bounds.y ?? 0)
+    });
+    return {
+      readable: true,
+      text: String(ocr?.text ?? ocr?.ocrText ?? ""),
+      targets: ocr?.targets ?? [],
+      captured,
+      ocr
+    };
+  }
+
+  // Drafting is intentionally NOT sending. WhatsApp's WebView exposes only its
+  // title-bar controls to Windows UIA, which made a generic controller repeatedly
+  // choose Minimize/Restore. The app's own Ctrl+K search shortcut avoids that
+  // opaque tree entirely, keeps one pinned window foregrounded, and never emits
+  // Enter after the message text has been inserted.
+  async draftWhatsAppMessage(contact, message) {
+    const recipient = String(contact ?? "").trim();
+    const body = String(message ?? "");
+    if (!recipient || !body.trim()) throw new Error("A WhatsApp contact and non-empty draft are required");
+    const launch = await this.launchApplication("whatsapp");
+    const windowId = launch?.windowIdentity?.windowId ?? launch?.window?.WindowHandle ?? null;
+    if (!windowId) return { performed: false, drafted: false, sent: false, reason: "whatsapp-window-not-ready", launch };
+    const pinned = { application: "whatsapp", windowId: String(windowId) };
+    await this.manageWindow("activate", pinned);
+    const compact = (value) => String(value ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const clickOcrTarget = async (target) => {
+      const bounds = target?.boundingRect ?? target?.bounds;
+      if (!bounds || !["x", "y", "width", "height"].every((key) => Number.isFinite(Number(bounds[key])))) {
+        return { performed: false, reason: "ocr-target-has-no-bounds" };
+      }
+      return this.pointerAction("click", {
+        ...pinned,
+        x: Math.round(Number(bounds.x) + Number(bounds.width) / 2),
+        y: Math.round(Number(bounds.y) + Number(bounds.height) / 2),
+        button: "left"
+      });
+    };
+
+    // The installed WhatsApp WebView does not implement Ctrl+K. Ground the
+    // visible search field through a fresh OCR observation instead. Pointer
+    // input is tied to that exact window and observed rectangle; there is no
+    // fixed screen coordinate or minimize/maximize probing.
+    const initialScreen = await this._readApplicationOcr("whatsapp", windowId);
+    const searchTarget = (initialScreen.targets ?? []).find((target) =>
+      /search.*(?:new\s+chat|chat)/i.test(String(target?.name ?? target?.text ?? ""))
+    );
+    if (!searchTarget) {
+      return { performed: false, drafted: false, sent: false, sendInvoked: false, reason: "whatsapp-search-not-visible", windowId: String(windowId), launch };
+    }
+    const searchOpened = await clickOcrTarget(searchTarget);
+    await this.keyboardAction("press", { ...pinned, keys: "^a" });
+    const contactTyped = await this.keyboardAction("type", { ...pinned, text: recipient });
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    const resultsScreen = await this._readApplicationOcr("whatsapp", windowId);
+    const searchBottom = Number(searchTarget.boundingRect?.y ?? 0) + Number(searchTarget.boundingRect?.height ?? 0);
+    const contactTarget = (resultsScreen.targets ?? [])
+      .filter((target) => compact(target?.name ?? target?.text) === compact(recipient))
+      .sort((left, right) => Number(left?.boundingRect?.y ?? 0) - Number(right?.boundingRect?.y ?? 0))
+      .find((target) => Number(target?.boundingRect?.y ?? 0) > searchBottom + 10);
+    if (!contactTarget) {
+      return { performed: false, drafted: false, sent: false, sendInvoked: false, reason: "whatsapp-contact-not-visible", windowId: String(windowId), launch };
+    }
+    const chatOpened = await clickOcrTarget(contactTarget);
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    const chatScreen = await this._readApplicationOcr("whatsapp", windowId);
+    const composerTarget = (chatScreen.targets ?? []).find((target) =>
+      /(?:type|write)\s+(?:a\s+)?message/i.test(String(target?.name ?? target?.text ?? ""))
+    );
+    const composerFocused = composerTarget ? await clickOcrTarget(composerTarget) : { performed: true, method: "chat-default-focus" };
+    const existingDraftSelected = await this.keyboardAction("press", { ...pinned, keys: "^a" });
+    const draftTyped = await this.keyboardAction("type", { ...pinned, text: body });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const screen = await this._readApplicationOcr("whatsapp", windowId).catch((error) => ({ readable: false, text: "", error: error.message }));
+    const visible = compact(screen.text);
+    const contactVisible = visible.includes(compact(recipient));
+    const draftVisible = visible.includes(compact(body));
+    return {
+      performed: draftTyped?.performed === true,
+      drafted: draftTyped?.performed === true && (draftVisible || screen.readable === false),
+      sent: false,
+      sendInvoked: false,
+      contact: recipient,
+      message: body,
+      contactVisible,
+      draftVisible,
+      windowId: String(windowId),
+      steps: { searchOpened, contactTyped, chatOpened, composerFocused, existingDraftSelected, draftTyped },
+      screen: { readable: screen.readable === true, contactVisible, draftVisible, targetCount: (screen.targets ?? []).length },
+      launch
+    };
+  }
+
   async _invokeSpotifyQueueButton(query, deadlineMs, windowHandle = null) {
     const limit = clampInt(deadlineMs, 500, 15000, 8000);
     const tokens = spotifyQueryTokens(query);
@@ -1771,16 +1909,21 @@ public static class SyscoraAudio {
       `$tokens=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedTokens}'))|ConvertFrom-Json);$query=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedQuery}'));`,
       "$near={param($a,$b);$a=[string]$a;$b=[string]$b;if($a-eq$b){return $true};if([Math]::Abs($a.Length-$b.Length)-gt 1){return $false};if($a.Length-eq$b.Length){$d=0;for($i=0;$i-lt$a.Length;$i++){if($a[$i]-ne$b[$i]){$d++}};return $d-le 1};$long=if($a.Length-gt$b.Length){$a}else{$b};$short=if($a.Length-gt$b.Length){$b}else{$a};for($i=0;$i-lt$long.Length;$i++){if($long.Remove($i,1)-eq$short){return $true}};return $false};",
       "$matches={param($name);$words=@(([string]$name).ToLower()-split'[^a-z0-9]+'|Where-Object{$_});foreach($token in @($tokens)){$hit=$false;foreach($word in $words){if(&$near $word $token){$hit=$true;break}};if(-not$hit){return $false}};return $true};",
-      "$activate={param($el);try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern);$pattern.Invoke();return $true}catch{};try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern);$pattern.DoDefaultAction();return $true}catch{};try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern);$pattern.Select();return $true}catch{};try{$b=$el.Current.BoundingRectangle;if($b.Width-gt 0-and$b.Height-gt 0){[void][SyscoraSpotifyMouse]::SetCursorPos([int]($b.X+$b.Width/2),[int]($b.Y+$b.Height/2));[SyscoraSpotifyMouse]::mouse_event(2,0,0,0,[UIntPtr]::Zero);[SyscoraSpotifyMouse]::mouse_event(4,0,0,0,[UIntPtr]::Zero);return $true}}catch{};return $false};",
+      "$activate={param($el);try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern);$pattern.Invoke();return $true}catch{};try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern);$pattern.Expand();return $true}catch{};try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern);$pattern.DoDefaultAction();return $true}catch{};try{$pattern=$el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern);$pattern.Select();return $true}catch{};try{$b=$el.Current.BoundingRectangle;if($b.Width-gt 0-and$b.Height-gt 0){[void][SyscoraSpotifyMouse]::SetCursorPos([int]($b.X+$b.Width/2),[int]($b.Y+$b.Height/2));[SyscoraSpotifyMouse]::mouse_event(2,0,0,0,[UIntPtr]::Zero);[SyscoraSpotifyMouse]::mouse_event(4,0,0,0,[UIntPtr]::Zero);return $true}}catch{};return $false};",
       "$display=[cultureinfo]::InvariantCulture.TextInfo.ToTitleCase($query.ToLower());$variants=@($display);foreach($digraph in @('t','d','k','g','p','b','c','s')){for($i=0;$i-lt$query.Length;$i++){if($query[$i]-eq$digraph){$variants+=[cultureinfo]::InvariantCulture.TextInfo.ToTitleCase($query.ToLower().Insert($i+1,'h'))}}};",
       "$label=$null;foreach($variant in $variants){$cond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$variant);$label=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$cond);if($label){break}};",
-      "if(-not$label){[pscustomobject]@{found=$false;invoked=$false;reason='matching-track-not-found'}|ConvertTo-Json -Compress;return};",
-      "$buttonCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button);$option=$null;$ancestor=$label;",
-      "for($depth=0;$depth-lt 5;$depth++){$ancestor=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor);if(-not$ancestor){break};$buttons=$ancestor.FindAll([System.Windows.Automation.TreeScope]::Descendants,$buttonCond);foreach($button in $buttons){if($button.Current.Name-like'More options for *'-and(&$matches $button.Current.Name)){$option=$button;break}};if($option){break}};",
+      "$buttonCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button);$option=$null;",
+      "if($label){$ancestor=$label;for($depth=0;$depth-lt 5;$depth++){$ancestor=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor);if(-not$ancestor){break};$buttons=$ancestor.FindAll([System.Windows.Automation.TreeScope]::Descendants,$buttonCond);foreach($button in $buttons){if($button.Current.Name-like'More options for *'-and(&$matches $button.Current.Name)){$option=$button;break}};if($option){break}}};",
+      // Spotify often exposes only one compound accessibility button such as
+      // "More options for Cry For Me by ..." and no exact title label. Search
+      // those buttons directly before declaring that the track was absent.
+      "if(-not$option){$buttons=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$buttonCond);foreach($button in $buttons){try{$name=$button.Current.Name;if(-not$button.Current.IsOffscreen-and$button.Current.IsEnabled-and$name-like'More options*'-and(&$matches $name)){$option=$button;break}}catch{}}};",
       "if(-not$option){[pscustomobject]@{found=$false;invoked=$false;reason='matching-track-options-not-found'}|ConvertTo-Json -Compress;return};",
       "if(-not(&$activate $option)){[pscustomobject]@{found=$true;invoked=$false;reason='track-options-not-opened'}|ConvertTo-Json -Compress;return};Start-Sleep -Milliseconds 350;",
-      "$queueName=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Add to queue');$queue=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$queueName);if(-not$queue){[pscustomobject]@{found=$true;invoked=$false;reason='add-to-queue-control-not-found'}|ConvertTo-Json -Compress;return};",
-      "$invoked=&$activate $queue;[pscustomobject]@{found=$true;invoked=$invoked;matchedLabel=$label.Current.Name;optionName=$option.Current.Name}|ConvertTo-Json -Compress"
+      // Chromium context menus may be hosted in a top-level popup outside the
+      // Spotify HWND subtree. Query the desktop UIA root after opening it.
+      "$queueName=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Add to queue');$desktop=[System.Windows.Automation.AutomationElement]::RootElement;$queue=$desktop.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$queueName);$queueNames=@();if(-not $queue){$desktopAll=$desktop.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);foreach($candidate in $desktopAll){try{$candidateName=[string]$candidate.Current.Name;if($candidateName -like '*queue*'){$queueNames+=$candidateName};if((-not $queue) -and $candidateName -like '*Add to queue*' -and (-not $candidate.Current.IsOffscreen) -and $candidate.Current.IsEnabled){$queue=$candidate}}catch{}}};if(-not $queue){[pscustomobject]@{found=$true;invoked=$false;reason='add-to-queue-control-not-found';menuNames=@($queueNames|Select-Object -Unique -First 20)}|ConvertTo-Json -Compress;return};",
+      "$invoked=&$activate $queue;$matched=if($label){$label.Current.Name}else{$option.Current.Name};[pscustomobject]@{found=$true;invoked=$invoked;matchedLabel=$matched;optionName=$option.Current.Name}|ConvertTo-Json -Compress"
     ].join(" ");
     const ps = await this.runPowerShell(script, { timeoutMs: limit + 4000 });
     let parsed = null;
@@ -1798,11 +1941,12 @@ public static class SyscoraAudio {
     const handle = playback.window?.WindowHandle;
     if (!handle) return { queued: false, query: text, reason: "spotify-window-not-ready" };
     const encodedQuery = Buffer.from(text, "utf8").toString("base64");
+    const encodedTokens = Buffer.from(JSON.stringify(spotifyQueryTokens(text)), "utf8").toString("base64");
     const script = [
       "Add-Type -AssemblyName UIAutomationClient;Add-Type -AssemblyName UIAutomationTypes;$root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]" + Number(handle) + ");",
       "$queueCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Queue');$queue=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$queueCond);if($queue){try{$qp=$queue.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern);if($qp.Current.ToggleState-eq[System.Windows.Automation.ToggleState]::Off){$qp.Toggle()}}catch{}};Start-Sleep -Milliseconds 300;",
-      `$query=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedQuery}'));$display=[cultureinfo]::InvariantCulture.TextInfo.ToTitleCase($query.ToLower());`,
-      "$nameCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$display);$labels=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$nameCond);$rb=$root.Current.BoundingRectangle;$match=$null;foreach($label in $labels){$b=$label.Current.BoundingRectangle;if(-not$label.Current.IsOffscreen-and$b.X-ge($rb.X+($rb.Width*0.55))){$match=$label;break}};[pscustomobject]@{queued=[bool]$match;evidence=if($match){$match.Current.Name}else{$null}}|ConvertTo-Json -Compress"
+      `$query=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedQuery}'));$tokens=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedTokens}'))|ConvertFrom-Json);`,
+      "$rb=$root.Current.BoundingRectangle;$match=$null;$all=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);foreach($label in $all){try{$name=[string]$label.Current.Name;$b=$label.Current.BoundingRectangle;if($label.Current.IsOffscreen -or $b.X -lt ($rb.X+($rb.Width*0.55))){continue};$words=@($name.ToLower() -split '[^a-z0-9]+' | Where-Object{$_});$ok=$true;foreach($token in @($tokens)){if($words -notcontains [string]$token){$ok=$false;break}};if($ok){$match=$label;break}}catch{}};[pscustomobject]@{queued=[bool]$match;evidence=if($match){$match.Current.Name}else{$null}}|ConvertTo-Json -Compress"
     ].join(" ");
     const ps = await this.runPowerShell(script, { timeoutMs: 7000 });
     let parsed = null;
