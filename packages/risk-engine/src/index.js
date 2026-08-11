@@ -8,6 +8,7 @@ import {
   maxRiskValue,
   completeRiskDimensions
 } from "../../shared-types/src/domain.js";
+import { classifyShellCommand, ShellVerdict, SHELL_CAPABILITIES } from "../../policy-engine/src/shell-rules.js";
 
 const RISK_ORDER = {
   [RiskLevel.LOW]: 1,
@@ -221,6 +222,51 @@ export class RiskEngine {
           value: "FINANCIAL_OR_SECURITY",
           why: "Browser interaction enters credential, payment or identity data into a page; " +
             "transmitted secrets cannot be withdrawn once sent."
+        });
+      }
+
+      // WHAT A COMMAND ACTUALLY DOES.
+      //
+      // Every other capability's risk is knowable from the capability:
+      // `filesystem.delete` deletes whatever you point it at. Running a command
+      // is the exception — `command.run` is a door, and what is on the other
+      // side is written in the command line and nowhere else. A single floor
+      // for it is therefore always wrong in one direction: set it high and
+      // `git --version` prompts for approval, set it low and `npm install`
+      // does not.
+      //
+      // So the command line is read, and the reading is applied here as
+      // raise-only evidence, like every other rule in this loop. A read stays
+      // at the capability's floor and runs. A mutation is a persistent change
+      // executing a script, which Rules 3 and 7 in the PolicyEngine turn into a
+      // confirmation. A destructive command is scored as what it is, which
+      // Rule 1 hard-denies — and it is refused again in the adapter, below the
+      // approval gate, because approving it would not make it recoverable.
+      const shellVerdict = this._classifyShellTask(task);
+      if (shellVerdict && shellVerdict.verdict !== ShellVerdict.ALLOW) {
+        const destructive = shellVerdict.verdict === ShellVerdict.DENY;
+        evidence[RiskDimension.MUTATION_IMPACT] = maxRiskValue(
+          RiskDimension.MUTATION_IMPACT, evidence[RiskDimension.MUTATION_IMPACT],
+          destructive ? "DESTRUCTIVE" : "PERSISTENT"
+        );
+        evidence[RiskDimension.EXECUTION_RISK] = maxRiskValue(
+          RiskDimension.EXECUTION_RISK, evidence[RiskDimension.EXECUTION_RISK],
+          destructive ? "UNTRUSTED_EXECUTION" : "SCRIPT_EXECUTION"
+        );
+        evidence[RiskDimension.RECOVERY_CONFIDENCE] = maxRiskValue(
+          RiskDimension.RECOVERY_CONFIDENCE, evidence[RiskDimension.RECOVERY_CONFIDENCE], "NO_ROLLBACK"
+        );
+        if (destructive) {
+          evidence[RiskDimension.REVERSIBILITY] = maxRiskValue(
+            RiskDimension.REVERSIBILITY, evidence[RiskDimension.REVERSIBILITY], "IRREVERSIBLE"
+          );
+        }
+        // The user reads this sentence on the approval card, so it says what
+        // the command is and why it stopped — not which rule number matched.
+        reasons.push({
+          dimension: RiskDimension.EXECUTION_RISK,
+          value: evidence[RiskDimension.EXECUTION_RISK],
+          why: shellVerdict.reason
         });
       }
 
@@ -442,6 +488,21 @@ export class RiskEngine {
     } catch {
       return null;
     }
+  }
+
+  // Returns null for every task that is not running a command, so this rule is
+  // inert unless a command line is genuinely being handed to a shell.
+  _classifyShellTask(task) {
+    const capability = String(task?.capability ?? task?.selectedCapability ?? "");
+    if (!SHELL_CAPABILITIES.has(capability)) return null;
+    const inputs = task?.inputs ?? task?.action?.parameters ?? {};
+    const command = inputs.command ?? inputs.commandLine ?? inputs.cmd;
+    // A command task with no command is not a safe command — it is an
+    // incomplete one, and "could not read it" must never resolve to "allow".
+    if (typeof command !== "string" || !command.trim()) {
+      return { verdict: ShellVerdict.ASK, rule: "unreadable-command", reason: "The command line could not be read, so it needs your approval." };
+    }
+    return classifyShellCommand(command, Array.isArray(inputs.args) ? inputs.args : []);
   }
 
   _deriveInputTrust(task, plan) {

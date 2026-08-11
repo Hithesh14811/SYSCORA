@@ -79,6 +79,142 @@ export function validateSchema(data, schema) {
   return { valid: errors.length === 0, errors };
 }
 
+// STREAMING TOOL-CALLING CHAT.
+//
+// The rest of this file exists to coax a single JSON object out of a model.
+// That shape cost the product its two most important properties: nothing could
+// be shown to the user until the whole object had been generated, and every
+// decision was a fresh, stateless prompt carrying the entire situation again.
+//
+// This is the other shape — the one Claude Code, Cursor and Codex use. The model
+// holds a conversation, speaks in plain text as it goes, and calls tools by
+// name. Its first sentence reaches the screen in a few hundred milliseconds,
+// while the tools it asked for are already running.
+//
+// Returns { text, toolCalls: [{ id, name, arguments }], finishReason, usage }.
+// `onTextDelta` is invoked with each token of prose as it arrives.
+export async function openAiCompatibleChat({
+  baseUrl,
+  apiKey,
+  model,
+  headers = {},
+  messages,
+  tools = [],
+  temperature = 0.2,
+  maxTokens = 2048,
+  timeoutMs = 60000,
+  signal = null,
+  onTextDelta = null,
+  stream = true
+}) {
+  if (!apiKey) throw new Error("No API key");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const onOuterAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...headers },
+      body: JSON.stringify({
+        model,
+        messages,
+        ...(tools.length > 0 ? { tools, tool_choice: "auto" } : {}),
+        temperature,
+        max_tokens: maxTokens,
+        stream
+      }),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const body = await response.text();
+        detail = body ? `: ${body.slice(0, 300)}` : "";
+      } catch { /* the status alone identifies the failure */ }
+      const error = new Error(`HTTP ${response.status}${detail}`);
+      error.status = response.status;
+      error.retryAfterMs = Number(response.headers.get("retry-after")) * 1000 || null;
+      throw error;
+    }
+    if (!stream || !response.body) {
+      const result = await response.json();
+      const message = result.choices?.[0]?.message ?? {};
+      if (message.content && onTextDelta) onTextDelta(String(message.content));
+      return {
+        text: String(message.content ?? ""),
+        toolCalls: (message.tool_calls ?? []).map((call, index) => ({
+          id: call.id ?? `call_${index}`,
+          name: call.function?.name ?? "",
+          arguments: call.function?.arguments ?? "{}"
+        })),
+        finishReason: result.choices?.[0]?.finish_reason ?? null,
+        usage: result.usage ?? null
+      };
+    }
+
+    // Server-sent events. Text deltas go straight out to the caller; tool-call
+    // deltas arrive in fragments keyed by index and are reassembled here.
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let text = "";
+    let finishReason = null;
+    let usage = null;
+    const pending = new Map();
+    let done = false;
+    while (!done) {
+      const { value, done: streamDone } = await reader.read();
+      if (streamDone) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n");
+      while (boundary !== -1) {
+        const line = buffer.slice(0, boundary).trim();
+        buffer = buffer.slice(boundary + 1);
+        boundary = buffer.indexOf("\n");
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") { done = true; break; }
+        let chunk;
+        try { chunk = JSON.parse(payload); } catch { continue; }
+        if (chunk.usage) usage = chunk.usage;
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+        const delta = choice.delta ?? {};
+        if (typeof delta.content === "string" && delta.content) {
+          text += delta.content;
+          onTextDelta?.(delta.content);
+        }
+        for (const [index, call] of (delta.tool_calls ?? []).entries()) {
+          const key = call.index ?? index;
+          const existing = pending.get(key) ?? { id: null, name: "", arguments: "" };
+          if (call.id) existing.id = call.id;
+          if (call.function?.name) existing.name = call.function.name;
+          if (call.function?.arguments) existing.arguments += call.function.arguments;
+          pending.set(key, existing);
+        }
+      }
+    }
+    await reader.cancel().catch(() => {});
+    const toolCalls = [...pending.entries()]
+      .sort(([left], [right]) => Number(left) - Number(right))
+      .map(([key, call], index) => ({
+        id: call.id ?? `call_${key ?? index}`,
+        name: call.name,
+        arguments: call.arguments || "{}"
+      }))
+      .filter((call) => call.name);
+    return { text, toolCalls, finishReason, usage };
+  } finally {
+    clearTimeout(timeout);
+    if (signal) signal.removeEventListener?.("abort", onOuterAbort);
+  }
+}
+
 export function isRetryableProviderError(error) {
   if (error?.name === "AbortError" || error?.name === "TypeError") return true;
   const status = String(error?.message ?? "").match(/HTTP\s+(\d{3})/i)?.[1];
@@ -109,6 +245,17 @@ export class LanguageModelProvider {
       options
     );
     return typeof result?.text === "string" ? result.text : String(result ?? "");
+  }
+
+  // Streaming tool-calling conversation. Providers that speak the OpenAI wire
+  // format override this; the rest report `supportsChat() === false` and the
+  // agent loop falls back to the structured path.
+  async chat() {
+    throw new Error("This provider does not support tool-calling chat");
+  }
+
+  supportsChat() {
+    return false;
   }
 
   // Legacy name kept for backward compatibility.
@@ -350,6 +497,21 @@ export class FailoverModelProvider extends LanguageModelProvider {
     }, { calls: 0, tokensIn: 0, tokensOut: 0, costUsd: 0 });
   }
 
+  supportsChat() { return this.providers.some((provider) => provider.supportsChat?.()); }
+
+  async chat(request = {}) {
+    const errors = [];
+    for (const provider of this.providers) {
+      if (!provider.supportsChat?.()) continue;
+      try {
+        return await provider.chat(request);
+      } catch (error) {
+        errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    throw new Error(`All configured model providers failed: ${errors.join("; ")}`);
+  }
+
   usage() { return this.getUsage(); }
   capabilities() { return { name: this.name, structured: true, text: true, streaming: false, providers: this.providers.map((provider) => provider.capabilities()) }; }
   telemetry() { return { ...super.telemetry(), attempts: this._attempts ?? [] }; }
@@ -448,6 +610,21 @@ export class ConsentAwareModelProvider extends LanguageModelProvider {
       if (directRecord) finishAttempt(directRecord, { ok: false, latencyMs: performance.now() - startedAt, error: error?.message });
       throw error;
     }
+  }
+
+  supportsChat() { return Boolean(this.provider?.supportsChat?.()); }
+
+  // The consent boundary applies to the CONTENT that leaves this machine, so it
+  // redacts each message the same way it redacts a structured prompt. It does
+  // not re-authorize per turn: the loop is one continuing request, authorized
+  // when it started.
+  async chat(request = {}) {
+    const messages = (request.messages ?? []).map((message) => (
+      typeof message.content === "string"
+        ? { ...message, content: sanitizeExternalContext(message.content, { maxStringLength: 32000 }) }
+        : message
+    ));
+    return this.provider.chat({ ...request, messages });
   }
 
   async healthCheck() { return this.provider?.healthCheck?.() ?? { ok: false }; }
@@ -561,8 +738,23 @@ export class OpenAIModelProvider extends LanguageModelProvider {
     throw lastError;
   }
 
+  supportsChat() { return Boolean(this.apiKey); }
+
+  async chat(request = {}) {
+    this._usage.calls += 1;
+    const result = await openAiCompatibleChat({
+      baseUrl: this.baseUrl,
+      apiKey: this.apiKey,
+      model: request.model || this.model,
+      ...request
+    });
+    this._usage.tokensIn += result.usage?.prompt_tokens ?? 0;
+    this._usage.tokensOut += result.usage?.completion_tokens ?? 0;
+    return result;
+  }
+
   capabilities() {
-    return { name: this.name, structured: true, text: true, streaming: false, model: this.model, remote: true };
+    return { name: this.name, structured: true, text: true, streaming: true, tools: true, model: this.model, remote: true };
   }
 }
 
@@ -657,6 +849,245 @@ export class AnthropicModelProvider extends LanguageModelProvider {
   }
 }
 
+// Mistral (https://api.mistral.ai/v1). OpenAI transport-compatible, and fast —
+// a trivial completion returns in well under a second, which is the property
+// that matters most here: the interactive loop makes one model call per
+// decision, so per-call latency is the product's latency.
+//
+// It deliberately does NOT use `response_format: json_schema, strict: true`,
+// even though recent Mistral models accept it. Strict mode emits the `required`
+// fields and nothing else, and this codebase has already paid for that once: the
+// optional `directAnswer` on INTENT_SCHEMA became unreachable, so a correctly
+// classified greeting arrived with no reply attached and fell all the way
+// through the planning pipeline. `json_object` plus the schema in the prompt
+// keeps optional fields reachable, and the caller (ReasoningEngine) validates
+// and repairs against the schema regardless — the runtime never trusts this
+// output directly.
+export class MistralModelProvider extends LanguageModelProvider {
+  constructor(config = {}) {
+    super(config);
+    // Same OS trust union as the other remote providers: which vendor is
+    // configured must not change whether the machine's CA store works.
+    enableSystemCaTrust();
+    this.apiKey = config.apiKey || process.env.MISTRAL_API_KEY || process.env.LLM_API_KEY;
+    this.model = config.model || "mistral-medium-3.5";
+    const rawBase = config.baseUrl || "https://api.mistral.ai/v1";
+    this.baseUrl = /\/v\d+$/.test(rawBase.replace(/\/$/, ""))
+      ? rawBase.replace(/\/$/, "")
+      : `${rawBase.replace(/\/$/, "")}/v1`;
+    // A truncated response is unparseable JSON, which the repair loop cannot
+    // fix because the model was not wrong — it was cut off. Interactive
+    // decisions carrying several localSteps are the largest outputs here.
+    this.maxTokens = Number(config.maxTokens ?? 4096);
+    // MINIMUM SPACING BETWEEN REQUESTS.
+    //
+    // A per-second rate limit rejects back-to-back calls, so this used to sleep
+    // 1.5s before every single one — an unconditional 1.5s tax on every step of
+    // every task, paid whether or not the account was anywhere near its limit.
+    //
+    // It now starts at zero and only widens in response to an actual 429 (see
+    // _widenAfterRateLimit), narrowing again once the account demonstrates it
+    // has room. Reacting to the limit costs one retry when it is hit; pre-empting
+    // it cost every request that would never have been limited at all.
+    this.baseRequestIntervalMs = Number(config.minRequestIntervalMs ?? 0);
+    this.minRequestIntervalMs = this.baseRequestIntervalMs;
+    this._nextSlotAt = 0;
+    this._callsSinceRateLimit = 0;
+    this.name = "mistral";
+  }
+
+  // Widen the spacing after a rate limit, and narrow it back once the account
+  // demonstrably has room again. Without the second half, a single busy second
+  // early in a session permanently slows every request after it — which is what
+  // a live probe measured: median latency went from 6.6s to 43s because the
+  // interval ratcheted to its ceiling on the third request and stayed there.
+  _widenAfterRateLimit() {
+    this._callsSinceRateLimit = 0;
+    // Starting from zero, multiplying stays at zero — so the first rate limit
+    // establishes a floor to widen from.
+    this.minRequestIntervalMs = Math.min(4000, Math.max(this.minRequestIntervalMs, 1000) * 1.5);
+  }
+
+  _narrowAfterSuccess() {
+    if (this.minRequestIntervalMs <= this.baseRequestIntervalMs) return;
+    this._callsSinceRateLimit += 1;
+    if (this._callsSinceRateLimit < 3) return;
+    this._callsSinceRateLimit = 0;
+    this.minRequestIntervalMs = Math.max(this.baseRequestIntervalMs, this.minRequestIntervalMs / 1.5);
+  }
+
+  // Serialize request starts so no two land closer than minRequestIntervalMs.
+  // Reserving the slot before awaiting is what makes this correct under
+  // concurrency: two callers arriving together take slot N and slot N+1 rather
+  // than both reading the same "now".
+  async _awaitRequestSlot() {
+    if (this.minRequestIntervalMs <= 0) return;
+    const now = Date.now();
+    const slot = Math.max(now, this._nextSlotAt);
+    this._nextSlotAt = slot + this.minRequestIntervalMs;
+    if (slot > now) await new Promise((resolve) => setTimeout(resolve, slot - now));
+  }
+
+  // Reachability only, with the same asymmetry the OpenAI provider uses: a
+  // definite negative (auth, bad route) is evidence the provider cannot serve
+  // us; anything else is UNKNOWN, and unknown means proceed. A false
+  // "unhealthy" costs every request until the TTL expires.
+  async healthCheck({ timeoutMs = 5000 } = {}) {
+    if (!this.apiKey) return { ok: false, error: "No Mistral API key" };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`${this.baseUrl}/models`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal: controller.signal
+      });
+      if (response.status >= 500) return { unknown: true, status: response.status };
+      return { ok: response.ok, status: response.status, model: this.model };
+    } catch (e) {
+      return { unknown: true, error: e.message };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  capabilities() {
+    return { name: this.name, structured: true, text: true, streaming: true, tools: true, model: this.model, remote: true };
+  }
+
+  supportsChat() { return Boolean(this.apiKey); }
+
+  // A rate limit is the endpoint saying "not yet", not "no", so it is retried
+  // here rather than surfacing as a failed step mid-task.
+  async chat(request = {}) {
+    this._usage.calls += 1;
+    let rateLimitRetries = 3;
+    for (;;) {
+      await this._awaitRequestSlot();
+      try {
+        const result = await openAiCompatibleChat({
+          baseUrl: this.baseUrl,
+          apiKey: this.apiKey,
+          model: request.model || this.model,
+          maxTokens: request.maxTokens ?? this.maxTokens,
+          ...request
+        });
+        this._usage.tokensIn += result.usage?.prompt_tokens ?? 0;
+        this._usage.tokensOut += result.usage?.completion_tokens ?? 0;
+        this._narrowAfterSuccess();
+        return result;
+      } catch (error) {
+        if (error?.status === 429 && rateLimitRetries > 0) {
+          rateLimitRetries -= 1;
+          this._widenAfterRateLimit();
+          const waitMs = Math.min(error.retryAfterMs ?? 1500, 10000);
+          // Being throttled is the single largest unexplained pause a user can
+          // see mid-task, and without this it is indistinguishable from the
+          // agent having stopped. Say so rather than going quiet for ten seconds.
+          request.onRetry?.({ reason: "rate-limited", waitMs, spacingMs: this.minRequestIntervalMs });
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  async generateStructured(prompt, schema, options = {}) {
+    this._usage.calls += 1;
+    if (!this.apiKey) throw new Error("No Mistral API key");
+    const timeoutMs = options.timeoutMs || 30000;
+    const maxRetries = options.maxRetries || 3;
+    // A rate limit is the endpoint saying "not yet", not "no". It gets its own
+    // small retry budget, separate from the transport retries above, because
+    // spending a transport attempt on it would let one busy second end a
+    // request that a one-second wait would have served.
+    let rateLimitRetries = 5;
+    let attempt = 0;
+    let lastError = null;
+    while (attempt < maxRetries) {
+      await this._awaitRequestSlot();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(`${this.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}` },
+          body: JSON.stringify({
+            model: options.model || this.model,
+            messages: [
+              {
+                role: "system",
+                content: "You output ONLY valid minified JSON conforming to the requested schema. No prose, no markdown fences, no explanation outside the JSON."
+              },
+              { role: "user", content: `${prompt}\n\nReturn ONLY JSON matching this schema: ${JSON.stringify(schema)}` }
+            ],
+            response_format: { type: "json_object" },
+            max_tokens: options.maxTokens || this.maxTokens,
+            temperature: options.temperature ?? 0.3
+          }),
+          signal: controller.signal
+        });
+        if (response.status === 429 && rateLimitRetries > 0) {
+          rateLimitRetries -= 1;
+          // Honour the server's own number when it gives one; otherwise widen
+          // the spacing, since being rate-limited is evidence the current
+          // spacing is too tight for this account.
+          const retryAfter = Number(response.headers.get("retry-after"));
+          const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+            ? Math.min(retryAfter * 1000, 10000)
+            : Math.max(1500, this.minRequestIntervalMs * 2);
+          this._widenAfterRateLimit();
+          clearTimeout(timeout);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+        if (!response.ok) {
+          // Mistral explains a rejected request in the body (bad model name,
+          // quota, malformed schema). Carrying that through turns an opaque
+          // "HTTP 400" into something a person can act on, and it is the
+          // difference between debugging the product and debugging the account.
+          let detail = "";
+          try {
+            const body = await response.text();
+            detail = body ? `: ${body.slice(0, 300)}` : "";
+          } catch { /* the status alone still identifies the failure */ }
+          throw new Error(`HTTP ${response.status}${detail}`);
+        }
+        const result = await response.json();
+        const usage = result.usage || {};
+        this._usage.tokensIn += usage.prompt_tokens || 0;
+        this._usage.tokensOut += usage.completion_tokens || 0;
+        const choice = result.choices?.[0];
+        // A response cut off at the token ceiling is truncated JSON. Say that,
+        // rather than letting it surface as a generic parse error that sends
+        // debugging after the prompt instead of after max_tokens.
+        if (choice?.finish_reason === "length") {
+          throw new Error("Mistral response truncated at the token limit (raise maxTokens)");
+        }
+        const parsed = extractJson(choice?.message?.content ?? "");
+        if (options.validateSchema) {
+          const validation = validateSchema(parsed, schema);
+          if (!validation.valid) throw new Error(`Invalid schema: ${validation.errors.join(", ")}`);
+        }
+        this._narrowAfterSuccess();
+        return parsed;
+      } catch (error) {
+        lastError = error;
+        attempt += 1;
+        if (attempt < maxRetries && isRetryableProviderError(error)) {
+          await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt), 10000)));
+        } else {
+          break;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw lastError;
+  }
+}
+
 // AgentRouter: an OpenAI-compatible model GATEWAY (https://agentrouter.org).
 // One endpoint + one API key gives access to many models (claude-opus-4-8,
 // gpt-5.5, glm-5.2, ...). SYSCORA is therefore NOT tied to a single vendor:
@@ -709,7 +1140,23 @@ export class AgentRouterModelProvider extends LanguageModelProvider {
   }
 
   capabilities() {
-    return { name: this.name, structured: true, text: true, streaming: false, model: this.model, gateway: true, remote: true };
+    return { name: this.name, structured: true, text: true, streaming: true, tools: true, model: this.model, gateway: true, remote: true };
+  }
+
+  supportsChat() { return Boolean(this.apiKey); }
+
+  async chat(request = {}) {
+    this._usage.calls += 1;
+    const result = await openAiCompatibleChat({
+      baseUrl: this.baseUrl,
+      apiKey: this.apiKey,
+      model: request.model || this.model,
+      headers: { "User-Agent": this.userAgent },
+      ...request
+    });
+    this._usage.tokensIn += result.usage?.prompt_tokens ?? 0;
+    this._usage.tokensOut += result.usage?.completion_tokens ?? 0;
+    return result;
   }
 
   async generateStructured(prompt, schema, options = {}) {
@@ -797,6 +1244,16 @@ export function createModelProvider(settings = {}) {
     case "anthropic": {
       const apiKey = settings.apiKey || process.env.ANTHROPIC_API_KEY;
       if (apiKey) return new AnthropicModelProvider({ apiKey, model: settings.model, baseUrl: settings.baseUrl });
+      return new MockModelProvider();
+    }
+    case "mistral": {
+      const apiKey = settings.apiKey || process.env.MISTRAL_API_KEY || process.env.LLM_API_KEY || process.env.SYSCORA_MODEL_API_KEY;
+      if (apiKey) return new MistralModelProvider({
+        apiKey,
+        model: settings.model,
+        baseUrl: settings.baseUrl,
+        maxTokens: settings.maxTokens
+      });
       return new MockModelProvider();
     }
     case "agentrouter": {

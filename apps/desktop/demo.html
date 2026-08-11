@@ -16,8 +16,12 @@
         </div>
       </div>
       <label class="debug-toggle">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span>Ready</span>
+        <!-- This said "Ready", in green, always — it was markup, not a reading.
+             With the daemon stopped it went on saying Ready while every request
+             failed, which is the worst thing a status indicator can do. It is
+             now driven by /api/health. -->
+        <span id="healthDot" class="status-dot" aria-hidden="true"></span>
+        <span id="healthLabel">Connecting…</span>
         <input id="debugToggle" type="checkbox" />
         Developer mode
       </label>
@@ -56,10 +60,13 @@
 
       <form id="chatForm" class="chat-bar">
         <textarea id="chatInput" rows="1" placeholder="Ask SYSCORA to do something..." required></textarea>
-        <label class="auto-approve" title="Skip approval prompts (demo only — off by default)">
-          <input id="autoApprove" type="checkbox" />
-          Auto-approve
-        </label>
+<!-- The "Auto-approve" checkbox that lived here is gone. The agent loop has no
+         approval gate to skip, so on every request that reaches it the toggle did
+         nothing at all; a control that does nothing is worse than no control,
+         because the user reasonably believes it is protecting them. Requests are
+         carried out as asked. The one floor that remains is below any approval and
+         cannot be toggled: WindowsAdapter.executeCommand refuses commands whose
+         damage no confirmation could undo. -->
         <button id="sendButton" type="submit" aria-label="Send message" title="Send (Enter)">&#8593;</button>
       </form>
     </main>

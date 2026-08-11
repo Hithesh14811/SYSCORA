@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { getWindowsAutomationHost } from "../../windows-host/src/client.js";
 import { CdpBrowserAdapter } from "../../browser/src/cdp-browser-adapter.js";
+import { classifyShellCommand, ShellVerdict } from "../../../packages/policy-engine/src/shell-rules.js";
 
 function parseEnvContents(rawContents) {
   const pairs = new Map();
@@ -70,10 +71,76 @@ function expandWindowsEnvironmentPath(value) {
   environment.set("USERPROFILE", process.env.USERPROFILE || os.homedir());
   environment.set("TEMP", process.env.TEMP || os.tmpdir());
   environment.set("TMP", process.env.TMP || os.tmpdir());
-  return String(value ?? "").replace(/%([^%]+)%/g, (match, key) => {
-    const replacement = environment.get(String(key).toUpperCase());
-    return replacement == null ? match : replacement;
-  });
+  const lookup = (key) => environment.get(String(key).toUpperCase());
+  return String(value ?? "")
+    .replace(/%([^%]+)%/g, (match, key) => lookup(key) ?? match)
+    // `$env:USERPROFILE\Desktop` is how a Windows path is written in PowerShell,
+    // and it is what a model writes when it has just been running PowerShell
+    // commands. Only `%VAR%` was expanded, so a perfectly ordinary path was
+    // resolved as a literal directory named `$env:USERPROFILE` relative to the
+    // working directory, and the write failed with ENOENT on a path containing
+    // the words the caller had asked to be substituted. Both spellings mean the
+    // same thing; both are accepted. `${env:VAR}` is the braced form.
+    .replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/gi, (match, key) => lookup(key) ?? match)
+    .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (match, key) => lookup(key) ?? match);
+}
+
+// PRESSING A KEY BY ITS NAME.
+//
+// The host sends keystrokes through SendKeys, whose notation is a DSL: Enter is
+// `{ENTER}`, Ctrl+S is `^s`, Alt+F4 is `%{F4}`. A bare word is not a key name to
+// SendKeys — it is TEXT — so `keys: "enter"` types the five letters e,n,t,e,r
+// into whatever has focus, and reports performed:true for doing it.
+//
+// Live, that is exactly what happened: asked to search YouTube, the agent typed
+// its query, pressed "enter", and the search box then read "Not Your Typeenter".
+// It tried again, cleared, retyped, pressed "enter" again, and burned its whole
+// step budget on a search it had already typed correctly twice — because the one
+// action that failed was the one that reported success.
+//
+// Nobody should have to know a 1995 Microsoft DSL to press Enter. A name is
+// translated to its token; a combination written the way people write it
+// ("ctrl+shift+esc") is translated to its modifiers; anything already in
+// SendKeys notation passes through untouched.
+const SEND_KEYS_NAMES = new Map(Object.entries({
+  enter: "{ENTER}", return: "{ENTER}", tab: "{TAB}", esc: "{ESC}", escape: "{ESC}",
+  space: " ", spacebar: " ", backspace: "{BACKSPACE}", bksp: "{BACKSPACE}", delete: "{DELETE}",
+  del: "{DELETE}", insert: "{INSERT}", home: "{HOME}", end: "{END}",
+  pageup: "{PGUP}", pgup: "{PGUP}", pagedown: "{PGDN}", pgdn: "{PGDN}",
+  up: "{UP}", down: "{DOWN}", left: "{LEFT}", right: "{RIGHT}",
+  printscreen: "{PRTSC}", prtsc: "{PRTSC}", capslock: "{CAPSLOCK}", numlock: "{NUMLOCK}",
+  break: "{BREAK}", help: "{HELP}",
+  ...Object.fromEntries(Array.from({ length: 16 }, (_, index) => [`f${index + 1}`, `{F${index + 1}}`]))
+}));
+const SEND_KEYS_MODIFIERS = new Map(Object.entries({
+  ctrl: "^", control: "^", ctl: "^", alt: "%", shift: "+", win: "^{ESC}"
+}));
+
+export function normalizeSendKeys(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return raw;
+  // Already SendKeys notation — it contains a brace group, or it LEADS with a
+  // modifier symbol. Leave it be: a caller that knows the notation is not
+  // guessing. Testing for a modifier symbol anywhere would catch the `+` in
+  // "ctrl+shift+escape", which is the spelling this exists to translate.
+  if (/[{}]/.test(raw) || /^[\^%~+]/.test(raw)) return raw;
+
+  const parts = raw.split(/\s*\+\s*/).filter(Boolean);
+  const modifiers = [];
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const modifier = SEND_KEYS_MODIFIERS.get(parts[index].toLowerCase());
+    // A "+"-joined string whose leading segments are not modifiers is not a
+    // combination at all; treat the whole thing as a single name.
+    if (!modifier) return SEND_KEYS_NAMES.get(raw.toLowerCase()) ?? raw;
+    modifiers.push(modifier);
+  }
+  const last = parts[parts.length - 1] ?? "";
+  const key = SEND_KEYS_NAMES.get(last.toLowerCase())
+    ?? (last.length === 1 ? last.toLowerCase() : null);
+  // An unrecognised name is returned unchanged rather than guessed at, so it
+  // fails visibly instead of typing something plausible.
+  if (!key) return raw;
+  return `${modifiers.join("")}${key}`;
 }
 
 // Coerce a caller-supplied duration into a bounded integer. UI-automation waits
@@ -239,6 +306,34 @@ export class WindowsAdapter {
   // of asking the model to declare which dialect it wrote.
   async executeCommand(workingDirectory, command, args = [], options = {}) {
     const commandLine = String(command ?? "");
+    // THE HARD FLOOR UNDER THE TERMINAL.
+    //
+    // This is the single place every command in the runtime is spawned, which
+    // makes it the only place a refusal cannot be routed around. Risk, policy
+    // and approval decide whether a *mutating* command runs; they are the right
+    // mechanism for that, and the user can answer yes. A command that formats a
+    // disk, wipes the shadow copies, disables Defender or pipes a download into
+    // a shell is not a question — approving it would not make it recoverable —
+    // so it is refused here, below the approval gate, where an auto-approving
+    // session cannot reach past it either.
+    //
+    // The refusal is a RESULT, not a throw: the caller's verify() reads a
+    // nonzero exit and reports the reason to the user, which is the same shape
+    // as any other command that did not succeed.
+    const verdict = classifyShellCommand(command, args);
+    if (verdict.verdict === ShellVerdict.DENY) {
+      return {
+        command,
+        args,
+        exitCode: -1,
+        timedOut: false,
+        cancelled: false,
+        blocked: true,
+        blockedRule: verdict.rule,
+        stdout: "",
+        stderr: verdict.reason
+      };
+    }
     const usesShell = args.length === 0 && /[\s|&<>^"']/.test(commandLine.trim());
     const [spawnCommand, spawnArgs] = usesShell
       ? ["powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", commandLine]]
@@ -2147,6 +2242,19 @@ public static class SyscoraAudio {
     return { processName: name, commandResult: ps };
   }
 
+  // The one window the user is looking at, without describing every other one.
+  // Returns null when the host cannot answer, so callers fall back to filtering
+  // listWindows() and nothing depends on this being available.
+  async getForegroundWindow() {
+    if (!this.automationHost) return null;
+    try {
+      const result = await this.hostRequest("window.foreground", {}, { timeoutMs: 4000 });
+      return result?.window ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async listWindows() {
     if (this.automationHost) {
       try {
@@ -2328,7 +2436,11 @@ public static class SyscoraWindowEnumerator {
   }
 
   async keyboardAction(operation, params = {}) {
-    return this.hostRequest(`keyboard.${operation}`, params, { timeoutMs: 5000 });
+    return this.hostRequest(
+      `keyboard.${operation}`,
+      operation === "press" ? { ...params, keys: normalizeSendKeys(params.keys) } : params,
+      { timeoutMs: 5000 }
+    );
   }
 
   async clipboardAction(operation, params = {}) {

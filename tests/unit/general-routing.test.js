@@ -268,10 +268,50 @@ test("an informational goal is offered no way to change anything", () => {
 
   for (const mutating of [
     "ui.action", "ui.click", "ui.type", "pointer.click", "pointer.drag",
-    "keyboard.type", "keyboard.press", "command.run"
+    "keyboard.type", "keyboard.press"
   ]) {
     assert.ok(!offered.includes(mutating), `${mutating} must not be offered to answer a question`);
   }
+});
+
+// The terminal is the exception, and it is enforced differently on purpose.
+//
+// `command.run` is a door: what it does is written in the command line and
+// nowhere else, so withholding the capability is the wrong control — it would
+// take away the fastest answer to most questions ("which process is using the
+// most memory" is one Get-Process away) to guard against a risk that only some
+// command lines carry. So it is offered, and the boundary sits on the argument:
+// while the goal is a question, a command that is not a pure read is rejected
+// and the rejection is fed back to the model.
+test("an informational goal may run a command that reads, and only that", () => {
+  const registry = createDefaultCapabilityRegistry(new WindowsAdapter());
+  const controller = new InteractiveAgentController({ capabilityRegistry: registry });
+  const offered = controller._catalog("which process is using the most memory", { readOnly: true }).map((c) => c.name);
+  assert.ok(offered.includes("command.run"), "a question must still be able to read the machine with a command");
+
+  const read = controller._validateAction(
+    { capability: "command.run", inputs: { command: "Get-Process | Sort-Object WS -Descending" } },
+    new Set(),
+    { readOnly: true }
+  );
+  assert.equal(read.valid, true, read.errors?.join("; "));
+
+  const write = controller._validateAction(
+    { capability: "command.run", inputs: { command: "Stop-Process -Name notepad" } },
+    new Set(),
+    { readOnly: true }
+  );
+  assert.equal(write.valid, false);
+  assert.match(write.errors.join(" "), /only commands that read may be run/);
+
+  // Outside read-only mode the same command is allowed to be PROPOSED; risk,
+  // policy and approval are what decide whether it runs.
+  const proposed = controller._validateAction(
+    { capability: "command.run", inputs: { command: "Stop-Process -Name notepad" } },
+    new Set(),
+    { readOnly: false }
+  );
+  assert.equal(proposed.valid, true, proposed.errors?.join("; "));
 });
 
 test("an informational goal can still look, open, focus and scroll", () => {

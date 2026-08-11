@@ -281,23 +281,12 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         return;
       }
 
-      if (request.method === "POST" && requestUrl.pathname === "/api/intents/acknowledge") {
-        const acknowledgementStartedAt = performance.now();
-        const body = await readJsonBody(request);
-        const parsed = parseRequestBodyWithEnvelope(body, "intent_acknowledgement_request");
-        const payload = parsed.payload;
-        if (!payload.text) {
-          sendJson(response, 400, { error: "text is required." });
-          return;
-        }
-        const acknowledgement = await runtime.acknowledgeIntent(payload.text);
-        acknowledgement.latencyMs = Math.round(performance.now() - acknowledgementStartedAt);
-        sendJson(response, 200, {
-          envelope: buildEnvelope("intent_acknowledgement_response", acknowledgement, parsed.requestId),
-          acknowledgement
-        });
-        return;
-      }
+      // POST /api/intents/acknowledge is gone. It existed so the chat surface
+      // could fire a second, parallel model request purely to get "sure, playing
+      // that now" on screen while the real work started. No client ever called
+      // it, and the agent loop now gets the same line for free: every tool call
+      // carries a `say`, which reaches the user about a second in, before the
+      // tool it describes has finished. One request, not two.
 
       if (request.method === "GET" && requestUrl.pathname === "/api/sessions") {
         const sessions = await runtime.sessionStore.list();

@@ -178,6 +178,31 @@ const INTERACTIVE_ACTION_SCHEMA = {
   }
 };
 
+// The decision schema, bound to the capability names this particular call is
+// allowed to answer with. The static export below is the same shape with the
+// name field left open, kept for callers and tests that do not have a catalog
+// to hand.
+export function buildInteractiveDecisionSchema(registeredNames = []) {
+  const action = registeredNames.length === 0
+    ? INTERACTIVE_ACTION_SCHEMA
+    : {
+        ...INTERACTIVE_ACTION_SCHEMA,
+        properties: {
+          ...INTERACTIVE_ACTION_SCHEMA.properties,
+          capability: { type: "string", enum: [...registeredNames] }
+        }
+      };
+  return {
+    ...INTERACTIVE_DECISION_SCHEMA,
+    properties: {
+      ...INTERACTIVE_DECISION_SCHEMA.properties,
+      action,
+      localSteps: { type: "array", items: action },
+      fallback: { type: "array", items: action }
+    }
+  };
+}
+
 export const INTERACTIVE_DECISION_SCHEMA = {
   type: "object",
   required: ["kind"],
@@ -475,8 +500,17 @@ export class ReasoningEngine {
         // slow, and treating it as "provider down" took the model away from
         // every following request in the TTL, turning one slow answer into a
         // string of refusals.
+        // A rate limit is the same argument as a timeout, one step further on:
+        // the endpoint received the request, understood it, and answered — it
+        // just said "not this second". Counting that as evidence the provider is
+        // down is how a busy second became a refusal for every request in the
+        // TTL. Measured live against a rate-limited account, three 429s during
+        // one adaptive loop opened the circuit and the next request was told
+        // "every configured model provider is temporarily unavailable" while the
+        // provider was up and answering.
         const timedOut = /abort|timeout|timed out/i.test(lastError);
-        if (!timedOut && options.recordHealth !== false) this._recordLiveOutcome(false);
+        const rateLimited = /\b429\b|rate.?limit/i.test(lastError);
+        if (!timedOut && !rateLimited && options.recordHealth !== false) this._recordLiveOutcome(false);
         break;
       }
 
@@ -869,6 +903,11 @@ return COMPLETE for anything you did on screen, read the screen back and quote
 what it actually says as your evidence. If it does not say what you expected,
 that is a step to fix, not a step to report as done.
 
+This applies to work done THROUGH A WINDOW. A command's own stdout is already
+direct evidence of what it found or changed, so quote that and do not add a
+screen.read after it — reading the screen costs seconds and tells you nothing
+about a command you did not run in a window.
+
 To click something that is not an accessible control — a drawing canvas, a map,
 a video, a game, a point inside a document — use pointer.clickAt with a
 coordinate you read from screen.read. The coordinate must lie inside the target
@@ -891,8 +930,18 @@ sequence deterministically, from durable screen diffs and grounded-element
 checks, without asking you again between steps.
 Stop the local sequence only at a genuine branch point that needs fresh
 observation — not merely to confirm that a step you already ordered worked.
+Plan the steps the task NEEDS and no more. Redundant confirmations are not
+thoroughness: asked whether Git is installed, "git --version" answers it, and
+adding "where git", "winget list", "Get-Command git" and a PATH dump costs the
+user four more round trips to learn nothing the first line did not say. If a
+step cannot change the answer, leave it out.
 Every action is:
-{ "capability": "registered.name", "inputs": {}, "modality": "..." }.
+{ "capability": "<one of availableCapabilities[].name, copied EXACTLY>", "inputs": {} }.
+"capability" must be copied character-for-character from availableCapabilities.
+It is a registered name such as "command.run" or "screen.read" — never a
+modality, never a category, and never a name you compose yourself. If nothing
+fits, use "command.run" with a PowerShell command line rather than inventing an
+identifier.
 Within localSteps, consume the immediately preceding action's output with a
 "$last.output.<field>" reference (for example "$last.output.target"). Do not
 invent values that a prior action has not returned.
@@ -933,6 +982,15 @@ Compact sanitized state:
 ${boundedJson(safeContext)}
 
 Return only JSON matching the decision schema.`.trim();
+    // The names the model is allowed to answer with. Repeating them in the
+    // rejection is the whole point: a repair message that says only "unknown
+    // capability: os_api.disk_space" tells the model that it was wrong and not
+    // what right looks like, so it re-asks and gets the same invention back.
+    // Measured live, that cost six consecutive 30-second decisions and killed a
+    // request that one `command.run` would have answered — the model had
+    // fused a MODALITY ("OS_API") with its intent and composed an identifier
+    // that has never existed.
+    const registeredNames = catalog.map((capability) => capability.name).filter(Boolean);
     const validateAction = (action, errors, label) => {
       if (!action || typeof action !== "object") {
         errors.push(`${label} is missing`);
@@ -945,7 +1003,10 @@ Return only JSON matching the decision schema.`.trim();
         const classification = resolution.kind === CapabilityResolutionKind.UNKNOWN_CAPABILITY
           ? "unknown capability"
           : "ambiguous capability";
-        errors.push(`${label} uses ${classification}: ${action.capability}`);
+        errors.push(
+          `${label} uses ${classification}: ${JSON.stringify(action.capability)}. ` +
+          `"capability" must be exactly one of: ${registeredNames.join(", ")}`
+        );
       }
       if (!action.inputs || typeof action.inputs !== "object" || Array.isArray(action.inputs)) {
         errors.push(`${label}.inputs must be an object`);
@@ -985,7 +1046,14 @@ Return only JSON matching the decision schema.`.trim();
       }
       return { valid: errors.length === 0, errors };
     };
-    return this._reasonStructured(prompt, INTERACTIVE_DECISION_SCHEMA, {
+    // A closed value set is only a constraint if something checks it, and the
+    // capability name is the most consequential closed set in the whole
+    // runtime — an invented one routes the request nowhere. `validate` above is
+    // the enforcement that always runs; declaring the enum makes a provider
+    // that supports strict json_schema refuse the invention at generation time,
+    // and gives every provider the list in the schema it is shown.
+    const schema = buildInteractiveDecisionSchema(registeredNames);
+    return this._reasonStructured(prompt, schema, {
       normalize: normalizeInteractiveDecision,
       validate,
       strictSchema: false,

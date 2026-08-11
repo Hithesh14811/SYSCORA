@@ -3,6 +3,7 @@ import { ExecutionModality, modalityProfile, validateInteractionTarget } from ".
 import { redactSensitiveData } from "../../shared-types/src/redaction.js";
 import { PRIVILEGED_OPERATIONS } from "../../privileged-helpers/src/index.js";
 import { captureScreenSnapshotViaAdapter } from "../../perception/src/vision-provider.js";
+import { classifyShellCommand, ShellVerdict } from "../../policy-engine/src/shell-rules.js";
 import crypto from "crypto";
 import {
   CAPABILITY_CONTRACT_VERSION,
@@ -1590,7 +1591,14 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     observe: async (result, args) => ({
       observationId: createId(), source: name, timestamp: new Date().toISOString(),
       structuredState: result, relatedActionId: args?.actionId,
-      detectedChanges: result?.performed === false ? [] : detectedChanges,
+      // `detectedChanges` may be a function when what changed depends on the
+      // call rather than on the capability. Running a command is the case that
+      // needs it: `git --version` changes nothing and `npm install` changes the
+      // workspace, and reporting "Changed: workspace" for the first one is the
+      // kind of untrue detail that makes every other line less believable.
+      detectedChanges: result?.performed === false
+        ? []
+        : (typeof detectedChanges === "function" ? detectedChanges(result, args) : detectedChanges),
       confidence: result?.performed === false || result?.found === false ? 0.4 : 0.95,
       trustLevel: "SYSTEM_TRUSTED"
     }),
@@ -2507,16 +2515,36 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
   // "Run a command" under the name it is reached for. `developer.command.run`
   // exists and does exactly this, but it reads as developer tooling, so the
   // planner kept emitting `cli.exec` / `cli.execute` and being rejected. Same
-  // executor, same MEDIUM risk and POLICY_ENGINE confirmation — only the name
-  // is different, and the name is what the model has to guess.
+  // executor — only the name is different, and the name is what the model has
+  // to guess.
+  //
+  // WHY THIS IS DECLARED READ.
+  //
+  // It was WRITE, which made its floor a PERSISTENT mutation, which made every
+  // single command a confirmation prompt — `git --version` and `format C:` were
+  // treated identically. A control that fires on everything is not a control:
+  // it trains the user to click Approve without reading, which is strictly
+  // worse than not asking.
+  //
+  // The risk of running a command is not a property of this capability. It is a
+  // property of the COMMAND LINE, and nothing but the command line can tell you
+  // what it is. So the floor is what the capability itself does — spawn a
+  // process and return its output — and the actual decision is made per call by
+  // classifyShellCommand: a read runs, a mutation goes through approval, a
+  // destructive command is refused in WindowsAdapter.executeCommand where no
+  // approval can reach past it. RiskEngine.assess applies that classification
+  // as raise-only evidence, so this floor can only ever be raised by it.
   registerM4Primitive({
     name: "command.run",
+    permissionType: "READ",
     description:
       "Run a Windows shell command (PowerShell) and return its stdout, stderr and exit code. " +
       "Put the whole command line in `command`, exactly as you would type it in a terminal " +
       "(for example \"git --version\" or \"Get-PSDrive C | Select-Object Used,Free\"), and leave " +
       "`args` empty. This is usually the fastest and most reliable way to read or change system " +
-      "state — prefer it over driving a GUI.",
+      "state — prefer it over driving a GUI. Commands that only read run immediately; commands " +
+      "that change something ask the user first; a few destructive commands (disk formatting, " +
+      "wiping backups, disabling security, piping a download into a shell) are refused outright.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2538,9 +2566,12 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       args.args ?? [],
       { timeoutMs: 90000 }
     ),
-    permissionType: "WRITE",
     resources: ["workspace"],
-    detectedChanges: ["workspace"],
+    // Only a command that could change something reports a change.
+    detectedChanges: (result, args) =>
+      classifyShellCommand(args?.command, args?.args ?? []).verdict === ShellVerdict.ALLOW
+        ? []
+        : ["workspace"],
     verify: async (observation) => {
       const state = observation?.structuredState ?? {};
       const ok = state.exitCode === 0 && !state.timedOut;
@@ -2548,9 +2579,13 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
         status: ok ? "VERIFIED" : "FAILED",
         // A nonzero exit code is the command reporting its own failure. Saying
         // so plainly stops a failed command reading as a completed step.
-        message: ok
-          ? "Command completed successfully"
-          : `Command exited with code ${state.exitCode ?? "unknown"}${state.timedOut ? " (timed out)" : ""}`,
+        // A command the rules refused never ran at all, and saying "exited with
+        // code -1" about it would hide the only fact that matters.
+        message: state.blocked === true
+          ? state.stderr
+          : (ok
+            ? "Command completed successfully"
+            : `Command exited with code ${state.exitCode ?? "unknown"}${state.timedOut ? " (timed out)" : ""}`),
         evidence: state,
         confidence: 1
       };

@@ -8,7 +8,7 @@ import {
   validateExecutionSession,
   validateIntent
 } from "../../shared-types/src/domain.js";
-import { IntentEngine } from "../../intent-engine/src/index.js";
+import { IntentEngine, providerIsRemoteModel } from "../../intent-engine/src/index.js";
 import { ContextEngine, SystemContextProvider, ProcessContextProvider, PortContextProvider, EnvironmentContextProvider, WorkspaceContextProvider } from "../../context-engine/src/index.js";
 import { GeneralPlanner, OPERATION_PLANS, PlanValidator, assessPlanGoalCoverage } from "../../planner/src/index.js";
 import { MockModelProvider, validateSchema } from "../../model-providers/src/index.js";
@@ -50,6 +50,7 @@ import {
 import { summarizeReadOnlyResults } from "./read-result-summary.js";
 import { PrerequisiteResolver } from "./prerequisite-resolver.js";
 import { EnvironmentModel } from "../../context-engine/src/environment-model.js";
+import { FastAgent, buildToolset } from "../../fast-agent/src/index.js";
 
 export {
   InteractiveAgentController,
@@ -241,7 +242,23 @@ export class AgentRuntime {
     };
   }
 
+  // THE ROUTE A REQUEST TAKES.
+  //
+  // A model that can hold a tool-calling conversation runs the agent loop, which
+  // is every case that matters in production. The staged pipeline below it —
+  // classify, collect context, plan, validate, assess risk, apply policy,
+  // request approval, schedule, observe, verify — remains the route when there
+  // is no such model, because offline it is not a degraded path, it is the only
+  // one that works at all. It is not a fallback FROM the loop: a loop that fails
+  // fails for reasons re-running it as a plan will not fix.
+  _canRunFastAgent(options = {}) {
+    if (options.fast === false) return false;
+    const provider = this.reasoningEngine?.modelProvider;
+    return typeof provider?.chat === "function" && provider.supportsChat?.() === true;
+  }
+
   async submitIntent(rawText, options = {}) {
+    if (this._canRunFastAgent(options)) return this._submitFastIntent(rawText, options);
     const timeoutMs = Number(options.maxElapsedTime);
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       return this._submitIntent(rawText, options);
@@ -298,6 +315,102 @@ export class AgentRuntime {
     }
   }
 
+  /**
+   * Run one request through the agent loop.
+   *
+   * The session object it returns is the same shape every other route returns,
+   * because the daemon, the session store and the chat surface all read it — but
+   * what it records is only what happened: what was said, which tools ran, and
+   * what they returned. There is no plan, because nothing composed one; no risk
+   * assessment, policy decision or approval commitment, because nothing was
+   * gated; no evidence ledger, because the model checks its own work by reading
+   * the screen back and says so in words the user can see.
+   */
+  async _submitFastIntent(rawText, options = {}) {
+    const session = this._createSession(options);
+    session.currentState = RuntimeState.EXECUTING;
+    session.fast = true;
+    options.onSessionCreated?.(session);
+    options.onSessionStarted?.(session.sessionId);
+
+    // Streaming means an event per token. Routing those through addSessionEvent
+    // would append one audit file write per token and store the whole stream
+    // twice — once as deltas, once as the finished message. Prose deltas are
+    // published live and not retained; everything else is a durable event.
+    const emit = (event) => {
+      if (event.type === "AGENT_DELTA") {
+        this.onSessionEvent?.(session.sessionId, { eventType: event.type, ...event });
+        return;
+      }
+      const record = {
+        eventId: createId("event"),
+        eventType: event.type,
+        timestamp: new Date().toISOString(),
+        details: event.details ?? {}
+      };
+      session.events.push(record);
+      this.onSessionEvent?.(session.sessionId, record);
+      this.auditRepository?.append?.(session.sessionId, event.type, record.details).catch?.(() => {});
+    };
+
+    emit({ type: "INTENT_RECEIVED", details: { rawText } });
+
+    const toolset = buildToolset({
+      registry: this.capabilityRegistry,
+      adapter: this.adapter,
+      basePath: options.workspacePath ?? process.cwd()
+    });
+    const agent = new FastAgent({
+      provider: this.reasoningEngine.modelProvider,
+      toolset,
+      onEvent: emit,
+      signal: options.signal ?? null,
+      ...(Number.isFinite(Number(options.maxElapsedTime)) && Number(options.maxElapsedTime) > 0
+        ? { maxElapsedMs: Number(options.maxElapsedTime) }
+        : {})
+    });
+
+    let outcome;
+    try {
+      outcome = await agent.run(rawText, { history: options.history ?? [] });
+    } catch (error) {
+      outcome = {
+        status: "FAILED",
+        message: error instanceof Error ? error.message : String(error),
+        steps: 0,
+        toolCalls: 0,
+        elapsedMs: 0
+      };
+    }
+
+    // The model was configured but could not be reached, and nothing has run —
+    // no tool was called, so nothing on the machine has been touched. That is
+    // the one case where the staged pipeline is worth paying for: it plans from
+    // typed capabilities without a model at all, so a request like "tell me
+    // about this computer" is still answerable with the network down. It is
+    // reached only from a standing start, never to retry work the loop began.
+    if (outcome.status === "FAILED" && outcome.toolCalls === 0 && options.fast !== true) {
+      emit({ type: "FAST_AGENT_UNAVAILABLE", details: { reason: outcome.message } });
+      return this._submitIntent(rawText, { ...options, fast: false, existingSession: session });
+    }
+
+    // COMPLETED is the only state the runtime can honestly claim here, and it
+    // claims it whenever the loop finished — the model's own words say what was
+    // and was not achieved. A stopped-early run is recorded as FAILED so the
+    // daemon treats it as terminal, with the real status on finalResponse.
+    session.currentState = outcome.status === "COMPLETED"
+      ? RuntimeState.COMPLETED
+      : RuntimeState.FAILED;
+    session.finalResponse = {
+      status: outcome.status,
+      message: outcome.message,
+      rawText,
+      metrics: { steps: outcome.steps, toolCalls: outcome.toolCalls, elapsedMs: outcome.elapsedMs }
+    };
+    await this.persistSession(session).catch(() => {});
+    return session;
+  }
+
   _assertSessionActive(session, options = {}) {
     if (session?.deadlineExceeded || options.deadlineSignal?.aborted ||
         (Number.isFinite(options.deadlineAt) && Date.now() >= options.deadlineAt)) {
@@ -345,6 +458,15 @@ export class AgentRuntime {
     session.deadlineAt = Number.isFinite(options.deadlineAt)
       ? new Date(options.deadlineAt).toISOString()
       : null;
+    // Continuing a session the agent loop opened and could not use, because the
+    // model was unreachable. It keeps its id and its events: the daemon has
+    // already published that id to the client, and a second id would strand the
+    // live stream on a session nothing further is ever written to.
+    if (options.existingSession) {
+      session.sessionId = options.existingSession.sessionId;
+      session.createdAt = options.existingSession.createdAt;
+      session.events = options.existingSession.events;
+    }
     options.onSessionCreated?.(session);
     options.onSessionStarted?.(session.sessionId);
 
@@ -477,6 +599,65 @@ export class AgentRuntime {
         }
       }
 
+      // 1c. WHICH ROUTE RUNS THIS REQUEST.
+      //
+      // Decided here, before any context is collected, because the answer
+      // changes what is worth collecting.
+      //
+      // A known typed operation already has a deterministic capability graph
+      // that reaches the OS through an internal/API route. That is both the
+      // fastest way to do the thing and the most verifiable, so it keeps its
+      // fast path — "play X on Spotify" should not be reasoned about step by
+      // step when one typed capability does it.
+      //
+      // EVERYTHING ELSE goes to the model. The one-shot planner composes a
+      // whole task graph from a single look at the request, before anything has
+      // been observed, and its output was then judged by a coverage check that
+      // could only reject it — so the common outcome for an ordinary request
+      // was a refusal built on a plan that was never going to run. The
+      // controller decides one step at a time from what is actually on screen,
+      // which is the only way an OS agent can work, and it has been the
+      // FALLBACK from that refusal rather than the route.
+      //
+      // `preferImmediateInteractive` was the flag meant to do this and no
+      // caller has ever set it: the branch below has been unreachable since it
+      // was written. The static planner is not removed — it remains the second
+      // attempt if the loop does not converge.
+      const hasLocalInteractiveStrategy = Boolean(
+        buildBrowserCompositionStrategy(rawText) ??
+        buildCrossModalTransferStrategy(rawText) ??
+        buildInternalToGuiTransferStrategy(rawText) ??
+        buildExplicitApplicationLaunchStrategy(rawText)
+      );
+      const hasDirectOperationPlan = Boolean(
+        session.intent.operation && OPERATION_PLANS[session.intent.operation]
+      );
+      // A message that asks nothing of the computer is not work, and putting it
+      // into the loop is the expensive kind of wrong: it spends the whole step
+      // budget looking for something to do about "what model are you" and then
+      // reports a failure. Same two signals the conversation fast path uses —
+      // the classifier naming work, or the message being action-shaped — so the
+      // two agree by construction.
+      const intentNamedWork = Boolean(session.intent.operation)
+        || (session.intent.requiredCapabilities ?? []).length > 0;
+      const conversationalShape = !intentNamedWork && this._looksConversational(rawText);
+      // The loop needs a model that can actually decide. The deterministic Mock
+      // answers every prompt with a canned INTENT fixture, which no interactive
+      // decision schema will ever accept — so routing to the loop without a real
+      // model spends the entire step budget on repair attempts and arrives
+      // nowhere, slowly. Offline, the deterministic planner is not a degraded
+      // path, it is the intended one. Same test IntentEngine already applies
+      // before it lets a model route an intent at all.
+      const modelCanDecide = providerIsRemoteModel(this.reasoningEngine?.modelProvider);
+      const modelFirstRoute =
+        options.interactive !== false &&
+        options.preferImmediateInteractive !== false &&
+        !hasDirectOperationPlan &&
+        !conversationalShape &&
+        modelCanDecide &&
+        typeof this.reasoningEngine?.decideInteractiveAction === "function" &&
+        (hasLocalInteractiveStrategy || modelHealthyForConversational);
+
       // 2. Collect context (including semantic state and memory). A known
       // read-only operation — or a direct, self-contained desktop action like a
       // Spotify play — already has its exact typed scope, so skip the expensive
@@ -500,7 +681,14 @@ export class AgentRuntime {
       // When the model is unavailable, semantic/memory collection cannot improve
       // the deterministic fallback plan but can add several seconds of Windows
       // inspection. Keep required base context, skip only this advisory layer.
-      const skipAdvisoryPlanningState = fastReadOnlyOperation || !modelHealthyForConversational;
+      //
+      // The model-first route skips it for a different reason: this layer exists
+      // to inform a one-shot plan composed before anything is observed, and the
+      // controller does not compose one — it perceives the live machine at every
+      // step, so paying seconds here buys a snapshot that is stale by the time
+      // the first decision is made.
+      const skipAdvisoryPlanningState =
+        fastReadOnlyOperation || modelFirstRoute || !modelHealthyForConversational;
       const requiredContext = session.intent.requiredContext || [];
       const baseContext = await this.contextEngine.collectContext(requiredContext, session.intent.entities);
       this._assertSessionActive(session, options);
@@ -561,42 +749,29 @@ export class AgentRuntime {
         });
       }
 
-      // Clearly interactive free-text goals should enter the closed-loop
-      // controller before paying for a one-shot task-graph composition. This is
-      // a modality-level routing rule, not an application workflow: typed
-      // operations keep their static fast path, while generic open/select/type/
-      // navigate goals require live perception and adaptation.
-      const hasLocalInteractiveStrategy = Boolean(
-        buildBrowserCompositionStrategy(rawText) ??
-        buildCrossModalTransferStrategy(rawText) ??
-        buildInternalToGuiTransferStrategy(rawText) ??
-        buildExplicitApplicationLaunchStrategy(rawText)
-      );
-      // A known typed operation already has a deterministic capability graph.
-      // Preserve that graph ahead of generic UI reasoning for every operation,
-      // not just for individual applications. The typed capability remains
-      // responsible for its own grounding and postcondition evidence.
-      const hasDirectOperationPlan = Boolean(
-        session.intent.operation && OPERATION_PLANS[session.intent.operation]
-      );
-      const earlyInteractiveGoal =
-        !hasDirectOperationPlan &&
-        (!session.intent.operation || hasLocalInteractiveStrategy) &&
-        (
-          ["APPLICATION", "BROWSER"].includes(String(session.intent.category ?? "").toUpperCase()) ||
-          /\b(open|launch|select|choose|click|type|enter|put|navigate|browser|website)\b/i.test(rawText) ||
-          /\bread\b[\s\S]{0,120}\b(?:into|in)\b/i.test(rawText)
-        );
-      if (
-        options.preferImmediateInteractive === true &&
-        options.interactive !== false &&
-        earlyInteractiveGoal &&
-        typeof this.reasoningEngine?.decideInteractiveAction === "function" &&
-        (hasLocalInteractiveStrategy || await this._isModelHealthy())
-      ) {
-        const interactive = await this._runInteractiveController(session, rawText, options);
-        if (interactive.status === "COMPLETE" || interactive.status === "NEEDS_USER") return session;
-        return this._settleIncompleteInteractive(session, interactive, rawText);
+      // The model-first route, decided in 1c above. The controller reasons from
+      // live perception, so it runs BEFORE the one-shot planner rather than
+      // after it has failed.
+      //
+      // A loop that does not converge falls THROUGH to the static planner
+      // instead of settling here. The two routes fail for different reasons —
+      // the loop runs out of steps or observations, the planner runs out of
+      // capabilities that cover the goal — so a second attempt down the other
+      // one is a genuinely different attempt, not a retry of the same thing.
+      // Whatever the loop already did successfully is preserved on the session
+      // either way, and _settleIncompleteInteractive still reports it if the
+      // planner produces nothing either.
+      let modelFirstOutcome = null;
+      if (modelFirstRoute) {
+        modelFirstOutcome = await this._runInteractiveController(session, rawText, options);
+        if (modelFirstOutcome.status === "COMPLETE" || modelFirstOutcome.status === "NEEDS_USER") {
+          return session;
+        }
+        session.currentState = RuntimeState.GENERATE_PLAN;
+        session.finalResponse = null;
+        await this.addSessionEvent(session, "MODEL_FIRST_ROUTE_FELL_BACK", {
+          reason: modelFirstOutcome.reason ?? "interactive-controller-did-not-complete"
+        });
       }
 
       // 3. Generate plan (memory + semantic state passed as planning inputs)
@@ -627,6 +802,13 @@ export class AgentRuntime {
         }
       }
       if (plannedTasks.length === 0) {
+        // Running the loop a second time on the same request, with the same
+        // observations, is not a second attempt — it is the same attempt, and
+        // it costs the user the whole budget again before failing identically.
+        // When the model-first route already ran, report what it managed.
+        if (modelFirstOutcome) {
+          return this._settleIncompleteInteractive(session, modelFirstOutcome, rawText);
+        }
         const canTryInteractive = options.interactive !== false &&
           !this._looksConversational(rawText) &&
           typeof this.reasoningEngine?.decideInteractiveAction === "function" &&
@@ -725,6 +907,10 @@ export class AgentRuntime {
         !inferredRouteCoverage.covered;
       if (
         options.interactive !== false &&
+        // Same argument as the empty-plan branch above: the loop has already
+        // seen this request and these observations. Re-entering it here only
+        // spends the budget twice to arrive at the same place.
+        !modelFirstOutcome &&
         (!session.intent.operation || !inferredRouteCoverage.covered) &&
         needsClosedLoopInteraction &&
         typeof this.reasoningEngine?.decideInteractiveAction === "function" &&
@@ -752,6 +938,16 @@ export class AgentRuntime {
         const coverage = assessPlanGoalCoverage(session.intent, session.plan.taskGraph, this.capabilityRegistry);
         await this.addSessionEvent(session, "DETERMINISTIC_PLAN_COVERAGE_CHECKED", coverage);
         if (!coverage.covered) {
+          // The loop ran first and did real work; the planner then failed to
+          // find a covering route. Reporting a flat FAILED here would discard
+          // everything the loop actually accomplished and verified — the false
+          // FAILURE this codebase has paid for repeatedly. Settle on the loop's
+          // own evidence instead, which reports the verified part and names the
+          // part that did not finish.
+          if (modelFirstOutcome) {
+            session.plan = null;
+            return this._settleIncompleteInteractive(session, modelFirstOutcome, rawText);
+          }
           session.currentState = RuntimeState.FAILED;
           // Say what actually happened.
           //
@@ -1130,16 +1326,19 @@ export class AgentRuntime {
         const relevantWindows = rankedWindows.slice(0, 12);
         const foreground = rawForeground;
         const groundedWindow = rankedWindows.find(matchesGoal) ?? rawForeground ?? rankedWindows[0] ?? null;
-        let ui = null;
-        if (groundedWindow) {
+        const inspectGroundedUi = async () => {
+          if (!groundedWindow) return null;
           try {
-            ui = await this.adapter.inspectUi({
+            return await this.adapter.inspectUi({
               application: groundedWindow.ProcessName ?? groundedWindow.processName,
               windowId: String(groundedWindow.WindowHandle ?? groundedWindow.windowId),
               maxElements: 100
             });
-          } catch { /* UIA is an optional perception source */ }
-        }
+          } catch {
+            // UIA is an optional perception source.
+            return null;
+          }
+        };
         // VISUAL PERCEPTION.
         //
         // Capture + OCR were implemented, working (measured: 0.6s to capture a
@@ -1158,19 +1357,31 @@ export class AgentRuntime {
         const uiFacingSession = /\b(open|launch|click|type|press|select|choose|scroll|drag|window|screen|see|look|read|show|display|button|menu|tab|dialog|app|application)\b/i
           .test(String(controllerState.goal ?? rawText)) ||
           (controllerState.recentActions ?? []).some((entry) => isUiFacingAction(entry?.action));
-        let screen = null;
-        if (groundedWindow && uiFacingSession) {
-          screen = await this._captureScreenEvidence({
+        const captureGroundedScreen = async () => {
+          if (!groundedWindow || !uiFacingSession) return null;
+          return this._captureScreenEvidence({
             windowId: String(groundedWindow.WindowHandle ?? groundedWindow.windowId),
             application: groundedWindow.ProcessName ?? groundedWindow.processName
           });
-        }
-        let browser = null;
-        try {
-          if (this.adapter.browserAutomation?.connection) {
-            browser = await this.adapter.browserDomAction("currentState", {});
-          }
-        } catch { /* browser may not be active */ }
+        };
+        const readBrowserState = async () => {
+          try {
+            if (this.adapter.browserAutomation?.connection) {
+              return await this.adapter.browserDomAction("currentState", {});
+            }
+          } catch { /* browser may not be active */ }
+          return null;
+        };
+        // Three independent looks at the same already-resolved window: the
+        // accessibility tree, the pixels, and the page. They were awaited one
+        // after another, so every step paid their sum — roughly 0.5s + 1.2s +
+        // the browser probe — when the wall-clock cost is the slowest of them.
+        // Perception runs before EVERY action, so this is per-step, not per-run.
+        const [ui, screen, browser] = await Promise.all([
+          inspectGroundedUi(),
+          captureGroundedScreen(),
+          readBrowserState()
+        ]);
         const rawControls = (ui?.elements ?? ui?.targets ?? []);
         const compactControls = rawControls.map((control) => ({
           targetId: control.targetId,
@@ -1473,26 +1684,6 @@ export class AgentRuntime {
     const verification = session.verifications.at(-1)
       ?? { status: "FAILED", message: "No verification was produced", confidence: 1 };
     return { executionResult: taskResult?.executionResult, observation, verification };
-  }
-
-  // Used by the chat surface as a separate, parallel request. The LLM generates
-  // its OWN natural, first-person acknowledgement ("Sure, playing 'Cry For Me'
-  // now.") — never a hardcoded/templated string — while submitIntent begins the
-  // safe typed work concurrently. Falls back to a minimal deterministic line only
-  // when no model is available so the user always sees an acknowledgement.
-  async acknowledgeIntent(rawText) {
-    if (!this.reasoningEngine?.acknowledgeAction) {
-      return { message: null, source: "unavailable" };
-    }
-    try {
-      const result = await this.reasoningEngine.acknowledgeAction(rawText);
-      const message = result?.ok && typeof result.text === "string" && result.text.trim()
-        ? result.text.trim()
-        : null;
-      return { message, source: message ? (result?.source ?? "model") : "unavailable" };
-    } catch {
-      return { message: null, source: "unavailable" };
-    }
   }
 
   // Supplementary action classifier for approval explanations and audit.

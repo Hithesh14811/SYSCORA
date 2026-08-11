@@ -201,8 +201,6 @@ export class VisionProvider {
         foreground: value(supplied, "foreground", "Foreground") === true
       };
     }
-    const windows = await this.adapter?.listWindows?.();
-    if (!Array.isArray(windows) || windows.length === 0) return null;
     const describe = (window) => ({
       windowId: String(value(window, "windowId", "WindowHandle")),
       processName: value(window, "processName", "ProcessName"),
@@ -218,19 +216,45 @@ export class VisionProvider {
     // Notepad's expected text against another program's screen. A capture of the
     // wrong window is worse than no capture, because it looks like evidence.
     if (application) {
+      const windows = await this.adapter?.listWindows?.();
+      if (!Array.isArray(windows) || windows.length === 0) return null;
       const needle = String(application).toLowerCase().replace(/\.exe$/, "");
       const named = windows.map(describe).filter((window) =>
         String(window.processName ?? "").toLowerCase().replace(/\.exe$/, "") === needle ||
         String(window.processName ?? "").toLowerCase().includes(needle) ||
         String(window.title ?? "").toLowerCase().includes(needle)
       );
-      // Prefer the one the user is actually looking at when several match.
-      if (named.length) return named.find((window) => window.foreground) ?? named[0];
-      return null;
+      // NOT EVERY WINDOW A PROCESS OWNS IS A WINDOW.
+      //
+      // Windows 11 Notepad keeps a handful of invisible `Pop-upHost` shells
+      // alongside its real documents — thirteen enumerated windows for three
+      // open files, seven of them zero-sized helpers. Taking the first name
+      // match landed on one of those, the capture failed because there is
+      // nothing there to capture, and the agent was told "the screen could not
+      // be read" while the document sat open in front of it. It then relaunched
+      // the application and tried again, repeatedly.
+      //
+      // A window with no area cannot be looked at or clicked, so it is not a
+      // candidate. Among the rest, prefer the one in front, then the largest —
+      // which is the document, never the helper.
+      const usable = named.filter((window) =>
+        Number(window.bounds?.width ?? 0) > 10 && Number(window.bounds?.height ?? 0) > 10);
+      const candidates = usable.length > 0 ? usable : named;
+      return candidates.find((window) => window.foreground)
+        ?? [...candidates].sort((left, right) =>
+          (right.bounds?.width ?? 0) * (right.bounds?.height ?? 0) -
+          (left.bounds?.width ?? 0) * (left.bounds?.height ?? 0))[0]
+        ?? null;
     }
 
-    const foreground = windows.map(describe).find((window) => window.foreground);
-    return foreground ?? null;
+    // Nothing was named, so this is "look at whatever I am looking at". Ask the
+    // OS for that one window rather than describing every window on the desktop
+    // and then discarding all but one of them.
+    const direct = await this.adapter?.getForegroundWindow?.();
+    if (direct) return describe(direct);
+    const windows = await this.adapter?.listWindows?.();
+    if (!Array.isArray(windows) || windows.length === 0) return null;
+    return windows.map(describe).find((window) => window.foreground) ?? null;
   }
 
   async collect(request = {}) {
@@ -251,33 +275,50 @@ export class VisionProvider {
       return { ...cached.raw, cached: true };
     }
 
-    const capture = await this.adapter.captureScreen({
-      windowId: window.windowId,
-      application: window.processName ?? request.application,
-      ...(request.capturePath ? { path: request.capturePath } : {})
-    });
-    if (!capture?.captured || !capture.path) {
-      return { available: false, reason: capture?.reason ?? "screen-capture-failed", window, capture };
-    }
-    let pixelHash = null;
-    try {
-      pixelHash = crypto.createHash("sha256").update(await fs.readFile(capture.path)).digest("hex");
-    } catch { /* the OCR/UIA snapshot still has value when the image cannot be re-read */ }
-    const bounds = normalizeBbox(capture.bounds ?? window.bounds) ?? { x: 0, y: 0, width: 0, height: 0 };
-    const [ocr, ui] = await Promise.all([
-      this.adapter.readOcr({
-        path: capture.path,
+    // Looking at a window is three separate operations, and only two of them
+    // depend on each other: OCR needs the PNG, the accessibility tree needs
+    // nothing. Awaiting the capture before starting the UIA inspection made
+    // every look cost their sum — measured on this machine at 1.5s + 1.8s —
+    // when the wall-clock cost is the slower of the two chains. Perception runs
+    // before and after every action, so this is a per-step tax, not a one-off.
+    const visual = (async () => {
+      const capture = await this.adapter.captureScreen({
         windowId: window.windowId,
-        originX: bounds.x,
-        originY: bounds.y
-      }),
+        application: window.processName ?? request.application,
+        ...(request.capturePath ? { path: request.capturePath } : {})
+      });
+      if (!capture?.captured || !capture.path) return { capture, ocr: null, pixelHash: null };
+      const bounds = normalizeBbox(capture.bounds ?? window.bounds) ?? { x: 0, y: 0, width: 0, height: 0 };
+      const [ocr, pixelHash] = await Promise.all([
+        this.adapter.readOcr({
+          path: capture.path,
+          windowId: window.windowId,
+          originX: bounds.x,
+          originY: bounds.y
+        }),
+        fs.readFile(capture.path)
+          .then((bytes) => crypto.createHash("sha256").update(bytes).digest("hex"))
+          // The OCR/UIA snapshot still has value when the image cannot be re-read.
+          .catch(() => null)
+      ]);
+      return { capture, ocr, pixelHash };
+    })();
+    const [{ capture, ocr, pixelHash }, ui] = await Promise.all([
+      visual,
       this.adapter.inspectUi({
         application: window.processName ?? request.application,
         windowId: window.windowId,
         maxElements: request.maxElements ?? 240
-      })
+      }).catch(() => null)
     ]);
-    const capturedAt = capture.timestamp ?? new Date(this.clock()).toISOString();
+    // A window that cannot be captured — protected content, a minimized window,
+    // a secure desktop — is very often still readable through UI Automation.
+    // Reporting the whole reading as unavailable threw that away and left the
+    // agent blind to a window it could in fact see most of.
+    if ((!capture?.captured || !capture.path) && !ui) {
+      return { available: false, reason: capture?.reason ?? "screen-capture-failed", window, capture };
+    }
+    const capturedAt = capture?.timestamp ?? new Date(this.clock()).toISOString();
     const raw = {
       available: true,
       snapshotId: `screen-${window.windowId}-${crypto.randomUUID()}`,

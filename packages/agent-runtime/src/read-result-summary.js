@@ -95,6 +95,39 @@ function formatResearchSummary(result) {
   return `Found ${items.length} result(s):\n${lines.join("\n")}\n\nThese are search results, not verified live prices — open a source to confirm before relying on it.${searched}`;
 }
 
+// A short, live preview of what one action returned, for the activity feed.
+//
+// Distinct from summarizeReadOnlyResults, which composes the FINAL answer from
+// every read in a session and deliberately drops `stdout` — the right choice for
+// a prose answer, and the wrong one here. Watching a command run and seeing only
+// "Command completed successfully" is the difference between a terminal and a
+// progress bar: the output IS the result, and it is what tells the user the
+// agent looked at the right thing.
+export function previewActionResult(capability, executionResult, { maxChars = 600 } = {}) {
+  const result = executionResult ?? null;
+  if (!result || typeof result !== "object") return null;
+
+  // A refusal explains itself; nothing else about the result matters.
+  if (result.blocked === true) return String(result.stderr ?? "Refused by the command rules.").slice(0, maxChars);
+
+  if (typeof result.stdout === "string" || typeof result.stderr === "string") {
+    const stdout = String(result.stdout ?? "").trim();
+    const stderr = String(result.stderr ?? "").trim();
+    const body = stdout || stderr;
+    if (body) return body.slice(0, maxChars);
+    if (Number.isFinite(result.exitCode)) return `exit code ${result.exitCode}`;
+  }
+
+  // Reading the screen returns a transcript; the first lines of it are what a
+  // person would glance at.
+  if (typeof result.visibleText === "string" && result.visibleText.trim()) {
+    return result.visibleText.trim().replace(/\n{2,}/g, "\n").slice(0, maxChars);
+  }
+
+  const value = summarizeValue(result);
+  return value ? String(value).slice(0, maxChars) : null;
+}
+
 export function summarizeReadOnlyResults(taskResults = [], capabilityRegistry = null) {
   if (taskResults.length === 0) return null;
   const allReadOnly = taskResults.every((result) =>

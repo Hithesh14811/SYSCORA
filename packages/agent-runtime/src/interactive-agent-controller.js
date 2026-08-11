@@ -20,6 +20,8 @@ import {
 } from "../../shared-types/src/evidence-ledger.js";
 import { evaluatePostcondition } from "../../shared-types/src/postconditions.js";
 import { diffScreenSnapshots } from "../../perception/src/vision-provider.js";
+import { previewActionResult } from "./read-result-summary.js";
+import { classifyShellCommand, ShellVerdict, SHELL_CAPABILITIES } from "../../policy-engine/src/shell-rules.js";
 
 const DEFAULT_BUDGETS = Object.freeze({
   // The floor, not the ceiling — computeSessionStepBudget scales it by the shape
@@ -1726,6 +1728,12 @@ export class InteractiveAgentController {
           return capability.permissionModel?.type === "READ"
             || InteractiveAgentController.VIEW_ONLY_CAPABILITIES.has(capability.name);
         }
+        // `command.run` reaches here through the READ branch above, which is
+        // correct: a question is very often one command away, and refusing the
+        // terminal to a question means answering "which process is using the
+        // most memory" by driving Task Manager with a mouse. What keeps it
+        // read-only is _validateAction, which rejects any command line that is
+        // not classified as a pure read while the goal is informational.
         if (isSafeToObserve(capability)) return true;
         if (desktopToolkit.test(capability.name) || commandToolkit.test(capability.name)) return true;
         if (modalityRelevant(capability.name)) return true;
@@ -1767,17 +1775,49 @@ export class InteractiveAgentController {
         ])
       ),
       requiredInputs: capability.inputSchema?.required ?? [],
-      modality: capability.execution?.modality,
-      modalities: capability.execution?.modalities
+      // The PREFERRED modality only. The full `modalities` profile array was
+      // 23% of this prompt — more than every capability name, alias and
+      // required-input list put together — and it told the model nothing the
+      // single preferred value does not, since the execution-priority guidance
+      // is about choosing between capabilities rather than within one.
+      //
+      // It also did active harm. Shown `{ name: "command.run", modalities:
+      // [{ kind: "OS_API" }, { kind: "CLI" }] }`, the model composed identifiers
+      // out of the modality — `os_api.disk_space`, `os_api.cli` — which resolve
+      // to nothing. Measured live, six consecutive decisions were rejected that
+      // way, each costing about thirty seconds, on a request that one
+      // `command.run` answered as soon as the field was gone.
+      modality: capability.execution?.modality ?? capability.execution?.preferredModality
       }));
   }
 
-  _validateAction(action, observedTargetIds = null) {
+  _validateAction(action, observedTargetIds = null, { readOnly = false } = {}) {
     if (!action || typeof action !== "object") return { valid: false, errors: ["action is required"] };
     const capability = this.capabilityRegistry?.get?.(action.capability);
     if (!capability) return { valid: false, errors: [`unknown capability: ${action.capability}`] };
     const validation = validateSchema(action.inputs ?? {}, capability.inputSchema ?? { type: "object" });
     const errors = [...(validation.errors ?? [])];
+    // READ-ONLY MODE AND THE TERMINAL.
+    //
+    // A question must not be answered by changing the machine. `command.run` is
+    // now typed READ — because running a command is a door and what it does is
+    // written in the command line, not in the capability — so omitting it from
+    // the read-only catalog would take away the single fastest way to answer
+    // most questions ("which process is using the most memory" is one
+    // Get-Process away). It stays offered, and the boundary moves to where the
+    // information actually is: the command line is classified, and in read-only
+    // mode nothing but a read may be proposed.
+    //
+    // Rejecting it here rather than hiding it is deliberate — the rejection is
+    // fed back to the model, which then writes the read it should have written.
+    if (readOnly && SHELL_CAPABILITIES.has(action.capability)) {
+      const verdict = classifyShellCommand(action.inputs?.command, action.inputs?.args ?? []);
+      if (verdict.verdict !== ShellVerdict.ALLOW) {
+        errors.push(
+          `this goal is a question, so only commands that read may be run; ${verdict.reason}`
+        );
+      }
+    }
     const groundedFields = action.capability === "pointer.drag"
       ? ["fromTarget", "toTarget"]
       : (["ui.action", "pointer.click", "browser.click", "browser.type", "browser.select", "browser.download"].includes(action.capability) ? ["target"] : []);
@@ -2227,6 +2267,41 @@ export class InteractiveAgentController {
           decisionType: data.kind,
           phase: state.modelCalls === 1 ? "INITIAL_STRATEGY" : "RECOVERY"
         });
+        // WHAT THE AGENT IS THINKING, IN ITS OWN WORDS.
+        //
+        // Every decision already contains the model's reasoning — `subgoal` is
+        // what it decided to do next and `reason` is why — and none of it has
+        // ever reached the user. The chat showed a request, a spinner, and a
+        // verdict, so a run that took thirty seconds and made six decisions
+        // looked from outside like one opaque pause. That is the whole gap
+        // between this and a coding agent: not what it does, but that you can
+        // watch it decide.
+        //
+        // Emitted as its own event rather than left for the UI to dig out of
+        // ADAPTIVE_DECIDED, because a presentation layer reaching into a
+        // decision's internals is how a rename silently empties the panel.
+        const narration = String(data.subgoal ?? data.reason ?? data.question ?? "").trim();
+        if (narration) {
+          await this.emit("AGENT_SAYS", {
+            step: state.steps,
+            kind: data.kind,
+            text: narration,
+            // The "why", when the model gave one distinct from the "what".
+            detail: data.reason && data.reason !== narration ? String(data.reason).trim() : null,
+            // The remaining happy path it just committed to, so the user sees
+            // the shape of the plan the moment it exists rather than one step
+            // at a time. Capability and inputs travel with each step so the
+            // client can name it the way it names a running step — a plan that
+            // reads "command.run, command.run, command.run" describes nothing.
+            steps: [data.action, ...(data.localSteps ?? [])]
+              .filter(Boolean)
+              .map((action) => ({
+                capability: action.capability,
+                inputs: action.inputs ?? {},
+                label: action.subgoal || action.expectedEffect || action.expectedPostcondition || null
+              }))
+          });
+        }
         if (data.kind === InteractiveDecisionKind.COMPLETE) {
           const completion = validateCompletionEvidence(data, initialContext, state);
           if (completion.valid) {
@@ -2337,7 +2412,7 @@ export class InteractiveAgentController {
       const consumedBindings = (queuedAction.requiresBindings ?? [])
         .map((name) => state.bindings[name]?.bindingId ?? name);
       const observedTargetIds = collectTargetIds([lastPerception, ...state.recentObservations]);
-      const validation = this._validateAction(action, observedTargetIds);
+      const validation = this._validateAction(action, observedTargetIds, { readOnly: informationalGoal });
       if (!validation.valid) {
         const unsupported = validation.errors.some((error) =>
           String(error).includes(InteractiveConvergenceState.UNSUPPORTED_ACTION)
@@ -2879,6 +2954,10 @@ export class InteractiveAgentController {
         step: state.steps,
         capability: action.capability,
         verification,
+        // What the step actually returned, short enough to stream. Without it
+        // the activity feed can only say that a step finished, which is the
+        // least interesting thing about it.
+        resultPreview: previewActionResult(action.capability, outcome?.executionResult),
         durationMs: this.now() - actionStarted
       });
 
@@ -3052,7 +3131,7 @@ export class InteractiveAgentController {
         continue;
       }
       const fallback = (action.fallback ?? []).find((candidate) =>
-        this._validateAction(candidate, observedTargetIds).valid
+        this._validateAction(candidate, observedTargetIds, { readOnly: informationalGoal }).valid
       );
       if (fallback && state.recoveries < this.budgets.recoveryBudget) {
         state.recoveries += 1;

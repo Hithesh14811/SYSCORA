@@ -28,14 +28,24 @@ export function loadModelConfig(basePath = process.cwd()) {
   }
 
   return {
-    provider: process.env.SYSCORA_MODEL_PROVIDER || fileConfig.provider || "mock",
+    // LLM_* is the vendor-neutral spelling used by most local .env files and by
+    // the provider dashboards themselves, so it is accepted alongside the
+    // SYSCORA_* names rather than requiring the key to be renamed on the way in.
+    // SYSCORA_* still wins, because it is the more specific of the two.
+    provider: process.env.SYSCORA_MODEL_PROVIDER || process.env.LLM_PROVIDER || fileConfig.provider || "mock",
     apiKey:
       process.env.SYSCORA_MODEL_API_KEY ||
+      process.env.LLM_API_KEY ||
       process.env.AGENTROUTER_API_KEY ||
       fileConfig.apiKey ||
       null,
-    model: process.env.SYSCORA_MODEL_NAME || fileConfig.model || undefined,
-    baseUrl: process.env.SYSCORA_MODEL_BASE_URL || fileConfig.baseUrl || undefined,
+    model: process.env.SYSCORA_MODEL_NAME || process.env.LLM_MODEL || fileConfig.model || undefined,
+    baseUrl: process.env.SYSCORA_MODEL_BASE_URL || process.env.LLM_BASE_URL || fileConfig.baseUrl || undefined,
+    // Ceiling on a single completion. Only large enough to matter for the
+    // interactive decision call, whose localSteps array is the biggest thing
+    // the model ever emits; a truncated response is unparseable JSON and the
+    // repair loop cannot fix it, because the model was not wrong.
+    maxTokens: Number(process.env.SYSCORA_MODEL_MAX_TOKENS || fileConfig.maxTokens || 4096),
     // Floor under every reasoning call. Generous by design: a timeout is a
     // CEILING, so raising it costs a fast model nothing — it returns in two
     // seconds either way — while a reasoning model that thinks before emitting
@@ -43,7 +53,7 @@ export function loadModelConfig(basePath = process.cwd()) {
     // failed". The session's own elapsed-time budget still bounds the request,
     // so this cannot produce an unbounded run.
     requestTimeoutMs: Number(
-      process.env.SYSCORA_MODEL_TIMEOUT_MS || fileConfig.requestTimeoutMs || 45000
+      process.env.SYSCORA_MODEL_TIMEOUT_MS || fileConfig.requestTimeoutMs || 30000
     ),
     fallbackProviders:
       process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS || fileConfig.fallbackProviders || "",

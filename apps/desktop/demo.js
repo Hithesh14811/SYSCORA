@@ -1,8 +1,18 @@
-// SYSCORA demo chat surface. A friendly, investor-facing view over the SAME
-// runtime the developer console uses: it POSTs natural language to /api/intents
-// and renders the returned session's events as understandable steps, surfaces
-// approval, and shows a plain-language result. No runtime bypass — every action
-// flows through the canonical pipeline. Raw JSON is only shown in debug mode.
+// SYSCORA chat surface.
+//
+// A turn is a TRANSCRIPT, not a verdict. The runtime narrates what it is
+// deciding, every step it takes runs in front of you with its output, and the
+// answer arrives at the end of that — the way you would watch someone work
+// rather than being handed a receipt.
+//
+// What this replaced: a spinner showing one line that was overwritten four times
+// a second, then a green "✓ Done" badge over a paragraph. Every reason the agent
+// gave for what it was doing was computed, serialized and sent, and thrown away
+// here. Nothing about the runtime needed to change for this; the events were
+// always on the wire.
+//
+// No runtime bypass — every action flows through the canonical pipeline, and
+// this file only renders what the pipeline reports.
 
 import { readIntentSession } from "./intent-client.js";
 
@@ -24,7 +34,8 @@ const chatForm = document.getElementById("chatForm");
 const chatInput = document.getElementById("chatInput");
 const debugToggle = document.getElementById("debugToggle");
 const suggestions = document.getElementById("suggestions");
-const autoApprove = document.getElementById("autoApprove");
+const healthDot = document.getElementById("healthDot");
+const healthLabel = document.getElementById("healthLabel");
 
 function showConnect(message) {
   if (message) { connectError.textContent = message; connectError.hidden = false; }
@@ -60,156 +71,510 @@ window.fetch = async (input, init = {}) => {
 };
 
 let debug = false;
-debugToggle.addEventListener("change", () => { debug = debugToggle.checked; document.body.classList.toggle("debug", debug); });
+debugToggle.addEventListener("change", () => {
+  debug = debugToggle.checked;
+  document.body.classList.toggle("debug", debug);
+});
 
-// ---- Friendly rendering of the canonical session -----------------------------
+// ---- Is the daemon actually there? ------------------------------------------
 
-// Map a raw event to a human line. Unknown/internal events return null (hidden
-// unless debug mode). This is presentation only — the runtime is authoritative.
-// A capability identifier is an internal name ("processes.list", "ui.action").
-// Falling back to it produced progress lines like "Working: processes.list" and
-// "Ran: step" — which tell a normal user nothing and read like debug output.
-// Prefer whatever describes the step in words; when nothing does, say something
-// plainly true rather than exposing the identifier.
-function stepWords(details, fallback) {
-  const described = details?.goal || details?.description || details?.subgoal;
-  return typeof described === "string" && described.trim() ? described.trim() : fallback;
+// A network failure and a request that ran and went wrong are different
+// problems with different fixes, and telling them apart is the difference
+// between "start the daemon" and an hour spent debugging the agent. The browser
+// reports an unreachable origin as a TypeError from fetch itself.
+function isDaemonUnreachable(error) {
+  return error instanceof TypeError
+    || /failed to fetch|networkerror|load failed|connection refused/i.test(String(error?.message ?? ""));
 }
 
-function humanizeEvent(ev) {
-  const t = ev.eventType;
-  const d = ev.details ?? {};
-  switch (t) {
-    case "VERIFICATION_UNCERTAIN": return { icon: "!", text: `Could not confirm: ${d.message || stepWords(d, "that step")}` };
-    // The step ran; nothing independent proved what it changed. Distinct from a
-    // failure, and shown as such — the runtime no longer aborts on these, so
-    // rendering one as "Did not work" would contradict the run that continues.
-    case "VERIFICATION_UNCONFIRMED": return { icon: "!", text: `Done, but unconfirmed: ${d.message || stepWords(d, "that step")}` };
-    case "INTENT_RECEIVED": return { icon: "•", text: "Understanding your request…" };
-    case "INTENT_CLASSIFIED": return { icon: "•", text: `Understood: ${d.normalizedGoal ?? "request"}` };
-    case "CONTEXT_COLLECTED": return { icon: "•", text: "Inspecting relevant system state…" };
-    case "PLAN_GENERATED": {
-      const tasks = d.taskGraph?.tasks ?? [];
-      return { icon: "•", text: "Creating a plan…", plan: tasks.map((x) => x.goal || x.capability) };
-    }
-    case "RISK_ASSESSED": return { icon: "•", text: `Assessed risk: ${d.overallRisk ?? "?"}` };
-    case "TASK_STARTING": return { icon: "▶", text: stepWords(d, "Working on it…") };
-    case "TASK_EXECUTED": return { icon: "✓", text: `Done: ${stepWords(d, "that step")}` };
-    case "VERIFICATION_COMPLETED": return { icon: "✓", text: `Checked: ${d.message || stepWords(d, "the result")}` };
-    case "VERIFICATION_FAILED": return { icon: "✗", text: `Did not work: ${d.message || stepWords(d, "that step")}` };
-    case "FAILURE_DIAGNOSED": return { icon: "⚠", text: `Diagnosed problem: ${d.rootCause || d.category || "issue"}` };
-    case "RECOVERY_DECIDED": return { icon: "↻", text: `Recovery: ${d.action}` };
-    case "STARTING_REPLANNING": return { icon: "↻", text: `Re-planning (attempt ${d.attempt})…` };
-    case "REPLAN_APPROVAL_REQUIRED": return { icon: "⏸", text: "The new plan needs your approval." };
-    case "ROLLING_BACK": return { icon: "↩", text: "Rolling back changes…" };
-    case "FINAL_VERIFICATION_COMPLETED": return { icon: "•", text: `Goal check: ${d.status ?? ""}` };
-    default: return null;
+let daemonReachable = null;
+function setDaemonReachable(reachable) {
+  if (reachable === daemonReachable) return;
+  daemonReachable = reachable;
+  healthDot?.classList.toggle("offline", !reachable);
+  if (healthLabel) healthLabel.textContent = reachable ? "Ready" : "Daemon not running";
+}
+
+async function checkHealth() {
+  try {
+    const response = await nativeFetch("/api/health", { cache: "no-store" });
+    setDaemonReachable(response.ok);
+  } catch {
+    setDaemonReachable(false);
   }
+}
+checkHealth();
+setInterval(checkHealth, 5000);
+
+// ---- Small DOM helpers -------------------------------------------------------
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function scrollToEnd() {
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function addBubble(role, node) {
+  const wrap = el("div", `bubble ${role}`);
+  wrap.appendChild(node);
+  chatLog.appendChild(wrap);
+  scrollToEnd();
+  return wrap;
+}
+
+function textNode(text) {
+  return el("div", null, text);
+}
+
+// ---- Naming things the way a person would -----------------------------------
+
+// A capability identifier is an internal name. `pointer.clickAt` is what the
+// runtime calls it; "Clicked" is what happened. The identifier is still shown
+// beside it in monospace, because seeing the actual tool is the point — this is
+// the label, not a replacement.
+const VERB = [
+  [/^command\.run$|^developer\.command\.run$/, "Ran"],
+  [/^screen\.(read|capture)$|^ocr\./, "Looked at the screen"],
+  [/^ui\.(inspect|find|extract|resolveTarget|verifyValue)$/, "Inspected the window"],
+  [/^ui\.action$/, "Used a control"],
+  [/^pointer\.(click|clickAt)$/, "Clicked"],
+  [/^pointer\.wheel$/, "Scrolled"],
+  [/^pointer\.(drag|move)$/, "Moved the pointer"],
+  [/^keyboard\.type$/, "Typed"],
+  [/^keyboard\.press$/, "Pressed a key"],
+  [/^clipboard\./, "Used the clipboard"],
+  [/^window\./, "Adjusted a window"],
+  [/^application\.launch$|^process\.launch$/, "Opened"],
+  [/^application\.close$/, "Closed"],
+  [/^filesystem\.(read|list|search)$/, "Read from disk"],
+  [/^filesystem\.(write|createDirectory|delete)$/, "Wrote to disk"],
+  [/^browser\.(navigate|launch|connect)$/, "Opened a page"],
+  [/^browser\.(read|extract|find|inspect|currentState|research|search)$/, "Read the page"],
+  [/^browser\./, "Used the browser"],
+  [/^system\./, "Checked the system"],
+  [/^package\./, "Checked packages"],
+  [/^spotify\./, "Used Spotify"]
+];
+
+// The agent loop's tools are already named the way a person would name them, so
+// these are just the past tense.
+const TOOL_VERB = {
+  run: "Ran",
+  screen: "Looked at the screen",
+  click: "Clicked",
+  type: "Typed",
+  key: "Pressed",
+  scroll: "Scrolled",
+  move_mouse: "Moved the pointer",
+  launch: "Opened",
+  open_url: "Opened a page",
+  windows: "Listed the windows",
+  focus: "Focused a window",
+  window_state: "Adjusted a window",
+  read_file: "Read a file",
+  write_file: "Wrote a file",
+  clipboard: "Used the clipboard",
+  play_music: "Played",
+  wait: "Waited"
+};
+
+function verbFor(capability) {
+  const name = String(capability ?? "");
+  if (TOOL_VERB[name]) return TOOL_VERB[name];
+  for (const [pattern, verb] of VERB) if (pattern.test(name)) return verb;
+  return "Ran a step";
+}
+
+// The one argument worth showing next to the tool name. A command line is the
+// whole story; a click is a coordinate; a type is the text. Anything else falls
+// back to the first short string argument, and to nothing at all rather than a
+// wall of JSON.
+function argSummary(capability, inputs) {
+  const i = inputs ?? {};
+  if (i.command) return String(i.command);
+  if (i.text) return JSON.stringify(String(i.text).slice(0, 120));
+  if (i.url) return String(i.url);
+  if (i.query) return String(i.query);
+  if (i.application) return String(i.application);
+  if (i.path || i.directoryPath) return String(i.path ?? i.directoryPath);
+  if (i.keys) return String(i.keys);
+  if (Number.isFinite(i.x) && Number.isFinite(i.y)) return `(${i.x}, ${i.y})`;
+  if (i.notches != null) return `${i.notches} notches`;
+  const firstString = Object.entries(i)
+    .find(([, value]) => typeof value === "string" && value.length > 0 && value.length < 80);
+  return firstString ? String(firstString[1]) : "";
+}
+
+// One line of the plan. The model names the first step and usually leaves the
+// rest unnamed, so falling back to the capability alone renders a plan reading
+// "command.run, command.run, command.run" — five identical lines describing
+// five different commands. The argument is what distinguishes them.
+function planLabel(step) {
+  if (typeof step === "string") return step;
+  const capability = step?.capability ?? "";
+  const arg = argSummary(capability, step?.inputs);
+  if (step?.label) return arg && !String(step.label).includes(arg) ? `${step.label} — ${arg}` : String(step.label);
+  return arg ? `${verbFor(capability)}: ${arg}` : (capability || "a step");
 }
 
 function riskWord(level) {
   return { LOW: "Low", MEDIUM: "Medium", HIGH: "High", CRITICAL: "Critical" }[level] ?? (level ?? "Unknown");
 }
 
-function addBubble(role, node) {
-  const wrap = document.createElement("div");
-  wrap.className = `bubble ${role}`;
-  wrap.appendChild(node);
-  chatLog.appendChild(wrap);
-  chatLog.scrollTop = chatLog.scrollHeight;
-  return wrap;
+// ---- The live turn -----------------------------------------------------------
+
+// One of these owns everything rendered for a single request. It is append-only
+// on purpose: a line that was true when it was written stays on screen, because
+// a transcript that rewrites itself is not a transcript.
+class Turn {
+  constructor() {
+    this.root = el("div", "turn");
+    chatLog.appendChild(this.root);
+    this.status = el("div", "turn-status", "Thinking…");
+    this.root.appendChild(this.status);
+    this.pendingSteps = [];
+    this.sawNarration = false;
+    // The adaptive loop executes each of its actions THROUGH the task graph, so
+    // one action emits both ADAPTIVE_ACTION_* and TASK_* — the same step under
+    // two names, at two levels. Rendering both drew every tool call twice: once
+    // with its argument and result, and again as a bare "Ran command.run".
+    // The static route emits only TASK_*, so it still renders; once an adaptive
+    // action has been seen, TASK_* is understood as its inner execution.
+    this.usesAdaptiveSteps = false;
+    scrollToEnd();
+  }
+
+  // The single transient line. It says what the runtime is doing before the
+  // model has said anything itself, and disappears the moment it has.
+  setStatus(text) {
+    if (!this.status) return;
+    this.status.textContent = text;
+    scrollToEnd();
+  }
+
+  clearStatus() {
+    this.status?.remove();
+    this.status = null;
+  }
+
+  // The model talking, one token at a time. This is the first thing on screen
+  // and it arrives while the tools it is describing are already running — the
+  // whole reason the loop streams at all.
+  streamDelta(text) {
+    this.clearStatus();
+    this.sawNarration = true;
+    if (!this.streamNode) {
+      const block = el("div", "agent-says streaming");
+      this.streamBlock = block;
+      this.streamNode = el("p", null, "");
+      block.appendChild(this.streamNode);
+      this.root.appendChild(block);
+    }
+    this.streamNode.textContent += text;
+    scrollToEnd();
+  }
+
+  // Close the streaming block. The complete message arrives separately once the
+  // model finishes its turn; when it matches what was already streamed there is
+  // nothing left to draw.
+  _closeStream(finalText) {
+    if (!this.streamNode) return false;
+    const streamed = this.streamNode.textContent.trim();
+    this.streamBlock?.classList.remove("streaming");
+    if (!streamed) this.streamBlock?.remove();
+    this.streamNode = null;
+    this.streamBlock = null;
+    return Boolean(streamed) && streamed === String(finalText ?? "").trim();
+  }
+
+  // The model's own words.
+  say(text, { detail = null, steps = [] } = {}) {
+    this.clearStatus();
+    this.throttleNode = null;
+    this.sawNarration = true;
+    this.lastSaid = text;
+    if (this._closeStream(text) && !detail && steps.length <= 1) return;
+    const block = el("div", "agent-says");
+    block.appendChild(el("p", null, text));
+    if (detail) block.appendChild(el("p", "agent-detail", detail));
+    if (steps.length > 1) {
+      const list = el("ol", "plan");
+      for (const step of steps) list.appendChild(el("li", null, planLabel(step)));
+      block.appendChild(list);
+    }
+    this.root.appendChild(block);
+    scrollToEnd();
+  }
+
+  note(text) {
+    this.throttleNode = null;
+    this.root.appendChild(el("div", "turn-note", text));
+    scrollToEnd();
+  }
+
+  // Being rate-limited produces one event per retry, and rendering each as its
+  // own line filled the transcript with the same sentence three and four times
+  // between every step — which reads as the app having broken rather than as one
+  // wait. Collapse them into a single line that counts up.
+  throttled(waitMs) {
+    this.throttleMs = (this.throttleNode ? this.throttleMs : 0) + (Number(waitMs) || 0);
+    if (!this.throttleNode) {
+      this.throttleNode = el("div", "turn-note", "");
+      this.root.appendChild(this.throttleNode);
+    }
+    this.throttleNode.textContent =
+      `Waiting on the model provider's rate limit — ${(this.throttleMs / 1000).toFixed(1)}s so far.`;
+    scrollToEnd();
+  }
+
+  // A tool call, rendered the moment it starts and resolved in place when it
+  // finishes. `key` is whatever the runtime will quote back on completion.
+  startStep({ key, capability, inputs, subgoal, arg: explicitArg }) {
+    this.clearStatus();
+    this.throttleNode = null;
+    this._closeStream(null);
+    const step = el("div", "step running");
+    const head = el("div", "step-head");
+    head.appendChild(el("span", "step-icon", "▸"));
+    head.appendChild(el("span", "step-verb", subgoal || verbFor(capability)));
+    head.appendChild(el("code", "step-tool", capability));
+    const arg = explicitArg || argSummary(capability, inputs);
+    if (arg) head.appendChild(el("code", "step-arg", arg));
+    step.appendChild(head);
+    this.root.appendChild(step);
+    this.pendingSteps.push({ key, capability, node: step, head });
+    scrollToEnd();
+    return step;
+  }
+
+  // Match a completion to the row it belongs to. Prefer the exact key the
+  // runtime quoted; fall back to the oldest unresolved row for that capability,
+  // then to the oldest unresolved row at all — a completion with no row is worse
+  // than a completion on an approximate row, because it vanishes.
+  _takeStep(key, capability) {
+    let index = this.pendingSteps.findIndex((step) => key != null && step.key === key);
+    if (index === -1) index = this.pendingSteps.findIndex((step) => step.capability === capability);
+    if (index === -1) index = 0;
+    return this.pendingSteps.splice(index, 1)[0] ?? null;
+  }
+
+  finishStep({ key, capability, ok, message, preview, durationMs }) {
+    const pending = this._takeStep(key, capability);
+    const step = pending?.node ?? this.startStep({ key, capability, inputs: {} });
+    const head = pending?.head ?? step.querySelector(".step-head");
+    step.classList.remove("running");
+    step.classList.add(ok ? "ok" : "bad");
+    const icon = head?.querySelector(".step-icon");
+    if (icon) icon.textContent = ok ? "✓" : "✗";
+    if (Number.isFinite(durationMs) && durationMs >= 1000) {
+      head?.appendChild(el("span", "step-time", `${(durationMs / 1000).toFixed(1)}s`));
+    }
+    // The output. This is the part that makes a step believable, so it is shown
+    // rather than summarized away — trimmed, and scrollable when it is long.
+    const body = preview || (ok ? null : message);
+    if (body) {
+      const out = el("pre", "step-output", String(body).trim());
+      step.appendChild(out);
+    } else if (!ok && message) {
+      step.appendChild(el("div", "step-error", message));
+    }
+    scrollToEnd();
+  }
+
+  // Anything still running when the turn ends did not report a result. Say that
+  // rather than leaving a spinner on screen forever.
+  settle() {
+    this.clearStatus();
+    this._closeStream(null);
+    for (const pending of this.pendingSteps) {
+      pending.node.classList.remove("running");
+      pending.node.classList.add("unknown");
+      const icon = pending.head?.querySelector(".step-icon");
+      if (icon) icon.textContent = "·";
+    }
+    this.pendingSteps = [];
+  }
+
+  append(node) {
+    this.root.appendChild(node);
+    scrollToEnd();
+    return node;
+  }
 }
 
-function textNode(text) { const p = document.createElement("div"); p.textContent = text; return p; }
+// ---- Events → the turn -------------------------------------------------------
 
-// Render the activity feed for a session response.
-function renderSession(session) {
-  const fr0 = session.finalResponse ?? {};
-  // Conversational reply (greeting, "what model are you", capability question):
-  // no actions were taken, so skip the activity feed and just show the answer.
-  if (fr0.status === "ANSWERED") {
-    addBubble("assistant", textNode(fr0.message || "…"));
-    if (debug) {
-      const pre = document.createElement("pre");
-      pre.className = "debug-only rawjson";
-      pre.textContent = JSON.stringify(session, null, 2);
-      addBubble("assistant", pre);
+// Phases the runtime passes through before the model has said anything. They
+// share the one transient status line; none of them is worth a permanent row.
+const PHASE_STATUS = {
+  INTENT_RECEIVED: "Thinking…",
+  INTENT_CLASSIFIED: "Working out what you meant…",
+  CAPABILITY_CATALOG_REFRESHED: "Checking what I can do…",
+  CONTEXT_COLLECTED: "Looking at the current state…",
+  ADAPTIVE_CONTROLLER_STARTED: "Getting started…",
+  ADAPTIVE_PERCEIVED: "Looking at the screen…",
+  STARTING_REPLANNING: "Rethinking the approach…"
+};
+
+function handleEvent(turn, event) {
+  const type = event?.eventType ?? event?.type;
+  const d = event?.details ?? {};
+
+  if (debug && type) {
+    turn.append(el("div", "raw debug-only", `[${type}] ${JSON.stringify(d).slice(0, 400)}`));
+  }
+
+  // The model, in its own words. This is the event this whole surface exists for.
+  if (type === "AGENT_DELTA") {
+    if (d.text) turn.streamDelta(d.text);
+    return;
+  }
+  if (type === "AGENT_SAYS") {
+    if (d.text) turn.say(d.text, { detail: d.detail, steps: d.steps ?? [] });
+    return;
+  }
+
+  // The agent loop: one row per tool call, opened the moment it starts.
+  if (type === "TOOL_STARTED") {
+    turn.usesAdaptiveSteps = true;
+    turn.startStep({ key: d.callId, capability: d.tool, inputs: d.args, arg: d.preview });
+    return;
+  }
+  if (type === "TOOL_FINISHED") {
+    turn.finishStep({
+      key: d.callId,
+      capability: d.tool,
+      ok: d.ok !== false,
+      preview: d.output,
+      durationMs: d.durationMs
+    });
+    return;
+  }
+  if (type === "AGENT_ERROR") {
+    return turn.note(`Model call failed: ${d.reason ?? "unknown"} — retrying or stopping.`);
+  }
+  if (type === "AGENT_THROTTLED") {
+    return turn.throttled(d.waitMs);
+  }
+
+  // Adaptive loop: one row per action, opened here and closed below.
+  if (type === "ADAPTIVE_ACTION_STARTING") {
+    turn.usesAdaptiveSteps = true;
+    turn.startStep({
+      key: d.step,
+      capability: d.action?.capability,
+      inputs: d.action?.inputs,
+      subgoal: d.action?.subgoal
+    });
+    return;
+  }
+  if (type === "ADAPTIVE_ACTION_VERIFIED") {
+    const status = d.verification?.status;
+    turn.finishStep({
+      key: d.step,
+      capability: d.capability,
+      // UNCONFIRMED is not FAILED. The step ran and nothing independent proved
+      // what it changed, which is an ordinary outcome for a GUI click and must
+      // not be drawn as an error.
+      ok: status !== "FAILED",
+      message: d.verification?.message,
+      preview: d.resultPreview,
+      durationMs: d.durationMs
+    });
+    return;
+  }
+
+  // Static task-graph path: the same two-phase shape under different names.
+  // Suppressed once the adaptive loop is driving, because there these are the
+  // inner execution of a step already on screen.
+  if (type === "TASK_STARTING" || type === "TASK_EXECUTED" || type === "TASK_FAILED" || type === "TASK_PRECONDITIONS_FAILED") {
+    if (turn.usesAdaptiveSteps) return;
+    if (type === "TASK_STARTING") {
+      turn.startStep({ key: d.taskId, capability: d.capability, inputs: d.inputs, subgoal: d.goal });
+    } else if (type === "TASK_EXECUTED") {
+      turn.finishStep({ key: d.taskId, capability: d.capability, ok: true });
+    } else {
+      turn.finishStep({ key: d.taskId, capability: d.capability, ok: false, message: d.error ?? d.reason });
     }
     return;
   }
 
-  // A known read-only request is a factual chat turn. It still ran through the
-  // typed runtime, but the user needs the answer, not an internal trace.
-  const compactReply = session.plan?.plannerSource === "DIRECT_OPERATION"
-    && fr0.status !== "AWAITING_APPROVAL";
-  if (compactReply) {
-    renderResult(session);
-    if (debug) {
-      const pre = document.createElement("pre");
-      pre.className = "debug-only rawjson";
-      pre.textContent = JSON.stringify(session, null, 2);
-      addBubble("assistant", pre);
+  if (type === "PLAN_GENERATED") {
+    const tasks = d.taskGraph?.tasks ?? [];
+    if (tasks.length) {
+      turn.say("Here's the plan.", { steps: tasks.map((task) => task.goal || task.capability) });
     }
     return;
   }
 
-  const activity = document.createElement("div");
-  activity.className = "activity";
-  const oncePerTurn = new Set();
-  const singlePhaseEvents = new Set([
-    "INTENT_RECEIVED", "INTENT_CLASSIFIED", "CONTEXT_COLLECTED", "PLAN_GENERATED", "RISK_ASSESSED"
-  ]);
+  // Things worth saying out loud because they change what happens next.
+  if (type === "REPLAN_APPROVAL_REQUIRED") return turn.note("The new plan needs your approval.");
+  if (type === "ROLLING_BACK") return turn.note("Rolling back the changes I made.");
+  if (type === "ADAPTIVE_LOOP_DETECTED") return turn.note("That repeated with no effect — trying something else.");
+  if (type === "VERIFICATION_FAILED") return turn.note(`That didn't work: ${d.message ?? "the check failed"}`);
+  if (type === "FAILURE_DIAGNOSED") return turn.note(`Diagnosed: ${d.rootCause || d.category || "a problem"}`);
 
-  for (const ev of session.events ?? []) {
-    if (singlePhaseEvents.has(ev.eventType)) {
-      if (oncePerTurn.has(ev.eventType)) continue;
-      oncePerTurn.add(ev.eventType);
-    }
-    const h = humanizeEvent(ev);
-    if (!h) {
-      if (debug) {
-        const raw = document.createElement("div");
-        raw.className = "step debug-only";
-        raw.textContent = `[${ev.eventType}] ${JSON.stringify(ev.details ?? {})}`;
-        activity.appendChild(raw);
-      }
-      continue;
-    }
-    const step = document.createElement("div");
-    step.className = "step";
-    step.innerHTML = `<span class="ico">${h.icon}</span><span>${escapeHtml(h.text)}</span>`;
-    activity.appendChild(step);
-    if (h.plan && h.plan.length) {
-      const ol = document.createElement("ol");
-      ol.className = "plan";
-      for (const p of h.plan) { const li = document.createElement("li"); li.textContent = p; ol.appendChild(li); }
-      activity.appendChild(ol);
-    }
-  }
-  addBubble("assistant", activity);
+  if (PHASE_STATUS[type]) turn.setStatus(PHASE_STATUS[type]);
+}
 
+// ---- Final rendering ---------------------------------------------------------
+
+const GOOD_STATUS = new Set(["COMPLETED", "COMPLETED_WITH_WARNINGS", "ANSWERED", "ROLLED_BACK", "VERIFIED"]);
+
+function renderFinal(turn, session) {
+  turn.settle();
   const fr = session.finalResponse ?? {};
+
   if (fr.status === "AWAITING_APPROVAL") {
-    renderApproval(session);
+    renderApproval(turn, session);
+    return;
+  }
+
+  const message = fr.summary?.summary || fr.summary?.text || fr.message
+    || (GOOD_STATUS.has(fr.status) ? "Done." : "I couldn't complete that.");
+
+  // A successful answer is just the assistant talking. It does not need a badge:
+  // the transcript above it already shows what happened, and a green "✓ Done"
+  // stamped over every reply is how a status indicator stops carrying
+  // information. Only a result that did NOT go well is labelled, because that is
+  // the case where the label tells you something.
+  // In the agent loop the closing message IS the model's last sentence, which is
+  // already on screen — it streamed there while the last tool was running.
+  // Printing it a second time as an "answer" is the receipt this surface exists
+  // to avoid.
+  if (String(message).trim() === String(turn.lastSaid ?? "").trim()) {
+    if (debug) turn.append(el("pre", "debug-only rawjson", JSON.stringify(session, null, 2)));
+    return;
+  }
+
+  if (GOOD_STATUS.has(fr.status)) {
+    turn.append(el("div", "agent-answer", message));
   } else {
-    renderResult(session);
+    const card = el("div", "result-card bad");
+    card.appendChild(el("div", "badge", fr.status === "PARTIALLY_COMPLETED" ? "Partly done" : "Didn't work"));
+    card.appendChild(el("p", null, message));
+    turn.append(card);
   }
 
   if (debug) {
-    const pre = document.createElement("pre");
-    pre.className = "debug-only rawjson";
-    pre.textContent = JSON.stringify(session, null, 2);
-    addBubble("assistant", pre);
+    const pre = el("pre", "debug-only rawjson", JSON.stringify(session, null, 2));
+    turn.append(pre);
   }
 }
 
 // Approval card — WHAT / WHY / RISK / WHAT CHANGES, then Approve / Reject.
-function renderApproval(session) {
+function renderApproval(turn, session) {
   const fr = session.finalResponse ?? {};
   const ia = fr.informedApproval ?? {};
-  const card = document.createElement("div");
-  card.className = "approval-card";
-  const what = (ia.whatItDoes && ia.whatItDoes.length) ? ia.whatItDoes.join(" ") : (fr.reason || "SYSCORA wants to perform an action.");
+  const card = el("div", "approval-card");
+  const what = (ia.whatItDoes && ia.whatItDoes.length)
+    ? ia.whatItDoes.join(" ")
+    : (fr.reason || "SYSCORA wants to perform an action.");
   card.innerHTML = `
     <h3>Approval required</h3>
     <p class="what">${escapeHtml(what)}</p>
@@ -223,32 +588,15 @@ function renderApproval(session) {
       <button class="approve">Approve</button>
       <button class="reject secondary">Reject</button>
     </div>`;
-  const wrap = addBubble("assistant", card);
+  turn.append(card);
   card.querySelector(".approve").addEventListener("click", async () => {
-    wrap.remove();
+    card.remove();
     await resume(session.sessionId, true);
   });
   card.querySelector(".reject").addEventListener("click", () => {
-    wrap.remove();
-    addBubble("assistant", textNode("Okay — I won't do that. No changes were made."));
+    card.remove();
+    turn.append(el("div", "agent-answer", "Okay — I won't do that. No changes were made."));
   });
-}
-
-function renderResult(session) {
-  const fr = session.finalResponse ?? {};
-  const ok = ["COMPLETED", "COMPLETED_WITH_WARNINGS", "ROLLED_BACK", "VERIFIED"].includes(fr.status);
-  const card = document.createElement("div");
-  card.className = `result-card ${ok ? "ok" : "bad"}`;
-  const summary = fr.summary?.summary || fr.summary?.text || fr.message || (ok ? "Done." : "The request could not be completed.");
-  const changes = (session.observations ?? [])
-    .flatMap((o) => Array.isArray(o?.detectedChanges) ? o.detectedChanges : [])
-    .filter((v, i, a) => v && a.indexOf(v) === i);
-  card.innerHTML = `
-    <div class="badge">${ok ? "✓ Done" : "✗ " + (fr.status ?? "Failed")}</div>
-    <p>${escapeHtml(summary)}</p>
-    ${changes.length ? `<p class="muted">Changed: ${escapeHtml(changes.join(", "))}</p>` : ""}
-  `;
-  addBubble("assistant", card);
 }
 
 function escapeHtml(s) {
@@ -257,12 +605,7 @@ function escapeHtml(s) {
 
 function getPayload(json) { return json?.envelope?.payload ?? json; }
 
-// A neutral placeholder shown only until the canonical session stream reports
-// whether this turn is conversation or work. It carries no assumptions about
-// the request and never starts a second model call.
-function acknowledgement() {
-  return "…";
-}
+// ---- Conversation memory -----------------------------------------------------
 
 // The conversation so far, oldest first. SYSCORA used to treat every message as
 // a first message: "open Notepad" then "now maximize it" classified the second
@@ -281,20 +624,26 @@ function remember(role, text) {
   if (conversation.length > 24) conversation.splice(0, conversation.length - 24);
 }
 
+// What the user was actually told, which is the only part of a turn a follow-up
+// can refer to. A failure is recorded too — "why did that not work?" is a
+// perfectly ordinary next message.
+function replyTextOf(session) {
+  const fr = session?.finalResponse ?? {};
+  return fr.summary?.summary || fr.summary?.text || fr.message || fr.status || "";
+}
+
+// ---- Submitting --------------------------------------------------------------
+
 let reqId = 0;
 async function submit(text) {
+  document.querySelector(".welcome")?.remove();
   addBubble("user", textNode(text));
   // Captured BEFORE this turn is appended: history means the turns before this
   // one, and including the current message would duplicate it in the prompt.
   const history = conversation.slice();
   remember("user", text);
-  const thinking = addBubble("assistant", textNode(acknowledgement(text)));
-  thinking.classList.add("thinking");
-  // Do not start a second model request merely to phrase an acknowledgement.
-  // It doubled provider load, could poison the health circuit during a 503, and
-  // treated conversational messages such as "I'm feeling low" as actions. The
-  // canonical session stream below already produces truthful live progress as
-  // soon as the model has decided whether this turn is chat or work.
+  const turn = new Turn();
+
   try {
     const res = await fetch("/api/intents", {
       method: "POST",
@@ -304,41 +653,48 @@ async function submit(text) {
           protocolVersion: "1.0.0",
           type: "intent_request",
           requestId: `demo-${reqId++}`,
-          payload: { text, history, autoApprove: Boolean(autoApprove?.checked) }
+          // A request is an instruction. The agent loop has no approval gate;
+          // this only matters on the offline route, where it stops that route
+          // asking a question the user has already answered by asking.
+          payload: { text, history, autoApprove: true }
         },
         text,
         history,
-        autoApprove: Boolean(autoApprove?.checked)
+        autoApprove: true
       })
     });
     const session = await readIntentSession(res, {
+      onEvent: (event) => handleEvent(turn, event),
+      // Only reached when the event stream could not be opened at all.
       onProgress: (status) => {
-        if (!thinking.isConnected) return;
-        const progress = humanizeEvent(status?.latestEvent ?? {});
-        if (progress?.text) {
-          thinking.replaceChildren(textNode(progress.text));
-        }
+        const type = status?.latestEvent?.eventType;
+        if (PHASE_STATUS[type]) turn.setStatus(PHASE_STATUS[type]);
       }
     });
-    thinking.remove();
-    renderSession(session);
+    renderFinal(turn, session);
     remember("assistant", replyTextOf(session));
   } catch (err) {
-    thinking.remove();
-    addBubble("assistant", textNode(`SYSCORA encountered a problem while performing this step. ${debug ? err.message : ""}`));
+    turn.settle();
+    // "Worth trying again" was the whole diagnosis, and the real reason — the
+    // daemon was not running — was thrown away unless developer mode happened
+    // to be on. Retrying a request whose server is gone does not work, so the
+    // one advice given was the one thing that could not help. Say what
+    // happened, in every mode: it is one line, and it is the difference between
+    // starting the daemon and debugging the agent.
+    if (isDaemonUnreachable(err)) {
+      setDaemonReachable(false);
+      turn.append(el("div", "agent-answer",
+        "I can't reach the SYSCORA daemon — it isn't running, or it restarted on a different port. " +
+        "Start it with `npm run mvp:ui`, reload this page, and send that again. Nothing was changed."));
+    } else {
+      turn.append(el("div", "agent-answer", `Something went wrong while running that: ${err.message}`));
+    }
   }
 }
 
-// What the user was actually told, which is the only part of a turn a follow-up
-// can refer to. A failure is recorded too — "why did that not work?" is a
-// perfectly ordinary next message.
-function replyTextOf(session) {
-  const fr = session?.finalResponse ?? {};
-  return fr.summary?.summary || fr.summary?.text || fr.message || fr.status || "";
-}
-
 async function resume(sessionId, approve) {
-  const thinking = addBubble("assistant", textNode(approve ? "Approved — continuing…" : "Cancelling…"));
+  const turn = new Turn();
+  turn.setStatus(approve ? "Approved — continuing…" : "Cancelling…");
   try {
     const path = approve
       ? `/api/sessions/${encodeURIComponent(sessionId)}/resume`
@@ -348,14 +704,18 @@ async function resume(sessionId, approve) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ autoApprove: approve })
     });
-    thinking.remove();
-    if (!res.ok) { addBubble("assistant", textNode(`Could not continue (${res.status}).`)); return; }
+    if (!res.ok) {
+      turn.settle();
+      turn.append(el("div", "agent-answer", `I couldn't continue (${res.status}).`));
+      return;
+    }
     const json = await res.json();
     const session = getPayload(json).session ?? json.session;
-    if (session) renderSession(session);
+    for (const event of session?.events ?? []) handleEvent(turn, event);
+    if (session) renderFinal(turn, session);
   } catch (err) {
-    thinking.remove();
-    addBubble("assistant", textNode(`Problem continuing: ${debug ? err.message : "please retry."}`));
+    turn.settle();
+    turn.append(el("div", "agent-answer", `I couldn't continue: ${debug ? err.message : "please retry."}`));
   }
 }
 
@@ -364,6 +724,7 @@ chatForm.addEventListener("submit", (e) => {
   const text = chatInput.value.trim();
   if (!text) return;
   chatInput.value = "";
+  chatInput.style.height = "auto";
   submit(text);
 });
 
@@ -382,9 +743,7 @@ suggestions.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-text]");
   if (!btn) return;
   const text = btn.getAttribute("data-text");
-  chatInput.value = text;
-  chatInput.focus();
-  // A suggested prompt is a one-click demo: populate the input AND submit it
-  // through the exact same chat path a typed request uses (no bypass).
+  // A suggested prompt is a one-click demo: it goes through the exact same chat
+  // path a typed request uses (no bypass).
   submit(text);
 });

@@ -267,6 +267,33 @@ function Get-WindowList {
   })
 }
 
+# Just the window the user is looking at.
+#
+# Get-WindowList calls Get-Process, Screen.FromHandle and DpiForWindow once per
+# window; on a normal desktop that is fifty-odd windows and a measured second of
+# wall clock. Every look at the screen paid it purely to find out which window
+# was in front, which the OS already knows. This asks that question directly.
+function Get-ForegroundWindow {
+  $handle = [M4Native]::GetForegroundWindow()
+  if ($handle -eq [IntPtr]::Zero) { return $null }
+  $target = $handle.ToInt64()
+  $found = @([M4Native]::Windows() | Where-Object { [Int64]$_.windowId -eq $target }) | Select-Object -First 1
+  if (-not $found) { return $null }
+  $process = Get-Process -Id $found.processId -ErrorAction SilentlyContinue
+  $display = [System.Windows.Forms.Screen]::FromHandle($handle)
+  [pscustomobject]@{
+    windowId = [string]$found.windowId
+    processId = $found.processId
+    processName = if ($process) { $process.ProcessName } else { $null }
+    title = $found.title
+    className = $found.className
+    bounds = @{ x=$found.x; y=$found.y; width=$found.width; height=$found.height }
+    displayId = if($display){$display.DeviceName}else{$null}
+    dpi = [int][M4Native]::DpiForWindow($handle)
+    foreground = $true
+  }
+}
+
 function Resolve-Window($params) {
   $windows = Get-WindowList
   if ($params.windowId) {
@@ -610,6 +637,7 @@ function Invoke-Operation($operation, $params) {
   switch ($operation) {
     "host.health" { return @{ ok=$true; pid=$PID; protocol="m4-windows-host/1"; sta=([Threading.Thread]::CurrentThread.ApartmentState.ToString()) } }
     "window.enumerate" { return @{ windows=(Get-WindowList) } }
+    "window.foreground" { return @{ window=(Get-ForegroundWindow) } }
     "window.resolve" { return Resolve-Window $params }
     "window.wait" {
       $timeout=[Math]::Min(20000,[Math]::Max(100,[int]$params.timeoutMs));$watch=[Diagnostics.Stopwatch]::StartNew();$found=$null

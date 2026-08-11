@@ -30,7 +30,7 @@ const DESKTOP_LAUNCH_OPERATIONS = new Set([
 // model is authoritative for LLM-first routing; Mock/offline falls through to the
 // deterministic extractors, which are its intended offline path. Detected via the
 // provider's own capabilities() (remote: true), including through a Failover chain.
-function providerIsRemoteModel(provider) {
+export function providerIsRemoteModel(provider) {
   if (!provider || typeof provider.capabilities !== "function") return false;
   let caps;
   try { caps = provider.capabilities(); } catch { return false; }
