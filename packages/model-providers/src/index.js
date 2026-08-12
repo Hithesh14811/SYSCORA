@@ -450,20 +450,30 @@ export class FailoverModelProvider extends LanguageModelProvider {
   constructor(providers = []) {
     super();
     this.providers = providers.filter(Boolean);
+    this.activeProviderIndex = 0;
     this.name = "failover";
   }
 
   async generateStructured(prompt, schema, options = {}) {
     const errors = [];
-    for (const provider of this.providers) {
+    for (let offset = 0; offset < this.providers.length; offset += 1) {
+      const index = (this.activeProviderIndex + offset) % this.providers.length;
+      const provider = this.providers[index];
       const startedAt = performance.now();
       const identity = getProviderIdentity(provider);
       const attempt = options.onExternalAttempt?.(identity);
       try {
-        const result = await provider.generateStructured(prompt, schema, options);
+        const result = await provider.generateStructured(prompt, schema, {
+          ...options,
+          // Failover owns retries when more than one credential is available.
+          // Let the next credential run immediately instead of sleeping on a
+          // throttled or otherwise failing account first.
+          ...(this.providers.length > 1 ? { maxRetries: 1, rateLimitRetries: 0 } : {})
+        });
         this._record(provider.name, startedAt, false);
         options.onExternalAttemptResult?.(attempt, { ok: true, latencyMs: performance.now() - startedAt });
         this.lastRequestProvider = provider;
+        this.activeProviderIndex = index;
         return result;
       } catch (error) {
         this._record(provider.name, startedAt, true);
@@ -501,10 +511,18 @@ export class FailoverModelProvider extends LanguageModelProvider {
 
   async chat(request = {}) {
     const errors = [];
-    for (const provider of this.providers) {
+    for (let offset = 0; offset < this.providers.length; offset += 1) {
+      const index = (this.activeProviderIndex + offset) % this.providers.length;
+      const provider = this.providers[index];
       if (!provider.supportsChat?.()) continue;
       try {
-        return await provider.chat(request);
+        const result = await provider.chat({
+          ...request,
+          ...(this.providers.length > 1 ? { maxRetries: 1, rateLimitRetries: 0 } : {})
+        });
+        this.activeProviderIndex = index;
+        this.lastRequestProvider = provider;
+        return result;
       } catch (error) {
         errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -961,7 +979,7 @@ export class MistralModelProvider extends LanguageModelProvider {
   // here rather than surfacing as a failed step mid-task.
   async chat(request = {}) {
     this._usage.calls += 1;
-    let rateLimitRetries = 3;
+    let rateLimitRetries = request.rateLimitRetries ?? 3;
     for (;;) {
       await this._awaitRequestSlot();
       try {
@@ -1002,7 +1020,7 @@ export class MistralModelProvider extends LanguageModelProvider {
     // small retry budget, separate from the transport retries above, because
     // spending a transport attempt on it would let one busy second end a
     // request that a one-second wait would have served.
-    let rateLimitRetries = 5;
+    let rateLimitRetries = options.rateLimitRetries ?? 5;
     let attempt = 0;
     let lastError = null;
     while (attempt < maxRetries) {
@@ -1085,6 +1103,129 @@ export class MistralModelProvider extends LanguageModelProvider {
       }
     }
     throw lastError;
+  }
+}
+
+// Google Gemini native REST transport. Gemini 3.6 Flash is optimized for the
+// short agentic loops SYSCORA runs and supports structured output and function
+// calling, so it can be a full primary provider.
+export class GeminiModelProvider extends LanguageModelProvider {
+  constructor(config = {}) {
+    super(config);
+    enableSystemCaTrust();
+    this.apiKey = config.apiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    this.model = config.model || "gemini-3.6-flash";
+    this.baseUrl = (config.baseUrl || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "");
+    this.maxTokens = Number(config.maxTokens ?? 4096);
+    this.name = "gemini";
+  }
+
+  async _request(body, { timeoutMs = 60000, signal = null } = {}) {
+    if (!this.apiKey) throw new Error("No Gemini API key");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const onOuterAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener("abort", onOuterAbort, { once: true });
+    }
+    try {
+      const response = await fetch(`${this.baseUrl}/models/${encodeURIComponent(this.model)}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": this.apiKey },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        let detail = "";
+        try {
+          const text = await response.text();
+          detail = text ? `: ${text.slice(0, 300)}` : "";
+        } catch {}
+        const error = new Error(`HTTP ${response.status}${detail}`);
+        error.status = response.status;
+        error.retryAfterMs = Number(response.headers.get("retry-after")) * 1000 || null;
+        throw error;
+      }
+      return response.json();
+    } finally {
+      clearTimeout(timeout);
+      if (signal) signal.removeEventListener?.("abort", onOuterAbort);
+    }
+  }
+
+  async healthCheck({ timeoutMs = 5000 } = {}) {
+    if (!this.apiKey) return { ok: false, error: "No Gemini API key" };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`${this.baseUrl}/models`, {
+        headers: { "x-goog-api-key": this.apiKey }, signal: controller.signal
+      });
+      if (response.status >= 500) return { unknown: true, status: response.status };
+      return { ok: response.ok, status: response.status, model: this.model };
+    } catch (error) {
+      return { unknown: true, error: error.message };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  capabilities() {
+    return { name: this.name, structured: true, text: true, streaming: false, tools: true, model: this.model, remote: true };
+  }
+
+  supportsChat() { return Boolean(this.apiKey); }
+
+  async generateStructured(prompt, schema, options = {}) {
+    this._usage.calls += 1;
+    const result = await this._request({
+      systemInstruction: { parts: [{ text: "Output only valid JSON matching the requested schema." }] },
+      contents: [{ role: "user", parts: [{ text: `${prompt}\n\nReturn ONLY JSON matching this schema: ${JSON.stringify(schema)}` }] }],
+      generationConfig: {
+        maxOutputTokens: options.maxTokens || this.maxTokens,
+        responseMimeType: "application/json",
+        responseJsonSchema: schema
+      }
+    }, options);
+    const usage = result.usageMetadata ?? {};
+    this._usage.tokensIn += usage.promptTokenCount ?? 0;
+    this._usage.tokensOut += usage.candidatesTokenCount ?? 0;
+    const text = (result.candidates?.[0]?.content?.parts ?? []).map((part) => part.text ?? "").join("");
+    return extractJson(text);
+  }
+
+  async chat(request = {}) {
+    this._usage.calls += 1;
+    const messages = Array.isArray(request.messages) ? request.messages : [];
+    const systemText = messages.filter((message) => message.role === "system").map((message) => String(message.content ?? "")).join("\n");
+    const contents = messages.filter((message) => message.role !== "system").map((message) => ({
+      role: message.role === "assistant" ? "model" : "user",
+      parts: [{ text: typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "") }]
+    }));
+    const declarations = (request.tools ?? []).map((tool) => tool.function).filter(Boolean).map((fn) => ({
+      name: fn.name,
+      description: fn.description,
+      parametersJsonSchema: fn.parameters ?? { type: "object", properties: {} }
+    }));
+    const result = await this._request({
+      ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
+      contents,
+      ...(declarations.length ? { tools: [{ functionDeclarations: declarations }] } : {}),
+      generationConfig: { maxOutputTokens: request.maxTokens ?? this.maxTokens }
+    }, request);
+    const usage = result.usageMetadata ?? {};
+    this._usage.tokensIn += usage.promptTokenCount ?? 0;
+    this._usage.tokensOut += usage.candidatesTokenCount ?? 0;
+    const parts = result.candidates?.[0]?.content?.parts ?? [];
+    const text = parts.map((part) => part.text ?? "").join("");
+    if (text) request.onTextDelta?.(text);
+    const toolCalls = parts.filter((part) => part.functionCall).map((part, index) => ({
+      id: `gemini_call_${index}`,
+      name: part.functionCall.name,
+      arguments: JSON.stringify(part.functionCall.args ?? {})
+    }));
+    return { text, toolCalls, finishReason: result.candidates?.[0]?.finishReason ?? null, usage };
   }
 }
 
@@ -1256,6 +1397,17 @@ export function createModelProvider(settings = {}) {
       });
       return new MockModelProvider();
     }
+    case "gemini":
+    case "google": {
+      const apiKey = settings.apiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.SYSCORA_MODEL_API_KEY;
+      if (apiKey) return new GeminiModelProvider({
+        apiKey,
+        model: settings.model,
+        baseUrl: settings.baseUrl,
+        maxTokens: settings.maxTokens
+      });
+      return new MockModelProvider();
+    }
     case "agentrouter": {
       const apiKey = settings.apiKey || process.env.AGENTROUTER_API_KEY || process.env.SYSCORA_MODEL_API_KEY;
       if (apiKey) return new AgentRouterModelProvider({ apiKey, model: settings.model, baseUrl: settings.baseUrl });
@@ -1284,9 +1436,16 @@ export function createModelProvider(settings = {}) {
 // array or a comma-separated list; the resulting chain is still one provider
 // as far as the reasoning boundary is concerned.
 export function createModelProviderChain(settings = {}) {
-  const primary = createModelProvider(settings);
+  const configuredKeys = Array.isArray(settings.apiKeys)
+    ? settings.apiKeys.map((key) => String(key).trim()).filter(Boolean)
+    : [];
+  const keyedProviders = configuredKeys.map((apiKey) => createModelProvider({ ...settings, apiKey, apiKeys: undefined }));
+  const primary = keyedProviders.length > 0 ? keyedProviders[0] : createModelProvider(settings);
   const configured = settings.fallbackProviders ?? process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS ?? "";
   const names = Array.isArray(configured) ? configured : String(configured).split(",").map((value) => value.trim()).filter(Boolean);
   const fallbacks = names.map((provider) => createModelProvider({ provider }));
-  return new FailoverModelProvider([primary, ...fallbacks]);
+  const configuredFallbacks = Array.isArray(settings.fallbackProviderConfigs)
+    ? settings.fallbackProviderConfigs.map((config) => createModelProvider(config))
+    : [];
+  return new FailoverModelProvider([primary, ...keyedProviders.slice(1), ...configuredFallbacks, ...fallbacks]);
 }

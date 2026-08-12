@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ContextEngine } from "../../packages/context-engine/src/index.js";
 import { IntentEngine } from "../../packages/intent-engine/src/index.js";
-import { FailoverModelProvider } from "../../packages/model-providers/src/index.js";
+import { FailoverModelProvider, createModelProviderChain } from "../../packages/model-providers/src/index.js";
 import { ReasoningEngine, INTENT_SCHEMA } from "../../packages/reasoning-engine/src/index.js";
 import { CapabilityRegistry } from "../../packages/capability-registry/src/index.js";
 import { GeneralPlanner, PlanValidator } from "../../packages/planner/src/index.js";
@@ -42,6 +42,54 @@ test("provider failover records a failed primary attempt and returns fallback ou
   assert.deepEqual(await provider.generateStructured("prompt", {}), { ok: true });
   assert.equal(provider.telemetry().attempts.length, 2);
   assert.equal(provider.telemetry().attempts[0].failed, true);
+});
+
+test("provider failover stays on the healthy credential and wraps back when it fails", async () => {
+  const calls = [];
+  let firstWorks = false;
+  let secondWorks = true;
+  const first = {
+    name: "first",
+    async generateStructured() {
+      calls.push("first");
+      if (!firstWorks) throw new Error("HTTP 429");
+      return { key: "first" };
+    }
+  };
+  const second = {
+    name: "second",
+    async generateStructured() {
+      calls.push("second");
+      if (!secondWorks) throw new Error("HTTP 429");
+      return { key: "second" };
+    }
+  };
+  const provider = new FailoverModelProvider([first, second]);
+
+  assert.deepEqual(await provider.generateStructured("prompt", {}), { key: "second" });
+  assert.deepEqual(calls, ["first", "second"]);
+
+  calls.length = 0;
+  assert.deepEqual(await provider.generateStructured("prompt", {}), { key: "second" });
+  assert.deepEqual(calls, ["second"]);
+
+  calls.length = 0;
+  firstWorks = true;
+  secondWorks = false;
+  assert.deepEqual(await provider.generateStructured("prompt", {}), { key: "first" });
+  assert.deepEqual(calls, ["second", "first"]);
+});
+
+test("model provider chain creates one same-model provider per configured API key", () => {
+  const chain = createModelProviderChain({
+    provider: "mistral",
+    model: "mistral-medium-3.5",
+    baseUrl: "https://api.mistral.ai/v1",
+    apiKeys: ["key-one", "key-two"]
+  });
+  assert.equal(chain.providers.length, 2);
+  assert.deepEqual(chain.providers.map((provider) => provider.apiKey), ["key-one", "key-two"]);
+  assert.ok(chain.providers.every((provider) => provider.model === "mistral-medium-3.5"));
 });
 
 test("model summaries retain runtime-owned fact lists", async () => {

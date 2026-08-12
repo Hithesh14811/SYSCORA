@@ -39,6 +39,12 @@ export function loadModelConfig(basePath = process.cwd()) {
       process.env.AGENTROUTER_API_KEY ||
       fileConfig.apiKey ||
       null,
+    apiKeys: (() => {
+      const configured = process.env.SYSCORA_MODEL_API_KEYS || fileConfig.apiKeys || [];
+      return (Array.isArray(configured) ? configured : String(configured).split(","))
+        .map((key) => String(key).trim())
+        .filter(Boolean);
+    })(),
     model: process.env.SYSCORA_MODEL_NAME || process.env.LLM_MODEL || fileConfig.model || undefined,
     baseUrl: process.env.SYSCORA_MODEL_BASE_URL || process.env.LLM_BASE_URL || fileConfig.baseUrl || undefined,
     // Ceiling on a single completion. Only large enough to matter for the
@@ -57,6 +63,9 @@ export function loadModelConfig(basePath = process.cwd()) {
     ),
     fallbackProviders:
       process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS || fileConfig.fallbackProviders || "",
+    fallbackProviderConfigs: Array.isArray(fileConfig.fallbackProviderConfigs)
+      ? fileConfig.fallbackProviderConfigs
+      : [],
     externalAIConsent: {
       scopes: String(
         process.env.SYSCORA_EXTERNAL_AI_CONSENT_SCOPES ||
