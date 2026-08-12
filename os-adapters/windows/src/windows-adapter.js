@@ -143,6 +143,24 @@ export function normalizeSendKeys(value) {
   return `${modifiers.join("")}${key}`;
 }
 
+// THE SAME KEY PRESS, SAID THE OTHER WAY.
+//
+// normalizeSendKeys turns "ctrl+shift+escape" into the notation SendKeys wants.
+// The host can now do better than SendKeys — hold the modifiers itself, tap the
+// key, release in the reverse order, and report whether Windows accepted the
+// events — but only for combinations it can parse. So the human spelling travels
+// alongside the notation and the host prefers it, falling back when a caller
+// wrote something only SendKeys understands, like "%{F4}" or a bare "{ENTER}".
+//
+// Nothing is validated here on purpose. The table of key names lives in the
+// host, next to the code that uses it; a second copy in this file would be a
+// second thing to keep correct.
+export function chordSpec(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || /[{}]/.test(raw) || /^[\^%~+]/.test(raw)) return null;
+  return raw.toLowerCase();
+}
+
 // Coerce a caller-supplied duration into a bounded integer. UI-automation waits
 // are interpolated (unquoted) into PowerShell, so they MUST be integer literals
 // derived from a clamped number, never free-form caller text.
@@ -1168,13 +1186,23 @@ export class WindowsAdapter {
     return { directoryPath: target, removed: true };
   }
 
+  // A FILE THAT IS NOT THERE IS A VERDICT, NOT AN EXCEPTION.
+  //
+  // This used to let the read throw, so "the file was never written" surfaced as
+  // a bare ENOENT from whichever caller was unlucky — losing the reason the write
+  // failed, which the caller had already worked out and was about to report.
+  // Absent is simply the strongest possible answer to "does it contain this".
   async verifyFileContains(filePath, expectedSubstring) {
-    const file = await this.readTextFile(filePath);
-    return {
-      filePath: file.filePath,
-      matches: file.contents.includes(expectedSubstring),
-      length: file.contents.length
-    };
+    try {
+      const file = await this.readTextFile(filePath);
+      return {
+        filePath: file.filePath,
+        matches: file.contents.includes(expectedSubstring),
+        length: file.contents.length
+      };
+    } catch (error) {
+      return { filePath, matches: false, exists: false, reason: error.message };
+    }
   }
 
   // Resolve an application name to a concrete installed identity WITHOUT
@@ -2435,11 +2463,47 @@ public static class SyscoraWindowEnumerator {
     return this.hostRequest(`pointer.${operation}`, params, { timeoutMs: 5000 });
   }
 
+  /**
+   * Deliver one or more continuous strokes.
+   *
+   * The path is sent as base64 little-endian Int32 pairs rather than as a JSON
+   * array. A detailed figure is thousands of numbers and the host's JSON parser
+   * boxes every one of them, which measured at roughly a fifth of the total cost
+   * of drawing a circle; a block copy costs nothing at any length.
+   *
+   * The timeout is derived from the work rather than fixed. A five-second
+   * ceiling is right for a click and wrong for a stroke the caller deliberately
+   * asked to take four seconds — and a stroke that times out is not merely a
+   * failed request. It abandons the host mid-path, which is why the host
+   * releases the button in a finally block and why the deadline here is
+   * generous enough that it should never be reached.
+   */
+  async pointerStroke({ paths, pacingMicros = 250, ...params } = {}) {
+    const encode = (flat) => Buffer.from(Int32Array.from(flat).buffer).toString("base64");
+    const list = (paths ?? []).filter((path) => Array.isArray(path) && path.length >= 4);
+    if (list.length === 0) throw new Error("A stroke needs at least one path of two or more points.");
+    const points = list.reduce((total, path) => total + path.length / 2, 0);
+    // The host's own ceiling on how long it will spend pacing, plus room for the
+    // per-point overhead and one round trip.
+    const budgetMs = Math.min(20000, Math.ceil((points * pacingMicros) / 1000)) + points * 2 + 5000;
+    return this.hostRequest(
+      "pointer.stroke",
+      { ...params, pacingMicros, pathsBase64: list.map(encode) },
+      { timeoutMs: Math.min(60000, budgetMs) }
+    );
+  }
+
   async keyboardAction(operation, params = {}) {
     return this.hostRequest(
       `keyboard.${operation}`,
-      operation === "press" ? { ...params, keys: normalizeSendKeys(params.keys) } : params,
-      { timeoutMs: 5000 }
+      // `chord` carries the combination as a person wrote it, so the host can
+      // press and release the keys itself; `keys` carries the SendKeys spelling
+      // for the notation this cannot parse. Both travel, and the host prefers
+      // the first.
+      operation === "press"
+        ? { ...params, keys: normalizeSendKeys(params.keys), chord: chordSpec(params.keys) }
+        : params,
+      { timeoutMs: operation === "type" ? 20000 : 5000 }
     );
   }
 
@@ -2466,32 +2530,198 @@ public static class SyscoraWindowEnumerator {
     return method.call(this.browserAutomation, { ...params, ...(signal ? { signal } : {}) });
   }
 
+  // TYPING A DOCUMENT, NOT PERFORMING IT AS KEYSTROKES.
+  //
+  // This used to push both the content and the destination path through
+  // SendKeys, escaped with escapePowerShellSingleQuoted — which escapes for a
+  // PowerShell string literal and has nothing to say about SendKeys' own
+  // language. So every `{`, `+`, `^`, `%`, `(` and `)` in the text was read as
+  // notation: source code, JSON and anything with an emoticon in it arrived
+  // mangled, and a Documents folder whose path contains a bracket could not be
+  // saved to at all. The file check at the end caught it, which turned silent
+  // corruption into a plain failure, but the text still never arrived.
+  //
+  // Both now go through the host's typing path, which is exact for any content.
+  //
+  // WRITE IN A NEW DOCUMENT, ALONGSIDE WHATEVER IS ALREADY OPEN.
+  //
+  // Notepad reuses its running instance, so asking it to open put the text into
+  // whichever document happened to be in front — someone's notes, mid-edit. The
+  // fix is not to avoid the running Notepad; refusing to work when the
+  // application is already in use would be a worse tool. It is to do what a
+  // person does: press Ctrl+N for a fresh document and write in that. On Windows
+  // 11 that is a new tab in the same window, on the older Notepad a new window,
+  // and either way the existing document is untouched and still open.
   async notepadTypeAndSave({ content, filename }) {
     const documents = this.getDocumentsPath();
     const filePath = path.join(documents, filename);
+    const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    // Whether Notepad was ALREADY running decides whether a fresh document is
+    // needed: a Notepad this call started opens on an empty Untitled one, and an
+    // extra Ctrl+N there would just leave a stray blank tab behind.
+    const alreadyRunning = (await this.listWindows().catch(() => []))
+      .some((window) => /notepad/i.test(String(window.ProcessName ?? "")));
     await this.launchApplication("notepad");
-    await new Promise((r) => setTimeout(r, 2000));
-    const escapedContent = escapePowerShellSingleQuoted(content);
-    const escapedPath = escapePowerShellSingleQuoted(filePath);
-    const ps = await this.runPowerShell(
-      `Add-Type -AssemblyName System.Windows.Forms; ` +
-      `$wshell = New-Object -ComObject WScript.Shell; ` +
-      `Start-Sleep -Milliseconds 800; ` +
-      `if (-not $wshell.AppActivate('Notepad')) { throw 'Notepad window not found' }; ` +
-      `Start-Sleep -Milliseconds 400; ` +
-      `[System.Windows.Forms.SendKeys]::SendWait('${escapedContent}'); ` +
-      `Start-Sleep -Milliseconds 400; ` +
-      `[System.Windows.Forms.SendKeys]::SendWait('^s'); ` +
-      `Start-Sleep -Milliseconds 1200; ` +
-      `[System.Windows.Forms.SendKeys]::SendWait('${escapedPath}'); ` +
-      `Start-Sleep -Milliseconds 400; ` +
-      `[System.Windows.Forms.SendKeys]::SendWait('{ENTER}'); ` +
-      `Start-Sleep -Milliseconds 800; ` +
-      `'saved'`,
-      { timeoutMs: 45000 }
-    );
+    let commandResult = null;
+
+    if (this.automationHost) {
+      try {
+        // waitForApplicationWindow returns a listWindows row, whose handle field
+        // is WindowHandle. Reading `windowId` off it yields undefined and
+        // quietly degrades to matching Notepad by name.
+        const found = await this.waitForApplicationWindow("notepad", 8000);
+        let handle = found?.window?.WindowHandle ?? found?.window?.windowId ?? null;
+        if (alreadyRunning) {
+          await settle(600);
+          await this.keyboardAction("press", {
+            ...(handle ? { windowId: String(handle) } : { application: "notepad" }),
+            keys: "ctrl+n"
+          });
+          // WAIT FOR THE NEW DOCUMENT TO BE READY TO RECEIVE TEXT.
+          //
+          // A fixed pause after Ctrl+N is not enough and fails in a way that
+          // looks like a typing bug rather than a timing one: measured here, the
+          // first nine characters of a sixty-character document arrived and the
+          // rest were discarded, because the tab was still building its editor
+          // and threw away what was already queued for it.
+          //
+          // A new document is titled "Untitled", so the title says when it is
+          // there. The new document may be a tab in the same window or a window
+          // of its own, which is the other reason to re-read the handle instead
+          // of assuming the one from before Ctrl+N still points at it.
+          const readyBy = Date.now() + 8000;
+          let front = null;
+          while (Date.now() < readyBy) {
+            await settle(300);
+            front = await this.getForegroundWindow();
+            if (front?.windowId
+              && /notepad/i.test(String(front.processName ?? ""))
+              && /^\*?untitled/i.test(String(front.title ?? ""))) break;
+            front = null;
+          }
+          if (!front) throw new Error("Notepad did not open a new document to write in");
+          handle = front.windowId;
+          // The title appears a moment before the editor will keep what it is
+          // given; this is the settle that the readiness check cannot replace.
+          await settle(700);
+        }
+        const target = handle ? { windowId: String(handle) } : { application: "notepad" };
+        await settle(600);
+
+        // TYPE, THEN CHECK IT WENT IN — AND TYPE AGAIN IF IT DID NOT.
+        //
+        // A freshly created tab accepts keystrokes before it is ready to keep
+        // them. Measured here, across runs that were otherwise identical: the
+        // whole document arrived, or the first nine characters of it did, or
+        // nothing did and an empty file was saved and reported as written. The
+        // keystrokes were delivered every time — Windows accepted every event —
+        // so nothing downstream could tell the difference.
+        //
+        // Notepad titles an unsaved document with a leading asterisk and its
+        // first line, so the title says whether anything landed. That is the
+        // cheap check that turns an unreliable step into a reliable one.
+        const documentHasText = async () => {
+          const front = await this.getForegroundWindow();
+          return /^\*/.test(String(front?.title ?? ""));
+        };
+        let typedIn = false;
+        for (let attempt = 0; attempt < 3 && !typedIn; attempt += 1) {
+          await this.keyboardAction("type", { ...target, text: String(content ?? "") });
+          const settledBy = Date.now() + 2500;
+          while (Date.now() < settledBy && !typedIn) {
+            await settle(300);
+            typedIn = await documentHasText();
+          }
+          // Anything a half-written attempt left behind must go, or the retry
+          // appends to it and the document ends up with the text twice.
+          //
+          // Select-all-and-delete is the most destructive keystroke pair in this
+          // file, so it is fenced: it only ever runs against a document that is
+          // still called Untitled, which is the one this call created moments
+          // ago. If the window in front is anything else — the user clicked away,
+          // the handle was wrong — the retry is abandoned rather than risk
+          // emptying a document somebody was working on.
+          if (!typedIn) {
+            const front = await this.getForegroundWindow();
+            if (!/^\*?untitled/i.test(String(front?.title ?? ""))) {
+              throw new Error("the document in front is no longer the new one; refusing to clear it");
+            }
+            await this.keyboardAction("press", { ...target, keys: "ctrl+a" });
+            await settle(150);
+            await this.keyboardAction("press", { ...target, keys: "{DEL}" });
+            await settle(300);
+          }
+        }
+        if (!typedIn) throw new Error("the text did not reach the new Notepad document");
+        await settle(400);
+        // WAIT FOR THE SAVE DIALOG THIS CTRL+S OPENED — not for any Save dialog.
+        //
+        // Two separate mistakes are being avoided here. A fixed pause is how the
+        // path ends up typed into the document instead of into the filename box:
+        // if the dialog is a beat late, the keystrokes land wherever focus still
+        // is. And matching any dialog that happens to be open is how a stale one
+        // left over from an earlier attempt gets typed into instead — which is
+        // exactly what made this fail intermittently while it was being built.
+        // So: note which dialogs exist first, then wait for one that is new.
+        const isSaveDialog = (window) => String(window.ClassName ?? window.className ?? "") === "#32770"
+          && /save/i.test(String(window.MainWindowTitle ?? window.title ?? ""));
+        const dialogsBefore = new Set((await this.listWindows().catch(() => []))
+          .filter(isSaveDialog).map((window) => String(window.WindowHandle ?? window.windowId)));
+        await this.keyboardAction("press", { ...target, keys: "ctrl+s" });
+        let dialog = null;
+        const dialogDeadline = Date.now() + 8000;
+        while (Date.now() < dialogDeadline && !dialog) {
+          await settle(300);
+          dialog = (await this.listWindows().catch(() => []))
+            .find((window) => isSaveDialog(window)
+              && !dialogsBefore.has(String(window.WindowHandle ?? window.windowId))) ?? null;
+        }
+        if (!dialog) throw new Error("the Save dialog did not appear, so nothing was typed into it");
+        const dialogHandle = dialog.WindowHandle ?? dialog.windowId;
+        await this.keyboardAction("type", {
+          ...(dialogHandle ? { windowId: String(dialogHandle) } : {}),
+          text: filePath
+        });
+        await settle(400);
+        await this.keyboardAction("press", { keys: "enter" });
+        await settle(900);
+        commandResult = { host: "persistent" };
+      } catch (error) {
+        commandResult = { host: "persistent", failed: true, reason: error.message };
+      }
+    }
+
+    if (!commandResult || commandResult.failed) {
+      // No host. The clipboard is still exact, so the fallback borrows it rather
+      // than reaching for SendKeys' notation again; only the two control keys
+      // are keystrokes, and those have no text to corrupt.
+      const escapedContent = escapePowerShellSingleQuoted(content);
+      const escapedPath = escapePowerShellSingleQuoted(filePath);
+      commandResult = await this.runPowerShell(
+        `Add-Type -AssemblyName System.Windows.Forms; ` +
+        `$wshell = New-Object -ComObject WScript.Shell; ` +
+        `Start-Sleep -Milliseconds 800; ` +
+        `if (-not $wshell.AppActivate('Notepad')) { throw 'Notepad window not found' }; ` +
+        `Start-Sleep -Milliseconds 400; ` +
+        `[System.Windows.Forms.Clipboard]::SetText('${escapedContent}'); ` +
+        `Start-Sleep -Milliseconds 200; ` +
+        `[System.Windows.Forms.SendKeys]::SendWait('^v'); ` +
+        `Start-Sleep -Milliseconds 400; ` +
+        `[System.Windows.Forms.SendKeys]::SendWait('^s'); ` +
+        `Start-Sleep -Milliseconds 1200; ` +
+        `[System.Windows.Forms.Clipboard]::SetText('${escapedPath}'); ` +
+        `Start-Sleep -Milliseconds 200; ` +
+        `[System.Windows.Forms.SendKeys]::SendWait('^v'); ` +
+        `Start-Sleep -Milliseconds 400; ` +
+        `[System.Windows.Forms.SendKeys]::SendWait('{ENTER}'); ` +
+        `Start-Sleep -Milliseconds 800; ` +
+        `'saved'`,
+        { timeoutMs: 45000 }
+      );
+    }
+
     const verify = await this.verifyFileContains(filePath, content);
-    return { filePath, content, commandResult: ps, verification: verify };
+    return { filePath, content, commandResult, verification: verify };
   }
 
   async browserSearch(query) {

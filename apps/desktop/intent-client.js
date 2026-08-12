@@ -119,7 +119,8 @@ export async function readIntentSession(response, {
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   onEvent = () => {},
-  onProgress = () => {}
+  onProgress = () => {},
+  onStart = () => {}
 } = {}) {
   const initialJson = await readJson(response);
   if (!response.ok) {
@@ -136,6 +137,10 @@ export async function readIntentSession(response, {
 
   const deadline = Date.now() + timeoutMs;
   const { statusUrl, streamUrl } = initialPayload;
+  // The caller needs the id to be able to stop this run. It is known here and
+  // nowhere else until the session comes back, which is far too late to offer a
+  // stop button for.
+  onStart(initialPayload.sessionId);
 
   let stream = null;
   try {

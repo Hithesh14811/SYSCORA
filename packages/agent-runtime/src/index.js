@@ -355,11 +355,26 @@ export class AgentRuntime {
 
     emit({ type: "INTENT_RECEIVED", details: { rawText } });
 
-    const toolset = buildToolset({
-      registry: this.capabilityRegistry,
-      adapter: this.adapter,
-      basePath: options.workspacePath ?? process.cwd()
-    });
+    // ONE TOOLSET, NOT ONE PER MESSAGE.
+    //
+    // The toolset holds what the agent knows about the machine right now: which
+    // window it is working in, which windows it opened itself, what the last
+    // screen reading found, which directory the terminal is in. Rebuilding it
+    // per request threw all of that away between turns — so "open Notepad" and
+    // then "now write a poem in it" were two strangers. The second turn had no
+    // working window, and `screen` with nothing to go on reads whatever is in
+    // front, which is this application's own chat window.
+    //
+    // The state is about the MACHINE, and there is one machine. Conversations
+    // are the client's to keep; where the pointer and the focus are is not.
+    if (!this._toolset) {
+      this._toolset = buildToolset({
+        registry: this.capabilityRegistry,
+        adapter: this.adapter,
+        basePath: options.workspacePath ?? process.cwd()
+      });
+    }
+    const toolset = this._toolset;
     const agent = new FastAgent({
       provider: this.reasoningEngine.modelProvider,
       toolset,
@@ -400,7 +415,9 @@ export class AgentRuntime {
     // daemon treats it as terminal, with the real status on finalResponse.
     session.currentState = outcome.status === "COMPLETED"
       ? RuntimeState.COMPLETED
-      : RuntimeState.FAILED;
+      : outcome.status === "CANCELLED"
+        ? RuntimeState.CANCELLED
+        : RuntimeState.FAILED;
     session.finalResponse = {
       status: outcome.status,
       message: outcome.message,

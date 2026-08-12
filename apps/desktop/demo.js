@@ -293,14 +293,19 @@ class Turn {
   }
 
   // The model's own words.
-  say(text, { detail = null, steps = [] } = {}) {
+  say(text, { detail = null, steps = [], observed = null } = {}) {
     this.clearStatus();
     this.throttleNode = null;
     this.sawNarration = true;
     this.lastSaid = text;
-    if (this._closeStream(text) && !detail && steps.length <= 1) return;
+    if (this._closeStream(text) && !detail && !observed && steps.length <= 1) return;
     const block = el("div", "agent-says");
-    block.appendChild(el("p", null, text));
+    // What it just read, before what it intends to do about it. This ordering is
+    // the point: the observation is the evidence for the action, and a reader
+    // should be able to disagree with the second line on the strength of the
+    // first.
+    if (observed) block.appendChild(el("p", "agent-observed", observed));
+    if (text) block.appendChild(el("p", null, text));
     if (detail) block.appendChild(el("p", "agent-detail", detail));
     if (steps.length > 1) {
       const list = el("ol", "plan");
@@ -435,7 +440,9 @@ function handleEvent(turn, event) {
     return;
   }
   if (type === "AGENT_SAYS") {
-    if (d.text) turn.say(d.text, { detail: d.detail, steps: d.steps ?? [] });
+    if (d.text || d.observed) {
+      turn.say(d.text ?? "", { detail: d.detail, steps: d.steps ?? [], observed: d.observed });
+    }
     return;
   }
 
@@ -552,7 +559,11 @@ function renderFinal(turn, session) {
     return;
   }
 
-  if (GOOD_STATUS.has(fr.status)) {
+  // Stopping is the user getting what they asked for, not a failure. Labelling
+  // it "Didn't work" in red tells them something went wrong when nothing did.
+  if (fr.status === "CANCELLED") {
+    turn.append(el("div", "agent-answer", message));
+  } else if (GOOD_STATUS.has(fr.status)) {
     turn.append(el("div", "agent-answer", message));
   } else {
     const card = el("div", "result-card bad");
@@ -634,8 +645,36 @@ function replyTextOf(session) {
 
 // ---- Submitting --------------------------------------------------------------
 
+// ---- Running / stopping ------------------------------------------------------
+
+// While a request runs the send button becomes a stop button. One control: when
+// it is working, "send another" is never what you want and "stop" always is.
+const sendButton = document.getElementById("sendButton");
+let runningSessionId = null;
+
+function setRunning(sessionId) {
+  runningSessionId = sessionId;
+  const running = sessionId !== null;
+  sendButton.classList.toggle("stopping", running);
+  sendButton.textContent = running ? "■" : "↑";
+  sendButton.setAttribute("aria-label", running ? "Stop" : "Send message");
+  sendButton.title = running ? "Stop" : "Send (Enter)";
+}
+
+async function stopRunning() {
+  if (!runningSessionId) return;
+  const sessionId = runningSessionId;
+  // Optimistic: the button must respond to the press, not to the round trip.
+  // The run settles on its own and renders whatever it had actually done.
+  setRunning(null);
+  try {
+    await fetch(`/api/intents/${encodeURIComponent(sessionId)}/stop`, { method: "POST" });
+  } catch { /* the run settles regardless; nothing here is worth surfacing */ }
+}
+
 let reqId = 0;
 async function submit(text) {
+  if (runningSessionId) return;
   document.querySelector(".welcome")?.remove();
   addBubble("user", textNode(text));
   // Captured BEFORE this turn is appended: history means the turns before this
@@ -664,6 +703,7 @@ async function submit(text) {
       })
     });
     const session = await readIntentSession(res, {
+      onStart: (sessionId) => setRunning(sessionId),
       onEvent: (event) => handleEvent(turn, event),
       // Only reached when the event stream could not be opened at all.
       onProgress: (status) => {
@@ -689,6 +729,8 @@ async function submit(text) {
     } else {
       turn.append(el("div", "agent-answer", `Something went wrong while running that: ${err.message}`));
     }
+  } finally {
+    setRunning(null);
   }
 }
 
@@ -719,8 +761,22 @@ async function resume(sessionId, approve) {
   }
 }
 
+// Stopping is handled on the BUTTON's click, not the form's submit.
+//
+// The textarea is `required`, so a click with an empty box triggers the
+// browser's own validation — "Please fill out this field." — and the submit
+// event never fires. Live, that meant the stop button visibly did nothing: the
+// user pressed stop, got a validation bubble about the message they had not
+// typed, and the request carried on running.
+sendButton.addEventListener("click", (event) => {
+  if (!runningSessionId) return;
+  event.preventDefault();
+  stopRunning();
+});
+
 chatForm.addEventListener("submit", (e) => {
   e.preventDefault();
+  if (runningSessionId) return;
   const text = chatInput.value.trim();
   if (!text) return;
   chatInput.value = "";

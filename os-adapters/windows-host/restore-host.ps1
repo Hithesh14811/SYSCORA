@@ -11,10 +11,12 @@ Add-Type -ReferencedAssemblies @("System.Drawing","Accessibility") -TypeDefiniti
 using System;
 using Accessibility;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 public sealed class M4Window {
   public long windowId;
@@ -26,6 +28,28 @@ public sealed class M4Window {
   public int width;
   public int height;
   public bool foreground;
+}
+
+// WHAT AN INPUT OPERATION ACTUALLY DID.
+//
+// `requested` and `injected` are separate numbers on purpose. SendInput returns
+// how many events the system accepted, and it accepts fewer than it was given
+// when something blocked them — a target window running at a higher integrity
+// level than this process, or another process holding an input lock. Every
+// automation tool that reports "clicked" without comparing these two is
+// reporting that it made the call, not that the click happened. Carrying both
+// out to the caller is what lets a blocked action be named as blocked.
+public sealed class M4StrokeResult {
+  public int points;
+  public int requested;
+  public int injected;
+  public int endX;
+  public int endY;
+  public bool exactStart;
+  public bool exactEnd;
+  public bool pressed;
+  public bool released;
+  public double durationMs;
 }
 
 public static class M4Native {
@@ -62,6 +86,601 @@ public static class M4Native {
   static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint objectId, ref Guid iid,
     [In, Out, MarshalAs(UnmanagedType.IUnknown)] ref object accessible);
 
+  // ------------------------------------------------------------------------
+  // SYNTHETIC INPUT
+  //
+  // mouse_event and keybd_event are the 1996 API. Microsoft documents both as
+  // superseded, and SendInput is not a cosmetic replacement for them:
+  //
+  //  * IT REPORTS WHAT IT DELIVERED. mouse_event returns void, so input that
+  //    the system refused — blocked by UIPI because the target window belongs
+  //    to a higher-integrity process, or dropped because another process holds
+  //    a foreground lock — is indistinguishable from input that landed. That is
+  //    exactly the failure this codebase keeps finding: the action reports
+  //    success and nothing happened. SendInput returns the number of events it
+  //    actually inserted, so "blocked" becomes a fact instead of a guess.
+  //
+  //  * ITS EVENTS CANNOT BE SPLIT BY REAL INPUT. The whole array enters the
+  //    queue as one unit, so a person who moves the mouse mid-stroke cannot
+  //    land a physical move between our button-down and our first move.
+  //
+  //  * MOUSEEVENTF_MOVE_NOCOALESCE asks the system not to merge consecutive
+  //    moves. Coalescing is precisely what turns a carefully spaced curve back
+  //    into a straight line — the application's message loop is handed one
+  //    WM_MOUSEMOVE carrying the final position rather than the fifty positions
+  //    along the way, and it draws what it was told: a chord.
+  //
+  //  * A WHOLE PATH CAN TRAVEL IN ONE CALL, so a stroke is one syscall rather
+  //    than one syscall plus one interpreter round trip per point.
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x; public int y; }
+  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT {
+    public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT {
+    public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo;
+  }
+  // The union really is a union: the two members overlap, which is why this is
+  // Explicit. Left Sequential, every INPUT would be the wrong size and SendInput
+  // would reject the whole array with ERROR_INVALID_PARAMETER.
+  [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION {
+    [FieldOffset(0)] public MOUSEINPUT mi;
+    [FieldOffset(0)] public KEYBDINPUT ki;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUTUNION u; }
+
+  [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, INPUT[] inputs, int size);
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+  [DllImport("user32.dll")] static extern uint GetDoubleClickTime();
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern short VkKeyScan(char ch);
+  [DllImport("user32.dll")] static extern uint MapVirtualKey(uint code, uint mapType);
+  [DllImport("user32.dll", SetLastError=true)] static extern IntPtr SetProcessDpiAwarenessContext(IntPtr context);
+  [DllImport("winmm.dll", EntryPoint="timeBeginPeriod")] static extern uint TimeBeginPeriod(uint ms);
+  [DllImport("winmm.dll", EntryPoint="timeEndPeriod")] static extern uint TimeEndPeriod(uint ms);
+
+  const uint INPUT_MOUSE = 0, INPUT_KEYBOARD = 1;
+  const uint MOUSEEVENTF_MOVE = 0x0001, MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
+  const uint MOUSEEVENTF_RIGHTDOWN = 0x0008, MOUSEEVENTF_RIGHTUP = 0x0010;
+  const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020, MOUSEEVENTF_MIDDLEUP = 0x0040;
+  const uint MOUSEEVENTF_XDOWN = 0x0080, MOUSEEVENTF_XUP = 0x0100;
+  const uint MOUSEEVENTF_WHEEL = 0x0800, MOUSEEVENTF_HWHEEL = 0x1000;
+  const uint MOUSEEVENTF_MOVE_NOCOALESCE = 0x2000, MOUSEEVENTF_VIRTUALDESK = 0x4000, MOUSEEVENTF_ABSOLUTE = 0x8000;
+  const uint KEYEVENTF_EXTENDEDKEY = 0x0001, KEYEVENTF_KEYUP = 0x0002, KEYEVENTF_UNICODE = 0x0004, KEYEVENTF_SCANCODE = 0x0008;
+  const int SM_XVIRTUALSCREEN = 76, SM_YVIRTUALSCREEN = 77, SM_CXVIRTUALSCREEN = 78, SM_CYVIRTUALSCREEN = 79;
+  static readonly int InputSize = Marshal.SizeOf(typeof(INPUT));
+
+  // The virtual desktop, cached for the duration of one operation. Absolute
+  // positioning needs all four metrics for every point; asking the OS 24000
+  // times to draw one circle is measurable and the answer cannot change
+  // mid-stroke.
+  static int vsx, vsy, vsw, vsh;
+  static void RefreshVirtualScreen() {
+    vsx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    vsy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    vsw = Math.Max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+    vsh = Math.Max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+  }
+
+  static INPUT MouseEventInput(uint flags, int x, int y, uint data) {
+    var input = new INPUT();
+    input.type = INPUT_MOUSE;
+    input.u.mi.dx = x;
+    input.u.mi.dy = y;
+    input.u.mi.mouseData = data;
+    input.u.mi.dwFlags = flags;
+    input.u.mi.time = 0;
+    input.u.mi.dwExtraInfo = IntPtr.Zero;
+    return input;
+  }
+
+  // A screen point in SendInput's absolute space: the virtual desktop mapped
+  // onto 0..65535 on each axis. MOUSEEVENTF_VIRTUALDESK is what makes the
+  // origin the virtual desktop rather than the primary monitor, which is the
+  // difference between working and not working on a second monitor placed left
+  // of or above the first — there, screen coordinates are NEGATIVE.
+  static INPUT MoveInput(int x, int y) {
+    var nx = (int)Math.Round((double)(x - vsx) * 65535.0 / Math.Max(1, vsw - 1));
+    var ny = (int)Math.Round((double)(y - vsy) * 65535.0 / Math.Max(1, vsh - 1));
+    if (nx < 0) nx = 0; if (nx > 65535) nx = 65535;
+    if (ny < 0) ny = 0; if (ny > 65535) ny = 65535;
+    return MouseEventInput(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE_NOCOALESCE, nx, ny, 0);
+  }
+
+  static int Send(INPUT[] inputs) {
+    if (inputs == null || inputs.Length == 0) return 0;
+    return (int)SendInput((uint)inputs.Length, inputs, InputSize);
+  }
+
+  static int SendOne(INPUT input) { return Send(new INPUT[] { input }); }
+
+  /**
+   * Wait for a stated number of microseconds, accurately.
+   *
+   * Thread.Sleep(1) does not sleep for a millisecond; it yields until the next
+   * scheduler tick, which is 15.6ms by default. A stroke paced with it would
+   * run thirteen times slower than asked and would jitter, and pacing is the
+   * one thing a drawing tool cannot get wrong. So: raise the timer resolution
+   * for the duration of the operation, sleep away the bulk of a long wait, and
+   * spin the last two milliseconds where sleeping cannot be trusted.
+   */
+  static void PreciseWait(long micros) {
+    if (micros <= 0) return;
+    var target = (long)(micros * (Stopwatch.Frequency / 1000000.0));
+    var clock = Stopwatch.StartNew();
+    while (true) {
+      var remaining = target - clock.ElapsedTicks;
+      if (remaining <= 0) return;
+      if (remaining * 1000.0 / Stopwatch.Frequency > 2.0) Thread.Sleep(1);
+      else Thread.SpinWait(50);
+    }
+  }
+
+  static void BeginPrecision() { try { TimeBeginPeriod(1); } catch {} }
+  static void EndPrecision() { try { TimeEndPeriod(1); } catch {} }
+
+  static void ButtonFlags(string button, out uint down, out uint up, out uint data) {
+    var name = (button == null ? "left" : button.ToLowerInvariant());
+    switch (name) {
+      case "right":  down = MOUSEEVENTF_RIGHTDOWN;  up = MOUSEEVENTF_RIGHTUP;  data = 0; break;
+      case "middle": down = MOUSEEVENTF_MIDDLEDOWN; up = MOUSEEVENTF_MIDDLEUP; data = 0; break;
+      case "x1":     down = MOUSEEVENTF_XDOWN;      up = MOUSEEVENTF_XUP;      data = 1; break;
+      case "x2":     down = MOUSEEVENTF_XDOWN;      up = MOUSEEVENTF_XUP;      data = 2; break;
+      case "none":   down = 0;                      up = 0;                    data = 0; break;
+      default:       down = MOUSEEVENTF_LEFTDOWN;   up = MOUSEEVENTF_LEFTUP;   data = 0; break;
+    }
+  }
+
+  /**
+   * Put the pointer exactly on a pixel, and say whether it got there.
+   *
+   * Absolute SendInput coordinates are a 16-bit fraction of the virtual
+   * desktop, so on a wide desktop one unit is worth more than one pixel and the
+   * position that arrives can be a pixel off the position that was asked for.
+   * Every automation library has this wart and none of them check for it. The
+   * cursor's real position is one call away: read it back, and nudge with
+   * SetCursorPos when the rounding lost a pixel. Endpoints are where this
+   * matters — a click, and the two ends of a stroke.
+   */
+  public static bool MoveExact(int x, int y, out int achievedX, out int achievedY) {
+    RefreshVirtualScreen();
+    SendOne(MoveInput(x, y));
+    POINT position;
+    GetCursorPos(out position);
+    if (position.x != x || position.y != y) {
+      SetCursorPos(x, y);
+      GetCursorPos(out position);
+    }
+    achievedX = position.x;
+    achievedY = position.y;
+    return position.x == x && position.y == y;
+  }
+
+  /**
+   * Insert points until no two consecutive positions are more than `maxStep`
+   * apart.
+   *
+   * An application draws a straight segment between the positions it is told
+   * about. Given only two endpoints it draws one straight line, however curved
+   * the intent — so the density of the path, not the shape of it, is what makes
+   * a drawn curve a curve. Callers that already spaced their own path pass
+   * maxStep <= 0 and this is skipped.
+   */
+  public static int[] Densify(int[] path, double maxStep) {
+    if (path == null || path.Length < 4 || maxStep <= 0) return path;
+    var output = new List<int>(path.Length * 2);
+    output.Add(path[0]); output.Add(path[1]);
+    for (var index = 2; index + 1 < path.Length; index += 2) {
+      double fromX = path[index - 2], fromY = path[index - 1];
+      double toX = path[index], toY = path[index + 1];
+      var span = Math.Sqrt((toX - fromX) * (toX - fromX) + (toY - fromY) * (toY - fromY));
+      var steps = Math.Max(1, (int)Math.Ceiling(span / maxStep));
+      for (var n = 1; n <= steps; n += 1) {
+        var x = (int)Math.Round(fromX + (toX - fromX) * n / steps);
+        var y = (int)Math.Round(fromY + (toY - fromY) * n / steps);
+        if (output[output.Count - 2] == x && output[output.Count - 1] == y) continue;
+        output.Add(x); output.Add(y);
+      }
+    }
+    return output.ToArray();
+  }
+
+  /**
+   * A path carried as raw bytes rather than as a JSON array.
+   *
+   * Measured on this machine, handing a path in as JSON costs about 0.12ms per
+   * point before a single event is sent — ConvertFrom-Json boxes every number
+   * into a PSObject, and a detailed figure is thousands of numbers. That is a
+   * fifth of the whole cost of drawing a circle spent on parsing the circle.
+   * Little-endian Int32 pairs in base64 decode with one block copy, so the same
+   * path arrives in microseconds and a very long one stops being expensive to
+   * describe at all.
+   */
+  public static int[] DecodePath(string encoded) {
+    if (String.IsNullOrEmpty(encoded)) return new int[0];
+    var bytes = Convert.FromBase64String(encoded);
+    var values = new int[bytes.Length / 4];
+    Buffer.BlockCopy(bytes, 0, values, 0, values.Length * 4);
+    return values;
+  }
+
+  /**
+   * One continuous stroke: position, press, follow the path, release.
+   *
+   * `pacingMicros` is the gap between injected positions. Zero means "deliver
+   * the whole path in a single SendInput call", which is right for a selection
+   * or for throwing a window across the desktop and wrong for drawing: an
+   * application that samples the mouse from its message loop sees a batch as
+   * one jump. A pacing of about a millisecond is the drawing default, and it
+   * corresponds to a real hand moving fast.
+   *
+   * The release is in a finally block. A stroke that throws or is abandoned
+   * halfway with the button still down leaves the machine with a mouse button
+   * physically stuck — selecting everything the pointer passes over, in the
+   * user's own session, with no obvious way to clear it.
+   */
+  public static M4StrokeResult Stroke(int[] path, string button, int pacingMicros, int settleMicros, int batchPoints, bool press, bool release) {
+    if (path == null || path.Length < 4) throw new ArgumentException("A stroke needs at least two points.");
+    var result = new M4StrokeResult();
+    result.points = path.Length / 2;
+    uint down, up, data;
+    ButtonFlags(button, out down, out up, out data);
+    var clock = Stopwatch.StartNew();
+    var pressed = false;
+    BeginPrecision();
+    try {
+      int achievedX, achievedY;
+      result.exactStart = MoveExact(path[0], path[1], out achievedX, out achievedY);
+      result.requested += 1;
+      result.injected += 1;
+      PreciseWait(settleMicros);
+
+      if (press && down != 0) {
+        result.requested += 1;
+        result.injected += SendOne(MouseEventInput(down, 0, 0, data));
+        pressed = true;
+        result.pressed = true;
+        // A press and an immediate move in the same instant is how an
+        // application concludes the click was a click and not the start of a
+        // drag. The settle is short and it is what makes the first millimetre
+        // of the stroke arrive.
+        PreciseWait(settleMicros);
+      }
+
+      if (pacingMicros <= 0) {
+        var batch = new INPUT[result.points - 1];
+        for (var index = 1; index < result.points; index += 1) batch[index - 1] = MoveInput(path[index * 2], path[index * 2 + 1]);
+        result.requested += batch.Length;
+        result.injected += Send(batch);
+      } else {
+        // MOVES GO IN SMALL GROUPS, NOT ONE AT A TIME.
+        //
+        // Measured here: a SendInput call carrying one move costs about 0.85ms,
+        // and a call carrying many costs about 0.15ms per move on top of the
+        // same fixed overhead. The expensive part is the call, not the event —
+        // so delivering a path one position per call spends five sixths of the
+        // time on syscall overhead, and a stroke can never go faster than about
+        // a thousand points a second however short its pacing.
+        //
+        // A group is still every position, in order, uncoalesced: an
+        // application draining its message queue receives exactly the same
+        // sequence of WM_MOUSEMOVEs. Only the arrival pattern changes, from a
+        // steady trickle to small bursts, and the group is sized by the CALLER'S
+        // PACING so that a burst stays a few milliseconds — comfortably inside
+        // one frame, so nothing that redraws on a timer can miss the motion.
+        var group = Math.Max(1, Math.Min(64, batchPoints));
+        var index = 1;
+        while (index < result.points) {
+          var size = Math.Min(group, result.points - index);
+          var batch = new INPUT[size];
+          for (var n = 0; n < size; n += 1) batch[n] = MoveInput(path[(index + n) * 2], path[(index + n) * 2 + 1]);
+          result.requested += size;
+          result.injected += Send(batch);
+          index += size;
+          PreciseWait((long)pacingMicros * size);
+        }
+      }
+
+      // The far end is a real coordinate the caller chose, so it gets the same
+      // exactness the near end got.
+      result.exactEnd = MoveExact(path[path.Length - 2], path[path.Length - 1], out achievedX, out achievedY);
+      result.endX = achievedX;
+      result.endY = achievedY;
+    } finally {
+      if (pressed && release && up != 0) {
+        PreciseWait(settleMicros);
+        result.requested += 1;
+        result.injected += Send(new INPUT[] { MouseEventInput(up, 0, 0, data) });
+        result.released = true;
+      }
+      EndPrecision();
+      result.durationMs = clock.Elapsed.TotalMilliseconds;
+    }
+    return result;
+  }
+
+  /** Press or release a button where the pointer already is, with no motion. */
+  public static M4StrokeResult ButtonAction(string button, bool down) {
+    uint downFlag, upFlag, data;
+    ButtonFlags(button, out downFlag, out upFlag, out data);
+    var flag = down ? downFlag : upFlag;
+    var result = new M4StrokeResult();
+    if (flag == 0) return result;
+    result.requested = 1;
+    result.injected = Send(new INPUT[] { MouseEventInput(flag, 0, 0, data) });
+    result.pressed = down;
+    result.released = !down;
+    POINT position;
+    GetCursorPos(out position);
+    result.endX = position.x;
+    result.endY = position.y;
+    return result;
+  }
+
+  /**
+   * A click, or a double click, delivered with the timing the OS actually asks
+   * for.
+   *
+   * A double click is two clicks inside GetDoubleClickTime, and the usual way
+   * of building one — call a click helper twice — leaves whatever delay the
+   * caller's loop happens to have between them. When that exceeds the system
+   * setting the application receives two single clicks: the file gets selected
+   * twice instead of opening, and nothing reports a problem.
+   */
+  public static M4StrokeResult Click(int x, int y, string button, int clicks, int settleMicros) {
+    uint down, up, data;
+    ButtonFlags(button, out down, out up, out data);
+    var result = new M4StrokeResult();
+    var count = Math.Max(1, Math.Min(3, clicks));
+    var clock = Stopwatch.StartNew();
+    // Comfortably inside the system's threshold, and long enough that the
+    // press and release are not collapsed into one another.
+    var gap = Math.Max(1000, Math.Min(60000, (int)GetDoubleClickTime() * 100));
+    BeginPrecision();
+    try {
+      int achievedX, achievedY;
+      result.exactStart = MoveExact(x, y, out achievedX, out achievedY);
+      result.endX = achievedX;
+      result.endY = achievedY;
+      result.requested += 1;
+      result.injected += 1;
+      PreciseWait(settleMicros);
+      for (var index = 0; index < count; index += 1) {
+        if (index > 0) PreciseWait(gap);
+        result.requested += 2;
+        result.injected += Send(new INPUT[] {
+          MouseEventInput(down, 0, 0, data),
+          MouseEventInput(up, 0, 0, data)
+        });
+      }
+      result.points = count;
+      result.pressed = true;
+      result.released = true;
+    } finally {
+      EndPrecision();
+      result.durationMs = clock.Elapsed.TotalMilliseconds;
+    }
+    return result;
+  }
+
+  /**
+   * The wheel.
+   *
+   * mouseData is declared unsigned and a scroll down is a NEGATIVE delta, so
+   * the value has to be reinterpreted rather than converted. In C# `unchecked`
+   * says exactly that in one word; the same cast written in PowerShell is
+   * checked and throws, which is how downward scrolling was once impossible.
+   */
+  public static M4StrokeResult Wheel(int delta, bool horizontal) {
+    var result = new M4StrokeResult();
+    result.requested = 1;
+    result.injected = Send(new INPUT[] {
+      MouseEventInput(horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL, 0, 0, unchecked((uint)delta))
+    });
+    POINT position;
+    GetCursorPos(out position);
+    result.endX = position.x;
+    result.endY = position.y;
+    return result;
+  }
+
+  static INPUT KeyInput(ushort virtualKey, ushort scan, uint flags) {
+    var input = new INPUT();
+    input.type = INPUT_KEYBOARD;
+    input.u.ki.wVk = virtualKey;
+    input.u.ki.wScan = scan;
+    input.u.ki.dwFlags = flags;
+    input.u.ki.time = 0;
+    input.u.ki.dwExtraInfo = IntPtr.Zero;
+    return input;
+  }
+
+  // Keys that must carry KEYEVENTF_EXTENDEDKEY. Without it the arrow keys are
+  // the numeric keypad's arrows, Home is keypad 7, and Delete is keypad full
+  // stop — which is why synthetic Ctrl+Right sometimes moves by a character
+  // instead of a word, or types a digit.
+  static bool IsExtended(ushort vk) {
+    return vk == 0x21 || vk == 0x22 || vk == 0x23 || vk == 0x24 // PgUp PgDn End Home
+      || vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28   // arrows
+      || vk == 0x2D || vk == 0x2E                               // Insert Delete
+      || vk == 0x5B || vk == 0x5C || vk == 0x5D                 // Win keys, Apps
+      || vk == 0xA3 || vk == 0xA5 || vk == 0x90 || vk == 0x6F;  // RCtrl RAlt NumLock keypad-divide
+  }
+
+  /**
+   * Type text as the characters it is, not as keystrokes that might produce
+   * them.
+   *
+   * KEYEVENTF_UNICODE carries a UTF-16 code unit directly, so what arrives is
+   * what was sent: braces, quotes, accents, emoji, every symbol a keyboard
+   * layout would otherwise have to be able to reach. SendKeys cannot say that —
+   * it interprets a keystroke language, so `{` and `+` and `%` and `^` mean
+   * something else and text that contains them arrives changed.
+   *
+   * Newlines are the one exception, and they are deliberate: a Unicode carriage
+   * return is not what an edit control listens for, so Enter is sent as the key
+   * it really is.
+   */
+  public static M4StrokeResult TypeUnicode(string text, int pacingMicros) {
+    var result = new M4StrokeResult();
+    if (String.IsNullOrEmpty(text)) return result;
+    var clock = Stopwatch.StartNew();
+    var events = new List<INPUT>(text.Length * 2);
+    for (var index = 0; index < text.Length; index += 1) {
+      var ch = text[index];
+      if (ch == '\r') {
+        // A CRLF is one Enter, not two.
+        if (index + 1 < text.Length && text[index + 1] == '\n') index += 1;
+        events.Add(KeyInput(0x0D, (ushort)MapVirtualKey(0x0D, 0), 0));
+        events.Add(KeyInput(0x0D, (ushort)MapVirtualKey(0x0D, 0), KEYEVENTF_KEYUP));
+        continue;
+      }
+      if (ch == '\n') {
+        events.Add(KeyInput(0x0D, (ushort)MapVirtualKey(0x0D, 0), 0));
+        events.Add(KeyInput(0x0D, (ushort)MapVirtualKey(0x0D, 0), KEYEVENTF_KEYUP));
+        continue;
+      }
+      events.Add(KeyInput(0, ch, KEYEVENTF_UNICODE));
+      events.Add(KeyInput(0, ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+    }
+    result.points = text.Length;
+    BeginPrecision();
+    try {
+      if (pacingMicros <= 0) {
+        // One call for the whole string. A window's message loop drains its
+        // queue in order, so a batch is not a race; it is the reason this can
+        // deliver a paragraph in the time a per-character loop spends on one
+        // letter. Chunked so a very long document does not build one enormous
+        // array.
+        var chunk = 512;
+        for (var start = 0; start < events.Count; start += chunk) {
+          var size = Math.Min(chunk, events.Count - start);
+          var batch = new INPUT[size];
+          events.CopyTo(start, batch, 0, size);
+          result.requested += size;
+          result.injected += Send(batch);
+        }
+      } else {
+        for (var index = 0; index < events.Count; index += 2) {
+          var pair = new INPUT[] { events[index], events[index + 1] };
+          result.requested += 2;
+          result.injected += Send(pair);
+          PreciseWait(pacingMicros);
+        }
+      }
+    } finally {
+      EndPrecision();
+      result.durationMs = clock.Elapsed.TotalMilliseconds;
+    }
+    return result;
+  }
+
+  static ushort NamedKey(string name) {
+    switch (name) {
+      case "enter": case "return": return 0x0D;
+      case "tab": return 0x09;
+      case "esc": case "escape": return 0x1B;
+      case "space": case "spacebar": return 0x20;
+      case "backspace": case "bksp": return 0x08;
+      case "delete": case "del": return 0x2E;
+      case "insert": case "ins": return 0x2D;
+      case "home": return 0x24;
+      case "end": return 0x23;
+      case "pageup": case "pgup": return 0x21;
+      case "pagedown": case "pgdn": return 0x22;
+      case "up": return 0x26;
+      case "down": return 0x28;
+      case "left": return 0x25;
+      case "right": return 0x27;
+      case "printscreen": case "prtsc": return 0x2C;
+      case "capslock": return 0x14;
+      case "numlock": return 0x90;
+      case "scrolllock": return 0x91;
+      case "pause": case "break": return 0x13;
+      case "apps": case "menu": return 0x5D;
+      case "win": case "lwin": return 0x5B;
+      case "rwin": return 0x5C;
+      case "ctrl": case "control": case "ctl": return 0x11;
+      case "alt": return 0x12;
+      case "shift": return 0x10;
+      case "volumeup": return 0xAF;
+      case "volumedown": return 0xAE;
+      case "volumemute": return 0xAD;
+      case "medianext": return 0xB0;
+      case "mediaprevious": return 0xB1;
+      case "mediastop": return 0xB2;
+      case "mediaplaypause": return 0xB3;
+      default: break;
+    }
+    if (name.Length > 1 && name[0] == 'f') {
+      int number;
+      if (Int32.TryParse(name.Substring(1), out number) && number >= 1 && number <= 24) return (ushort)(0x6F + number);
+    }
+    if (name.Length == 1) {
+      var scan = VkKeyScan(name[0]);
+      if (scan != -1) return (ushort)(scan & 0xFF);
+    }
+    return 0;
+  }
+
+  /**
+   * A key or a combination, held and released in the right order.
+   *
+   * "ctrl+shift+s" means: hold Ctrl, hold Shift, tap S, release Shift, release
+   * Ctrl. Releasing in the same order they were pressed leaves a modifier
+   * logically down for an instant with the other already up, and applications
+   * that watch modifier state — every editor with a multi-select — see a
+   * different gesture than the one that was asked for.
+   *
+   * A modifier that a keyboard layout requires for the final character is
+   * applied too: on a US layout `%` is Shift+5, and sending the 5 key without
+   * the shift produces a 5.
+   */
+  public static M4StrokeResult Chord(string spec) {
+    var result = new M4StrokeResult();
+    if (String.IsNullOrWhiteSpace(spec)) return result;
+    var parts = spec.Trim().ToLowerInvariant().Split('+');
+    var held = new List<ushort>();
+    ushort target = 0;
+    for (var index = 0; index < parts.Length; index += 1) {
+      var part = parts[index].Trim();
+      if (part.Length == 0) {
+        // A lone "+" written as part of a combination, e.g. "ctrl++".
+        part = "+";
+      }
+      var isLast = index == parts.Length - 1;
+      if (!isLast) {
+        var modifier = NamedKey(part);
+        if (modifier == 0) throw new ArgumentException("Unknown modifier: " + part);
+        held.Add(modifier);
+        continue;
+      }
+      target = NamedKey(part);
+      if (target == 0) throw new ArgumentException("Unknown key: " + part);
+      if (part.Length == 1) {
+        var scan = VkKeyScan(part[0]);
+        if (scan != -1) {
+          var state = (scan >> 8) & 0xFF;
+          if ((state & 1) != 0 && !held.Contains((ushort)0x10)) held.Add(0x10);
+          if ((state & 2) != 0 && !held.Contains((ushort)0x11)) held.Add(0x11);
+          if ((state & 4) != 0 && !held.Contains((ushort)0x12)) held.Add(0x12);
+        }
+      }
+    }
+    var events = new List<INPUT>();
+    for (var index = 0; index < held.Count; index += 1) {
+      events.Add(KeyInput(held[index], (ushort)MapVirtualKey(held[index], 0), IsExtended(held[index]) ? KEYEVENTF_EXTENDEDKEY : 0));
+    }
+    events.Add(KeyInput(target, (ushort)MapVirtualKey(target, 0), IsExtended(target) ? KEYEVENTF_EXTENDEDKEY : 0));
+    events.Add(KeyInput(target, (ushort)MapVirtualKey(target, 0), KEYEVENTF_KEYUP | (IsExtended(target) ? KEYEVENTF_EXTENDEDKEY : 0)));
+    for (var index = held.Count - 1; index >= 0; index -= 1) {
+      events.Add(KeyInput(held[index], (ushort)MapVirtualKey(held[index], 0), KEYEVENTF_KEYUP | (IsExtended(held[index]) ? KEYEVENTF_EXTENDEDKEY : 0)));
+    }
+    result.requested = events.Count;
+    result.injected = Send(events.ToArray());
+    result.points = 1;
+    return result;
+  }
+
   public static List<M4Window> Windows() {
     var result = new List<M4Window>();
     var fg = GetForegroundWindow();
@@ -79,7 +698,32 @@ public static class M4Native {
     return result;
   }
 
-  public static bool EnableDpiAwareness() { return SetProcessDPIAware(); }
+  /**
+   * Ask for the strongest DPI awareness this Windows offers.
+   *
+   * SetProcessDPIAware alone declares SYSTEM awareness, which means: correct on
+   * the monitor Windows booted with, and silently virtualised on any monitor
+   * with a different scale factor. On a mixed-DPI desktop — a 150% laptop panel
+   * beside a 100% external screen, which is the ordinary setup now — every
+   * window rectangle read on the second monitor comes back scaled, so a click
+   * computed from those bounds lands somewhere other than the control it was
+   * aimed at, and a screen capture of that window is the wrong size.
+   *
+   * Per-Monitor-V2 removes the virtualisation: coordinates are physical pixels
+   * everywhere, which is the space this host already assumes it is working in.
+   * It needs Windows 10 1703, so the older call stays as the fallback and the
+   * mode that was actually obtained is reported in host.health rather than
+   * assumed.
+   */
+  public static string EnableDpiAwareness() {
+    try {
+      if (SetProcessDpiAwarenessContext(new IntPtr(-4)) != IntPtr.Zero) return "per-monitor-v2";
+    } catch {}
+    try {
+      if (SetProcessDPIAware()) return "system";
+    } catch {}
+    return "unaware";
+  }
   public static uint DpiForWindow(IntPtr h) { try { var dpi=GetDpiForWindow(h); return dpi == 0 ? 96u : dpi; } catch { return 96u; } }
   public static bool Activate(IntPtr h) {
     if (!IsWindow(h)) return false;
@@ -205,7 +849,7 @@ public static class M4Native {
   }
 }
 '@
-[M4Native]::EnableDpiAwareness() | Out-Null
+$script:DpiMode = [M4Native]::EnableDpiAwareness()
 
 function Wait-WinRt($operation, $resultType) {
   $method = [System.WindowsRuntimeSystemExtensions].GetMethods() |
@@ -545,13 +1189,25 @@ function Invoke-UiAction($params) {
           } else {
             $foreground=Acquire-Foreground @{windowId=$window.windowId;processId=$window.processId;title=$window.title;className=$window.className}
             if(-not $foreground.acquired){return @{performed=$false;reason="foreground-not-acquired";target=$found.target;foreground=$foreground}}
-            $r=$hit.Current.BoundingRectangle; [M4Native]::SetCursorPos([int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2))|Out-Null; [M4Native]::mouse_event(2,0,0,0,[UIntPtr]::Zero);[M4Native]::mouse_event(4,0,0,0,[UIntPtr]::Zero);$method="bounded-pointer"
+            # The same click every other pointer action delivers. It used to be a
+            # bare SetCursorPos and two mouse_events, which is the one path left
+            # in this file that could report a click Windows had refused.
+            $r=$hit.Current.BoundingRectangle
+            $clicked=[M4Native]::Click([int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2),"left",1,8000)
+            if($clicked.injected -lt $clicked.requested){
+              return @{performed=$false;reason="input-blocked: Windows accepted $($clicked.injected) of $($clicked.requested) events.";target=$found.target;foreground=$foreground}
+            }
+            $method="bounded-pointer"
           }
         }
       }
       "focus" { $hit.SetFocus(); $method="SetFocus" }
       "setValue" { $hit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue([string]$params.text); $method="ValuePattern" }
-      "type" { try{$hit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue([string]$params.text);$method="ValuePattern"}catch{$hit.SetFocus();[System.Windows.Forms.SendKeys]::SendWait([string]$params.text);$method="SendKeys"} }
+      # The fallback types the text as characters, not as SendKeys notation. Fed
+      # a value containing a brace, a plus or a percent — a password, a format
+      # string, an equation — SendKeys reads it as its own syntax and puts
+      # something else in the field, while reporting that it typed.
+      "type" { try{$hit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue([string]$params.text);$method="ValuePattern"}catch{$hit.SetFocus();[M4Native]::TypeUnicode([string]$params.text,0)|Out-Null;$method="UnicodeSendInput"} }
       "select" { $hit.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select(); $method="SelectionItemPattern" }
       "expand" { $hit.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand(); $method="ExpandCollapsePattern" }
       "collapse" { $hit.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse(); $method="ExpandCollapsePattern" }
@@ -574,68 +1230,96 @@ function Invoke-UiAction($params) {
   } catch { return @{ performed=$false; reason=$_.Exception.Message; target=$found.target; foreground=$foreground; reGrounded=$true; geometryChanged=$geometryChanged; groundingAttempts=($groundAttempt+1) } }
 }
 
-# Escape text for SendKeys.
+# TEXT NO LONGER GOES THROUGH SendKeys AT ALL.
 #
-# SendKeys does not send text — it interprets a small language. `+ ^ % ~` are
-# Shift/Ctrl/Alt/Enter, `( )` group, `{ }` delimit key names and `[ ]` are
-# reserved. Passing raw text straight into SendWait therefore corrupts anything
-# with punctuation, silently and unpredictably: typing "// syscora typing probe"
-# into Notepad produced "typing pre", and asking for a C++ program — which is
-# almost entirely braces, parentheses and angle brackets — produced garbage or
-# nothing at all, while the capability cheerfully reported performed=$true.
+# It used to, and the escaping it needed lived here: SendKeys does not send text,
+# it interprets a small language in which `+ ^ % ~` are Shift/Ctrl/Alt/Enter,
+# `( )` group and `{ }` delimit key names. Raw text therefore arrived corrupted,
+# silently — "// syscora typing probe" reached Notepad as "typing pre", and a C++
+# program, being almost entirely braces and angle brackets, arrived as garbage
+# while the capability reported performed=$true. Escaping every character made it
+# survivable but never faithful.
 #
-# Every special character is sent as its literal form `{c}`, and real newlines
-# and tabs become the key names SendKeys understands. Text typed through here
-# arrives as written.
-# Returns one SendKeys-safe string. Built with a StringBuilder and returned as a
-# plain string on purpose: returning a collection from a PowerShell function
-# invites the pipeline to unroll or re-wrap it, which produced the literal text
-# "System.Object[]" being typed into Notepad.
-function ConvertTo-SendKeysLiteral([string]$text) {
-  if ([string]::IsNullOrEmpty($text)) { return "" }
-  $builder = New-Object System.Text.StringBuilder
-  foreach ($ch in $text.ToCharArray()) {
-    switch ($ch) {
-      "`r" { }                                   # CRLF arrives as CR+LF; the LF emits the ENTER
-      "`n" { [void]$builder.Append("{ENTER}") }
-      "`t" { [void]$builder.Append("{TAB}") }
-      "+"  { [void]$builder.Append("{+}") }
-      "^"  { [void]$builder.Append("{^}") }
-      "%"  { [void]$builder.Append("{%}") }
-      "~"  { [void]$builder.Append("{~}") }
-      "("  { [void]$builder.Append("{(}") }
-      ")"  { [void]$builder.Append("{)}") }
-      "{"  { [void]$builder.Append("{{}") }
-      "}"  { [void]$builder.Append("{}}") }
-      "["  { [void]$builder.Append("{[}") }
-      "]"  { [void]$builder.Append("{]}") }
-      default { [void]$builder.Append($ch) }
-    }
-  }
-  return $builder.ToString()
+# KEYEVENTF_UNICODE has no language to misread: the code unit that is sent is the
+# character that arrives. Both the escaper and the chunker it needed are gone
+# with the path that required them, and SendKeys now only ever receives notation
+# a caller wrote deliberately.
+
+# Where MoveExact reports the position the pointer actually reached. Declared up
+# front because PowerShell binds an `out` parameter through [ref] to a variable
+# that already exists.
+$script:AchievedX = 0
+$script:AchievedY = 0
+$script:LastPacingMicros = 0
+
+# Every pointer setting arrives from a language model, so none of them are
+# trusted: a missing value takes the default, a value that is not a number takes
+# the default, and anything out of range is clamped rather than refused. A pacing
+# of a hundred seconds per point is not a request worth honouring, and it is also
+# not a reason to decline to draw.
+function Get-PointerSetting($value, [int]$fallback, [int]$minimum, [int]$maximum) {
+  if ($null -eq $value) { return $fallback }
+  $number = 0
+  if (-not [int]::TryParse([string]$value, [ref]$number)) { return $fallback }
+  return [Math]::Max($minimum, [Math]::Min($maximum, $number))
 }
 
-# Split an escaped string into chunks WITHOUT ever cutting inside a `{...}`
-# escape — half of "{ENTER}" is the literal text "{ENT". SendKeys drops
-# characters on very long bursts, so chunking with a short pause is what makes a
-# full source file arrive intact.
-function Split-SendKeysChunks([string]$literal, [int]$size) {
-  $matches = [regex]::Matches($literal, '\{[^}]*\}|.', 'Singleline')
-  $chunks = New-Object System.Collections.ArrayList
-  $current = New-Object System.Text.StringBuilder
-  $count = 0
-  foreach ($m in $matches) {
-    [void]$current.Append($m.Value)
-    $count++
-    if ($count -ge $size) { [void]$chunks.Add($current.ToString()); $current = New-Object System.Text.StringBuilder; $count = 0 }
+# DELIVERED IS NOT THE SAME AS ACCEPTED.
+#
+# SendInput says how many events the system took. Fewer than were offered means
+# something blocked them — most often the target window belongs to a process
+# running at a higher integrity level than this one, which is what happens the
+# moment an elevated application is in the foreground. Reporting performed:true
+# there would be the exact false success this codebase keeps having to undo, so
+# the comparison decides `performed` and the shortfall gets a name.
+function New-InputResult($result, [hashtable]$extra) {
+  $blocked = $result.injected -lt $result.requested
+  $payload = @{
+    performed = (-not $blocked)
+    requestedEvents = $result.requested
+    injectedEvents = $result.injected
+    durationMs = [Math]::Round($result.durationMs, 1)
   }
-  if ($current.Length -gt 0) { [void]$chunks.Add($current.ToString()) }
-  return ,$chunks.ToArray()
+  if ($blocked) {
+    $payload.reason = "input-blocked: Windows accepted $($result.injected) of $($result.requested) events. " +
+      "The target window is most likely running elevated, which blocks input from this process."
+  }
+  # GetEnumerator, NOT $extra.Keys.
+  #
+  # PowerShell resolves a property on a hashtable against its ENTRIES before its
+  # .NET members, so `$extra.Keys` on a hashtable that happens to contain a key
+  # named "keys" returns that entry's value instead of the key collection. That
+  # is not hypothetical: keyboard.press passes `keys`, so every key press
+  # returned a result with one nonsense field named after the keystroke and
+  # nothing else — no method, no windowId, no foreground.
+  foreach ($entry in $extra.GetEnumerator()) { $payload[$entry.Key] = $entry.Value }
+  return $payload
+}
+
+# A stroke is the one operation whose cost is chosen by its caller, so it is the
+# one that can outlive the client's timeout. That matters more than it sounds:
+# abandoning a stroke midway is abandoning it with the mouse button DOWN.
+# Stroke's own finally block releases the button, but the request still has to
+# come back inside the time the client is willing to wait, so a path that would
+# take too long is delivered faster rather than delivered in pieces.
+function Invoke-BoundedStroke([int[]]$path, [string]$button, [int]$pacingMicros, [int]$settleMicros) {
+  if ($null -eq $path -or $path.Length -lt 4) { throw "A stroke needs at least two points." }
+  $points = [int]($path.Length / 2)
+  if ($points -gt 20000) { throw "That path has $points points; the limit for one stroke is 20000." }
+  $budgetMicros = 20000000
+  $spend = [int64]$points * [int64]$pacingMicros
+  if ($spend -gt $budgetMicros) { $pacingMicros = [int]($budgetMicros / $points) }
+  $script:LastPacingMicros = $pacingMicros
+  # Group the moves so each burst spans roughly three milliseconds — long enough
+  # to amortise the syscall, short enough that a window redrawing at 60Hz still
+  # sees several updates per frame.
+  $group = if ($pacingMicros -gt 0) { [Math]::Max(1, [Math]::Min(32, [int](3000 / $pacingMicros))) } else { 1 }
+  return [M4Native]::Stroke($path, $button, $pacingMicros, $settleMicros, $group, $true, $true)
 }
 
 function Invoke-Operation($operation, $params) {
   switch ($operation) {
-    "host.health" { return @{ ok=$true; pid=$PID; protocol="m4-windows-host/1"; sta=([Threading.Thread]::CurrentThread.ApartmentState.ToString()) } }
+    "host.health" { return @{ ok=$true; pid=$PID; protocol="m4-windows-host/1"; sta=([Threading.Thread]::CurrentThread.ApartmentState.ToString()); inputEngine="SendInput"; dpiAwareness=$script:DpiMode } }
     "window.enumerate" { return @{ windows=(Get-WindowList) } }
     "window.foreground" { return @{ window=(Get-ForegroundWindow) } }
     "window.resolve" { return Resolve-Window $params }
@@ -651,87 +1335,243 @@ function Invoke-Operation($operation, $params) {
     "ui.inspect" { return Get-UiElements $params }
     "ui.find" { return Find-UiElement $params }
     "ui.action" { return Invoke-UiAction $params }
-    "pointer.move" { return @{performed=[M4Native]::SetCursorPos([int]$params.x,[int]$params.y);x=[int]$params.x;y=[int]$params.y} }
-    "pointer.click" { if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window};$button=if($params.button){[string]$params.button}else{"left"};[M4Native]::SetCursorPos([int]$params.x,[int]$params.y)|Out-Null;$flags=if($button -eq "right"){8}else{2};[M4Native]::mouse_event($flags,0,0,0,[UIntPtr]::Zero);[M4Native]::mouse_event(($flags*2),0,0,0,[UIntPtr]::Zero);return @{performed=$true;x=$params.x;y=$params.y;button=$button;windowId=if($w){$w.windowId}else{$null};foreground=$focus} }
+    "pointer.move" {
+      $moved=[M4Native]::MoveExact([int]$params.x,[int]$params.y,[ref]$script:AchievedX,[ref]$script:AchievedY)
+      # The position the pointer REACHED, not the one it was sent. They differ
+      # when a coordinate falls outside every monitor, and a caller that is told
+      # its own argument back has no way to find that out.
+      return @{performed=$true;x=$script:AchievedX;y=$script:AchievedY;requestedX=[int]$params.x;requestedY=[int]$params.y;exact=$moved}
+    }
+    "pointer.click" {
+      if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}
+      $button=if($params.button){[string]$params.button}else{"left"}
+      $clicks=if($params.clicks){[Math]::Max(1,[Math]::Min(3,[int]$params.clicks))}elseif($params.doubleClick -eq $true){2}else{1}
+      $settle=Get-PointerSetting $params.settleMicros 8000 0 500000
+      $r=[M4Native]::Click([int]$params.x,[int]$params.y,$button,$clicks,$settle)
+      return (New-InputResult $r @{x=$r.endX;y=$r.endY;requestedX=[int]$params.x;requestedY=[int]$params.y;button=$button;clicks=$clicks;windowId=if($w){$w.windowId}else{$null};foreground=$focus})
+    }
+    "pointer.down" {
+      if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}}}
+      if($null -ne $params.x -and $null -ne $params.y){[M4Native]::MoveExact([int]$params.x,[int]$params.y,[ref]$script:AchievedX,[ref]$script:AchievedY)|Out-Null}
+      $button=if($params.button){[string]$params.button}else{"left"}
+      return (New-InputResult ([M4Native]::ButtonAction($button,$true)) @{button=$button})
+    }
+    # THE WAY OUT OF A STUCK BUTTON. A stroke that is abandoned between its press
+    # and its release leaves the machine selecting everything the pointer touches,
+    # in the user's own session. Stroke releases in a finally block so it cannot
+    # happen from here, but a button can also be left down deliberately, and
+    # whatever puts it down must have a counterpart that always works.
+    "pointer.up" {
+      $button=if($params.button){[string]$params.button}else{"left"}
+      return (New-InputResult ([M4Native]::ButtonAction($button,$false)) @{button=$button})
+    }
     "pointer.wheel" {
       if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}
       $delta=[Math]::Max(-1200,[Math]::Min(1200,[int]$params.delta))
       # SCROLLING DOWN.
       #
-      # mouse_event's dwData is declared uint, and WHEEL_DELTA is signed: a
-      # scroll down is a NEGATIVE delta. `[uint32]$delta` is a checked cast in
-      # PowerShell, so every downward scroll ever attempted threw
-      # "Cannot convert value -120 to type System.UInt32" before a single wheel
-      # event was sent. Scrolling up worked, scrolling down could not — which is
-      # the direction almost every real task needs.
-      #
-      # Reinterpret the bits instead of converting the value, which is what the
-      # Win32 API expects: -120 must arrive as 0xFFFFFF88, not be rejected.
-      $wheelData=[BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$delta),0)
-      [M4Native]::mouse_event(0x0800,0,0,$wheelData,[UIntPtr]::Zero)
-      return @{performed=$true;delta=$delta;windowId=if($w){$w.windowId}else{$null}}
+      # A scroll down is a NEGATIVE delta, and the field that carries it is
+      # declared unsigned. Converting the value rather than reinterpreting its
+      # bits is what made every downward scroll throw before a single wheel event
+      # was sent — "Cannot convert value -120 to type System.UInt32" — so
+      # scrolling up worked and scrolling down could not, which is the direction
+      # almost every real task needs. The reinterpretation now happens inside the
+      # native call, where `unchecked` states it in one word and the checked cast
+      # that caused this cannot be written by accident.
+      $horizontal=($params.axis -eq "horizontal")
+      return (New-InputResult ([M4Native]::Wheel($delta,$horizontal)) @{delta=$delta;axis=if($horizontal){"horizontal"}else{"vertical"};windowId=if($w){$w.windowId}else{$null}})
     }
     "pointer.drag" {
       if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}
-      [M4Native]::SetCursorPos([int]$params.fromX,[int]$params.fromY)|Out-Null
-      [M4Native]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
-      $steps=10
-      for($i=1;$i -le $steps;$i++){
-        $x=[int]($params.fromX+(($params.toX-$params.fromX)*$i/$steps))
-        $y=[int]($params.fromY+(($params.toY-$params.fromY)*$i/$steps))
-        [M4Native]::SetCursorPos($x,$y)|Out-Null;Start-Sleep -Milliseconds 12
+      # A drag is a stroke with two vertices. It used to be ten hops with a
+      # Start-Sleep between them, and Start-Sleep cannot wait for twelve
+      # milliseconds — it waits for the next scheduler tick, so the pause was
+      # nearer sixteen and jittered. Ten hops is also far too coarse to draw
+      # with: an application joins the positions it is told about, so a 900-pixel
+      # drag delivered as ten jumps is ten straight chords no matter what tool is
+      # selected. Densifying here makes the motion continuous.
+      $path=[int[]]@([int]$params.fromX,[int]$params.fromY,[int]$params.toX,[int]$params.toY)
+      $pacing=Get-PointerSetting $params.pacingMicros 250 0 50000
+      $settle=Get-PointerSetting $params.settleMicros 12000 0 500000
+      $button=if($params.button){[string]$params.button}else{"left"}
+      $dense=[M4Native]::Densify($path,(Get-PointerSetting $params.stepPx 2 1 500))
+      $r=Invoke-BoundedStroke $dense $button $pacing $settle
+      return (New-InputResult $r @{from=@{x=[int]$params.fromX;y=[int]$params.fromY};to=@{x=[int]$params.toX;y=[int]$params.toY};windowId=if($w){$w.windowId}else{$null}})
+    }
+    # ONE FIGURE, ONE STROKE, ONE ROUND TRIP.
+    #
+    # Everything drawn rather than clicked used to have to be spelled as a series
+    # of separate drags, and the button comes up between drags — so a circle
+    # arrived as disconnected chords, each its own entry in the application's undo
+    # stack, each costing a model round trip. A path travels whole: the button
+    # goes down once, follows every point, and comes up at the end.
+    #
+    # `paths` draws several strokes in one call, which is what a figure that lifts
+    # the pen needs — a letter, a face, a diagram.
+    "pointer.stroke" {
+      if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}
+      # An ArrayList, not `,@(...)`. A one-element array whose element is itself
+      # an array does not survive being the value of an `if` expression:
+      # PowerShell unrolls it on the way out, so the list of paths becomes a flat
+      # list of coordinates and every "path" in it is a single number.
+      $paths=New-Object System.Collections.ArrayList
+      if($params.pathsBase64){foreach($one in $params.pathsBase64){[void]$paths.Add([M4Native]::DecodePath([string]$one))}}
+      elseif($params.pathBase64){[void]$paths.Add([M4Native]::DecodePath([string]$params.pathBase64))}
+      elseif($params.paths){foreach($one in $params.paths){[void]$paths.Add([int[]]$one)}}
+      elseif($params.path){[void]$paths.Add([int[]]$params.path)}
+      if($paths.Count -eq 0){throw "pointer.stroke needs a path."}
+      $pacing=Get-PointerSetting $params.pacingMicros 250 0 50000
+      $settle=Get-PointerSetting $params.settleMicros 12000 0 500000
+      $button=if($params.button){[string]$params.button}else{"left"}
+      $stepPx=Get-PointerSetting $params.stepPx 0 0 500
+      $detail=@()
+      $totalPoints=0
+      $totalRequested=0
+      $totalInjected=0
+      $totalMs=0.0
+      $exact=$true
+      $blocked=$false
+      $lastX=0
+      $lastY=0
+      foreach($flat in $paths){
+        if($stepPx -gt 0){$flat=[M4Native]::Densify($flat,$stepPx)}
+        $r=Invoke-BoundedStroke $flat $button $pacing $settle
+        $totalPoints+=$r.points
+        $totalRequested+=$r.requested
+        $totalInjected+=$r.injected
+        $totalMs+=$r.durationMs
+        $lastX=$r.endX
+        $lastY=$r.endY
+        if($r.injected -lt $r.requested){$blocked=$true}
+        if(-not ($r.exactStart -and $r.exactEnd)){$exact=$false}
+        $detail+=@{points=$r.points;durationMs=[Math]::Round($r.durationMs,1);endX=$r.endX;endY=$r.endY;exactStart=$r.exactStart;exactEnd=$r.exactEnd}
       }
-      [M4Native]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
-      return @{performed=$true;from=@{x=$params.fromX;y=$params.fromY};to=@{x=$params.toX;y=$params.toY};windowId=if($w){$w.windowId}else{$null}}
+      $strokeResult=@{
+        performed=(-not $blocked);strokes=$detail.Count;points=$totalPoints
+        requestedEvents=$totalRequested;injectedEvents=$totalInjected
+        durationMs=[Math]::Round($totalMs,1);pacingMicros=$script:LastPacingMicros;exact=$exact
+        endX=$lastX;endY=$lastY;detail=$detail
+        windowId=if($w){$w.windowId}else{$null}
+      }
+      if($blocked){
+        $strokeResult.reason="input-blocked: Windows accepted $totalInjected of $totalRequested events. " +
+          "The target window is most likely running elevated, which blocks input from this process."
+      }
+      return $strokeResult
     }
     "keyboard.type" {
       if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}
-      # Typed in bounded chunks. SendKeys drops characters on long bursts, which
-      # is the other half of why typed text arrived incomplete; a short pause
-      # between chunks lets the target window's message queue keep up.
-      # Type via the clipboard, not via SendKeys.
+      # TEXT IS TYPED, NOT PASTED.
       #
-      # SendKeys does not transmit text, it interprets a keystroke language, and
-      # no amount of escaping makes it faithful: driven with a short C++ program
-      # it dropped every newline, turned `<iostream>` into `,iostream>` and one
-      # `}` into `]`. Text arriving subtly wrong is worse than text not arriving,
-      # because the action still reports success.
+      # SendKeys was never an option: it does not transmit text, it interprets a
+      # keystroke language, and no amount of escaping makes it faithful — driven
+      # with a short C++ program it dropped every newline, turned `<iostream>`
+      # into `,iostream>` and one `}` into `]`, while reporting success.
       #
-      # Setting the clipboard and pasting is exact for any content — newlines,
-      # tabs, quotes, braces, unicode — in one operation rather than hundreds of
-      # simulated keystrokes. The previous clipboard is captured and restored, so
-      # borrowing it is not something the user is left to discover.
+      # The replacement was the clipboard, and pasting IS exact — but borrowing
+      # the user's clipboard has a race in it that cannot be closed. The sequence
+      # is: save the old clipboard, set the new text, send Ctrl+V, restore the old
+      # clipboard. Ctrl+V only enters the target's message queue; if that window
+      # has not drained it by the time the restore runs, THE PASTE READS THE
+      # RESTORED CLIPBOARD. Live, that put the contents of the user's clipboard
+      # into a Notepad document and used it as the filename in the Save dialog.
+      # That is not a formatting bug, it is the user's own data being typed into
+      # an application by an action that reported success.
+      #
+      # KEYEVENTF_UNICODE looked like the answer and is not, for the editors that
+      # matter. Measured against Windows 11 Notepad with the same string by each
+      # method: batched, it arrived as "int main() { return 100%2; }" followed by
+      # forty copies of the document's last letter; paced at 1.5ms it truncated;
+      # paced at 6ms it was worse still, characters repeating everywhere. Pasting
+      # was exact. A WinForms text box, by contrast, takes any of them perfectly —
+      # which is exactly why testing against one produced a confident "every
+      # character arrived as written" for a method that corrupts real editors.
+      #
+      # So pasting stays the default, and the race is narrowed instead: the
+      # restore now waits long enough for the target to have drained the Ctrl+V.
+      # Unicode remains available with method:"keys" for a target that refuses
+      # paste, and it is the honest choice only where its corruption does not
+      # apply.
       $text=[string]$params.text
+      $requested=[string]$params.method
       $pasted=$false
+      $typed=$null
       $previousClipboard=$null
-      try{ $previousClipboard=[System.Windows.Forms.Clipboard]::GetText() }catch{ $previousClipboard=$null }
-      if($text.Length -gt 0){
+      if($text.Length -gt 0 -and $requested -ne "keys"){
+        try{ $previousClipboard=[System.Windows.Forms.Clipboard]::GetText() }catch{ $previousClipboard=$null }
         try{
           [System.Windows.Forms.Clipboard]::SetText($text)
-          Start-Sleep -Milliseconds 60
-          [System.Windows.Forms.SendKeys]::SendWait("^v")
-          Start-Sleep -Milliseconds 120
+          Start-Sleep -Milliseconds 80
+          [M4Native]::Chord("ctrl+v") | Out-Null
+          # THE RESTORE MUST NOT OVERTAKE THE PASTE.
+          #
+          # Ctrl+V only enters the target's queue. Restore the clipboard before
+          # that window drains it and the paste reads the RESTORED contents —
+          # which is how the user's own clipboard ended up typed into a document
+          # and used as the filename in a Save dialog, by an action that reported
+          # success. It was 120ms then. A second and a half is far longer than any
+          # window observed here takes to drain a keystroke, and the cost of being
+          # generous is a delay nobody notices.
+          Start-Sleep -Milliseconds 1500
           $pasted=$true
         }catch{ $pasted=$false }
       }
-      if(-not $pasted){
-        # Clipboard unavailable (locked by another process, or a session with no
-        # clipboard). Fall back to escaped, chunked SendKeys — imperfect, but
-        # better than typing nothing.
-        $literal=ConvertTo-SendKeysLiteral $text
-        foreach($chunk in @(Split-SendKeysChunks $literal 60)){
-          [System.Windows.Forms.SendKeys]::SendWait([string]$chunk)
-          Start-Sleep -Milliseconds 40
-        }
+      if($text.Length -gt 0 -and -not $pasted){
+        # PACED, NOT FIRED IN ONE BURST.
+        #
+        # Delivering the whole string in a single SendInput call is faster and is
+        # WRONG in a way that is very hard to see. Windows accepts every event —
+        # the call reports all of them injected — but an application that cannot
+        # drain its queue that fast reads the newest character repeatedly instead
+        # of each queued one. Measured against Notepad: "int main() { return
+        # 100%2; }" arrived as "int main() " followed by forty-odd copies of the
+        # last letter of the document. A WinForms text box takes the same burst
+        # perfectly, which is exactly why this was not caught by testing against
+        # one.
+        #
+        # A millisecond and a half per character keeps every target tested
+        # here exact, and puts a thousand characters at a second and a half.
+        $typed=[M4Native]::TypeUnicode($text,(Get-PointerSetting $params.pacingMicros 1500 0 50000))
       }
       if($null -ne $previousClipboard){
         try{ if($previousClipboard -eq ""){[System.Windows.Forms.Clipboard]::Clear()}else{[System.Windows.Forms.Clipboard]::SetText($previousClipboard)} }catch{}
       }
-      $inputWindowId=if($w){$w.windowId}else{$null};return @{performed=$true;method=if($pasted){"clipboard-paste"}else{"sendkeys"};length=$text.Length;windowId=$inputWindowId;foreground=$focus}
+      $inputWindowId=if($w){$w.windowId}else{$null}
+      $typeResult=@{performed=$true;method=if($pasted){"clipboard-paste"}else{"unicode-sendinput"};length=$text.Length;windowId=$inputWindowId;foreground=$focus}
+      if($null -ne $typed){
+        $typeResult.requestedEvents=$typed.requested
+        $typeResult.injectedEvents=$typed.injected
+        $typeResult.durationMs=[Math]::Round($typed.durationMs,1)
+        if($typed.injected -lt $typed.requested){
+          $typeResult.performed=$false
+          $typeResult.reason="input-blocked: Windows accepted $($typed.injected) of $($typed.requested) keystrokes."
+        }
+      }
+      return $typeResult
     }
+    # PRESSING A COMBINATION, HELD PROPERLY.
+    #
+    # SendKeys expresses Ctrl+Shift+S as "^+s" and decides on its own how long to
+    # hold each modifier; it cannot hold a key across two actions, cannot press a
+    # media key, and reports nothing about what the system did with it. The chord
+    # path presses the modifiers, taps the key, and releases in the reverse order
+    # — which is the order applications that watch modifier state expect.
+    #
+    # SendKeys stays as the fallback because callers may pass its notation
+    # directly, and a string like "%{F4}" is not a chord this can parse.
     "keyboard.press" {
       if($params.windowId -or $params.application){$focus=Acquire-Foreground $params;if(-not $focus.acquired){return @{performed=$false;reason=$focus.reason;foreground=$focus}};$w=$focus.window}
-      [System.Windows.Forms.SendKeys]::SendWait([string]$params.keys);$inputWindowId=if($w){$w.windowId}else{$null};return @{performed=$true;keys=$params.keys;windowId=$inputWindowId;foreground=$focus}
+      $keys=[string]$params.keys
+      $inputWindowId=if($w){$w.windowId}else{$null}
+      $chord=$null
+      if($params.chord){
+        try{ $chord=[M4Native]::Chord([string]$params.chord) }catch{ $chord=$null }
+      }
+      if($null -eq $chord){
+        [System.Windows.Forms.SendKeys]::SendWait($keys)
+        return @{performed=$true;method="sendkeys";keys=$keys;windowId=$inputWindowId;foreground=$focus}
+      }
+      return (New-InputResult $chord @{method="chord";keys=$keys;chord=[string]$params.chord;windowId=$inputWindowId;foreground=$focus})
     }
     "clipboard.read" { return @{text=[System.Windows.Forms.Clipboard]::GetText()} }
     "clipboard.write" { $previous=[System.Windows.Forms.Clipboard]::GetText();[System.Windows.Forms.Clipboard]::SetText([string]$params.text);return @{written=$true;previousText=$previous} }

@@ -120,6 +120,195 @@ test("an invented tool name is answered with the real list instead of ending the
   assert.match(provider.seen[1].find((message) => message.role === "tool").content, /no tool called/i);
 });
 
+// Live, told "(699, 1186) is outside Restore pages?", the model clicked the same
+// coordinate again, got the same error, and clicked it a third time. Nothing had
+// changed between them, so nothing could.
+test("an identical call that already failed is refused instead of repeated", async () => {
+  let runs = 0;
+  const provider = scriptedProvider([
+    { text: "", toolCalls: [{ name: "run", args: { command: "click there" } }] },
+    { text: "", toolCalls: [{ name: "run", args: { command: "click there" } }] },
+    { text: "Tried something else instead." }
+  ]);
+  const events = [];
+  const agent = new FastAgent({
+    provider,
+    toolset: stubToolset({
+      run: async () => { runs += 1; return { ok: false, text: "(699, 1186) is outside Restore pages?" }; }
+    }),
+    onEvent: (event) => events.push(event)
+  });
+
+  await agent.run("click the field");
+
+  assert.equal(runs, 1, "the second identical call must not reach the machine");
+  const refusal = events.filter((event) => event.type === "TOOL_FINISHED").at(-1);
+  assert.equal(refusal.details.repeated, true);
+  assert.match(refusal.details.output, /already ran exactly this/i);
+  // And the model is told what it failed with, so it can choose a real alternative.
+  assert.match(refusal.details.output, /outside Restore pages/);
+  assert.match(refusal.details.output, /Change something/);
+});
+
+// A REFUSAL THAT NEVER EXPIRES IS A TASK THAT CANNOT RECOVER.
+//
+// Click "Save" — not on screen. Open the File menu. Click "Save" again: refused,
+// "you already ran exactly this and it failed", for a reason that stopped being
+// true when the menu opened. The guard exists to stop a loop of identical
+// attempts with nothing in between, and a successful call in between is exactly
+// what makes the next attempt a different one.
+test("a call that failed can be tried again once something else has worked", async () => {
+  const attempted = [];
+  const provider = scriptedProvider([
+    { text: "", toolCalls: [{ name: "click", args: { text: "Save" } }] },
+    { text: "", toolCalls: [{ name: "menu", args: { open: "File" } }] },
+    { text: "", toolCalls: [{ name: "click", args: { text: "Save" } }] },
+    { text: "Saved." }
+  ]);
+  const agent = new FastAgent({
+    provider,
+    toolset: stubToolset({
+      click: async (args) => {
+        attempted.push("click");
+        // It works once the menu has been opened.
+        return attempted.includes("menu")
+          ? { ok: true, text: "Clicked Save." }
+          : { ok: false, text: 'Nothing on screen is labelled "Save".' };
+      },
+      menu: async () => { attempted.push("menu"); return { ok: true, text: "File menu open." }; }
+    })
+  });
+
+  const outcome = await agent.run("save the file");
+  assert.deepEqual(attempted, ["click", "menu", "click"],
+    "the second Save must reach the machine, because the world changed in between");
+  assert.equal(outcome.status, "COMPLETED");
+});
+
+// A different argument is a different attempt and must still run.
+test("a changed argument is a real second attempt, not a repeat", async () => {
+  let runs = 0;
+  const provider = scriptedProvider([
+    { text: "", toolCalls: [{ name: "run", args: { command: "a" } }] },
+    { text: "", toolCalls: [{ name: "run", args: { command: "b" } }] },
+    { text: "Done." }
+  ]);
+  const agent = new FastAgent({
+    provider,
+    toolset: stubToolset({ run: async () => { runs += 1; return { ok: false, text: "nope" }; } })
+  });
+
+  await agent.run("try twice");
+  assert.equal(runs, 2);
+});
+
+// The narration is shown on its own line; repeating it as the tool's argument
+// rendered rows reading `windows  Checking all open windows to find the...`.
+test("narration is not shown as if it were an argument", async () => {
+  const provider = scriptedProvider([
+    {
+      text: "",
+      toolCalls: [{
+        name: "run",
+        args: { saw: "Port 3000 is held by PID 41292.", say: "Looking up that process.", command: "dir" }
+      }]
+    },
+    { text: "Done." }
+  ]);
+  const events = [];
+  const agent = new FastAgent({
+    provider,
+    toolset: stubToolset({ run: async () => ({ ok: true, text: "ok" }) }),
+    onEvent: (event) => events.push(event)
+  });
+
+  await agent.run("look");
+
+  const started = events.find((event) => event.type === "TOOL_STARTED");
+  assert.deepEqual(started.details.args, { command: "dir" }, "only real arguments reach the tool row");
+
+  // The observation and the intent are carried separately, so the surface can
+  // show what was read as the evidence for what is being done.
+  const said = events.find((event) => event.type === "AGENT_SAYS");
+  assert.equal(said.details.observed, "Port 3000 is held by PID 41292.");
+  assert.equal(said.details.text, "Looking up that process.");
+});
+
+test("every tool asks for the observation as well as the intent", async () => {
+  const { buildToolset: build } = await import("../../packages/fast-agent/src/tools.js");
+  const toolset = build({ registry: { get: () => null }, adapter: {} });
+  for (const definition of toolset.definitions) {
+    const properties = definition.function.parameters.properties;
+    assert.ok(properties.saw, `${definition.function.name} must ask what was observed`);
+    assert.ok(properties.say, `${definition.function.name} must ask what is being done`);
+    assert.match(properties.saw.description, /backward-looking/,
+      "the field must be described backwards, or it gets filled in with a plan");
+    // Left optional, both were dropped on exactly the steps that mattered: `say`
+    // on the first action, when the user is definitely watching, and `saw` on the
+    // steps following a result it had not really read.
+    for (const field of ["saw", "say"]) {
+      assert.ok(definition.function.parameters.required.includes(field),
+        `${definition.function.name} must REQUIRE ${field}; asking for it in the prompt is not enough`);
+    }
+  }
+});
+
+// The user's stop button. A queued sequence of clicks and keystrokes must not
+// keep landing after they have asked it to stop.
+test("stopping takes effect before the next tool runs, not after the queue drains", async () => {
+  const controller = new AbortController();
+  const ran = [];
+  const provider = scriptedProvider([{
+    text: "Working.",
+    toolCalls: [
+      { name: "run", args: { command: "first" } },
+      { name: "run", args: { command: "second" } },
+      { name: "run", args: { command: "third" } }
+    ]
+  }]);
+  const agent = new FastAgent({
+    provider,
+    signal: controller.signal,
+    toolset: stubToolset({
+      run: async (args) => {
+        ran.push(args.command);
+        if (args.command === "first") controller.abort();
+        return { ok: true, text: "ok" };
+      }
+    })
+  });
+
+  const outcome = await agent.run("do three things");
+
+  assert.equal(outcome.status, "CANCELLED");
+  assert.deepEqual(ran, ["first"], "the queued calls after the stop must not run");
+  assert.match(outcome.message, /still in place/);
+});
+
+// Pressing stop aborts the in-flight request, which reaches the loop as a
+// provider error. Reporting "all configured model providers failed" blames the
+// endpoint for something the user did.
+test("stopping is reported as stopping, not as the model provider failing", async () => {
+  const controller = new AbortController();
+  const agent = new FastAgent({
+    signal: controller.signal,
+    toolset: stubToolset({ run: async () => ({ ok: true, text: "ok" }) }),
+    provider: {
+      supportsChat: () => true,
+      async chat() {
+        controller.abort();
+        throw new Error("All configured model providers failed: mistral: This operation was aborted");
+      }
+    }
+  });
+
+  const outcome = await agent.run("something long");
+
+  assert.equal(outcome.status, "CANCELLED");
+  assert.match(outcome.message, /^Stopped\./);
+  assert.doesNotMatch(outcome.message, /providers failed/);
+});
+
 test("the loop stops at its step ceiling and keeps what it already did", async () => {
   const turns = Array.from({ length: 10 }, () => ({ text: "again", toolCalls: [{ name: "run", args: {} }] }));
   const agent = new FastAgent({
@@ -183,7 +372,7 @@ test("a screen reading indexes its elements so a click never needs a guessed coo
     adapter: {}
   });
 
-  const screen = await toolset.execute("screen", {});
+  const screen = await toolset.execute("screen", { application: "the app under test" });
   assert.match(screen.text, /Window: notepad/);
   assert.match(screen.text, /0\| Button "Save" @30,25/);
   assert.match(screen.text, /1\| Edit "Text Editor" @100,90/);
@@ -231,7 +420,7 @@ function calculatorToolset() {
 
 test("the same control seen by both UI Automation and OCR is listed once", async () => {
   const toolset = calculatorToolset();
-  const screen = await toolset.execute("screen", {});
+  const screen = await toolset.execute("screen", { application: "the app under test" });
   const listed = screen.text.match(/^\d+\| /gm) ?? [];
   assert.equal(listed.length, 4, `six raw elements, four real controls, got:\n${screen.text}`);
   assert.equal((screen.text.match(/"Eight"/g) ?? []).length, 1);
@@ -239,7 +428,7 @@ test("the same control seen by both UI Automation and OCR is listed once", async
 
 test("clicking by label lands on that control, whatever its position in the list", async () => {
   const toolset = calculatorToolset();
-  await toolset.execute("screen", {});
+  await toolset.execute("screen", { application: "the app under test" });
   const eight = await toolset.execute("click", { text: "Eight" });
   assert.equal(eight.ok, true);
   assert.match(eight.text, /Clicked at 660,1089/);
@@ -249,7 +438,7 @@ test("clicking by label lands on that control, whatever its position in the list
 
 test("clicking a label that is not on screen refuses rather than clicking the nearest thing", async () => {
   const toolset = calculatorToolset();
-  await toolset.execute("screen", {});
+  await toolset.execute("screen", { application: "the app under test" });
   const result = await toolset.execute("click", { text: "Square root" });
   assert.equal(result.ok, false);
   assert.match(result.text, /Nothing on screen is labelled "Square root"/);
@@ -272,7 +461,7 @@ test("typing into a named field clicks the field, not the text being typed", asy
     adapter: {}
   });
 
-  await toolset.execute("screen", {});
+  await toolset.execute("screen", { application: "the app under test" });
   const typed = await toolset.execute("type", { into: "Password", text: "Username" });
   assert.equal(typed.ok, true);
   assert.deepEqual(

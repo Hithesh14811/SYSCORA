@@ -255,6 +255,18 @@ body {
 #chatInput:focus { outline: none; }
 #sendButton { border-radius: 12px; width: 40px; height: 40px; padding: 0; font-size: 21px; }
 
+/* While a request is running the same button stops it. One control, because the
+   thing you want when it is working is never "send another one" — it is "stop".
+   Square glyph, and it must not read as disabled: it is the most active control
+   on screen at that moment. */
+#sendButton.stopping {
+  background: var(--danger);
+  font-size: 15px;
+  opacity: 1;
+  cursor: pointer;
+}
+#sendButton.stopping:disabled { opacity: 1; cursor: pointer; }
+
 /* The live turn ------------------------------------------------------------
    A turn is a transcript that grows downward while the request runs: the
    agent's own words, then the steps it took with their output, then the answer.
@@ -289,6 +301,17 @@ body {
 .agent-says p { margin: 0 0 6px; line-height: 1.55; }
 .agent-says p:last-child { margin-bottom: 0; }
 .agent-detail { color: var(--muted); font-size: 13.5px; }
+
+/* What it read, as distinct from what it decided. Set back from the action line
+   so the transcript reads as observation-then-response rather than as one
+   undifferentiated stream of assertions. */
+.agent-observed {
+  color: var(--muted);
+  font-size: 13.5px;
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  margin: 0 0 4px;
+}
 
 /* Text still arriving. The caret is the difference between "the agent is
    thinking out loud" and "the agent has stopped mid-sentence". */

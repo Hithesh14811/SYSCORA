@@ -1628,6 +1628,11 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       application: args.application,
       maxElements: args.maxElements ?? 240,
       includeVision: true,
+      // The accessibility tree alone, when the caller says that is enough. The
+      // capture and the OCR over it are the slow half of every look and, for an
+      // application with a real UIA tree, they return the same words a second
+      // time and misread.
+      ...(args.includeOcr === false ? { includeOcr: false } : {}),
       force: true
     });
     if (!snapshot) {
@@ -1684,11 +1689,29 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       && y >= bounds.y && y <= bounds.y + bounds.height;
 
     if (windowId || application) {
-      const named = windows.map(identify).find((window) =>
-        (windowId && window.windowId === String(windowId)) ||
-        (application && String(window.processName ?? "").toLowerCase() === String(application).toLowerCase()) ||
-        (application && String(window.title ?? "").toLowerCase().includes(String(application).toLowerCase()))
-      );
+      // A SPECIFIC IDENTIFIER MUST BEAT A VAGUE ONE.
+      //
+      // This was one `find` over an OR of windowId, process name and title, so it
+      // returned whichever window came first in z-order and matched ANY clause —
+      // and a process name matches every window that application has open. With
+      // an Avast "Restore pages?" dialog sitting in front of the Google Flights
+      // window, every click on the flights page was validated against the dialog,
+      // 720x372 in the corner, and refused as "outside the window". The exact
+      // windowId naming the right window was in the same call, and lost to the
+      // process name because the process name was tested on an earlier window.
+      //
+      // So: the handle decides when there is one. Only when there is not does the
+      // application name get consulted, and then the window actually under the
+      // point wins over the first one that happens to share the name.
+      const identified = windows.map(identify);
+      const appMatches = application
+        ? identified.filter((window) =>
+            String(window.processName ?? "").toLowerCase() === String(application).toLowerCase() ||
+            String(window.title ?? "").toLowerCase().includes(String(application).toLowerCase()))
+        : [];
+      const named = (windowId && identified.find((window) => window.windowId === String(windowId)))
+        || appMatches.find((window) => contains(window.bounds))
+        || appMatches[0];
       if (!named) throw new Error(`No live window matches ${windowId ?? application}`);
       if (!contains(named.bounds)) {
         throw new Error(
@@ -2643,7 +2666,10 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
         application: { type: "string" },
         maxElements: { type: "number" },
         // Full text can be long; the caller may ask for only the elements.
-        includeText: { type: "boolean" }
+        includeText: { type: "boolean" },
+        // Skip the capture and the OCR over it entirely — the accessibility tree
+        // alone. Roughly halves the time a look costs.
+        includeOcr: { type: "boolean" }
       },
       required: []
     },
@@ -2709,19 +2735,25 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       },
       required: ["x", "y"]
     },
+    // A DOUBLE CLICK IS ONE ACTION, NOT TWO CLICKS.
+    //
+    // It used to be two separate host requests, and Windows only counts two
+    // clicks as a double click when they arrive inside the user's double-click
+    // interval — 500ms by default, and configurable down to about 200. Two round
+    // trips through the host, each of which may also re-acquire the foreground,
+    // is not reliably inside that, and when it is not, the application receives
+    // two single clicks: the file gets selected twice instead of opening, and
+    // nothing reports a problem. The host now delivers both clicks in one call,
+    // spaced by the interval Windows itself reports.
     execute: async (args) => {
       const window = await resolveWindowContaining(args);
       const result = await adapter.pointerAction("click", {
         windowId: window.windowId,
         x: Math.round(args.x),
         y: Math.round(args.y),
-        button: args.button ?? "left"
+        button: args.button ?? "left",
+        clicks: args.doubleClick === true ? 2 : 1
       });
-      if (args.doubleClick === true) {
-        await adapter.pointerAction("click", {
-          windowId: window.windowId, x: Math.round(args.x), y: Math.round(args.y), button: args.button ?? "left"
-        });
-      }
       return { ...result, window, x: Math.round(args.x), y: Math.round(args.y) };
     },
     modality: ExecutionModality.VISION_GUI, permissionType: "WRITE",
@@ -2785,6 +2817,54 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
       });
     },
     modality: ExecutionModality.VISION_GUI, permissionType: "WRITE", resources: ["desktop"], detectedChanges: ["application.ui"]
+  });
+  // DRAWING, AS OPPOSED TO DRAGGING.
+  //
+  // pointer.drag can only express a straight line, so every curve had to be
+  // spelled as a series of drags — and the button comes up between drags. A
+  // circle asked for that way arrives as disconnected chords, each a separate
+  // entry in the application's undo stack. This carries the whole figure as one
+  // path: the button goes down once, visits every point, and comes up at the
+  // end. `paths` draws several such strokes in one call, which is what a figure
+  // that lifts the pen needs.
+  //
+  // The coordinates are checked against a window that exists right now, exactly
+  // as pointer.clickAt checks a click, so a path invented out of nothing lands
+  // nowhere rather than somewhere.
+  registerM4Primitive({
+    name: "pointer.stroke",
+    description:
+      "Draw or drag along a continuous path with the button held down. Give `paths` as arrays of " +
+      "interleaved x,y screen coordinates. Use this for anything drawn rather than clicked — a shape on a " +
+      "canvas, a signature, a lasso selection, a gesture.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        paths: { type: "array", items: { type: "array", items: { type: "number" } } },
+        windowId: { type: "string" }, application: { type: "string" },
+        button: { type: "string", enum: ["left", "right", "middle"] },
+        pacingMicros: { type: "number" }
+      },
+      required: ["paths"]
+    },
+    execute: async (args) => {
+      const paths = (args.paths ?? []).map((path) => path.map((value) => Math.round(Number(value))));
+      if (paths.length === 0 || paths.some((path) => path.length < 4 || path.some((value) => !Number.isFinite(value)))) {
+        throw new Error("Every path needs at least two points, given as finite interleaved x,y coordinates.");
+      }
+      const window = await resolveWindowContaining({
+        x: paths[0][0], y: paths[0][1], windowId: args.windowId ?? null, application: args.application ?? null
+      });
+      const result = await adapter.pointerStroke({
+        paths,
+        windowId: window.windowId,
+        button: args.button ?? "left",
+        ...(Number.isFinite(Number(args.pacingMicros)) ? { pacingMicros: Number(args.pacingMicros) } : {})
+      });
+      return { ...result, window };
+    },
+    modality: ExecutionModality.VISION_GUI, permissionType: "WRITE",
+    resources: ["desktop"], detectedChanges: ["application.ui"]
   });
   registerM4Primitive({
     name: "keyboard.type",

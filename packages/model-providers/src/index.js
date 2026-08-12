@@ -200,6 +200,21 @@ export async function openAiCompatibleChat({
       }
     }
     await reader.cancel().catch(() => {});
+    // A CUT CONNECTION IS NOT A FINISHED ANSWER.
+    //
+    // If the socket drops mid-turn, this loop simply ends: whatever prose had
+    // arrived is returned, with no tool calls, and the agent loop reads a turn
+    // with no tool calls as the model having finished — so a task that was
+    // interrupted halfway through was reported to the user as complete, in the
+    // model's own confident half-sentence. The endpoint this runs against drops
+    // connections intermittently, so this is an ordinary Tuesday, not an edge
+    // case. `[DONE]` or a finish_reason is what finished looks like; anything
+    // else is a transport failure, and the caller already retries those.
+    if (!done && !finishReason) {
+      const error = new Error("The model stream ended before the turn was complete (connection dropped).");
+      error.status = 503;
+      throw error;
+    }
     const toolCalls = [...pending.entries()]
       .sort(([left], [right]) => Number(left) - Number(right))
       .map(([key, call], index) => ({
@@ -512,6 +527,14 @@ export class FailoverModelProvider extends LanguageModelProvider {
   async chat(request = {}) {
     const errors = [];
     for (let offset = 0; offset < this.providers.length; offset += 1) {
+      // STOP MEANS STOP, INCLUDING HERE.
+      //
+      // Pressing stop aborts the in-flight request, which arrives here as a
+      // provider failure — and failover's job is to answer a provider failure by
+      // trying the next provider. So one stop press sent a fresh request to
+      // every other configured account in turn, each of which was aborted on
+      // arrival, and the user paid for all of them.
+      if (request.signal?.aborted) break;
       const index = (this.activeProviderIndex + offset) % this.providers.length;
       const provider = this.providers[index];
       if (!provider.supportsChat?.()) continue;
@@ -524,9 +547,11 @@ export class FailoverModelProvider extends LanguageModelProvider {
         this.lastRequestProvider = provider;
         return result;
       } catch (error) {
+        if (request.signal?.aborted) throw error;
         errors.push(`${provider.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    if (request.signal?.aborted) throw new Error("Cancelled");
     throw new Error(`All configured model providers failed: ${errors.join("; ")}`);
   }
 
@@ -914,16 +939,21 @@ export class MistralModelProvider extends LanguageModelProvider {
     this.name = "mistral";
   }
 
-  // Widen the spacing after a rate limit, and narrow it back once the account
-  // demonstrably has room again. Without the second half, a single busy second
-  // early in a session permanently slows every request after it — which is what
-  // a live probe measured: median latency went from 6.6s to 43s because the
-  // interval ratcheted to its ceiling on the third request and stayed there.
+  // NO PRE-EMPTIVE SPACING. Retained as a no-op so the structured path below,
+  // which still calls it, keeps working unchanged.
+  //
+  // This used to ratchet a delay onto EVERY subsequent request after a single
+  // 429 — up to four seconds, applied silently before each call, decaying only
+  // after three consecutive successes. So one busy moment taxed the rest of the
+  // session, invisibly: the user saw ten seconds of nothing before the first
+  // command of a task ran and had no way to know why, because the delay was
+  // self-imposed and nothing reported it.
+  //
+  // It was guarding against a limit the account may not even be near. A real 429
+  // is cheap to detect and is handled where it happens; guessing at one in
+  // advance costs every request that would never have been limited.
   _widenAfterRateLimit() {
     this._callsSinceRateLimit = 0;
-    // Starting from zero, multiplying stays at zero — so the first rate limit
-    // establishes a floor to widen from.
-    this.minRequestIntervalMs = Math.min(4000, Math.max(this.minRequestIntervalMs, 1000) * 1.5);
   }
 
   _narrowAfterSuccess() {
@@ -979,9 +1009,19 @@ export class MistralModelProvider extends LanguageModelProvider {
   // here rather than surfacing as a failed step mid-task.
   async chat(request = {}) {
     this._usage.calls += 1;
-    let rateLimitRetries = request.rateLimitRetries ?? 3;
+    // A throttled account is the commonest reason a long task dies half-finished,
+    // and it dies for want of patience measured in seconds. Six attempts backing
+    // off 2s, 4s, 8s, 16s, 30s costs a minute in the worst case and turns "this
+    // failed" into "this was slow" — which, mid-task with a window already open
+    // and half the work done, is an entirely different outcome.
+    //
+    // It cannot rescue an exhausted quota, and it does not pretend to: after the
+    // last attempt the 429 is thrown and reported as what it is.
+    // No pre-emptive spacing: this goes out immediately, every time. The only
+    // waiting that ever happens is in response to a 429 the server actually sent.
+    let rateLimitRetries = request.rateLimitRetries ?? 6;
+    let backoffMs = 2000;
     for (;;) {
-      await this._awaitRequestSlot();
       try {
         const result = await openAiCompatibleChat({
           baseUrl: this.baseUrl,
@@ -998,7 +1038,12 @@ export class MistralModelProvider extends LanguageModelProvider {
         if (error?.status === 429 && rateLimitRetries > 0) {
           rateLimitRetries -= 1;
           this._widenAfterRateLimit();
-          const waitMs = Math.min(error.retryAfterMs ?? 1500, 10000);
+          // The server's own number when it gives one; otherwise back off
+          // exponentially. A flat 1.5s retried three times is six seconds of
+          // patience, which is not enough to outlast anything but the mildest
+          // per-second throttle.
+          const waitMs = error.retryAfterMs ?? backoffMs;
+          backoffMs = Math.min(backoffMs * 2, 30000);
           // Being throttled is the single largest unexplained pause a user can
           // see mid-task, and without this it is indistinguishable from the
           // agent having stopped. Say so rather than going quiet for ten seconds.
@@ -1172,7 +1217,7 @@ export class GeminiModelProvider extends LanguageModelProvider {
   }
 
   capabilities() {
-    return { name: this.name, structured: true, text: true, streaming: false, tools: true, model: this.model, remote: true };
+    return { name: this.name, structured: true, text: true, streaming: true, tools: true, model: this.model, remote: true };
   }
 
   supportsChat() { return Boolean(this.apiKey); }
@@ -1195,25 +1240,91 @@ export class GeminiModelProvider extends LanguageModelProvider {
     return extractJson(text);
   }
 
+  // THE MODEL HAS TO SEE ITS OWN TOOL CALLS.
+  //
+  // The conversation the loop keeps is in OpenAI's shape: an assistant message
+  // carrying `tool_calls`, then one `tool` message per result. Gemini's shape is
+  // a `functionCall` part from the model and a `functionResponse` part back.
+  // Mapping every non-system message to a plain text part — which is what this
+  // did — dropped the assistant's calls entirely and handed the results back as
+  // if the USER had typed them.
+  //
+  // What Gemini then saw was: a request, an empty model turn, and a stranger
+  // reciting "Clicked at 640,400." It had no record of having acted, so at every
+  // step it was deciding from scratch, and the obvious thing to do next was the
+  // thing it had just done. This is the primary provider.
+  static _toGeminiContents(messages) {
+    const contents = [];
+    // Which tool each call id belongs to, so a result can be sent back under
+    // the name of the function it came from. Gemini matches on the name.
+    const callNames = new Map();
+    for (const message of messages) {
+      if (message.role === "system") continue;
+      const text = typeof message.content === "string" ? message.content : "";
+      if (message.role === "tool") {
+        const name = callNames.get(message.tool_call_id) ?? "tool";
+        contents.push({
+          role: "user",
+          parts: [{ functionResponse: { name, response: { result: text } } }]
+        });
+        continue;
+      }
+      if (message.role === "assistant") {
+        const parts = [];
+        if (text.trim()) parts.push({ text });
+        for (const call of message.tool_calls ?? []) {
+          const name = call.function?.name ?? call.name ?? "";
+          if (!name) continue;
+          if (call.id) callNames.set(call.id, name);
+          let args = {};
+          try { args = JSON.parse(call.function?.arguments ?? call.arguments ?? "{}"); } catch { args = {}; }
+          parts.push({ functionCall: { name, args } });
+        }
+        // A turn with neither prose nor calls has nothing in it; Gemini rejects
+        // an empty parts array.
+        if (parts.length > 0) contents.push({ role: "model", parts });
+        continue;
+      }
+      if (text) contents.push({ role: "user", parts: [{ text }] });
+    }
+    return contents;
+  }
+
   async chat(request = {}) {
     this._usage.calls += 1;
     const messages = Array.isArray(request.messages) ? request.messages : [];
     const systemText = messages.filter((message) => message.role === "system").map((message) => String(message.content ?? "")).join("\n");
-    const contents = messages.filter((message) => message.role !== "system").map((message) => ({
-      role: message.role === "assistant" ? "model" : "user",
-      parts: [{ text: typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "") }]
-    }));
+    const contents = GeminiModelProvider._toGeminiContents(messages);
     const declarations = (request.tools ?? []).map((tool) => tool.function).filter(Boolean).map((fn) => ({
       name: fn.name,
       description: fn.description,
       parametersJsonSchema: fn.parameters ?? { type: "object", properties: {} }
     }));
-    const result = await this._request({
+    const body = {
       ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
       contents,
       ...(declarations.length ? { tools: [{ functionDeclarations: declarations }] } : {}),
-      generationConfig: { maxOutputTokens: request.maxTokens ?? this.maxTokens }
-    }, request);
+      generationConfig: {
+        maxOutputTokens: request.maxTokens ?? this.maxTokens,
+        ...(Number.isFinite(Number(request.temperature)) ? { temperature: Number(request.temperature) } : {})
+      }
+    };
+    // Streamed, because the first sentence reaching the screen in under a second
+    // is the whole point of this loop, and `:generateContent` holds everything
+    // back until the turn is complete. A stream that fails falls back to the
+    // single-shot call rather than failing the step.
+    if (typeof request.onTextDelta === "function") {
+      try {
+        return await this._streamContent(body, request);
+      } catch (error) {
+        if (request.signal?.aborted) throw error;
+      }
+    }
+    const result = await this._request(body, request);
+    return this._readCandidate(result, request);
+  }
+
+  _readCandidate(result, request) {
     const usage = result.usageMetadata ?? {};
     this._usage.tokensIn += usage.promptTokenCount ?? 0;
     this._usage.tokensOut += usage.candidatesTokenCount ?? 0;
@@ -1226,6 +1337,80 @@ export class GeminiModelProvider extends LanguageModelProvider {
       arguments: JSON.stringify(part.functionCall.args ?? {})
     }));
     return { text, toolCalls, finishReason: result.candidates?.[0]?.finishReason ?? null, usage };
+  }
+
+  async _streamContent(body, { timeoutMs = 60000, signal = null, onTextDelta = null } = {}) {
+    if (!this.apiKey) throw new Error("No Gemini API key");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const onOuterAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener("abort", onOuterAbort, { once: true });
+    }
+    try {
+      const response = await fetch(
+        `${this.baseUrl}/models/${encodeURIComponent(this.model)}:streamGenerateContent?alt=sse`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": this.apiKey },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        }
+      );
+      if (!response.ok || !response.body) {
+        let detail = "";
+        try { const text = await response.text(); detail = text ? `: ${text.slice(0, 300)}` : ""; } catch { /* status is enough */ }
+        const error = new Error(`HTTP ${response.status}${detail}`);
+        error.status = response.status;
+        throw error;
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let text = "";
+      let finishReason = null;
+      let usage = null;
+      const toolCalls = [];
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf("\n");
+        while (boundary !== -1) {
+          const line = buffer.slice(0, boundary).trim();
+          buffer = buffer.slice(boundary + 1);
+          boundary = buffer.indexOf("\n");
+          if (!line.startsWith("data:")) continue;
+          let chunk;
+          try { chunk = JSON.parse(line.slice(5).trim()); } catch { continue; }
+          if (chunk.usageMetadata) usage = chunk.usageMetadata;
+          const candidate = chunk.candidates?.[0];
+          if (!candidate) continue;
+          if (candidate.finishReason) finishReason = candidate.finishReason;
+          for (const part of candidate.content?.parts ?? []) {
+            if (typeof part.text === "string" && part.text) {
+              text += part.text;
+              onTextDelta?.(part.text);
+            }
+            if (part.functionCall) {
+              toolCalls.push({
+                id: `gemini_call_${toolCalls.length}`,
+                name: part.functionCall.name,
+                arguments: JSON.stringify(part.functionCall.args ?? {})
+              });
+            }
+          }
+        }
+      }
+      await reader.cancel().catch(() => {});
+      this._usage.tokensIn += usage?.promptTokenCount ?? 0;
+      this._usage.tokensOut += usage?.candidatesTokenCount ?? 0;
+      return { text, toolCalls: toolCalls.filter((call) => call.name), finishReason, usage };
+    } finally {
+      clearTimeout(timeout);
+      if (signal) signal.removeEventListener?.("abort", onOuterAbort);
+    }
   }
 }
 

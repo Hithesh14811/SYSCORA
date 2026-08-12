@@ -162,6 +162,23 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         return;
       }
 
+      // Stop a running request. Deliberately its own route rather than the
+      // session pause/cancel machinery: this is the user pressing stop on a
+      // thing they can see running, and it must take effect now — abort the
+      // in-flight model call and let the loop settle on what it already did.
+      const stopMatch = requestUrl.pathname.match(/^\/api\/intents\/([^/]+)\/stop$/);
+      if (request.method === "POST" && stopMatch) {
+        const [, sessionId] = stopMatch;
+        const run = intentRuns.get(sessionId);
+        if (!run) {
+          sendJson(response, 404, { error: "Unknown intent session." });
+          return;
+        }
+        run.canceller?.abort(new Error("STOPPED_BY_USER"));
+        sendJson(response, 202, { sessionId, stopping: true, settled: run.settled });
+        return;
+      }
+
       const progressMatch = requestUrl.pathname.match(/^\/api\/intents\/([^/]+)\/(status|stream)$/);
       if (request.method === "GET" && progressMatch) {
         const [, sessionId, channel] = progressMatch;
@@ -259,11 +276,16 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         let rejectStarted;
         let submittedSessionId = null;
         const started = new Promise((resolve, reject) => { resolveStarted = resolve; rejectStarted = reject; });
+        // The user's stop button. Held against the run so POST .../stop can
+        // reach the agent loop mid-step; the loop checks it between steps and
+        // the in-flight model request is aborted with it.
+        const canceller = new AbortController();
         const runPromise = Promise.resolve(runtime.submitIntent(payload.text, {
           ...runOptions,
+          signal: canceller.signal,
           onSessionStarted: (sessionId) => {
             submittedSessionId = sessionId;
-            ensureRun(sessionId);
+            ensureRun(sessionId).canceller = canceller;
             resolveStarted(sessionId);
           }
         }));
