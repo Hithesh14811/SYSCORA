@@ -163,6 +163,12 @@ const VERB = [
 
 // The agent loop's tools are already named the way a person would name them, so
 // these are just the past tense.
+// A TOOL MISSING FROM HERE IS RENDERED "Ran a step".
+//
+// Which is worse than it sounds: the transcript exists so the user can follow
+// what is happening, and four of the loop's verbs — including the two that draw
+// and the one that does everything at once — showed up as an anonymous row.
+// Every entry the loop adds needs a line here.
 const TOOL_VERB = {
   run: "Ran",
   screen: "Looked at the screen",
@@ -170,16 +176,28 @@ const TOOL_VERB = {
   type: "Typed",
   key: "Pressed",
   scroll: "Scrolled",
+  drag: "Dragged",
+  draw: "Drew",
   move_mouse: "Moved the pointer",
   launch: "Opened",
+  new_document: "Started a new document",
   open_url: "Opened a page",
   windows: "Listed the windows",
   focus: "Focused a window",
   window_state: "Adjusted a window",
+  close_app: "Closed",
   read_file: "Read a file",
   write_file: "Wrote a file",
+  edit_file: "Edited a file",
   clipboard: "Used the clipboard",
   play_music: "Played",
+  volume: "Set the volume",
+  web_open: "Opened a page",
+  web_read: "Read the page",
+  web_click: "Clicked on the page",
+  web_type: "Typed on the page",
+  web_scroll: "Scrolled the page",
+  batch: "Ran several steps",
   wait: "Waited"
 };
 

@@ -27,6 +27,14 @@ export function loadModelConfig(basePath = process.cwd()) {
     fileConfig = {};
   }
 
+  const fallbackProviderConfigs = Array.isArray(fileConfig.fallbackProviderConfigs)
+    ? fileConfig.fallbackProviderConfigs.map((fallback) => (
+      fallback?.apiKeyFromExistingConfig
+        ? { ...fallback, apiKey: fileConfig.apiKey }
+        : fallback
+    ))
+    : [];
+
   return {
     // LLM_* is the vendor-neutral spelling used by most local .env files and by
     // the provider dashboards themselves, so it is accepted alongside the
@@ -37,6 +45,7 @@ export function loadModelConfig(basePath = process.cwd()) {
       process.env.SYSCORA_MODEL_API_KEY ||
       process.env.LLM_API_KEY ||
       process.env.AGENTROUTER_API_KEY ||
+      fileConfig.primaryApiKey ||
       fileConfig.apiKey ||
       null,
     apiKeys: (() => {
@@ -63,9 +72,7 @@ export function loadModelConfig(basePath = process.cwd()) {
     ),
     fallbackProviders:
       process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS || fileConfig.fallbackProviders || "",
-    fallbackProviderConfigs: Array.isArray(fileConfig.fallbackProviderConfigs)
-      ? fileConfig.fallbackProviderConfigs
-      : [],
+    fallbackProviderConfigs,
     externalAIConsent: {
       scopes: String(
         process.env.SYSCORA_EXTERNAL_AI_CONSENT_SCOPES ||

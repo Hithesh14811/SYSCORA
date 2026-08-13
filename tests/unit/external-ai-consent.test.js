@@ -87,7 +87,15 @@ test("provider switching and failover cannot bypass sanitization", async () => {
     { externalAI: { dataCategories: [Category.SANITIZED_TASK_TEXT] } }
   );
   assert.equal(received.length, 2);
-  assert.ok(received.every((prompt) => !/SUPERSECRET|private-user/.test(prompt)));
+  // The credential must not reach either provider — that is what this guards.
+  assert.ok(received.every((prompt) => !/SUPERSECRET/.test(prompt)),
+    "a key must not survive a failover to a second provider");
+  // The PATH deliberately does survive. Rewriting the home directory to the
+  // literal "%USERPROFILE%" meant the agent was handed a string PowerShell
+  // cannot expand, so it echoed it back and every file operation resolved
+  // against the wrong directory. A home directory is not a credential.
+  assert.ok(received.every((prompt) => /C:\\Users\\private-user\\notes\.txt/.test(prompt)),
+    "the agent has to receive a usable path or it cannot open the file");
   assert.deepEqual(
     guarded.getExternalRequestProvenance().map((record) => record.provider),
     ["primary", "fallback"]

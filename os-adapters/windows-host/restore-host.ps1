@@ -1317,7 +1317,45 @@ function Invoke-BoundedStroke([int[]]$path, [string]$button, [int]$pacingMicros,
   return [M4Native]::Stroke($path, $button, $pacingMicros, $settleMicros, $group, $true, $true)
 }
 
+# THE RESTORE HAS TO HAPPEN AFTER THE PASTE, NOT BEFORE THE CALL RETURNS.
+#
+# Typing goes through the clipboard because it is the only method that arrives
+# exactly in real editors, and the clipboard has to be given back to the user
+# afterwards. Restoring it too early is not cosmetic: Ctrl+V only enters the
+# target's message queue, so a restore that overtakes it means THE PASTE READS
+# THE RESTORED CLIPBOARD — live, that put the contents of the user's clipboard
+# into a document and used it as a filename in a Save dialog.
+#
+# The fix for that was to sleep 1.5 seconds before restoring, and it worked. It
+# also charged a second and a half to every single line of text typed, in a
+# product whose main complaint is that it feels slow, and the wait was pure
+# dead time: nothing was being done with it.
+#
+# Deferring costs nothing and is just as safe. The restore is held and performed
+# at the START of the next operation, which is at minimum a network round trip
+# and a model decision away — far longer than the wait it replaces — so it still
+# cannot overtake the paste. It is also flushed before any operation that reads
+# or writes the clipboard, and before the next paste, so nothing observes the
+# clipboard mid-borrow.
+$script:PendingClipboardRestore = $null
+$script:PendingClipboardRestoreAt = 0
+
+function Flush-ClipboardRestore {
+  if ($null -eq $script:PendingClipboardRestore) { return }
+  # However long the caller took, the paste has had at least this much; top it
+  # up on the rare occasion two operations arrive back to back.
+  $elapsed = [Environment]::TickCount - $script:PendingClipboardRestoreAt
+  if ($elapsed -lt 1500) { Start-Sleep -Milliseconds (1500 - $elapsed) }
+  $value = $script:PendingClipboardRestore
+  $script:PendingClipboardRestore = $null
+  try {
+    if ($value -eq "") { [System.Windows.Forms.Clipboard]::Clear() }
+    else { [System.Windows.Forms.Clipboard]::SetText($value) }
+  } catch {}
+}
+
 function Invoke-Operation($operation, $params) {
+  Flush-ClipboardRestore
   switch ($operation) {
     "host.health" { return @{ ok=$true; pid=$PID; protocol="m4-windows-host/1"; sta=([Threading.Thread]::CurrentThread.ApartmentState.ToString()); inputEngine="SendInput"; dpiAwareness=$script:DpiMode } }
     "window.enumerate" { return @{ windows=(Get-WindowList) } }
@@ -1503,16 +1541,15 @@ function Invoke-Operation($operation, $params) {
           [System.Windows.Forms.Clipboard]::SetText($text)
           Start-Sleep -Milliseconds 80
           [M4Native]::Chord("ctrl+v") | Out-Null
-          # THE RESTORE MUST NOT OVERTAKE THE PASTE.
+          # THE RESTORE MUST NOT OVERTAKE THE PASTE — see Flush-ClipboardRestore.
           #
           # Ctrl+V only enters the target's queue. Restore the clipboard before
-          # that window drains it and the paste reads the RESTORED contents —
-          # which is how the user's own clipboard ended up typed into a document
-          # and used as the filename in a Save dialog, by an action that reported
-          # success. It was 120ms then. A second and a half is far longer than any
-          # window observed here takes to drain a keystroke, and the cost of being
-          # generous is a delay nobody notices.
-          Start-Sleep -Milliseconds 1500
+          # that window drains it and the paste reads the RESTORED contents, which
+          # is how the user's own clipboard ended up typed into a document and
+          # used as the filename in a Save dialog, by an action that reported
+          # success. This used to be paid for with a 1.5s sleep in the middle of
+          # every single type; it is now held and done at the start of the next
+          # operation, which is always further away than that.
           $pasted=$true
         }catch{ $pasted=$false }
       }
@@ -1534,7 +1571,11 @@ function Invoke-Operation($operation, $params) {
         $typed=[M4Native]::TypeUnicode($text,(Get-PointerSetting $params.pacingMicros 1500 0 50000))
       }
       if($null -ne $previousClipboard){
-        try{ if($previousClipboard -eq ""){[System.Windows.Forms.Clipboard]::Clear()}else{[System.Windows.Forms.Clipboard]::SetText($previousClipboard)} }catch{}
+        # Held, not done now. The next operation flushes it, by which time the
+        # target has had far longer to drain the Ctrl+V than the sleep this
+        # replaces ever gave it.
+        $script:PendingClipboardRestore = $previousClipboard
+        $script:PendingClipboardRestoreAt = [Environment]::TickCount
       }
       $inputWindowId=if($w){$w.windowId}else{$null}
       $typeResult=@{performed=$true;method=if($pasted){"clipboard-paste"}else{"unicode-sendinput"};length=$text.Length;windowId=$inputWindowId;foreground=$focus}

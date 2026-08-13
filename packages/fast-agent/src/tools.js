@@ -135,9 +135,180 @@ function renderElements(elements, table) {
   for (const [index, { element, text, center }] of candidates.entries()) {
     if (!shown.has(index)) continue;
     const role = String(element.role ?? element.controlType ?? "").replace(/^ControlType\./, "");
+    // A NAMELESS CONTAINER IS A LINE OF TOKENS THAT SAYS NOTHING.
+    //
+    // Live readings were full of `group @815,638`, `pane @1008,327`,
+    // `group @1820,326` — layout boxes with no label, which cannot be clicked
+    // by name and mean nothing to a reader. Spotify's reading carried a dozen of
+    // them, and every one is paid for again on every later step of the task.
+    // They stay in the TABLE, so an index still resolves; they are simply not
+    // read out.
+    if (!text && STRUCTURAL_ROLES.test(role)) continue;
     lines.push(`${index}| ${role}${text ? ` "${text.slice(0, 80)}"` : ""} @${center.x},${center.y}${element.enabled === false ? " (disabled)" : ""}`);
   }
   return lines;
+}
+
+// YOU ARE ALREADY IN POWERSHELL.
+//
+// `run` spawns `powershell.exe -Command <line>`. When the model writes
+// `powershell -Command "... $_.WorkingSet ..."`, the OUTER shell parses that
+// line first — and a double-quoted string is interpolated, so `$_` (empty
+// outside a pipeline) and `$ramMB` (not yet defined) are replaced with nothing
+// before the inner powershell.exe ever starts. What arrives is
+// `[math]::Round(.WorkingSet / 1MB, 2)`, which is a syntax error.
+//
+// Live, that ate eight consecutive commands on "what's using the most RAM" and
+// two more on a calculation, each failing with a parser error about a token the
+// model never wrote — so it could not learn anything from the error and kept
+// rewriting a command that was already correct. The wrapper is redundant in
+// every case, so it is removed rather than explained.
+// Leading flags are consumed lazily — `-NoProfile`, `-ExecutionPolicy Bypass`
+// and anything else — up to the `-Command`/`-c` whose quoted argument runs to
+// the end of the line.
+const NESTED_POWERSHELL = /^\s*(?:powershell|pwsh)(?:\.exe)?\s+(?:\S+\s+)*?-(?:command|c)\s+(['"])([\s\S]+)\1\s*$/i;
+
+export function unwrapNestedShell(command) {
+  let current = String(command ?? "");
+  // Twice at most: `powershell -c "powershell -c '...'"` is rare but the loop
+  // must terminate regardless of what arrives.
+  for (let depth = 0; depth < 2; depth += 1) {
+    const match = NESTED_POWERSHELL.exec(current);
+    if (!match) break;
+    current = match[2];
+  }
+  return current;
+}
+
+// CMD IS NOT POWERSHELL, AND THE COLLISIONS ARE SILENT.
+//
+// `where python` returned exit 0 and NOTHING, four times in a row, because in
+// PowerShell `where` is an alias for Where-Object — it read nothing from an
+// empty pipeline and succeeded. An empty success is the worst possible answer:
+// the model cannot tell it from "python is not on the PATH", so it asked again.
+// `sort` is Sort-Object the same way, and `%PATH%` and `&&` are cmd syntax that
+// Windows PowerShell rejects outright.
+//
+// `where.exe` is what was meant every time; the rest are named in the result so
+// the error says what is actually wrong instead of a parser complaint.
+const CMD_BUILTIN_ALIAS = /(^|[;|&(]\s*)(where|sort)(\s+(?!-|\$|\{))/gi;
+
+export function repairCmdIsms(command) {
+  const notes = [];
+  let repaired = String(command ?? "").replace(CMD_BUILTIN_ALIAS, (whole, lead, name, tail) => {
+    notes.push(`\`${name}\` is PowerShell's ${name === "where" ? "Where-Object" : "Sort-Object"} alias, not cmd's — ran \`${name}.exe\` instead.`);
+    return `${lead}${name}.exe${tail}`;
+  });
+  if (/%\w+%/.test(repaired)) {
+    notes.push("`%VAR%` is cmd syntax; in PowerShell an environment variable is `$env:VAR`.");
+  }
+  if (/&&|\|\|/.test(repaired)) {
+    notes.push("`&&` and `||` are not valid in Windows PowerShell 5.1 — separate the commands with `;`.");
+  }
+  return { command: repaired, notes };
+}
+
+// Commands whose whole purpose is to keep running. Not an exhaustive list and
+// it does not need to be — it is a default for the obvious cases, and
+// `background: true` states it explicitly for everything else.
+const KEEPS_RUNNING = /(^|[\s;&|])(jupyter(\s+(notebook|lab|console))?|npm\s+(run\s+)?(dev|start|serve|watch)|yarn\s+(dev|start)|pnpm\s+(dev|start)|vite|next\s+dev|ng\s+serve|flask\s+run|streamlit\s+run|uvicorn|gunicorn|rails\s+s(erver)?|php\s+-S|http-server|serve\b|ngrok|docker\s+compose\s+up(?!\s+-d)|tensorboard)\b/i;
+
+// IS THERE ANYTHING IN THIS READING BUT THE WINDOW FRAME?
+//
+// A raw element count is the wrong question, and getting it wrong blinded the
+// agent completely: WhatsApp's accessibility tree publishes its window, an input
+// sink, a title bar and three caption buttons — SIX elements, none of which is
+// the application — and a "fewer than six means fall back to pixels" test let
+// that through as a usable reading. The agent looked at WhatsApp four times,
+// saw Minimize/Restore/Close, waited, looked again, and gave up on a window
+// with a hundred and thirty-eight chats on screen.
+//
+// What matters is whether anything in there belongs to the APPLICATION rather
+// than to the window: named, non-structural, and not the caption bar. When that
+// comes back near-empty the tree is a shell and the pixels are worth their three
+// seconds.
+const MIN_APPLICATION_ELEMENTS = 8;
+
+export function hasUsableContent(elements) {
+  let usable = 0;
+  for (const element of elements ?? []) {
+    const text = String(element.text ?? element.name ?? "").trim();
+    const role = String(element.role ?? element.controlType ?? "").replace(/^ControlType\./, "");
+    if (!text) continue;
+    if (STRUCTURAL_ROLES.test(role)) continue;
+    if (CHROME_FURNITURE.test(text)) continue;
+    usable += 1;
+    if (usable >= MIN_APPLICATION_ELEMENTS) return true;
+  }
+  return false;
+}
+
+// Scripts the Windows OCR engine will not recognise unless that language pack is
+// installed. `TryCreateFromUserProfileLanguages()` builds the recogniser from
+// what the profile actually has, so on an ordinary English machine these come
+// back as empty space rather than as wrong words — which is the harder failure,
+// because empty space looks exactly like nothing having been typed.
+const UNREADABLE_SCRIPT =
+  /[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯֐-׿؀-ۿऀ-ॿঀ-৿஀-௿ఀ-౿ಀ-೿ഀ-ൿ฀-๿]/;
+
+export function hasUnreadableScript(text) {
+  return UNREADABLE_SCRIPT.test(String(text ?? ""));
+}
+
+// The biggest unlabelled surface in the window — a canvas, a document body, a
+// video, a map. It is what you draw ON, and because it has no name it is
+// invisible to a listing built out of labels.
+//
+// "Unlabelled and large" is the whole definition, deliberately: it identifies
+// Paint's canvas without knowing what Paint is, and does the same for an image
+// editor, a whiteboard or a game nobody has heard of. Anything with a name
+// is a control and is already listed.
+export function findCanvas(elements) {
+  const boundsOf = (element) => element.bounds ?? element.boundingRect ?? null;
+  const areaOf = (element) => {
+    const bounds = boundsOf(element);
+    return bounds ? Number(bounds.width ?? 0) * Number(bounds.height ?? 0) : 0;
+  };
+  const windowArea = Math.max(1, ...(elements ?? []).map(areaOf));
+
+  // THE APPLICATION USUALLY SAYS SO. Paint publishes the surface as "Using Oval
+  // tool on Canvas"; editors and whiteboards name theirs too. A name that says
+  // canvas is far better evidence than any geometry heuristic, so it wins.
+  const named = (elements ?? []).find((element) => {
+    const label = String(element.text ?? element.name ?? "");
+    return /\b(canvas|drawing (surface|area)|artboard)\b/i.test(label) && boundsOf(element);
+  });
+  if (named) return boundsOf(named);
+
+  // Otherwise the biggest unlabelled box that is NOT the window itself. The
+  // frame is unlabelled and largest by definition, so without that exclusion
+  // this returns the whole window — including its toolbars — and a shape drawn
+  // "in the middle of the canvas" lands on the ribbon.
+  let best = null;
+  for (const element of elements ?? []) {
+    const bounds = boundsOf(element);
+    if (!bounds) continue;
+    if (String(element.text ?? element.name ?? "").trim()) continue;
+    const area = areaOf(element);
+    const fraction = area / windowArea;
+    // A sliver is a scrollbar track; the whole window is the frame.
+    if (fraction < 0.2 || fraction > 0.95) continue;
+    if (Number(bounds.width ?? 0) < 120 || Number(bounds.height ?? 0) < 120) continue;
+    if (!best || area > best.area) best = { bounds, area };
+  }
+  return best?.bounds ?? null;
+}
+
+function describeCanvas(elements) {
+  const bounds = findCanvas(elements);
+  if (!bounds) return null;
+  const x = Math.round(bounds.x);
+  const y = Math.round(bounds.y);
+  const width = Math.round(bounds.width);
+  const height = Math.round(bounds.height);
+  return `Drawing surface (the large unlabelled area — this is what you draw on): ` +
+    `x ${x} to ${x + width}, y ${y} to ${y + height}, centre ${Math.round(x + width / 2)},${Math.round(y + height / 2)}. ` +
+    `Every point of a shape must be inside that rectangle.`;
 }
 
 // The windows a person would recognise as open: titled, and big enough to see.
@@ -176,21 +347,36 @@ export function buildToolset({
   // What the last look at the screen found, so a click can name an element
   // rather than a coordinate. Reset by every fresh observation.
   //
-  // `freshWindows` are surfaces this run created — a window that did not exist
-  // before we launched it, or a document we opened with new_document. Anything
-  // else was already there when we arrived, and what is in it belongs to the
-  // user. `ownedWindows` are the ones that question has already been settled
-  // for, so it is asked once per window rather than before every keystroke.
+  // `emptySurfaces` are surfaces OBSERVED to be blank; `ownedWindows` are the
+  // ones the model has said it means to write into. Between them the question
+  // is asked once per surface rather than before every keystroke.
   const state = {
     elements: [],
     cwd: basePath,
     lastWindow: null,
-    freshWindows: new Set(),
+    // Surfaces SEEN to be empty — not surfaces we happen to have opened.
+    //
+    // Those were the same set until a live run showed they are not: launching
+    // Notepad started a genuinely new window, and Windows 11 restored the user's
+    // eight tabs into it. "I opened this window" was taken as "this window is
+    // blank", and the agent typed a C program into the middle of somebody's
+    // file. Only an emptiness that was actually observed belongs in here.
+    emptySurfaces: new Set(),
     ownedWindows: new Set(),
     // Files this run has written. Rewriting one of our own is not overwriting
     // anybody's work, and must not be interrupted to ask.
-    ownedPaths: new Set()
+    ownedPaths: new Set(),
+    // Windows whose accessibility tree came back empty, so the next look goes
+    // straight to the capture instead of walking it again to find out.
+    needsPixels: new Set(),
+    // The drawing surface found in the last reading, so a stroke can be checked
+    // against it before the mouse moves.
+    lastCanvas: null
   };
+
+  // What a window is called for the purpose of remembering things about it.
+  const result_windowKey = (target) =>
+    String(target?.windowId ?? "") || `application:${String(target?.application ?? "").toLowerCase()}`;
 
   const runCapability = async (name, inputs, options = {}) => {
     const capability = registry.get(name);
@@ -250,21 +436,13 @@ export function buildToolset({
 
   const boundsOf = (element) => element.bounds ?? element.boundingRect ?? null;
 
-  const workspaceState = async ({ windowId, application } = {}) => {
-    if (typeof adapter.inspectUi !== "function") return null;
-    let ui = null;
-    try {
-      ui = await adapter.inspectUi({
-        ...(windowId ? { windowId: String(windowId) } : { application }),
-        maxElements: 240
-      });
-    } catch {
-      return null;
-    }
-    const elements = ui?.elements ?? ui?.targets ?? [];
+  // The reading itself, over elements from either shape: raw UIA targets
+  // (`controlType`, `name`, `boundingRect`) or a normalized screen reading
+  // (`role`, `text`, `bounds`). Kept separate from fetching them so a look at
+  // the screen that already happened answers this for free, instead of paying
+  // for a second accessibility read a second later.
+  const summarizeWorkspace = (elements, title = "") => {
     if (!Array.isArray(elements) || elements.length === 0) return null;
-    const window = (ui?.windows ?? [])[0] ?? null;
-    const title = String(window?.MainWindowTitle ?? window?.title ?? "").trim();
     // "Big enough to be the document" has to be a fraction, not a pixel count —
     // a pixel count means something different on every screen. The window
     // publishes no bounds here, but its largest descendant fills it, so that is
@@ -275,15 +453,21 @@ export function buildToolset({
     };
     const windowArea = Math.max(1, ...elements.map(areaOf));
 
-    const undo = elements.find((element) => /^undo\b/i.test(String(element.name ?? "").trim()));
+    const labelOf = (element) => String(element.name ?? element.text ?? "").trim();
+    const undo = elements.find((element) => /^undo\b/i.test(labelOf(element)));
     const newControl = elements.find((element) => {
       if (element.enabled === false) return false;
       const bounds = boundsOf(element);
-      return bounds && NEW_CONTROL.test(String(element.name ?? "").trim());
+      return bounds && NEW_CONTROL.test(labelOf(element));
     });
 
     let editing = false;
     let contentChars = 0;
+    // A Document control is what an editor publishes for the thing you write in.
+    // An Edit is a text box, and a big one is only PROBABLY the document — on a
+    // login form it is the username field. The distinction decides whether the
+    // weakest signal below (what the window is called) is allowed to speak.
+    let hasDocumentSurface = false;
     // WHETHER THE ANSWER IS ZERO, OR THERE IS NO ANSWER.
     //
     // Reading a surface's contents needs UI Automation's ValuePattern, and a
@@ -299,9 +483,11 @@ export function buildToolset({
       // A Document is the document. An Edit is only the document when it fills a
       // real part of the window — otherwise it is the omnibox, the search box or
       // a form field, and typing into one of those is not editing anyone's work.
-      const isSurface = DOCUMENT_ROLE.test(role) || (EDIT_ROLE.test(role) && area / windowArea >= 0.25);
+      const isDocument = DOCUMENT_ROLE.test(role);
+      const isSurface = isDocument || (EDIT_ROLE.test(role) && area / windowArea >= 0.25);
       if (!isSurface) continue;
       editing = true;
+      if (isDocument) hasDocumentSurface = true;
       const patterns = Array.isArray(element.supportedPatterns) ? element.supportedPatterns.join(" ") : "";
       if (typeof element.value === "string" || /value/i.test(patterns)) contentReadable = true;
       contentChars = Math.max(contentChars, String(element.value ?? "").trim().length);
@@ -312,12 +498,13 @@ export function buildToolset({
       editing: editing || Boolean(undo),
       contentChars,
       contentReadable,
+      hasDocumentSurface,
       hasUndo: Boolean(undo),
       undoEnabled: undo ? undo.enabled !== false : null,
       newControl: newControl
         ? {
-            name: String(newControl.name ?? "").trim(),
-            center: {
+            name: labelOf(newControl),
+            center: newControl.center ?? {
               x: Math.round(boundsOf(newControl).x + boundsOf(newControl).width / 2),
               y: Math.round(boundsOf(newControl).y + boundsOf(newControl).height / 2)
             }
@@ -325,6 +512,106 @@ export function buildToolset({
         : null
     };
   };
+
+  // The application's own window, if it already has one. Matched on process
+  // name the way a person would — "spotify" is Spotify.exe, "calc" is
+  // Calculator — and only ever a window with area and a title, because Windows
+  // 11 keeps invisible helper shells alongside the real thing.
+  const findRunningWindow = async (application) => {
+    const needle = String(application ?? "").toLowerCase().replace(/\.exe$/, "").replace(/[^a-z0-9]/g, "");
+    if (!needle || typeof adapter.listWindows !== "function") return null;
+    const windows = await adapter.listWindows().catch(() => []) ?? [];
+    const usable = windows.filter((window) => {
+      const bounds = window.Bounds ?? window.bounds ?? {};
+      return String(window.MainWindowTitle ?? window.title ?? "").trim()
+        && Number(bounds.width ?? 0) > 10 && Number(bounds.height ?? 0) > 10;
+    });
+    const scored = usable.map((window) => {
+      const process = String(window.ProcessName ?? window.processName ?? "")
+        .toLowerCase().replace(/\.exe$/, "").replace(/[^a-z0-9]/g, "");
+      const title = String(window.MainWindowTitle ?? window.title ?? "").toLowerCase();
+      let score = 0;
+      if (process && process === needle) score = 3;
+      else if (process && (process.includes(needle) || needle.includes(process))) score = 2;
+      else if (title.includes(needle)) score = 1;
+      if (window.Foreground ?? window.foreground) score += 0.5;
+      return { window, score };
+    }).filter((entry) => entry.score > 0).sort((left, right) => right.score - left.score);
+    return scored[0]?.window ?? null;
+  };
+
+  // EVERY WEB PAGE IS A "Document", AND NONE OF THEM IS YOUR DOCUMENT.
+  //
+  // A browser publishes the page it is showing as a ControlType.Document, which
+  // is the exact signal summarizeWorkspace uses to recognise an editor. So the
+  // gate fired on ordinary web pages, constantly, and its refusal was always
+  // wrong: "there is already work in this document — its title is 'Anime Spy -
+  // YouTube', the document holds 79 characters" is a description of a YouTube
+  // page, not of somebody's unsaved file.
+  //
+  // Live it refused typing into Spotify's search box, Google Flights' origin
+  // field and NVIDIA's login form — three round trips thrown away, and each one
+  // taught the model to answer the gate with `existing: "append"` on reflex,
+  // which is precisely how it would sail through the one time it was right.
+  //
+  // A browser's own text boxes are still protected by everything else here;
+  // what it must not do is treat the rendered page as an unsaved document.
+  const BROWSER_PROCESS = /^(chrome|msedge|firefox|opera|brave|avastbrowser|vivaldi|iexplore|safari|arc|chromium)$/i;
+
+  const workspaceState = async ({ windowId, application } = {}) => {
+    if (typeof adapter.inspectUi !== "function") return null;
+    let ui = null;
+    try {
+      ui = await adapter.inspectUi({
+        ...(windowId ? { windowId: String(windowId) } : { application }),
+        maxElements: 240
+      });
+    } catch {
+      return null;
+    }
+    const window = (ui?.windows ?? [])[0] ?? null;
+    const process = String(window?.ProcessName ?? window?.processName ?? application ?? "")
+      .replace(/\.exe$/i, "");
+    if (BROWSER_PROCESS.test(process)) return { editing: false, browser: true };
+    return summarizeWorkspace(
+      ui?.elements ?? ui?.targets ?? [],
+      String(window?.MainWindowTitle ?? window?.title ?? "").trim()
+    );
+  };
+
+  // Which control has the keyboard right now, according to the application.
+  // Null when nothing claims focus — which is not evidence that focus is wrong,
+  // so callers treat it as "cannot tell" and carry on.
+  const focusedElement = async () => {
+    if (typeof adapter.inspectUi !== "function") return null;
+    const windowId = state.lastWindow?.windowId;
+    const application = state.lastWindow?.application;
+    if (!windowId && !application) return null;
+    try {
+      const ui = await adapter.inspectUi({
+        ...(windowId ? { windowId: String(windowId) } : { application }),
+        maxElements: 240
+      });
+      const focused = (ui?.elements ?? ui?.targets ?? []).find((element) => element.focused === true);
+      const bounds = focused ? boundsOf(focused) : null;
+      if (!focused || !bounds) return null;
+      return {
+        name: String(focused.name ?? focused.text ?? "").trim() || String(focused.controlType ?? focused.role ?? "control"),
+        center: focused.center ?? {
+          x: Math.round(bounds.x + bounds.width / 2),
+          y: Math.round(bounds.y + bounds.height / 2)
+        }
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  // Focus lands on the control containing the click, whose centre is rarely the
+  // exact pixel clicked — so this asks whether they are the same thing, not
+  // whether they are the same point.
+  const nearPoint = (focus, target) =>
+    Math.abs(focus.center.x - target.x) <= 200 && Math.abs(focus.center.y - target.y) <= 60;
 
   const undoAvailable = async (target) => {
     const workspace = await workspaceState(target);
@@ -363,9 +650,23 @@ export function buildToolset({
   // decide explicitly, because the choice between adding to someone's document
   // and starting a new one is not one to make silently.
   //
-  // The gate is asked once per window, only for windows we did not create, and
-  // only where the application says it is an editing surface with something in
-  // it. A browser, a music player, a search box, an empty document: no gate.
+  // WHO OPENED THE WINDOW TURNED OUT TO BE THE WRONG QUESTION.
+  //
+  // The first version of this skipped the check for windows the agent had opened
+  // itself, on the reasoning that a window we just created cannot contain
+  // anybody's work. A live run disproved it in the first minute: Notepad started
+  // a genuinely new window and Windows 11 restored the user's eight tabs into
+  // it, so `launch` correctly reported a new window and the agent typed a C
+  // program into the middle of a saved file. Session restore, "reopen last
+  // document", a template, a recovered draft — all of them put somebody's work
+  // into a window nobody walked into.
+  //
+  // So the only thing that settles it is what is IN the surface, now. Provenance
+  // buys nothing and cost a document.
+  //
+  // The gate is asked once per surface, and only where the application says it
+  // is an editing surface with something in it. A browser, a music player, a
+  // search box, a blank document: no gate.
   const documentGate = async (args) => {
     // Whatever the typing is about to land in. A windowId when one is known;
     // otherwise the application named on the call, because `type {application:
@@ -380,12 +681,21 @@ export function buildToolset({
     // The model has said what it means to do. That settles it for this window.
     const intent = String(args.existing ?? "").trim();
     if (intent) { state.ownedWindows.add(key); return; }
-    if (state.freshWindows.has(key) || state.ownedWindows.has(key)) return;
+    if (state.emptySurfaces.has(key) || state.ownedWindows.has(key)) return;
 
-    const workspace = await workspaceState(target);
+    // A look at the screen that has just happened already answered this. Paying
+    // for a second accessibility read a second later is the kind of tax that
+    // turns "type a line" into three seconds, and the reading is the same one.
+    const recent = state.lastWorkspace;
+    const workspace = recent && recent.key === key && Date.now() - recent.at < 15000
+      ? recent.workspace
+      : await workspaceState(target);
     // UNCONFIRMED IS NOT OCCUPIED. If the application says nothing, that is not
     // evidence of a document, and refusing on it would block ordinary typing.
     if (!workspace?.editing) { state.ownedWindows.add(key); return; }
+    // The gate speaks for what it can actually see: the surface in front. In a
+    // tabbed editor that is the ACTIVE tab, which is the one about to be typed
+    // into — the other seven are not at risk and are not its business.
     // WHAT AN UNREADABLE SURFACE IS CALLED IS THE LAST THING LEFT TO GO ON.
     //
     // When the contents cannot be read and the application has nothing to undo,
@@ -395,12 +705,19 @@ export function buildToolset({
     // Document1, so a title that is none of those is a document. It is a weaker
     // signal than the other two and is used only when they say nothing; the cost
     // of being wrong is one round trip, against losing a file.
+    //
+    // Restricted to a real Document control, because a title is not evidence
+    // about a text BOX. A login form has two Edits and a window called "Login",
+    // and reading that as "somebody's unsaved work called Login" stopped an
+    // ordinary sign-in.
     const named = String(workspace.title ?? "").split(" - ")[0].trim();
-    const looksNamed = Boolean(named) && !/^(untitled|new (tab|document|file)|document\s*\d*|blank)$/i.test(named);
+    const looksNamed = workspace.hasDocumentSurface
+      && Boolean(named)
+      && !/^(untitled|new (tab|document|file)|document\s*\d*|blank)$/i.test(named);
     const occupied = workspace.contentChars > 0
       || workspace.undoEnabled === true
       || (!workspace.contentReadable && workspace.undoEnabled !== true && looksNamed);
-    if (!occupied) { state.ownedWindows.add(key); return; }
+    if (!occupied) { state.emptySurfaces.add(key); return; }
 
     const evidence = [
       workspace.title ? `its title is "${workspace.title}"` : null,
@@ -411,8 +728,9 @@ export function buildToolset({
         : null
     ].filter(Boolean).join(", and ");
     throw new Error(
-      `This window was ALREADY OPEN before you got here, and there is work in it — ${evidence}. ` +
-      "Typing now would edit the user's existing document, not write a new one.\n" +
+      `There is already work in this document — ${evidence}. It is not yours: an application ` +
+      "restores its last session, reopens the file it had open, or was simply left that way. " +
+      "Typing now would edit it, not write something new.\n" +
       (workspace.newControl
         ? `This application offers "${workspace.newControl.name}" — call new_document to use it.\n`
         : "Call new_document to start a fresh one.\n") +
@@ -479,14 +797,42 @@ export function buildToolset({
       // A silent tie-break is a guess wearing a decision's clothes. Naming the
       // candidates costs one cheap round trip and lets the model choose using
       // what it can see and the tie-break cannot: which one is in the chat list.
+      // A LIST OF IDENTICAL LABELS IS NOT A CHOICE.
+      //
+      // Asked for the song "Headlines", Spotify's reading contained the word
+      // eight times — and the disambiguation offered eight lines reading
+      // `dataitem "Headlines"`, which are the same eight words. The model had
+      // nothing to choose ON, picked the row's SUBTITLE, clicked a piece of text
+      // that does nothing, and the podcast kept playing. A person looking at that
+      // screen is not choosing between eight "Headlines": they are choosing
+      // between a row that says Song • Drake and a row that says Episode • Top
+      // Hits Unpacked, and they can see that because they can see the ROW.
+      //
+      // So each candidate is offered with what sits beside it. That is the
+      // difference between a list and a decision.
+      const rowContext = (element) => {
+        const near = state.elements
+          .filter((other) => other !== element
+            && other.text
+            && normalizeLabel(other.text) !== normalizeLabel(element.text)
+            && Math.abs(other.center.y - element.center.y) <= 30
+            && Math.abs(other.center.x - element.center.x) <= 700)
+          .sort((left, right) =>
+            Math.abs(left.center.x - element.center.x) - Math.abs(right.center.x - element.center.x))
+          .slice(0, 3)
+          .map((other) => `"${String(other.text).slice(0, 50)}"`);
+        return near.length ? ` — beside it: ${near.join(", ")}` : "";
+      };
       const tied = ranked.filter((entry) => entry.score === ranked[0].score);
       if (tied.length > 1) {
         const options = tied
-          .map((entry) => `  ${entry.index}| ${entry.element.role ?? ""} "${entry.element.text}" @${entry.element.center.x},${entry.element.center.y}`)
+          .map((entry) => `  ${entry.index}| ${entry.element.role ?? ""} "${entry.element.text}" @${entry.element.center.x},${entry.element.center.y}${rowContext(entry.element)}`)
           .join("\n");
         throw new Error(
           `"${wanted}" matches ${tied.length} things on screen, and they are not the same thing:\n${options}\n` +
-          "Pick the one you mean by its index."
+          "Pick the one you mean by its index. If what is beside it tells you which row you want, prefer that " +
+          "row's own action — a Play or Open control acts, whereas a title is often just text and clicking it " +
+          "does nothing."
         );
       }
       const { element } = ranked[0];
@@ -503,6 +849,108 @@ export function buildToolset({
     throw new Error("Give text (the label from the last screen reading), or element, or x and y.");
   };
 
+  // ---- The controlled browser --------------------------------------------
+  //
+  // Things that ACT when clicked. Deliberately narrower than the set `inspect`
+  // lists: a heading or a paragraph can contain the words of a search result
+  // without being the link, and clicking one does nothing while reporting that
+  // it clicked something.
+  const CLICKABLE_SELECTOR =
+    'a,button,input[type=submit],input[type=button],[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="option"],[onclick]';
+
+  // One page reading: where it is, what it says, what can be acted on. The three
+  // are fetched together because they are one CDP connection multiplexing by
+  // request id, so they cost one round trip rather than three.
+  const readOnce = async (selector) => {
+    const [state, elements, body] = await Promise.all([
+      runCapability("browser.currentState", {}).catch(() => null),
+      runCapability("browser.inspect", { limit: 140 }).catch(() => []),
+      runCapability("browser.read", { selector: selector ?? "body" }).catch(() => null)
+    ]);
+    return { state, elements: Array.isArray(elements) ? elements : [], text: body?.text ?? "" };
+  };
+
+  // A URL IS NOT A PAGE YET.
+  //
+  // `launch` returns as soon as the address has changed from about:blank, which
+  // on a framework-rendered site is several hundred milliseconds before there is
+  // anything in the body — so the first reading of nodejs.org came back as the
+  // inline hydration script, and once that was filtered out, as nothing at all.
+  // Either way the model was handed a blank page for a site that had loaded
+  // perfectly, and its only reasonable move was to try somewhere else.
+  //
+  // Polling for content rather than sleeping a fixed amount keeps the fast case
+  // fast: a static page answers on the first read and pays nothing for this.
+  const SETTLE_DEADLINE_MS = 5000;
+  const readWebPage = async ({ selector = null, settle = false } = {}) => {
+    let page = await readOnce(selector);
+    if (!settle) return page;
+    const deadline = Date.now() + SETTLE_DEADLINE_MS;
+    while (Date.now() < deadline && page.text.trim().length < 40 && page.elements.length < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      page = await readOnce(selector);
+    }
+    return page;
+  };
+
+  const shortHref = (href) => {
+    const value = String(href ?? "");
+    if (!value || /^javascript:/i.test(value)) return "";
+    try {
+      const url = new URL(value);
+      const tail = `${url.pathname}${url.search}`.replace(/\/$/, "");
+      return `${url.hostname}${tail.length > 48 ? `${tail.slice(0, 48)}…` : tail}`;
+    } catch { return value.slice(0, 60); }
+  };
+
+  const webLines = (elements, { clickableOnly = false } = {}) => {
+    const lines = [];
+    const seen = new Set();
+    for (const element of elements ?? []) {
+      const label = String(element.text ?? element.name ?? "").replace(/\s+/g, " ").trim();
+      const role = String(element.controlType ?? element.role ?? "").toLowerCase();
+      const actionable = element.clickable === true || ["a", "button", "input", "select", "textarea"].includes(role);
+      if (clickableOnly && !actionable) continue;
+      // A paragraph is already in the page text; listing it again as an element
+      // pays for the same words twice.
+      if (!label || (!actionable && ["p", "h1", "h2", "h3"].includes(role))) continue;
+      const key = `${role}|${normalizeLabel(label)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (lines.length >= 60) break;
+      const href = shortHref(element.href);
+      lines.push(`  ${role} "${label.slice(0, 90)}"${href ? ` → ${href}` : ""}`);
+    }
+    return lines;
+  };
+
+  const clickableLabels = (page) => webLines(page?.elements, { clickableOnly: true }).slice(0, 25);
+
+  const renderWebPage = (page) => {
+    const state = page?.state ?? {};
+    if (!state.url) return "The controlled browser has no page open. Call web_open with a URL.";
+    const lines = webLines(page.elements);
+    const text = page.text?.trim() ?? "";
+    // AN EMPTY READING MUST NOT LOOK LIKE AN EMPTY PAGE.
+    //
+    // Rendered as just a URL, a page that had not finished rendering was
+    // indistinguishable from one with nothing on it — so the model concluded the
+    // site was broken and went looking for another. Naming which of the two it
+    // is makes the next move obvious.
+    if (!text && lines.length === 0) {
+      return `Page: ${state.title ? `"${state.title}" — ` : ""}${state.url}\n` +
+        "It loaded, but there is NOTHING readable on it — no text and no controls. Either it is still " +
+        "rendering, or it needs a sign-in, or it is blocking automated browsers. Try web_read once more; " +
+        "if it is still empty, this page cannot be read this way and the answer has to come from " +
+        "somewhere else.";
+    }
+    return [
+      `Page: ${state.title ? `"${state.title}" — ` : ""}${state.url}`,
+      text ? `Text:\n${clip(text, MAX_SCREEN_TEXT_CHARS)}` : null,
+      lines.length ? `Links, buttons and fields:\n${lines.join("\n")}` : null
+    ].filter(Boolean).join("\n\n");
+  };
+
   const tools = [
     {
       name: "run",
@@ -515,24 +963,88 @@ export function buildToolset({
         properties: {
           command: { type: "string", description: "The full command line, exactly as you would type it" },
           cwd: { type: "string", description: "Working directory (defaults to the last one used)" },
+          background: {
+            type: "boolean",
+            description:
+              "For anything that stays running rather than finishing — a server, a notebook, a watcher, a " +
+              "tunnel. Starts it and returns immediately instead of waiting for an exit that never comes."
+          },
           timeoutMs: { type: "number", description: "Kill the command after this long (default 90000)" }
         },
         required: ["command"]
       },
       preview: (args) => args.command,
+      // A SERVER DOES NOT EXIT, AND WAITING FOR IT TO IS A HANG.
+      //
+      // `jupyter notebook` starts a server and keeps running until it is quit —
+      // which is the point of it. Run like an ordinary command it blocked the
+      // whole loop for the full ninety-second timeout, with the notebook already
+      // open and working on screen, and then reported a timeout. Every later
+      // request in that conversation went back to it and hung again.
+      //
+      // The same is true of every dev server, watcher, tunnel and daemon, so
+      // this is a category rather than an application: something the user wants
+      // RUNNING is started detached and reported as started.
       execute: async (args) => {
         if (args.cwd) state.cwd = args.cwd;
-        const result = await adapter.executeCommand(state.cwd, args.command, [], {
+        const written = String(args.command ?? "");
+        const unwrapped = unwrapNestedShell(written);
+        const { command, notes } = repairCmdIsms(unwrapped);
+        if (unwrapped !== written) {
+          notes.unshift(
+            "You are already in PowerShell, so `powershell -Command \"…\"` was removed — nesting it makes " +
+            "the outer shell expand `$_` and your own variables to nothing before the inner one runs."
+          );
+        }
+        const background = args.background === true || KEEPS_RUNNING.test(command);
+        if (background) {
+          // Started through Start-Process so it outlives this call and keeps its
+          // own console; the shell returns as soon as Windows accepts it.
+          const launched = await adapter.executeCommand(
+            state.cwd,
+            `$p = Start-Process -PassThru -FilePath "powershell" -ArgumentList '-NoExit','-Command',${JSON.stringify(command)}; $p.Id`,
+            [],
+            { timeoutMs: 20000 }
+          );
+          return { ...launched, background: true, command };
+        }
+        const result = await adapter.executeCommand(state.cwd, command, [], {
           timeoutMs: Number(args.timeoutMs) || 90000
         });
-        return result;
+        return { ...result, command, notes };
       },
       render: (result) => {
         if (result.blocked) return `REFUSED: ${result.stderr}`;
+        if (result.background) {
+          const pid = String(result.stdout ?? "").trim().split(/\s+/).pop();
+          return result.exitCode === 0
+            ? `Started \`${result.command}\` in the background${pid ? ` (PID ${pid})` : ""}. It keeps running; ` +
+              "this call did not wait for it. Give it a moment, then check it the way you would check any " +
+              "service — a request to its port, or its window."
+            : `Could not start it: ${clip(result.stderr, 400)}`;
+        }
         const parts = [];
         if (result.stdout?.trim()) parts.push(clip(result.stdout.trim()));
         if (result.stderr?.trim()) parts.push(`stderr: ${clip(result.stderr.trim(), 1500)}`);
-        parts.push(result.timedOut ? "(timed out)" : `exit ${result.exitCode}`);
+        if (result.timedOut) {
+          parts.push(
+            "(timed out — if this is a server, a notebook or anything else that stays running, it was " +
+            "never going to exit: start it again with background: true)"
+          );
+        } else if (!result.stdout?.trim() && !result.stderr?.trim()) {
+          // EXIT 0 AND NOTHING IS NOT AN ANSWER.
+          //
+          // `where python` succeeded four times running and printed nothing,
+          // because PowerShell's `where` read an empty pipeline. Rendered as a
+          // bare "exit 0" that reads like a result, so the model asked again —
+          // and again. Saying there was no output is what makes it a fact the
+          // model can act on rather than a silence it fills in.
+          parts.push(`exit ${result.exitCode} — the command printed NOTHING. That is not the same as a ` +
+            "successful answer: either it genuinely found nothing, or it was not the command you meant.");
+        } else {
+          parts.push(`exit ${result.exitCode}`);
+        }
+        if (result.notes?.length) parts.push(result.notes.map((note) => `note: ${note}`).join("\n"));
         return parts.join("\n");
       }
     },
@@ -597,9 +1109,39 @@ export function buildToolset({
         // reading. A window with nothing accessible in it — a canvas, a game, a
         // remote session, an application that publishes no tree — is exactly when
         // pixels are worth three seconds, and only then are they paid for.
-        let result = await runCapability("screen.read", { ...target, maxElements: 240, includeOcr: false });
-        if (!result?.read || (result.elements ?? []).length < 6) {
+        //
+        // ASK A WINDOW ONCE WHETHER ITS TREE IS ANY GOOD.
+        //
+        // For an application that publishes nothing — WhatsApp is the standing
+        // example, four caption buttons and an input sink — the probe fails every
+        // single time, and the full read that follows walks the same empty tree
+        // AGAIN before it captures. So every look at WhatsApp paid for two
+        // accessibility passes to learn something we already knew, and the user
+        // watched eight of those at three seconds each.
+        //
+        // Remembering the answer per window costs nothing and cannot mislead: the
+        // full read still includes the tree, so a window that grows a real one
+        // later loses no elements, only the chance to skip the capture.
+        const memoKey = String(result_windowKey(target));
+        let result;
+        if (memoKey && state.needsPixels.has(memoKey)) {
           result = await runCapability("screen.read", { ...target, maxElements: 240 });
+        } else {
+          result = await runCapability("screen.read", { ...target, maxElements: 240, includeOcr: false });
+          if (!result?.read || !hasUsableContent(result.elements)) {
+            if (memoKey) state.needsPixels.add(memoKey);
+            result = await runCapability("screen.read", { ...target, maxElements: 240 });
+            // ONE WINDOW, TWO NAMES. The agent asks for "WhatsApp" sometimes and
+            // for the working window's handle other times, and those are
+            // different keys for the same empty tree — so the memo missed every
+            // other look and paid for the probe again. Record both names the
+            // full read gives back, and the window is known however it is asked
+            // for next.
+            if (result?.read) {
+              if (result.windowId) state.needsPixels.add(String(result.windowId));
+              if (result.application) state.needsPixels.add(`application:${String(result.application).toLowerCase()}`);
+            }
+          }
         }
         // A reading that found nothing is a dead end unless it says what IS
         // there. Without this the agent's only move is to try the same name
@@ -607,6 +1149,24 @@ export function buildToolset({
         if (!result?.read) {
           const windows = await adapter.listWindows?.().catch(() => []) ?? [];
           result.openWindows = describeWindows(windows);
+          return result;
+        }
+        // "Window: ? — ?" IS A READING THAT WILL NOT SAY WHERE IT IS.
+        //
+        // Reading by windowId returns no application or title, so nearly every
+        // look in a long session was headed `Window: ? — ? (windowId 5180378)`.
+        // The agent then has nothing to check itself against — it cannot notice
+        // it is in Avast rather than Chrome, or in the wrong window entirely,
+        // which is exactly the mistake that ran through the whole session. The
+        // window list already knows; one cheap lookup fills it in.
+        if (!result.application || !result.title) {
+          const windows = await adapter.listWindows?.().catch(() => []) ?? [];
+          const match = windows.find((window) =>
+            String(window.WindowHandle ?? window.windowId) === String(result.windowId));
+          if (match) {
+            result.application = result.application || (match.ProcessName ?? match.processName) || null;
+            result.title = result.title || (match.MainWindowTitle ?? match.title) || null;
+          }
         }
         return result;
       },
@@ -625,9 +1185,37 @@ export function buildToolset({
         }
         state.elements = [];
         state.lastWindow = { windowId: result.windowId, application: result.application };
+        // The same reading answers "is there already a document in here", so the
+        // gate before the next `type` costs nothing rather than a second
+        // accessibility read a second later.
+        // Same exclusion as workspaceState: a rendered page is a Document
+        // control, and reading one must not leave a browser looking like an
+        // editor with somebody's unsaved work in it.
+        const readProcess = String(result.application ?? "").replace(/\.exe$/i, "");
+        state.lastWorkspace = {
+          key: String(result.windowId ?? ""),
+          at: Date.now(),
+          workspace: BROWSER_PROCESS.test(readProcess)
+            ? { editing: false, browser: true }
+            : summarizeWorkspace(result.elements ?? [], String(result.title ?? ""))
+        };
         const lines = renderElements(result.elements ?? [], state.elements);
         return [
           `Window: ${result.application ?? "?"} — ${result.title ?? "?"} (windowId ${result.windowId})`,
+          // WHERE IS THE CANVAS? NOBODY EVER SAID.
+          //
+          // Asked to draw a snowman, the agent selected the Oval tool correctly
+          // and then drew at 900,820 — outside the canvas. Told nothing was
+          // drawn, it tried 1152,1300, then 2592,1300, guessing the drawing area
+          // from the window size each time and getting three "NOTHING TO UNDO"
+          // in a row. The tool was honest; the agent was blind. A canvas has no
+          // label, so it never appears in the element listing, and the listing
+          // was the only thing describing the window's geometry.
+          //
+          // The drawing surface IS in the reading — it is the big unnamed pane
+          // nothing else sits inside. Naming its rectangle turns "draw a circle
+          // somewhere in the middle" from a guess into arithmetic.
+          ((state.lastCanvas = findCanvas(result.elements ?? [])), describeCanvas(result.elements ?? [])),
           result.visibleText?.trim() ? `Visible text:\n${clip(result.visibleText.trim(), MAX_SCREEN_TEXT_CHARS)}` : null,
           lines.length ? `Elements (index| role "text" @x,y):\n${lines.join("\n")}` : null
         ].filter(Boolean).join("\n\n");
@@ -701,16 +1289,54 @@ export function buildToolset({
           // target must be resolved from `into` and never from `text`.
           const target = resolveTarget({ text: args.into, element: args.element });
           await runCapability("pointer.clickAt", { ...target, application: args.application ?? state.lastWindow?.application });
+          // A CLICK ON A FIELD IS NOT PROOF THE FIELD HAS FOCUS.
+          //
+          // On Google Flights the agent clicked "Where from?", typed Frankfurt,
+          // clicked "Where to?", typed New York — and both went into the FIRST
+          // box, which read "FrankfurtNew York", because the origin field's
+          // suggestion list was still open and swallowed the second click. Every
+          // step reported success. The application knows which control has the
+          // keyboard, and asking is the only way to find out.
+          const focus = await focusedElement();
+          if (focus && !nearPoint(focus, target)) {
+            throw new Error(
+              `Clicking "${args.into ?? args.element}" did not move the keyboard there — focus is on ` +
+              `"${focus.name}" at ${focus.center.x},${focus.center.y}. Typing now would go into that instead.\n` +
+              "Usually something is in the way: an open suggestion list, a dialog, or a control that only " +
+              "takes focus on a second click. Read the screen, close or choose from whatever is open, and " +
+              "click the field again."
+            );
+          }
         }
-        return runCapability("keyboard.type", {
+        const typed = await runCapability("keyboard.type", {
           text: args.text,
           application: args.application ?? state.lastWindow?.application,
           windowId: state.lastWindow?.windowId
         });
+        return { ...typed, unreadableScript: hasUnreadableScript(args.text) };
       },
-      render: (result) => (result.performed === false
-        ? `Typing did not complete: ${result.reason ?? "unknown"}`
-        : "Typed. Read the screen back if it matters that the text landed.")
+      render: (result) => {
+        if (result.performed === false) return `Typing did not complete: ${result.reason ?? "unknown"}`;
+        // TEXT YOU CANNOT READ BACK IS NOT TEXT THAT FAILED.
+        //
+        // The screen reader's OCR is built from the languages installed on this
+        // Windows profile, so on an English machine Chinese, Japanese, Korean,
+        // Arabic, Hebrew and Indic scripts come back as nothing at all. Live,
+        // the agent typed a Chinese message into WhatsApp, sent it, and then
+        // could not find it on screen — because OCR could not see those glyphs,
+        // not because the message was missing. It re-typed and re-sent, hunting
+        // for a confirmation that this machine cannot produce.
+        //
+        // Saying so up front redirects it to evidence that DOES survive: the
+        // input box going empty, and the conversation's own row updating.
+        if (result.unreadableScript) {
+          return "Typed. NOTE: this text is in a script the screen reader cannot read back on this machine, " +
+            "so looking for these exact characters on screen will find nothing even when they are there. " +
+            "Do not re-type or re-send on that basis. Confirm it a different way — the input box being " +
+            "empty afterwards, or the conversation/row showing a new entry at the current time.";
+        }
+        return "Typed. Read the screen back if it matters that the text landed.";
+      }
     },
     {
       name: "key",
@@ -912,6 +1538,33 @@ export function buildToolset({
           : [args];
         const paths = specs.map((spec) => buildPath(spec));
         const points = paths.reduce((total, path) => total + path.length, 0);
+        // OUTSIDE THE CANVAS IS NOT A DRAWING, IT IS A CLICK ON THE TOOLBAR.
+        //
+        // A stroke that lands outside the drawing surface changes nothing, and
+        // the only way the agent found out was the undo check afterwards —
+        // three seconds and a whole step to be told "NOTHING WAS DRAWN", with no
+        // hint that the reason was geometry rather than the tool. It guessed
+        // again, and again. Checking first is instant and says exactly what is
+        // wrong and where the canvas actually is.
+        const canvas = state.lastCanvas;
+        if (canvas) {
+          const all = paths.flat();
+          const outside = all.filter((point) =>
+            point.x < canvas.x || point.x > canvas.x + canvas.width ||
+            point.y < canvas.y || point.y > canvas.y + canvas.height);
+          if (outside.length > 0) {
+            const left = Math.round(canvas.x);
+            const top = Math.round(canvas.y);
+            const right = Math.round(canvas.x + canvas.width);
+            const bottom = Math.round(canvas.y + canvas.height);
+            throw new Error(
+              `${outside.length} of ${all.length} points are outside the drawing surface, so this would ` +
+              `draw nothing. The canvas is x ${left} to ${right}, y ${top} to ${bottom} ` +
+              `(centre ${Math.round((left + right) / 2)},${Math.round((top + bottom) / 2)}). ` +
+              "Put the whole shape inside that rectangle."
+            );
+          }
+        }
         // How long the motion takes is the caller's to choose, and the default is
         // the host's. Asking for a duration sets the pace per point rather than a
         // sleep at the end, so the stroke is spread evenly instead of being drawn
@@ -1012,7 +1665,39 @@ export function buildToolset({
         required: ["application"]
       },
       preview: (args) => args.application,
-      execute: async (args) => runCapability("application.launch", { application: args.application }),
+      // AN APPLICATION THAT IS RUNNING IS INSTALLED.
+      //
+      // Launching resolves a name to something installable — a Start menu
+      // AppUserModelId, an App Paths registration, a shortcut — and when that
+      // resolution misses it reports APPLICATION_NOT_INSTALLED. Live, it said
+      // "spotify is not installed" while Spotify was playing music in a window
+      // on screen, and "calc is not installed" a second after `start calc.exe`
+      // had opened it. The agent believed it and ran `winget install Spotify`,
+      // which tried to reinstall a running application over itself.
+      //
+      // The window is the evidence, and it is both cheaper and more certain than
+      // the registry: an open window means the application exists, is installed,
+      // and is ready. So look there first — 100ms instead of the 8-10 seconds a
+      // launch-and-ground costs, and it cannot be wrong about "installed".
+      execute: async (args) => {
+        const wanted = String(args.application ?? "").trim();
+        const running = await findRunningWindow(wanted);
+        if (running) {
+          return {
+            application: wanted,
+            windowIdentity: {
+              windowId: String(running.WindowHandle ?? running.windowId),
+              title: running.MainWindowTitle ?? running.title ?? ""
+            },
+            alreadyRunning: true,
+            // Bring it forward, since "open X" means the user wants to see it.
+            activated: await runCapability("window.activate", {
+              windowId: String(running.WindowHandle ?? running.windowId)
+            }).then((result) => result?.performed !== false).catch(() => false)
+          };
+        }
+        return runCapability("application.launch", { application: wanted });
+      },
       render: (result) => {
         const window = result.windowIdentity ?? result.window;
         if (!window) {
@@ -1029,15 +1714,23 @@ export function buildToolset({
         // with whatever the user was doing still in it. The adapter knows which
         // happened, because it listed the windows before it launched; the model
         // was told neither way and reasonably assumed it had a fresh one.
-        const reused = Array.isArray(result.before?.windowIds)
-          && result.before.windowIds.includes(windowId);
-        if (!reused) state.freshWindows.add(windowId);
+        const reused = result.alreadyRunning === true
+          || (Array.isArray(result.before?.windowIds) && result.before.windowIds.includes(windowId));
         const title = String(window.title ?? window.MainWindowTitle ?? "").trim();
+        // A NEW WINDOW IS NOT A BLANK ONE.
+        //
+        // Live, Notepad started a genuinely new window and Windows restored the
+        // user's eight tabs into it — so "opened in a new window" was true and
+        // read as "here is a blank page", and a C program went into the middle
+        // of a saved file. Session restore, reopen-last-document and recovered
+        // drafts all do this, so neither branch may imply the surface is empty.
         return reused
           ? `${result.application} was ALREADY RUNNING — this is the window that was already open ` +
-            `(windowId ${windowId}${title ? `, "${title}"` : ""}), not a new one. Whatever is in it is the ` +
-            "user's, so do not assume it is empty: if you are starting something new, use new_document."
-          : `${result.application} is open in a new window (windowId ${windowId}).`;
+            `(windowId ${windowId}${title ? `, "${title}"` : ""}), not a new one. ` +
+            "Do not assume it is empty; if you are starting something new, use new_document."
+          : `${result.application} opened a new window (windowId ${windowId}${title ? `, "${title}"` : ""}). ` +
+            "Applications restore their last session into a new window, so this may still have the user's " +
+            "work in it — if you are starting something new, use new_document.";
       }
     },
     {
@@ -1098,7 +1791,7 @@ export function buildToolset({
           : null;
         if (result.movedWindow) {
           state.lastWindow = { windowId: target.windowId, application: result.movedWindow.application };
-          state.freshWindows.add(target.windowId);
+          state.emptySurfaces.add(target.windowId);
           return `Used ${result.route}, and a new window is now in front — ${result.movedWindow.application} ` +
             `"${result.movedWindow.title ?? ""}" (windowId ${target.windowId}). That is where typing will go.`;
         }
@@ -1109,7 +1802,7 @@ export function buildToolset({
           state.lastWindow = { windowId: String(result.windowId), application: result.application };
         }
         if (empty === true) {
-          state.freshWindows.add(String(result.windowId));
+          state.emptySurfaces.add(String(result.windowId));
           return `Used ${result.route}, and the surface is now empty with nothing to undo — this is a fresh ` +
             "document. Type here.";
         }
@@ -1285,6 +1978,98 @@ export function buildToolset({
         : `Wrote ${result.filePath}${result.existed ? " (replacing what was there)" : ""}.`)
     },
     {
+      name: "edit_file",
+      // THERE WAS NO WAY TO CHANGE PART OF A FILE.
+      //
+      // Asked to inspect a React app and improve it, the agent read every source
+      // file, said "now I'll rebuild App.tsx into a polished site" — and stopped.
+      // Told to continue, it read the same files and said the same sentence.
+      // Three times. It was not confused about the task; it had no verb for it.
+      // `write_file` takes the ENTIRE new contents, so changing twenty lines of a
+      // four-hundred-line file means re-emitting the whole file, and a model that
+      // is about to spend its output budget restating code it just read will
+      // usually announce the plan instead and yield.
+      //
+      // Replacing a named piece is the operation that was missing, and it is also
+      // the safe one: it fails when the text is not found or is ambiguous, so it
+      // cannot silently write over the wrong part of the file.
+      description:
+        "Change part of a text file by replacing an exact snippet with another. Use this for editing code " +
+        "and documents instead of rewriting the whole file. `old` must appear EXACTLY once — include " +
+        "enough surrounding lines to make it unique. To add something new, make `old` the line you want " +
+        "to insert after and repeat it at the start of `new`.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          old: { type: "string", description: "The exact text to replace, copied from the file" },
+          new: { type: "string", description: "What to put in its place" },
+          all: { type: "boolean", description: "Replace every occurrence instead of requiring exactly one" }
+        },
+        required: ["path", "old", "new"]
+      },
+      preview: (args) => args.path,
+      execute: async (args) => {
+        const filePath = String(args.path);
+        const current = await runCapability("filesystem.read", { filePath })
+          .then((result) => String(result?.contents ?? result?.content ?? ""))
+          .catch(() => null);
+        if (current === null) throw new Error(`${filePath} could not be read — check the path.`);
+        const old = String(args.old ?? "");
+        if (!old) throw new Error("edit_file needs `old`: the exact text to replace.");
+        const occurrences = current.split(old).length - 1;
+        if (occurrences === 0) {
+          // A near miss is nearly always whitespace or a line the model
+          // reconstructed from memory rather than copied. Saying which line it
+          // got closest to turns a dead end into a correction.
+          // Ranked by how much of the anchor's first line they share, because a
+          // miss is almost always a small difference — one changed character, a
+          // reflowed argument, indentation — and a substring test finds none of
+          // those. What the model needs is the line it MEANT, printed exactly.
+          const firstLine = old.split(/\r?\n/)[0].trim();
+          const tokens = (value) => new Set(String(value).toLowerCase().match(/[a-z0-9_$]+/g) ?? []);
+          const wanted = tokens(firstLine);
+          const near = wanted.size === 0 ? [] : current.split(/\r?\n/)
+            .map((line, index) => {
+              const actual = tokens(line);
+              const shared = [...wanted].filter((token) => actual.has(token)).length;
+              return { line, index, overlap: shared / wanted.size };
+            })
+            .filter((entry) => entry.overlap >= 0.5 && entry.line.trim())
+            .sort((left, right) => right.overlap - left.overlap)
+            .slice(0, 3)
+            .map(({ line, index }) => `  line ${index + 1}: ${line.trim().slice(0, 120)}`);
+          throw new Error(
+            `That text is not in ${filePath}, so nothing was changed.` +
+            (near.length
+              ? `\nThe closest lines actually in the file are:\n${near.join("\n")}\n` +
+                "Copy the text exactly as it appears — indentation and all."
+              : "\nRead the file again and copy the snippet exactly, including indentation.")
+          );
+        }
+        if (occurrences > 1 && args.all !== true) {
+          throw new Error(
+            `That text appears ${occurrences} times in ${filePath}, so it is ambiguous and nothing was ` +
+            "changed. Include more of the surrounding lines to pick out the one you mean, or pass " +
+            "all: true to change every one."
+          );
+        }
+        const next = args.all === true
+          ? current.split(old).join(String(args.new ?? ""))
+          : current.replace(old, String(args.new ?? ""));
+        await runCapability("filesystem.write", { filePath, content: next });
+        state.ownedPaths.add(filePath.toLowerCase());
+        // Where the change landed, so the next step does not need to re-read the
+        // whole file to know it worked.
+        const lineNumber = current.slice(0, current.indexOf(old)).split(/\r?\n/).length;
+        return { filePath, occurrences: args.all === true ? occurrences : 1, lineNumber, bytes: next.length };
+      },
+      render: (result) =>
+        `Changed ${result.filePath} at line ${result.lineNumber}` +
+        `${result.occurrences > 1 ? ` and ${result.occurrences - 1} other place(s)` : ""} — ` +
+        `the file is now ${result.bytes} characters.`
+    },
+    {
       name: "clipboard",
       description: "Read the clipboard, or write text to it.",
       parameters: {
@@ -1323,7 +2108,20 @@ export function buildToolset({
       // execute() directly and so never ran it. Comparing here restores that
       // check at the only place the loop can see it.
       render: (result) => {
-        if (result.available === false) return result.reason ?? "Spotify is not installed.";
+        // THE DESKTOP CLIENT IS NOT THE ONLY WAY TO PLAY SOMETHING.
+        //
+        // This tool hands the track to the Spotify desktop app over the
+        // `spotify:` protocol. When that app is not installed the hand-off has
+        // no receiver, and Windows answers a `spotify:` URI by offering to
+        // install Spotify from the Store — which is the installer the user saw
+        // appear, unannounced, because nothing in the agent had decided to
+        // install anything. Saying where the music actually is stops it from
+        // trying this route twice.
+        if (result.available === false) {
+          return `${result.reason ?? "The Spotify desktop app is not installed."} ` +
+            "Do not try this tool again for this machine. If Spotify is open in a browser, or the user " +
+            "plays music on the web, use open_url with the track's page and the screen tools instead.";
+        }
         const playback = result.playback ?? {};
         const nowPlaying = playback.nowPlaying ?? playback.title ?? result.title ?? "";
         if (!playback.playing) {
@@ -1334,7 +2132,286 @@ export function buildToolset({
           return `Spotify is still playing "${nowPlaying}", which is NOT what was asked for ` +
             `("${result.requested}"). The track did not start. Read the screen and click the right result.`;
         }
+        // A PODCAST ABOUT THE SONG IS NOT THE SONG.
+        //
+        // An episode's title routinely contains both the track and the artist,
+        // so it satisfies every name check a song does — and then the reply says
+        // "Playing Shake It Off" while a talk show plays. Only the search result
+        // itself knows which row it was, so when it was an episode that fact has
+        // to travel all the way out here and be said plainly.
+        if (result.playedEpisode) {
+          return `Spotify is playing "${nowPlaying}", but that is a PODCAST EPISODE, not the song — ` +
+            "no song by that name was in the results. Tell the user it is an episode, or read the " +
+            "screen and pick a row marked \"Song\" if one is there.";
+        }
         return `Playing "${nowPlaying}".`;
+      }
+    },
+    // THE WEB WAS ONLY REACHABLE THROUGH A CAMERA.
+    //
+    // There is a complete Chrome DevTools Protocol stack in this repo — navigate,
+    // inspect, find, click, type, scroll, read, extract — and the agent loop
+    // could not name a single one of it. `open_url` handed the address to the
+    // default browser and walked away, so every web task after that was OCR of a
+    // Chrome window: three seconds a look, the page competing with the bookmarks
+    // bar and the tab strip for room in the reading, links unreachable because a
+    // link is not an accessible control, and a scroll position the agent had to
+    // infer from what happened to be visible.
+    //
+    // Through the DOM the same page is a list of its actual links and fields, in
+    // about a hundred milliseconds, with the text exact rather than transcribed.
+    //
+    // WHAT THIS BROWSER IS NOT: it is a separate Chromium with a temporary
+    // profile, so it is signed in to nothing. That is stated in the description
+    // rather than hidden, because the choice between it and the user's own
+    // browser is a real one the model has to make — reading, searching and
+    // research here; anything touching the user's accounts through the desktop.
+    {
+      name: "web_open",
+      description:
+        "Open a URL in a controlled browser and read the page back as structured text and links — far " +
+        "faster and more exact than opening Chrome and reading the screen. Use it for looking things up, " +
+        "reading pages, searching and research. It is a SEPARATE browser signed in to NOTHING: for " +
+        "anything needing the user's own accounts or logins, use launch/open_url and the desktop tools.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string" },
+          rejectCookies: {
+            type: "boolean",
+            description: "Dismiss a consent banner first, always choosing the least-permissive option. Costs a few seconds."
+          }
+        },
+        required: ["url"]
+      },
+      preview: (args) => args.url,
+      execute: async (args) => {
+        const url = String(args.url ?? "");
+        if (!/^https?:\/\//i.test(url)) throw new Error("Only http(s) URLs can be opened.");
+        // launch() reuses an already-running controlled browser and navigates it,
+        // so this is both "start one" and "go there".
+        await runCapability("browser.launch", { url });
+        await runCapability("browser.wait", {
+          condition: "document.readyState", value: "complete", timeoutMs: 10000
+        }).catch(() => null);
+        if (args.rejectCookies === true) {
+          await runCapability("browser.dismissCookieNotice", { timeoutMs: 6000 }).catch(() => null);
+        }
+        return readWebPage({ settle: true });
+      },
+      render: (page) => renderWebPage(page)
+    },
+    {
+      name: "web_read",
+      description:
+        "Re-read the controlled browser's current page: its URL, its text, and the links, buttons and " +
+        "fields on it. Use it after clicking or typing to see what the page became.",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: { type: "string", description: "Read only this part of the page, e.g. \"main\" or \"#results\"" }
+        },
+        required: []
+      },
+      preview: (args) => args.selector ?? "",
+      // Settles for the same reason web_open does: this is usually called right
+      // after a click that navigated, which is precisely when the page has an
+      // address and no content yet.
+      execute: async (args) => readWebPage({ selector: args.selector, settle: true }),
+      render: (page) => renderWebPage(page)
+    },
+    {
+      name: "web_click",
+      description:
+        "Click a link or button on the controlled browser's page by its visible text. Reports the label it " +
+        "actually matched and where the page went, so you can tell whether it was the one you meant.",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string", description: "The visible text of the link or button" } },
+        required: ["text"]
+      },
+      preview: (args) => `"${args.text}"`,
+      execute: async (args) => {
+        const wanted = String(args.text ?? "").trim();
+        if (!wanted) throw new Error("web_click needs text: the visible label of the link or button.");
+        // Things that DO something first. Only if nothing there answers to the
+        // name is the net widened to page furniture, because clicking a heading
+        // that merely contains the words is how a search result gets "opened"
+        // without anything happening.
+        let found = await runCapability("browser.findBest", { selector: CLICKABLE_SELECTOR, text: wanted, minCoverage: 0.5 });
+        if (!found?.found) {
+          found = await runCapability("browser.findBest", {
+            selector: `${CLICKABLE_SELECTOR},li,tr,h1,h2,h3,[tabindex]`, text: wanted, minCoverage: 0.34
+          });
+        }
+        if (!found?.found) {
+          const page = await readWebPage().catch(() => null);
+          const labels = page ? clickableLabels(page) : [];
+          // "What is actually clickable:" followed by nothing is the dead end
+          // this listing exists to prevent. A page with nothing to click is a
+          // real and different situation, and saying which one it is decides
+          // whether the next move is a better label or a different page.
+          throw new Error(
+            `Nothing on the page is labelled "${wanted}".\n` +
+            (labels.length
+              ? `What is actually clickable:\n${labels.join("\n")}\n` +
+                "Use one of those exactly, or call web_read again — the page may have changed."
+              : `There is nothing clickable on this page at all${page?.state?.url ? ` (${page.state.url})` : ""} — ` +
+                "it is text only. You are on the wrong page, or what you want is behind a scroll or a " +
+                "different link.")
+          );
+        }
+        const before = await runCapability("browser.currentState", {}).catch(() => null);
+        const clicked = await runCapability("browser.click", { target: found.target });
+        // A click that navigates needs a moment before the new page is readable.
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        const after = await runCapability("browser.currentState", {}).catch(() => null);
+        return { ...clicked, label: found.target?.name ?? found.target?.text ?? wanted, wanted, before, after };
+      },
+      render: (result) => {
+        if (result.performed === false) {
+          return `The click did not land on "${result.label}": ${result.reason ?? "the element could not be clicked"}.`;
+        }
+        const moved = result.before && result.after && result.before.url !== result.after.url;
+        // WHAT IT CLICKED, NOT WHAT WAS ASKED FOR. A best match is a match, and
+        // the difference between the two is the thing worth reporting: asked for
+        // "Headlines", clicked "Headlines — Top Hits Unpacked, Episode" is a
+        // podcast, and the model can only notice that if it is told.
+        const matched = normalizeLabel(result.label) === normalizeLabel(result.wanted)
+          ? `Clicked "${result.label}".`
+          : `Clicked "${result.label}" — the closest thing to "${result.wanted}". Check that is what you meant.`;
+        if (moved) {
+          return `${matched} The page went to ${result.after.title ? `"${result.after.title}" — ` : ""}${result.after.url}. ` +
+            "Call web_read to see it.";
+        }
+        return `${matched} The URL did not change, so it acted on this page rather than navigating — ` +
+          "call web_read to see what it did.";
+      }
+    },
+    {
+      name: "web_type",
+      description:
+        "Type into a field on the controlled browser's page, found by its placeholder or label. Set " +
+        "submit: true to press Enter afterwards, which is what a search box needs — text sitting in a " +
+        "search box has not been searched for.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          into: { type: "string", description: "The field's placeholder or label, e.g. \"Search\". Omit for the page's main field" },
+          submit: { type: "boolean", description: "Press Enter after typing" }
+        },
+        required: ["text"]
+      },
+      preview: (args) => `${JSON.stringify(String(args.text).slice(0, 60))}${args.into ? ` into "${args.into}"` : ""}`,
+      execute: async (args) => {
+        const field = await runCapability("browser.findField", { text: args.into ?? null });
+        if (!field?.found) {
+          throw new Error(
+            `No field on this page matches ${args.into ? `"${args.into}"` : "that"}.` +
+            (field?.labels?.length ? `\nThe fields actually on it are:\n${field.labels.map((l) => `  "${l}"`).join("\n")}` : "") +
+            "\nName one of those, or call web_read to see the page."
+          );
+        }
+        const typed = await runCapability("browser.type", { target: field.target, text: args.text, clear: true });
+        let submitted = null;
+        let after = null;
+        if (args.submit === true) {
+          submitted = await runCapability("browser.key", { key: "Enter", target: field.target });
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          after = await runCapability("browser.currentState", {}).catch(() => null);
+        }
+        return { ...typed, field: field.label, submitted, after };
+      },
+      render: (result) => {
+        if (result.performed === false) {
+          return `Typing into "${result.field}" did not take — the field holds ${JSON.stringify(String(result.landed ?? "").slice(0, 60))} ` +
+            "instead. The page may have rejected it, or the field may be a stand-in that opens a real one when clicked. " +
+            "Read the page and try the field that actually accepts text.";
+        }
+        const where = `Typed into "${result.field}".`;
+        if (!result.submitted) return `${where} It has NOT been submitted — pass submit: true if this is a search box.`;
+        return `${where} Pressed Enter${result.after?.url ? `, and the page is now ${result.after.url}` : ""}. Call web_read to see the result.`;
+      }
+    },
+    {
+      name: "web_scroll",
+      description: "Scroll the controlled browser's page. Positive is down.",
+      parameters: {
+        type: "object",
+        properties: { y: { type: "number", description: "Pixels to scroll, default 600" } },
+        required: []
+      },
+      preview: (args) => `${args.y ?? 600}px`,
+      execute: async (args) => runCapability("browser.scroll", { y: Number.isFinite(Number(args.y)) ? Number(args.y) : 600 }),
+      render: (result) => (result.moved
+        ? `Scrolled to ${result.scrollAfter?.y ?? "?"}. Call web_read to see what is there now.`
+        : "The page did not move — you are already at the end of it.")
+    },
+    {
+      name: "volume",
+      // "Turn it down" had no verb. The capabilities have been there and
+      // verified the whole time — read the level, set the level, mute — and the
+      // loop could not name any of them, so the only route was the Settings app
+      // through the GUI, for a thing that is one call.
+      description:
+        "Read or set the system volume. With no arguments it reports the current level; give percent to " +
+        "set it, or mute true/false.",
+      parameters: {
+        type: "object",
+        properties: {
+          percent: { type: "number", description: "0 to 100" },
+          mute: { type: "boolean" }
+        },
+        required: []
+      },
+      preview: (args) => (args.percent != null ? `${args.percent}%` : args.mute != null ? (args.mute ? "mute" : "unmute") : "read"),
+      execute: async (args) => {
+        if (args.percent == null && args.mute == null) return runCapability("system.volume.inspect", {});
+        // Muting alone must not move the level; read it back and set what is
+        // already there so the one call can carry either intent.
+        const percent = args.percent == null
+          ? Number((await runCapability("system.volume.inspect", {}).catch(() => null))?.percent ?? 50)
+          : Math.max(0, Math.min(100, Number(args.percent)));
+        return runCapability("system.volume.set", { percent, ...(args.mute == null ? {} : { mute: args.mute }) });
+      },
+      render: (result) => {
+        if (result.available === false) return "I could not read the audio endpoint.";
+        if (result.applied === false) {
+          return `Asked for ${result.requestedPercent}% but the endpoint reports ${result.percent ?? "an unreadable level"} — it did not take.`;
+        }
+        return `Volume is ${result.percent}%${result.muted ? " (muted)" : ""}.`;
+      }
+    },
+    {
+      name: "close_app",
+      description: "Close a running application by name, and confirm it actually stopped.",
+      parameters: {
+        type: "object",
+        properties: { application: { type: "string" } },
+        required: ["application"]
+      },
+      preview: (args) => args.application,
+      execute: async (args) => {
+        const name = String(args.application ?? "").trim();
+        if (!name) throw new Error("close_app needs an application name.");
+        const result = await runCapability("application.close", { processName: name });
+        // The capability's own verify() checks the process list afterwards, and
+        // the loop calls execute() directly — so, as with play_music, the check
+        // is done here or it is not done at all.
+        const processes = await adapter.listProcesses?.().catch(() => null);
+        const list = Array.isArray(processes?.processes) ? processes.processes : (Array.isArray(processes) ? processes : []);
+        const needle = name.toLowerCase().replace(/\.exe$/, "");
+        const stillRunning = list.some((entry) =>
+          String(entry?.ProcessName ?? entry?.name ?? "").toLowerCase().replace(/\.exe$/, "") === needle);
+        return { ...result, application: name, stillRunning, checked: list.length > 0 };
+      },
+      render: (result) => {
+        if (!result.checked) return `Asked ${result.application} to close, but I could not check whether it did.`;
+        return result.stillRunning
+          ? `${result.application} is STILL RUNNING — it did not close. It may be holding an unsaved document ` +
+            "and asking about it; read the screen."
+          : `${result.application} is closed.`;
       }
     },
     {
@@ -1352,6 +2429,94 @@ export function buildToolset({
   ];
 
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
+
+  // ONE ROUND TRIP PER KEYSTROKE IS THE WHOLE LATENCY BUDGET.
+  //
+  // Live, "45 × 6664533365" was entered by calling `click` once per digit. Each
+  // click cost about a second on the machine and three or four seconds waiting
+  // for the model to decide the next digit — so twelve digits took the better
+  // part of a minute, the run hit the provider's rate limit partway through, and
+  // it never reached "=". The clicking was not slow. Deciding twelve times was.
+  //
+  // The prompt has asked for several calls per turn since the beginning and the
+  // models do not comply; that is not something a stronger sentence fixes. A
+  // declared parameter is the one thing a tool-calling model reliably fills in,
+  // so the sequence becomes an argument: one decision, one round trip, N actions.
+  //
+  // It stops at the first failure and says which step failed, because a sequence
+  // that carries on after a click missed is how you end up typing a password
+  // into a window that never opened.
+  const batch = {
+    name: "batch",
+    description:
+      "Run several steps in one go, in order, with no round trip between them. Use this whenever the next " +
+      "few actions are already decided — entering a number, filling a form, a menu path, a keyboard " +
+      "sequence. Each step is {tool, args} using the same tools and arguments you would call directly. " +
+      "It stops at the first step that fails and tells you which one.",
+    parameters: {
+      type: "object",
+      properties: {
+        steps: {
+          type: "array",
+          description: "In order, e.g. [{\"tool\":\"click\",\"args\":{\"text\":\"Four\"}},{\"tool\":\"key\",\"args\":{\"keys\":\"enter\"}}]",
+          items: {
+            type: "object",
+            properties: {
+              tool: { type: "string" },
+              args: { type: "object", description: "The arguments for that tool" }
+            },
+            required: ["tool"]
+          }
+        }
+      },
+      required: ["steps"]
+    },
+    preview: (args) => (Array.isArray(args.steps)
+      ? args.steps.map((step) => step?.tool).filter(Boolean).join(" → ")
+      : ""),
+    execute: async (args) => {
+      const steps = Array.isArray(args.steps) ? args.steps.slice(0, 40) : [];
+      if (steps.length === 0) throw new Error("batch needs steps: a list of {tool, args}.");
+      const done = [];
+      for (const [index, step] of steps.entries()) {
+        const name = String(step?.tool ?? "").trim();
+        if (name === "batch") throw new Error("A batch cannot contain another batch.");
+        const tool = byName.get(name);
+        if (!tool) {
+          return {
+            done,
+            failedAt: index,
+            failure: `There is no tool called "${name}". Use one of: ${[...byName.keys()].join(", ")}.`
+          };
+        }
+        const { say: _s, saw: _w, ...inputs } = step?.args ?? {};
+        try {
+          const result = await tool.execute(inputs);
+          done.push({ tool: name, text: tool.render(result ?? {}) });
+        } catch (error) {
+          return {
+            done,
+            failedAt: index,
+            failure: error instanceof Error ? error.message : String(error)
+          };
+        }
+      }
+      return { done, failedAt: null, failure: null };
+    },
+    render: (result) => {
+      const lines = result.done.map((entry, index) => `${index + 1}. ${entry.tool}: ${entry.text}`);
+      if (result.failedAt == null) {
+        return [`All ${result.done.length} steps ran.`, ...lines].join("\n");
+      }
+      return [
+        `Stopped at step ${result.failedAt + 1} of the batch: ${result.failure}`,
+        result.done.length ? `What did run first:\n${lines.join("\n")}` : "Nothing ran before it.",
+        "The steps after it did NOT run."
+      ].join("\n");
+    }
+  };
+  tools.push(batch);
+  byName.set(batch.name, batch);
 
   // WHY EVERY TOOL TAKES A `say`.
   //
@@ -1455,6 +2620,7 @@ export function buildToolset({
     // poem in it" mean anything.
     beginTurn() {
       state.elements = [];
+      state.lastCanvas = null;
     },
 
     previewOf(name, args) {

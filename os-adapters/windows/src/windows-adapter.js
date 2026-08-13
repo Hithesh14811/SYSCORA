@@ -266,7 +266,29 @@ export function correlateLaunchWindow({
     return { window, score, signals, titleSimilarity };
   }).sort((left, right) => right.score - left.score);
   const best = candidates[0];
-  if (!best || best.score < 45) {
+  // "NEW" AND "IN FRONT" DO NOT SAY WHICH APPLICATION THIS IS.
+  //
+  // new-hwnd alone scored 45 against a threshold of 45, so ANY window that
+  // happened not to be in the previous enumeration was accepted as the
+  // application just launched — with no name, process or title match at all.
+  // Add the foreground-transition bonus and it cleared the bar comfortably.
+  //
+  // Live, that is exactly what happened, twice: `launch mspaint` and `launch
+  // WhatsApp` both came back grounded on windowId 198792 — SYSCORA's own
+  // Electron chat window, which is the window in front because the user is
+  // watching it. Every step afterwards read, clicked and typed into the wrong
+  // application, and the launch had reported success.
+  //
+  // Being new and being in front are corroborating signals; they are not
+  // identifying ones. At least one signal that actually names the application —
+  // the PID we launched, its process name, or its title — has to be present
+  // before this may claim to have found it.
+  const IDENTIFYING = ["launched-pid", "process-identity", "title-similarity", "interactive-application-frame"];
+  const identified = best && (best.signals ?? []).some((signal) =>
+    signal === "interactive-application-frame"
+      ? best.titleSimilarity >= 0.5
+      : IDENTIFYING.includes(signal));
+  if (!best || best.score < 45 || !identified) {
     return { grounded: false, window: null, confidence: 0, candidates: candidates.slice(0, 5) };
   }
   return {
@@ -1252,20 +1274,39 @@ export class WindowsAdapter {
     const escapedExeWithSuffix = escapePowerShellSingleQuoted(
       /\.exe$/i.test(executable) ? executable : `${executable}.exe`
     );
-    const commandResult = await this.runPowerShell(
+    // EVERY PROBE RAN EVERY TIME, AND TOGETHER THEY EXCEEDED THE TIMEOUT.
+    //
+    // Measured on this machine: `Get-StartApps` takes 5.7 SECONDS, and
+    // `Get-Command` on a name that is not an executable takes another 4.5 while
+    // it searches the PATH. Both ran unconditionally, before the cheap checks,
+    // inside an eight-second budget — so resolution TIMED OUT and came back
+    // RESOLUTION_PROBE_FAILED, which `launch` reports as "not installed".
+    //
+    // That is why WhatsApp could not be opened: it is a packaged app, only
+    // Get-StartApps knows it, and the probe never survived long enough to say
+    // so. The agent fell back to working the AppUserModelId out by hand —
+    // Get-Process, Get-StartApps, shell:AppsFolder — five commands and half a
+    // minute for something the tool was supposed to do.
+    //
+    // So the order is now by cost. The registry and the Start menu's own
+    // shortcuts answer in about 200ms and cover ordinary desktop programs
+    // (Spotify resolves here). Only when they find nothing is the slow pair
+    // paid for, and then with a budget that lets it finish.
+    const fast = await this.runPowerShell(
       `$ErrorActionPreference = 'SilentlyContinue'; ` +
-      `$app = Get-StartApps | Where-Object { $_.Name -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
-      `if (-not $app) { $app = Get-StartApps | Where-Object { $_.Name -ilike '${escapedApplication}*' } | Select-Object -First 1 }; ` +
-      `$command = Get-Command -Name '${escapedExe}' -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
-      `if (-not $command) { $command = Get-Command -Name '${escapedExeWithSuffix}' -ErrorAction SilentlyContinue | Select-Object -First 1 }; ` +
       `$appPath = Get-ItemProperty -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\' + '${escapedExeWithSuffix}') -ErrorAction SilentlyContinue; ` +
       `if (-not $appPath.'(default)') { $appPath = Get-ItemProperty -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\' + '${escapedExe}') -ErrorAction SilentlyContinue }; ` +
       `$roots = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms')) | Where-Object { $_ }; ` +
       `$shortcut = $roots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue } | ` +
       `Where-Object { $_.BaseName -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
-      `if ($app) { $kind = 'start-menu'; $target = $app.AppID } ` +
-      `elseif ($command) { $kind = 'command'; $target = $command.Source } ` +
-      `elseif ($appPath.'(default)') { $kind = 'app-path'; $target = $appPath.'(default)' } ` +
+      // where.exe answers the same question as Get-Command in 174ms instead of
+      // 4.5 seconds, because it looks at the PATH and stops rather than building
+      // PowerShell's whole command table. It is what finds notepad, the
+      // browsers, and anything else that is simply on the PATH.
+      `$onPath = & where.exe '${escapedExeWithSuffix}' 2>$null | Select-Object -First 1; ` +
+      `if (-not $onPath) { $onPath = & where.exe '${escapedExe}' 2>$null | Select-Object -First 1 }; ` +
+      `if ($appPath.'(default)') { $kind = 'app-path'; $target = $appPath.'(default)' } ` +
+      `elseif ($onPath) { $kind = 'command'; $target = $onPath } ` +
       `elseif ($shortcut) { $kind = 'start-menu-shortcut'; $target = $shortcut.FullName } ` +
       `else { $kind = $null; $target = $null } ` +
       `[pscustomobject]@{ ok = $true; resolved = [bool]$kind; kind = $kind; target = $target } | ConvertTo-Json -Compress; ` +
@@ -1273,7 +1314,26 @@ export class WindowsAdapter {
       { timeoutMs: 8000 }
     );
     let parsed = null;
-    try { parsed = JSON.parse(commandResult.stdout || "null"); } catch { parsed = null; }
+    try { parsed = JSON.parse(fast.stdout || "null"); } catch { parsed = null; }
+    let commandResult = fast;
+    if (parsed?.ok === true && parsed.resolved !== true) {
+      const slow = await this.runPowerShell(
+        `$ErrorActionPreference = 'SilentlyContinue'; ` +
+        `$app = Get-StartApps | Where-Object { $_.Name -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
+        `if (-not $app) { $app = Get-StartApps | Where-Object { $_.Name -ilike '${escapedApplication}*' } | Select-Object -First 1 }; ` +
+        `$command = $null; ` +
+        `if (-not $app) { $command = Get-Command -Name '${escapedExe}' -ErrorAction SilentlyContinue | Select-Object -First 1 }; ` +
+        `if (-not $app -and -not $command) { $command = Get-Command -Name '${escapedExeWithSuffix}' -ErrorAction SilentlyContinue | Select-Object -First 1 }; ` +
+        `if ($app) { $kind = 'start-menu'; $target = $app.AppID } ` +
+        `elseif ($command) { $kind = 'command'; $target = $command.Source } ` +
+        `else { $kind = $null; $target = $null } ` +
+        `[pscustomobject]@{ ok = $true; resolved = [bool]$kind; kind = $kind; target = $target } | ConvertTo-Json -Compress; ` +
+        `exit 0`,
+        { timeoutMs: 25000 }
+      );
+      commandResult = slow;
+      try { parsed = JSON.parse(slow.stdout || "null"); } catch { parsed = null; }
+    }
     if (parsed?.ok !== true) {
       return {
         application,
@@ -1681,16 +1741,43 @@ public static class SyscoraAudio {
   // Bounded wait for an application's main window to appear. NEVER waits
   // indefinitely: polls listWindows() until a match or the (clamped) deadline,
   // returning { ready, window }.
-  async waitForApplicationWindow(match, timeoutMs = 8000) {
+  // A BROWSER TAB NAMED AFTER AN APPLICATION IS NOT THAT APPLICATION.
+  //
+  // This accepted any window whose process name OR TITLE contained the needle,
+  // and a title match is not evidence of anything: a Chrome window showing
+  // "Spotify - Web Player: Music for everyone" matched "spotify" and was
+  // returned as the Spotify desktop client.
+  //
+  // Live, that produced the installer the user saw and never asked for.
+  // playSpotifyTrack takes a ready window as proof the client is there and then
+  // hands the track off over the `spotify:` protocol — so with a browser tab
+  // standing in for the client, Windows received a `spotify:` URI with no
+  // registered handler behind it and offered to install Spotify from the Store.
+  // Nothing in the transcript said "installing", because nothing was: it was a
+  // protocol hand-off to an application that is not on this machine.
+  //
+  // So the process is what identifies it, and `matchTitle` is opt-in for the
+  // callers that genuinely mean "a window called this".
+  async waitForApplicationWindow(match, timeoutMs = 8000, { matchTitle = false } = {}) {
     const needle = String(match ?? "").toLowerCase();
+    const compact = needle.replace(/[^a-z0-9]/g, "");
     const deadline = Date.now() + clampInt(timeoutMs, 500, 20000, 8000);
+    // Browsers are never the application: they are the one process that can be
+    // called anything, because a page chooses its own title.
+    const BROWSER = /^(chrome|msedge|firefox|opera|brave|avastbrowser|vivaldi|iexplore|safari)$/i;
     let window = null;
     while (Date.now() < deadline) {
       const windows = await this.listWindows();
-      window = windows.find((w) =>
-        String(w.ProcessName ?? "").toLowerCase().includes(needle) ||
-        String(w.MainWindowTitle ?? "").toLowerCase().includes(needle)
-      ) ?? null;
+      const named = windows.filter((w) => {
+        const process = String(w.ProcessName ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        return process && compact && (process.includes(compact) || compact.includes(process));
+      });
+      window = named[0] ?? null;
+      if (!window && matchTitle) {
+        window = windows.find((w) =>
+          !BROWSER.test(String(w.ProcessName ?? "")) &&
+          String(w.MainWindowTitle ?? "").toLowerCase().includes(needle)) ?? null;
+      }
       if (window) break;
       await new Promise((r) => setTimeout(r, 400));
     }
@@ -1762,6 +1849,8 @@ public static class SyscoraAudio {
       resultFound: uia.found,
       invoked: uia.invoked,
       playedButton: uia.name ?? null,
+      playedEpisode: uia.pickedEpisode === true,
+      matchedLabel: uia.matchedLabel ?? null,
       title: playback.title,
       playback,
       steps
@@ -1826,10 +1915,29 @@ public static class SyscoraAudio {
       // insertion/deletion/substitution per meaningful token, matching the same
       // tolerance used by independent playback verification.
       "$near={param($a,$b);$a=[string]$a;$b=[string]$b;if($a -eq $b){return $true};if([Math]::Abs($a.Length-$b.Length)-gt 1){return $false};if($a.Length -eq $b.Length){$d=0;for($i=0;$i-lt$a.Length;$i++){if($a[$i]-ne$b[$i]){$d++}};return $d-le 1};$long=if($a.Length-gt$b.Length){$a}else{$b};$short=if($a.Length-gt$b.Length){$b}else{$a};for($i=0;$i-lt$long.Length;$i++){if(($long.Remove($i,1))-eq$short){return $true}};return $false};",
-      "$matches={ param($name) if(-not $name){ return $false }; $words=@(([string]$name).ToLower() -split '[^a-z0-9]+' | Where-Object { $_ }); foreach($token in @($tokens)){ $hit=$false;foreach($word in $words){if(& $near ([string]$word) ([string]$token)){$hit=$true;break}};if(-not $hit){return $false} }; return $true };",
+      // A SONG'S TITLE NEVER CONTAINS ITS ARTIST. A PODCAST EPISODE'S DOES.
+      //
+      // This required EVERY token of the query to appear in the row's label, and
+      // that rule quietly favours the wrong kind of result. Asked for "Shake It
+      // Off Taylor Swift", Spotify's own song row is labelled just "Shake It
+      // Off" — no artist, so two of the five tokens are missing and it was
+      // rejected. The podcast episode "Shake It Off - Taylor Swift" contains all
+      // five, matched exactly, and played. The user got an episode ABOUT the
+      // song instead of the song, and every check downstream agreed it was
+      // right, because it matched the words they asked for.
+      //
+      // So: a majority of tokens is enough to be a candidate, and the row's own
+      // kind decides between candidates. Nothing here knows what Taylor Swift
+      // is; it knows that a row advertising "Episode" or "Your Episodes" is a
+      // podcast, and that a request for a track means the song when both exist.
+      "$scoreOf={ param($name) if(-not $name){ return 0 }; $words=@(([string]$name).ToLower() -split '[^a-z0-9]+' | Where-Object { $_ }); $hits=0; foreach($token in @($tokens)){ foreach($word in $words){if(& $near ([string]$word) ([string]$token)){$hits++;break}} }; return $hits };",
+      "$needed=[Math]::Max(1,[Math]::Ceiling(@($tokens).Count * 0.5));",
+      "$matches={ param($name) return ((& $scoreOf $name) -ge $needed) };",
+      "$isEpisode={ param($node) try{ $all=$node.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition); $n=[Math]::Min($all.Count,40); for($i=0;$i -lt $n;$i++){ $nm=[string]$all[$i].Current.Name; if($nm -and ($nm -like 'Episode*' -or $nm -like '*Your Episodes*' -or $nm -like 'Podcast*')){ return $true } } }catch{}; return $false };",
       "$play=$null;",
       "$matchedLabel=$null;",
       "$matchedBounds=$null;",
+      "$episodePlay=$null;$episodeLabel=$null;$episodeBounds=$null;$pickedEpisode=$false;",
       "while($sw.ElapsedMilliseconds -lt " + limit + " -and -not $play){",
       "  $best=$null;$bestScore=-100000;",
       // Ask UIA for exact-name elements first. Spotify exposes the requested top
@@ -1844,7 +1952,7 @@ public static class SyscoraAudio {
       // faster than walking every descendant in Spotify's Chromium tree.
       "  if($labels.Count -eq 0){try{foreach($variant in @($queryVariants)){if($sw.ElapsedMilliseconds -ge (" + limit + "/2)){break};$variantCondition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,[string]$variant);$variantLabel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$variantCondition);if($variantLabel){$labels=@($variantLabel);break}}}catch{$labels=@()}};",
       "  $playNameCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Play');$genericPlayCond=New-Object System.Windows.Automation.AndCondition($buttonCond,$playNameCond);",
-      "  foreach($labelEl in $labels){try{$label=$labelEl.Current.Name;$rr=$labelEl.Current.BoundingRectangle;if($labelEl.Current.IsOffscreen -or -not (& $matches $label) -or $rr.Width -le 0 -or $rr.Height -le 0 -or $rr.Height -gt 260){continue};$ancestor=$labelEl;for($depth=0;$depth-lt 5;$depth++){$ancestor=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor);if(-not $ancestor){break};$candidate=$ancestor.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$genericPlayCond);if($candidate -and -not $candidate.Current.IsOffscreen -and $candidate.Current.IsEnabled){$best=$candidate;$matchedLabel=$label;$matchedBounds=$rr;break}}}catch{};if($best){break}};",
+      "  foreach($labelEl in $labels){try{$label=$labelEl.Current.Name;$rr=$labelEl.Current.BoundingRectangle;if($labelEl.Current.IsOffscreen -or -not (& $matches $label) -or $rr.Width -le 0 -or $rr.Height -le 0 -or $rr.Height -gt 260){continue};$ancestor=$labelEl;for($depth=0;$depth-lt 5;$depth++){$ancestor=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor);if(-not $ancestor){break};$candidate=$ancestor.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$genericPlayCond);if($candidate -and -not $candidate.Current.IsOffscreen -and $candidate.Current.IsEnabled){if(& $isEpisode $ancestor){if(-not $episodePlay){$episodePlay=$candidate;$episodeLabel=$label;$episodeBounds=$rr}}else{$best=$candidate;$matchedLabel=$label;$matchedBounds=$rr};break}}}catch{};if($best){break}};",
       // Some Chromium apps expose the action and object as one accessibility
       // control (for example "Play Good For You by ..."). Search only Button
       // controls, not the entire raw tree, and bind the action to the requested
@@ -1854,10 +1962,15 @@ public static class SyscoraAudio {
       "  if($best){$play=$best;break};",
       "  if(-not $play){ Start-Sleep -Milliseconds 400 }",
       "};",
+      // An episode is used ONLY when nothing else answered to the name — asked
+      // for a podcast, that is the right answer; asked for a song that does not
+      // exist, it is at least the honest one, and it is reported as an episode
+      // so the caller can say so rather than claiming it played the track.
+      "if(-not $play -and $episodePlay){$play=$episodePlay;$matchedLabel=$episodeLabel;$matchedBounds=$episodeBounds;$pickedEpisode=$true};",
       "if(-not $play){ [pscustomobject]@{found=$false;invoked=$false;reason='matching-track-not-found'} | ConvertTo-Json -Compress; return };",
       "$name=$play.Current.Name; $invoked=$false;",
       "try{ $ip=$play.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $ip.Invoke(); $invoked=$true }catch{ $invoked=$false };",
-      "[pscustomobject]@{found=$true;invoked=$invoked;name=$name;matchedLabel=$matchedLabel;matchedBounds=$matchedBounds} | ConvertTo-Json -Compress"
+      "[pscustomobject]@{found=$true;invoked=$invoked;name=$name;matchedLabel=$matchedLabel;matchedBounds=$matchedBounds;pickedEpisode=$pickedEpisode} | ConvertTo-Json -Compress"
     ].join(" ");
     const ps = await this.runPowerShell(script, { timeoutMs: limit + 4000 });
     let parsed = null;
@@ -1868,6 +1981,7 @@ public static class SyscoraAudio {
       name: parsed?.name ?? null,
       matchedLabel: parsed?.matchedLabel ?? null,
       matchedBounds: parsed?.matchedBounds ?? null,
+      pickedEpisode: parsed?.pickedEpisode === true,
       reason: parsed?.reason ?? null,
       commandResult: ps
     };

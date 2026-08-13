@@ -108,6 +108,23 @@ export async function openAiCompatibleChat({
   stream = true
 }) {
   if (!apiKey) throw new Error("No API key");
+  // ONLY THE FIELDS THIS WIRE FORMAT DECLARES.
+  //
+  // The conversation carries provider bookkeeping that other providers need —
+  // Gemini's thought signature has to be replayed with each of its function
+  // calls — and an OpenAI-compatible gateway is entitled to reject a tool_call
+  // object with a field it has never heard of. Whatever is added for one
+  // provider must be dropped for the others rather than hoped over.
+  const wireMessages = (messages ?? []).map((message) => (Array.isArray(message.tool_calls)
+    ? {
+        ...message,
+        tool_calls: message.tool_calls.map((call) => ({
+          id: call.id,
+          type: call.type ?? "function",
+          function: { name: call.function?.name, arguments: call.function?.arguments }
+        }))
+      }
+    : message));
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const onOuterAbort = () => controller.abort();
@@ -121,7 +138,7 @@ export async function openAiCompatibleChat({
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}`, ...headers },
       body: JSON.stringify({
         model,
-        messages,
+        messages: wireMessages,
         ...(tools.length > 0 ? { tools, tool_choice: "auto" } : {}),
         temperature,
         max_tokens: maxTokens,
@@ -1278,7 +1295,18 @@ export class GeminiModelProvider extends LanguageModelProvider {
           if (call.id) callNames.set(call.id, name);
           let args = {};
           try { args = JSON.parse(call.function?.arguments ?? call.arguments ?? "{}"); } catch { args = {}; }
-          parts.push({ functionCall: { name, args } });
+          // THE SIGNATURE HAS TO COME BACK WITH THE CALL.
+          //
+          // Gemini attaches a `thoughtSignature` to each function call it makes
+          // and requires it on the way back — replaying the call without it is
+          // rejected outright: "Function call is missing a thought_signature in
+          // functionCall parts". Live, that turned into an HTTP 400 on the
+          // fourteenth step of a task, which the loop reported as the provider
+          // failing. It is an opaque token; it is carried and returned, not read.
+          parts.push({
+            functionCall: { name, args },
+            ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {})
+          });
         }
         // A turn with neither prose nor calls has nothing in it; Gemini rejects
         // an empty parts array.
@@ -1334,7 +1362,9 @@ export class GeminiModelProvider extends LanguageModelProvider {
     const toolCalls = parts.filter((part) => part.functionCall).map((part, index) => ({
       id: `gemini_call_${index}`,
       name: part.functionCall.name,
-      arguments: JSON.stringify(part.functionCall.args ?? {})
+      arguments: JSON.stringify(part.functionCall.args ?? {}),
+      // Opaque, and required back on the next turn. See _toGeminiContents.
+      ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {})
     }));
     return { text, toolCalls, finishReason: result.candidates?.[0]?.finishReason ?? null, usage };
   }
@@ -1397,7 +1427,9 @@ export class GeminiModelProvider extends LanguageModelProvider {
               toolCalls.push({
                 id: `gemini_call_${toolCalls.length}`,
                 name: part.functionCall.name,
-                arguments: JSON.stringify(part.functionCall.args ?? {})
+                arguments: JSON.stringify(part.functionCall.args ?? {}),
+                // Opaque, and required back on the next turn. See _toGeminiContents.
+                ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {})
               });
             }
           }

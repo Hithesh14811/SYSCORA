@@ -16,6 +16,50 @@ function clipped(value, depth = 0, maxStringLength = 1200) {
   );
 }
 
+// AN EMAIL ADDRESS IS NOT A SECRET, IT IS THE SUBJECT OF THE WORK.
+//
+// This used to end with a blanket `…@….… → ***REDACTED_EMAIL***`, applied to
+// every message on the way to the model — including the user's own words. Live,
+// that broke two different tasks and neither failure looked like redaction:
+//
+//   "log in with hitheshs096@gmail.com" reached the model as "log in with
+//   ***REDACTED_EMAIL***", so it typed that literal placeholder into the form,
+//   the site rejected it, and the user had to spell the address out as
+//   "hitheshs096 at the rate g mail . com" to get past our own filter.
+//
+//   Asked to check it was on the right Gmail account and switch if not, the
+//   model saw "Google Account: Prathibha Shetty (***REDACTED_EMAIL***)" and a
+//   switcher listing four accounts, ALL of them ***REDACTED_EMAIL***. The
+//   comparison it had been asked to make was erased from its input. It guessed
+//   from the display name — the only thing left — and was blamed for ignoring
+//   the instruction.
+//
+// Credentials still go, because a leaked key is unrecoverable and the agent
+// never needs to read one back. An address is the opposite: it is routinely the
+// whole point of the request, it is already on the user's own screen, and
+// without it the agent cannot tell two accounts apart.
+//
+// A HOME DIRECTORY IS NOT A SECRET EITHER, AND HIDING IT BREAKS EVERY PATH.
+//
+// This also used to rewrite `C:\Users\<name>` to the literal text
+// `%USERPROFILE%`. The model never saw a real path — it saw the placeholder,
+// and then, reasonably, typed the placeholder back into the next command.
+// PowerShell does not expand `%VAR%`, so the string was taken as a RELATIVE
+// path and resolved against the working directory:
+//
+//   Get-ChildItem : Cannot find path 'C:\Users\hithe\OneDrive\Documents\SYSCORA\
+//   %USERPROFILE%\OneDrive\Documents\check\beautify-ecommerce\node_modules'
+//
+// Asked to find a folder and improve the app inside it, the agent found the
+// folder, was handed a path it could not use, and spent its whole budget
+// re-locating it — searching C:\Users, listing node_modules recursively at
+// thirteen seconds a go, and finally giving up without editing a single file.
+// It even reasoned aloud that "the tool masks the real username", which is
+// exactly right and exactly the problem.
+//
+// The username is in every window title, every Explorer breadcrumb and every
+// screenshot the agent already receives; concealing it in paths alone bought no
+// privacy and cost the filesystem.
 function scrub(item, parentKey = "") {
   if (Array.isArray(item)) return item.map((child) => scrub(child, parentKey));
   if (!item || typeof item !== "object") {
@@ -25,12 +69,10 @@ function scrub(item, parentKey = "") {
       return "[PRIVATE_WINDOW_TITLE]";
     }
     return item
-      .replace(/\b[A-Za-z]:\\Users\\[^\\\s]+/gi, "%USERPROFILE%")
       .replace(/\b(?:sk|gsk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b/gi, "***REDACTED***")
       .replace(/\bAKIA[A-Z0-9]{12,}\b/g, "***REDACTED***")
       .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, "Bearer ***REDACTED***")
-      .replace(/\b(api[_ -]?key|password|access[_ -]?token|auth[_ -]?token)\s*[:=]\s*[^\s,;]+/gi, "$1=***REDACTED***")
-      .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "***REDACTED_EMAIL***");
+      .replace(/\b(api[_ -]?key|password|access[_ -]?token|auth[_ -]?token)\s*[:=]\s*[^\s,;]+/gi, "$1=***REDACTED***");
   }
   return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, scrub(child, key)]));
 }

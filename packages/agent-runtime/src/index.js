@@ -404,7 +404,21 @@ export class AgentRuntime {
     // typed capabilities without a model at all, so a request like "tell me
     // about this computer" is still answerable with the network down. It is
     // reached only from a standing start, never to retry work the loop began.
-    if (outcome.status === "FAILED" && outcome.toolCalls === 0 && options.fast !== true) {
+    // A THROTTLED ACCOUNT IS NOT AN OFFLINE MACHINE.
+    //
+    // The staged pipeline exists for the case where no model can be reached at
+    // all, and it answers from typed capabilities — so when it cannot map a
+    // request it says "I couldn't turn that into a concrete action". Live, a
+    // 429 took that branch, and the honest message the loop had already written
+    // ("your model provider is rate-limiting this account") was thrown away and
+    // replaced with a sentence that blames the request. The user asked a
+    // perfectly clear question and was told it made no sense.
+    //
+    // Rate limiting, quota and authentication are facts about the account, and
+    // re-planning cannot help with any of them.
+    const accountProblem = /\b(429|401|403)\b|rate.?limit|quota|exceeded|unauthorized|invalid.*api.?key/i
+      .test(String(outcome.message ?? ""));
+    if (outcome.status === "FAILED" && outcome.toolCalls === 0 && options.fast !== true && !accountProblem) {
       emit({ type: "FAST_AGENT_UNAVAILABLE", details: { reason: outcome.message } });
       return this._submitIntent(rawText, { ...options, fast: false, existingSession: session });
     }

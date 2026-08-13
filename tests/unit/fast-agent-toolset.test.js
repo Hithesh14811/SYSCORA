@@ -158,6 +158,415 @@ test("writing over a file that already has something in it stops and says so fir
   assert.equal(written.at(-1).content, "hello again");
 });
 
+// YOU ARE ALREADY IN POWERSHELL.
+//
+// `run` spawns `powershell.exe -Command <line>`, so `powershell -Command "…"`
+// nested inside it means the OUTER shell interpolates the inner double-quoted
+// string first — and `$_` outside a pipeline, or a variable not yet assigned,
+// expands to nothing. Live this ate eight consecutive commands on "what's using
+// the most RAM", each failing with a parser error about `.WorkingSet`, a token
+// the model never wrote and therefore could not learn anything from.
+test("a command wrapped in another powershell is unwrapped, so its variables survive", async () => {
+  const ran = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: {
+      executeCommand: async (cwd, command) => {
+        ran.push(command);
+        return { stdout: "ok", stderr: "", exitCode: 0 };
+      }
+    }
+  });
+
+  const inner = "Get-Process | Sort-Object WorkingSet -Descending | Select-Object -First 5 Name, @{N='MB';E={[math]::Round($_.WorkingSet / 1MB, 2)}}";
+  const result = await toolset.execute("run", { command: `powershell -Command "${inner}"` });
+  assert.equal(ran[0], inner, "the wrapper must be removed, not passed on to be interpolated away");
+  assert.match(result.text, /already in PowerShell/);
+
+  // Other spellings of the same wrapper.
+  await toolset.execute("run", { command: `powershell.exe -NoProfile -c '${inner}'` });
+  assert.equal(ran[1], inner);
+  await toolset.execute("run", { command: `pwsh -Command "Get-Date"` });
+  assert.equal(ran[2], "Get-Date");
+
+  // And a command that is not wrapped is left exactly alone.
+  await toolset.execute("run", { command: "node --version" });
+  assert.equal(ran[3], "node --version");
+});
+
+// CMD IS NOT POWERSHELL, AND THE COLLISIONS ARE SILENT.
+//
+// `where python` returned exit 0 and nothing, four times running, because in
+// PowerShell `where` is Where-Object reading an empty pipeline. An empty success
+// is the worst possible answer: indistinguishable from "python is not on the
+// PATH", so the model asked again.
+test("cmd builtins that are PowerShell aliases are run as the real program", async () => {
+  const ran = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: {
+      executeCommand: async (cwd, command) => {
+        ran.push(command);
+        return { stdout: "C:\\Python\\python.exe", stderr: "", exitCode: 0 };
+      }
+    }
+  });
+
+  const result = await toolset.execute("run", { command: "where python" });
+  assert.equal(ran[0], "where.exe python");
+  assert.match(result.text, /Where-Object alias/);
+
+  // Not touched when it is genuinely Where-Object.
+  await toolset.execute("run", { command: "Get-Process | where -Property WS -gt 100" });
+  assert.equal(ran[1], "Get-Process | where -Property WS -gt 100");
+});
+
+test("cmd syntax that PowerShell cannot run is named rather than left as a parser error", async () => {
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: { executeCommand: async () => ({ stdout: "", stderr: "boom", exitCode: 1 }) }
+  });
+  const chained = await toolset.execute("run", { command: "where.exe python && echo %PATH%" });
+  assert.match(chained.text, /`&&` and `\|\|` are not valid/);
+  assert.match(chained.text, /`%VAR%` is cmd syntax/);
+});
+
+// EXIT 0 AND NOTHING IS NOT AN ANSWER.
+test("a command that printed nothing is reported as having printed nothing", async () => {
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: { executeCommand: async () => ({ stdout: "", stderr: "", exitCode: 0 }) }
+  });
+  const result = await toolset.execute("run", { command: "Get-Nothing" });
+  assert.match(result.text, /printed NOTHING/);
+  assert.match(result.text, /not the same as a successful answer/);
+});
+
+// AN APPLICATION THAT IS RUNNING IS INSTALLED.
+//
+// Live, `launch spotify` reported "spotify is not installed" while Spotify was
+// playing music in a window on screen, and the agent believed it and ran
+// `winget install Spotify` over the running application.
+test("launching something that is already running uses its window instead of asking the installer", async () => {
+  const capabilities = [];
+  const toolset = buildToolset({
+    registry: {
+      get: (name) => ({
+        execute: async (inputs) => {
+          capabilities.push({ name, inputs });
+          if (name === "application.launch") {
+            return { application: "spotify", window: null, failureCategory: "APPLICATION_NOT_INSTALLED" };
+          }
+          return { performed: true };
+        }
+      })
+    },
+    adapter: {
+      listWindows: async () => [
+        { WindowHandle: 3607104, ProcessName: "Spotify", MainWindowTitle: "Spotify Free", Bounds: { width: 1600, height: 1200 } },
+        { WindowHandle: 99, ProcessName: "explorer", MainWindowTitle: "Program Manager", Bounds: { width: 2880, height: 1800 } }
+      ]
+    }
+  });
+
+  const result = await toolset.execute("launch", { application: "spotify" });
+  assert.equal(capabilities.some((call) => call.name === "application.launch"), false,
+    "an open window is proof the application exists; do not go to the installer");
+  assert.equal(capabilities[0].name, "window.activate", "and open means bring it to the front");
+  assert.match(result.text, /ALREADY RUNNING/);
+  assert.match(result.text, /3607104/);
+
+  // Nothing of that name is open, so it really does have to be launched.
+  const cold = buildToolset({
+    registry: {
+      get: (name) => ({
+        execute: async () => (name === "application.launch"
+          ? { application: "inkscape", windowIdentity: { windowId: "5" }, before: { windowIds: [] } }
+          : { performed: true })
+      })
+    },
+    adapter: { listWindows: async () => [] }
+  });
+  const launched = await cold.execute("launch", { application: "inkscape" });
+  assert.match(launched.text, /opened a new window/);
+});
+
+// A LIST OF IDENTICAL LABELS IS NOT A CHOICE.
+//
+// Asked for the song "Headlines", Spotify's reading held the word eight times
+// and the refusal offered eight lines reading `dataitem "Headlines"` — the same
+// eight words. The model had nothing to choose on, picked a row's subtitle,
+// clicked a piece of text that does nothing, and the podcast kept playing.
+test("when one label matches many things, each is offered with what sits beside it", async () => {
+  const row = (y, title, subtitle) => ([
+    { role: "dataitem", text: title, clickable: true, bounds: { x: 400, y, width: 200, height: 20 } },
+    { role: "dataitem", text: subtitle, bounds: { x: 620, y, width: 300, height: 20 } },
+    { role: "button", text: "Play", clickable: true, bounds: { x: 900, y, width: 40, height: 40 } }
+  ]);
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "9", application: "Spotify", title: "Spotify", visibleText: "",
+        elements: [
+          ...row(338, "Headlines", "Explicit Song • Drake"),
+          ...row(1077, "Headlines", "Episode • Top Hits Unpacked"),
+          ...paintTools
+        ]
+      }),
+      "pointer.clickAt": async (inputs) => ({ performed: true, x: inputs.x, y: inputs.y })
+    }),
+    adapter: {}
+  });
+  await toolset.execute("screen", { application: "Spotify" });
+
+  const ambiguous = await toolset.execute("click", { text: "Headlines" });
+  assert.equal(ambiguous.ok, false);
+  assert.match(ambiguous.text, /matches 2 things/);
+  // The row is what a person chooses between, so the row is what is offered.
+  assert.match(ambiguous.text, /beside it: .*Explicit Song • Drake/);
+  assert.match(ambiguous.text, /beside it: .*Episode • Top Hits Unpacked/);
+  // And a title is often just text; the row's own control is what acts.
+  assert.match(ambiguous.text, /a Play or Open control acts/);
+});
+
+// A raw element count is the wrong question. WhatsApp's tree publishes its
+// window, an input sink, a title bar and three caption buttons — six elements,
+// none of which is the application — and a "fewer than six" test let that
+// through as usable. The agent looked four times, saw Minimize/Restore/Close,
+// and gave up on a window with 138 chats on screen.
+test("a window whose tree is nothing but its own frame falls back to pixels", async () => {
+  const asked = [];
+  const frameOnly = [
+    { role: "window", text: "WhatsApp", bounds: { x: 0, y: 0, width: 2880, height: 1700 } },
+    { role: "pane", text: "Non Client Input Sink Window", bounds: { x: 0, y: 0, width: 2880, height: 64 } },
+    { role: "pane", text: "AppWindow Custom Title Bar", bounds: { x: 2600, y: 0, width: 280, height: 64 } },
+    { role: "button", text: "Minimize", clickable: true, bounds: { x: 2650, y: 32, width: 40, height: 40 } },
+    { role: "button", text: "Restore", clickable: true, bounds: { x: 2742, y: 32, width: 40, height: 40 } },
+    { role: "button", text: "Close", clickable: true, bounds: { x: 2834, y: 32, width: 40, height: 40 } }
+  ];
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async (inputs) => {
+        asked.push(inputs);
+        return {
+          read: true, windowId: "393290", application: "WhatsApp.Root", title: "WhatsApp",
+          visibleText: inputs.includeOcr === false ? "" : "Chats  Amma  Unread 136",
+          elements: inputs.includeOcr === false ? frameOnly : [...frameOnly, ...paintTools]
+        };
+      }
+    }),
+    adapter: { listWindows: async () => [] }
+  });
+
+  const result = await toolset.execute("screen", { application: "whatsapp" });
+  assert.equal(asked.length, 2, "six caption buttons are not a reading of the application");
+  assert.equal(asked[0].includeOcr, false);
+  assert.equal(asked[1].includeOcr, undefined);
+  assert.match(result.text, /Chats  Amma  Unread 136/);
+});
+
+// A CLICK ON A FIELD IS NOT PROOF THE FIELD HAS FOCUS.
+//
+// On Google Flights the agent clicked "Where from?", typed Frankfurt, clicked
+// "Where to?", typed New York — and both went into the FIRST box, which read
+// "FrankfurtNew York", because the origin field's suggestion list was still open
+// and swallowed the second click. Every step reported success.
+test("typing into a field refuses when the keyboard did not actually go there", async () => {
+  const typed = [];
+  const fields = [
+    { role: "edit", text: "Where from?", clickable: true, focused: true, bounds: { x: 400, y: 1100, width: 200, height: 40 } },
+    { role: "edit", text: "Where to?", clickable: true, bounds: { x: 760, y: 1100, width: 200, height: 40 } },
+    ...paintTools
+  ];
+  const build = (focusedLabel) => buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "9", application: "browser", title: "Flights", visibleText: "", elements: fields
+      }),
+      "pointer.clickAt": async (inputs) => ({ performed: true, x: inputs.x, y: inputs.y }),
+      "keyboard.type": async (inputs) => { typed.push(inputs.text); return { performed: true }; }
+    }),
+    adapter: {
+      inspectUi: async () => ({
+        elements: fields.map((field) => ({
+          name: field.text,
+          controlType: `ControlType.${field.role}`,
+          boundingRect: field.bounds,
+          focused: field.text === focusedLabel
+        }))
+      })
+    }
+  });
+
+  // The suggestion list ate the click: focus is still on the origin field.
+  const stuck = build("Where from?");
+  await stuck.execute("screen", { application: "browser" });
+  const refused = await stuck.execute("type", { text: "New York", into: "Where to?" });
+  assert.equal(refused.ok, false);
+  assert.match(refused.text, /did not move the keyboard there/);
+  assert.match(refused.text, /focus is on "Where from\?"/);
+  assert.match(refused.text, /suggestion list/);
+  assert.deepEqual(typed, [], "not one character may go into the wrong box");
+
+  // Focus followed the click, so it types.
+  const ok = build("Where to?");
+  await ok.execute("screen", { application: "browser" });
+  assert.equal((await ok.execute("type", { text: "New York", into: "Where to?" })).ok, true);
+  assert.deepEqual(typed, ["New York"]);
+});
+
+test("a window that reports no focus at all is not treated as the wrong window", async () => {
+  const typed = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "9", application: "app", title: "app", visibleText: "",
+        elements: [{ role: "edit", text: "Search", clickable: true, bounds: { x: 0, y: 0, width: 200, height: 40 } }, ...paintTools]
+      }),
+      "pointer.clickAt": async (inputs) => ({ performed: true, x: inputs.x, y: inputs.y }),
+      "keyboard.type": async (inputs) => { typed.push(inputs.text); return { performed: true }; }
+    }),
+    // Nothing claims focus. UNCONFIRMED IS NOT WRONG.
+    adapter: { inspectUi: async () => ({ elements: [{ name: "Search", controlType: "ControlType.Edit", boundingRect: { x: 0, y: 0, width: 200, height: 40 } }] }) }
+  });
+  await toolset.execute("screen", { application: "app" });
+  assert.equal((await toolset.execute("type", { text: "cats", into: "Search" })).ok, true);
+  assert.deepEqual(typed, ["cats"]);
+});
+
+// A registry of exactly the capabilities a test cares about.
+function stubRegistry(capabilities) {
+  return { get: (name) => (capabilities[name] ? { execute: capabilities[name] } : null) };
+}
+
+// ONE ROUND TRIP PER KEYSTROKE IS THE WHOLE LATENCY BUDGET.
+//
+// Live, "45 × 6664533365" was entered one `click` per digit. Each click cost
+// about a second on the machine and three or four waiting for the model to
+// decide the next digit, so twelve digits took most of a minute, the run hit the
+// provider's rate limit partway through, and it never reached "=".
+test("a decided sequence runs in one call instead of one round trip per keystroke", async () => {
+  const clicked = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "9", application: "Calculator", title: "Calculator", visibleText: "0",
+        elements: ["Four", "Five", "Multiply by", "Six", "Equals", "Seven"].map((name, index) => ({
+          role: "button", text: name, clickable: true,
+          bounds: { x: index * 100, y: 500, width: 80, height: 80 }
+        }))
+      }),
+      "pointer.clickAt": async (inputs) => { clicked.push(inputs); return { performed: true, x: inputs.x, y: inputs.y }; }
+    }),
+    adapter: {}
+  });
+  await toolset.execute("screen", { application: "Calculator" });
+
+  const result = await toolset.execute("batch", {
+    steps: [
+      { tool: "click", args: { text: "Four" } },
+      { tool: "click", args: { text: "Five" } },
+      { tool: "click", args: { text: "Multiply by" } },
+      { tool: "click", args: { text: "Six" } },
+      { tool: "click", args: { text: "Equals" } }
+    ]
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(clicked.length, 5, "all five actions happen without going back to the model");
+  assert.match(result.text, /All 5 steps ran/);
+  assert.match(result.text, /1\. click: Clicked at 40,540/);
+});
+
+// A sequence that carries on after a step missed is how a password gets typed
+// into a window that never opened.
+test("a batch stops at the first step that fails and says which one", async () => {
+  const clicked = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "9", application: "app", title: "app", visibleText: "",
+        elements: [{ role: "button", text: "Four", clickable: true, bounds: { x: 0, y: 0, width: 80, height: 80 } }]
+      }),
+      "pointer.clickAt": async (inputs) => { clicked.push(inputs); return { performed: true, x: inputs.x, y: inputs.y }; }
+    }),
+    adapter: {}
+  });
+  await toolset.execute("screen", { application: "app" });
+
+  const result = await toolset.execute("batch", {
+    steps: [
+      { tool: "click", args: { text: "Four" } },
+      { tool: "click", args: { text: "Nine" } },
+      { tool: "click", args: { text: "Four" } }
+    ]
+  });
+
+  assert.equal(result.ok, true, "a failed step is a result to read, not a crash");
+  assert.match(result.text, /Stopped at step 2/);
+  assert.match(result.text, /Nothing on screen is labelled "Nine"/);
+  assert.match(result.text, /steps after it did NOT run/);
+  assert.equal(clicked.length, 1, "the third step must not run after the second failed");
+});
+
+test("a batch cannot contain a batch, and an unknown tool in one is named", async () => {
+  const toolset = buildToolset({ registry: stubRegistry({}), adapter: {} });
+  const nested = await toolset.execute("batch", { steps: [{ tool: "batch", args: { steps: [] } }] });
+  assert.equal(nested.ok, false);
+  assert.match(nested.text, /cannot contain another batch/);
+
+  const unknown = await toolset.execute("batch", { steps: [{ tool: "levitate", args: {} }] });
+  assert.match(unknown.text, /no tool called "levitate"/);
+});
+
+// A SERVER DOES NOT EXIT, AND WAITING FOR IT TO IS A HANG.
+//
+// Live, `jupyter notebook` blocked the loop for the full ninety-second timeout
+// with the notebook already open and working on screen, then reported a timeout
+// — and every later request in that conversation went back to it and hung again.
+test("something that stays running is started, not waited on", async () => {
+  const ran = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: {
+      executeCommand: async (cwd, command, args, options) => {
+        ran.push({ command, options });
+        return { stdout: "31402", stderr: "", exitCode: 0 };
+      }
+    }
+  });
+
+  const server = await toolset.execute("run", { command: "jupyter notebook" });
+  assert.match(ran[0].command, /Start-Process/, "it must not be waited on");
+  assert.match(ran[0].command, /jupyter notebook/);
+  assert.ok(ran[0].options.timeoutMs <= 20000, "and it must not hold the loop for the full command timeout");
+  assert.match(server.text, /Started `jupyter notebook` in the background \(PID 31402\)/);
+  assert.match(server.text, /keeps running/);
+
+  // An ordinary command is still an ordinary command.
+  await toolset.execute("run", { command: "node --version" });
+  assert.equal(ran[1].command, "node --version");
+  assert.doesNotMatch(ran[1].command, /Start-Process/);
+
+  // And anything else can say so for itself.
+  await toolset.execute("run", { command: "./my-daemon --serve-forever", background: true });
+  assert.match(ran[2].command, /Start-Process/);
+});
+
+// The loop reads a timeout as "that did not work", and for a server it is the
+// opposite — so the result has to say which one it was.
+test("a command that timed out is told it may simply never have been going to exit", async () => {
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: {
+      executeCommand: async () => ({ stdout: "", stderr: "", exitCode: null, timedOut: true })
+    }
+  });
+  const result = await toolset.execute("run", { command: "./unknown-long-thing" });
+  assert.match(result.text, /timed out/);
+  assert.match(result.text, /background: true/);
+});
+
 test("reading a file returns its contents to the model", async () => {
   const { toolset } = realToolset();
   const result = await toolset.execute("read_file", { path: "C:\\x.txt" });
@@ -412,6 +821,13 @@ test("an exact window handle wins over a process name shared by other windows", 
 // `screen` with no arguments, and got back a reading of the CLAUDE window — the
 // user was watching, so their chat was the OS foreground window. Every
 // conclusion after that was drawn from the wrong application.
+// Enough of the APPLICATION's own controls that the reading counts as usable —
+// a tree this rich is never worth photographing on top of.
+const paintTools = ["Pencil", "Brushes", "Shapes", "Fill", "Text", "Eraser", "Magnifier", "Colour picker", "Rotate"]
+  .map((name, index) => ({
+    role: "button", text: name, clickable: true, bounds: { x: index * 40, y: 100, width: 30, height: 30 }
+  }));
+
 test("reading the screen re-reads the window being worked in, not whatever is in front", async () => {
   const asked = [];
   const toolset = buildToolset({
@@ -422,7 +838,10 @@ test("reading the screen re-reads the window being worked in, not whatever is in
             return { application: "mspaint", windowIdentity: { windowId: "7408238" } };
           }
           asked.push(inputs);
-          return { read: true, windowId: inputs.windowId ?? "0", application: "mspaint", title: "Paint", visibleText: "", elements: [] };
+          return {
+            read: true, windowId: inputs.windowId ?? "0", application: "mspaint", title: "Paint",
+            visibleText: "", elements: paintTools
+          };
         }
       })
     },
@@ -431,11 +850,46 @@ test("reading the screen re-reads the window being worked in, not whatever is in
 
   await toolset.execute("launch", { application: "mspaint" });
   await toolset.execute("screen", {});
+  assert.equal(asked.length, 1, "a tree with real controls in it needs no second, slower look");
+  assert.equal(asked[0].includeOcr, false, "the accessibility tree is asked for first, without pixels");
   assert.equal(asked[0].windowId, "7408238", "it must re-read the window it is working in");
 
   // And it can still deliberately look at whatever is in front when it says so.
   await toolset.execute("screen", { desktop: true });
   assert.equal(asked[1].windowId, undefined);
+});
+
+// CAPTURE + OCR IS THE SLOW HALF OF EVERY LOOK.
+//
+// Roughly two of the three seconds, and for an application with a real
+// accessibility tree it returns the same words a second time, misread — live
+// readings came back with "Va1ues", "dflff.tx" and "printf("Va1ues" as extra
+// unclickable elements sitting on top of the real controls, costing tokens on
+// every step afterwards. It is worth paying for when there is no tree at all.
+test("pixels are only paid for when the accessibility tree comes back empty", async () => {
+  const asked = [];
+  const make = (elements) => buildToolset({
+    registry: {
+      get: () => ({
+        execute: async (inputs) => {
+          asked.push(inputs);
+          return {
+            read: true, windowId: "7", application: "game", title: "A game",
+            visibleText: inputs.includeOcr === false ? "" : "read off the pixels",
+            elements: inputs.includeOcr === false ? elements : [...elements, ...paintTools]
+          };
+        }
+      })
+    },
+    adapter: { listWindows: async () => [] }
+  });
+
+  // A window with nothing accessible in it — a canvas, a game, a remote session.
+  const blind = await make([]).execute("screen", { application: "game" });
+  assert.equal(asked.length, 2, "an empty tree is exactly when a photograph is worth three seconds");
+  assert.equal(asked[0].includeOcr, false);
+  assert.equal(asked[1].includeOcr, undefined);
+  assert.match(blind.text, /read off the pixels/);
 });
 
 // Live, Paint exposes well over sixty elements, so "Shapes" and "Brushes" fell
@@ -840,8 +1294,31 @@ test("launching an application that was already running says so, instead of impl
 
   const fresh = editorToolset({ windows: [{ WindowHandle: 9 }] });
   const opened = await fresh.toolset.execute("launch", { application: "notepad" });
-  assert.match(opened.text, /open in a new window/);
+  assert.match(opened.text, /opened a new window/);
   assert.doesNotMatch(opened.text, /ALREADY RUNNING/);
+  // A NEW WINDOW IS NOT A BLANK ONE, and saying it is cost a document: Notepad
+  // opened a genuinely new window with the user's eight restored tabs in it.
+  assert.match(opened.text, /restore their last session/);
+});
+
+// The first version of the gate skipped any window the agent had opened itself.
+// Live, that was wrong within a minute: Notepad started a new window and Windows
+// restored the user's session into it, so the "fresh" window was full of their
+// work and a C program went into the middle of a saved file.
+test("a window we opened ourselves is still checked, because applications restore sessions into new windows", async () => {
+  const restored = editorToolset({
+    // Handle 9 was open before; 42 is the window this launch created.
+    windows: [{ WindowHandle: 9 }],
+    launched: { WindowHandle: 42, title: "quarterly-report.txt - Notepad" },
+    elements: [documentSurface(500, { undo: true })]
+  });
+  const opened = await restored.toolset.execute("launch", { application: "notepad" });
+  assert.match(opened.text, /opened a new window/);
+
+  const refused = await restored.toolset.execute("type", { text: "a poem" });
+  assert.equal(refused.ok, false, "who opened the window says nothing about what is in it");
+  assert.match(refused.text, /already work in this document/);
+  assert.match(refused.text, /500 characters/);
 });
 
 test("typing into a document that was already open refuses once and says what is in it", async () => {
@@ -853,7 +1330,7 @@ test("typing into a document that was already open refuses once and says what is
 
   const refused = await toolset.execute("type", { text: "a poem" });
   assert.equal(refused.ok, false);
-  assert.match(refused.text, /ALREADY OPEN/);
+  assert.match(refused.text, /already work in this document/);
   assert.match(refused.text, /120 characters/);
   assert.match(refused.text, /unsaved edits/);
   assert.match(refused.text, /new_document/);
@@ -869,17 +1346,11 @@ test("typing into a document that was already open refuses once and says what is
   assert.equal(calls.filter((call) => call.name === "keyboard.type").length, 2);
 });
 
-test("an empty document, a window we opened ourselves, and a search box are never gated", async () => {
+test("an empty document and a search box are never gated", async () => {
   const empty = editorToolset({ windows: [{ WindowHandle: 42 }], elements: [documentSurface(0, { undo: false })] });
   await empty.toolset.execute("launch", { application: "notepad" });
   assert.equal((await empty.toolset.execute("type", { text: "hello" })).ok, true,
     "an open but empty document is not somebody's work");
-
-  // We opened this one, so whatever is in it is ours. No probe, no gate.
-  const ours = editorToolset({ windows: [{ WindowHandle: 9 }], elements: [documentSurface(500, { undo: true })] });
-  await ours.toolset.execute("launch", { application: "notepad" });
-  assert.equal((await ours.toolset.execute("type", { text: "hello" })).ok, true);
-  assert.equal(ours.inspections.length, 0, "a window we created needs no interrogation");
 
   // A browser: the address bar holds a URL, and it is a small control rather
   // than a document. Typing into a search box must never be gated.
@@ -985,7 +1456,9 @@ test("looking at the screen before anything is open asks which window, instead o
       get: () => ({
         execute: async (inputs) => {
           asked.push(inputs);
-          return { read: true, windowId: "7", application: "notepad", title: "x", visibleText: "", elements: [] };
+          return {
+            read: true, windowId: "7", application: "notepad", title: "x", visibleText: "", elements: paintTools
+          };
         }
       })
     },
@@ -1057,5 +1530,5 @@ test("new_document that did not actually open one says so rather than reporting 
   // And the window stays gated, because nothing about it has changed.
   const typed = await stuck.toolset.execute("type", { text: "a poem" });
   assert.equal(typed.ok, false);
-  assert.match(typed.text, /ALREADY OPEN/);
+  assert.match(typed.text, /already work in this document/);
 });

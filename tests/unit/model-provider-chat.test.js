@@ -95,6 +95,78 @@ test("Gemini is sent the tool calls it made and the results as responses to them
   assert.match(response.response.result, /windowId 42/);
 });
 
+// THE SIGNATURE HAS TO COME BACK WITH THE CALL.
+//
+// Gemini attaches a thoughtSignature to each function call it makes and requires
+// it on the way back; replaying the call without it is rejected outright —
+// "Function call is missing a thought_signature in functionCall parts". Live,
+// that arrived as an HTTP 400 on the fourteenth step of a task and was reported
+// to the user as the provider having failed.
+test("Gemini's thought signature is carried back with the call it belongs to", async (t) => {
+  const calls = withFetch(t, (n) => (n === 1
+    ? sseResponse([
+        'data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"launch","args":{"application":"mspaint"}},"thoughtSignature":"sig-abc123"}]},"finishReason":"STOP"}]}'
+      ])
+    : sseResponse(['data: {"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]}'])));
+  const provider = new GeminiModelProvider({ apiKey: "k" });
+
+  const first = await provider.chat({
+    messages: [{ role: "user", content: "open paint" }],
+    onTextDelta: () => {}
+  });
+  assert.equal(first.toolCalls[0].thoughtSignature, "sig-abc123",
+    "the signature must survive the read, or there is nothing to send back");
+
+  // The loop replays the call on the next turn; the signature must ride with it.
+  await provider.chat({
+    messages: [
+      { role: "user", content: "open paint" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: first.toolCalls[0].id,
+          type: "function",
+          function: { name: "launch", arguments: first.toolCalls[0].arguments },
+          thoughtSignature: first.toolCalls[0].thoughtSignature
+        }]
+      },
+      { role: "tool", tool_call_id: first.toolCalls[0].id, content: "mspaint opened." }
+    ],
+    onTextDelta: () => {}
+  });
+  const modelTurn = calls[1].body.contents.find((entry) => entry.role === "model");
+  assert.equal(modelTurn.parts[0].thoughtSignature, "sig-abc123");
+  assert.equal(modelTurn.parts[0].functionCall.name, "launch");
+});
+
+// Whatever is added to the conversation for one provider must be dropped for
+// the others: an OpenAI-compatible gateway is entitled to reject a tool_call
+// object carrying a field it has never heard of.
+test("provider bookkeeping is stripped before it reaches an OpenAI-shaped endpoint", async (t) => {
+  const calls = withFetch(t, () => sseResponse([
+    'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}',
+    "data: [DONE]"
+  ]));
+  await openAiCompatibleChat({
+    baseUrl: "https://x/v1",
+    apiKey: "k",
+    model: "m",
+    messages: [{
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "call_0",
+        type: "function",
+        function: { name: "launch", arguments: "{}" },
+        thoughtSignature: "sig-abc123"
+      }]
+    }]
+  });
+  const sent = calls[0].body.messages[0].tool_calls[0];
+  assert.deepEqual(sent, { id: "call_0", type: "function", function: { name: "launch", arguments: "{}" } });
+});
+
 // An assistant turn with neither prose nor calls has nothing in it, and Gemini
 // rejects an empty parts array outright — which would fail the whole request.
 test("Gemini is not sent an empty turn", async (t) => {

@@ -135,7 +135,7 @@ test("interactive controller detects repeated action/state loops", async () => {
   assert.equal(result.steps, 2);
 });
 
-test("interactive context sanitization removes secrets and personal machine paths", () => {
+test("interactive context sanitization removes secrets but keeps paths usable", () => {
   const safe = sanitizeInteractiveState({
     token: "secret-token",
     path: "C:\\Users\\Alice\\Documents\\private.txt",
@@ -143,7 +143,12 @@ test("interactive context sanitization removes secrets and personal machine path
   });
   assert.equal(safe.token, "***REDACTED***");
   assert.equal(safe.nested.password, "***REDACTED***");
-  assert.equal(safe.path, "%USERPROFILE%\\Documents\\private.txt");
+  // This used to become "%USERPROFILE%\Documents\private.txt". PowerShell does
+  // not expand %VAR%, so the agent — reasonably typing back the only path it had
+  // been given — resolved it against the working directory and could not open,
+  // read or edit anything under the home folder. The username is already in
+  // every window title it receives; hiding it here bought nothing.
+  assert.equal(safe.path, "C:\\Users\\Alice\\Documents\\private.txt");
   const classified = classifyInteractiveContext({ clipboardText: "private", MainWindowTitle: "secret.txt - Notepad" });
   assert.equal(classified.safeForExternalReasoning, true);
   assert.equal(classified.data.clipboardText, "***REDACTED***");

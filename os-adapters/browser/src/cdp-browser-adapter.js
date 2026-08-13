@@ -768,6 +768,85 @@ export class CdpBrowserAdapter {
     return { found: true, target: normalizeBrowserElement(found), textCoverage: found.textCoverage };
   }
 
+  // AN INPUT HAS NO TEXT IN IT, WHICH IS THE WHOLE POINT OF AN INPUT.
+  //
+  // `find` and `findBest` both match on innerText/textContent, and an empty text
+  // box has neither — so "the search box", "Email", "Where from?" matched
+  // nothing, or matched some paragraph that happened to contain the word. What a
+  // person reads as the field's name is its placeholder, its aria-label, or the
+  // <label> pointing at it, and none of those is innerText.
+  //
+  // With no text at all this returns the largest visible field, which is what
+  // "type into the box" means on a page that has one.
+  async findField({ text = null } = {}) {
+    const query = JSON.stringify({ text: text == null ? null : String(text) });
+    const found = await this._evaluate(`(() => {
+      const q=${query};
+      const visible=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);
+        return r.width>0&&r.height>0&&s.visibility!=="hidden"&&s.display!=="none"&&!e.disabled&&!e.readOnly};
+      const SKIP=new Set(["hidden","submit","button","reset","checkbox","radio","file","image"]);
+      const fields=[...document.querySelectorAll('input,textarea,[contenteditable=true],[role="textbox"],[role="searchbox"],[role="combobox"]')]
+        .filter(e=>!(e.tagName==="INPUT"&&SKIP.has((e.getAttribute("type")||"text").toLowerCase())))
+        .filter(visible);
+      if(fields.length===0)return null;
+      // Everything a person MIGHT read as this field's name, for matching — and
+      // separately the one a person would actually SAY, for reporting back.
+      // Joining them for both produced 'Typed into "Search the archive q"',
+      // which names the field by its placeholder and its form key at once.
+      const namesOf=e=>{
+        const parts=[e.getAttribute("aria-label"),e.getAttribute("placeholder"),
+          e.getAttribute("aria-labelledby")?(document.getElementById(e.getAttribute("aria-labelledby"))||{}).innerText:null];
+        if(e.id){const l=document.querySelector('label[for="'+CSS.escape(e.id)+'"]');if(l)parts.push(l.innerText);}
+        const wrapping=e.closest("label"); if(wrapping)parts.push(wrapping.innerText);
+        // Weaker, machine-facing names last: they match but should not be quoted.
+        parts.push(e.getAttribute("title"),e.getAttribute("name"),e.getAttribute("id"));
+        return parts.filter(Boolean).map(v=>String(v).replace(/\\s+/g," ").trim()).filter(Boolean);
+      };
+      const labelOf=e=>namesOf(e).join(" ");
+      const spokenOf=e=>namesOf(e)[0]||"";
+      const area=e=>{const r=e.getBoundingClientRect();return r.width*r.height};
+      let best=null;
+      if(q.text){
+        const tokens=v=>String(v||"").toLowerCase().match(/[a-z0-9]+/g)||[];
+        const wanted=[...new Set(tokens(q.text))];
+        for(const field of fields){
+          const actual=new Set(tokens(labelOf(field)));
+          const hits=wanted.filter(t=>actual.has(t)).length;
+          const coverage=wanted.length?hits/wanted.length:0;
+          if(!best||coverage>best.coverage||(coverage===best.coverage&&area(field)>area(best.hit)))
+            best={hit:field,label:spokenOf(field),coverage};
+        }
+        // Below half the words matched, this is a different field with a word in
+        // common — saying so beats typing a password into a search box.
+        if(!best||best.coverage<0.5)return null;
+      } else {
+        for(const field of fields) if(!best||area(field)>area(best.hit)) best={hit:field,label:spokenOf(field),coverage:1};
+      }
+      const r=best.hit.getBoundingClientRect();
+      const token="syscora-"+(globalThis.crypto?.randomUUID?.()||Math.random().toString(36).slice(2));
+      best.hit.dataset.syscoraTarget=token;
+      return {targetId:token,source:"DOM",selector:'[data-syscora-target="'+token+'"]',
+        name:best.label||best.hit.getAttribute("placeholder")||best.hit.tagName.toLowerCase(),
+        controlType:best.hit.tagName.toLowerCase(),boundingRect:{x:r.x,y:r.y,width:r.width,height:r.height},
+        confidence:best.coverage,observedAt:new Date().toISOString(),url:location.href,
+        fieldCount:fields.length,labels:fields.slice(0,12).map(spokenOf).filter(Boolean)};
+    })()`);
+    if (!found) {
+      // What IS on the page, so a miss is a next move rather than a dead end.
+      const labels = await this._evaluate(`(() => {
+        const visible=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);
+          return r.width>0&&r.height>0&&s.visibility!=="hidden"&&s.display!=="none"};
+        return [...document.querySelectorAll('input,textarea,[contenteditable=true],[role="textbox"],[role="searchbox"]')]
+          .filter(visible).slice(0,12)
+          .map(e=>(e.getAttribute("aria-label")||e.getAttribute("placeholder")||e.getAttribute("name")||e.getAttribute("id")||e.tagName.toLowerCase()))
+          .filter(Boolean);
+      })()`).catch(() => []);
+      return { found: false, reason: "field-not-found", labels: labels ?? [] };
+    }
+    this.observedTargets.set(found.targetId, found);
+    return { found: true, target: normalizeBrowserElement(found), label: found.name, coverage: found.confidence };
+  }
+
   _targetSelector(target) {
     const observed = target?.targetId ? this.observedTargets.get(target.targetId) : null;
     if (!observed || observed.selector !== target.selector || target?.source !== "DOM") {
@@ -799,14 +878,100 @@ export class CdpBrowserAdapter {
     return { performed, target };
   }
 
+  // ASSIGNING `.value` IS INVISIBLE TO A FRAMEWORK.
+  //
+  // React (and Vue, and every library that keeps its own copy of the input's
+  // value) installs its own setter on HTMLInputElement.prototype.value and
+  // tracks the last value it wrote. A plain `e.value = x` writes through that
+  // tracker without updating it, so the InputEvent that follows is discarded as
+  // a no-op and the framework re-renders the field back to empty. The box looks
+  // typed for a frame and then is not — and `type` returned `performed: true`
+  // for it, which is the false success this codebase keeps paying for.
+  //
+  // Calling the PROTOTYPE's native setter is what a real keystroke does, and it
+  // leaves the tracker stale in exactly the way the framework watches for.
+  // contenteditable has no `.value` at all and needs its text set directly.
   async type({ target, text, clear = true } = {}) {
     const selector = this._targetSelector(target);
     const payload = JSON.stringify(String(text ?? ""));
-    const performed = await this._evaluate(`(() => { const e=document.querySelector(${selector}); if(!e)return false;
-      e.focus(); if(${clear ? "true" : "false"}) e.value=""; e.value+=${payload};
+    const result = await this._evaluate(`(() => { const e=document.querySelector(${selector}); if(!e)return null;
+      e.focus();
+      const editable = e.isContentEditable && !("value" in e);
+      if (editable) {
+        if (${clear ? "true" : "false"}) e.textContent = "";
+        e.textContent += ${payload};
+      } else {
+        const proto = e instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const native = Object.getOwnPropertyDescriptor(proto, "value");
+        const next = (${clear ? "true" : "false"} ? "" : (e.value ?? "")) + ${payload};
+        if (native && native.set) native.set.call(e, next); else e.value = next;
+      }
       e.dispatchEvent(new InputEvent("input",{bubbles:true,inputType:"insertText",data:${payload}}));
-      e.dispatchEvent(new Event("change",{bubbles:true})); return true; })()`);
-    return { performed, length: String(text ?? "").length, target };
+      e.dispatchEvent(new Event("change",{bubbles:true}));
+      // What the field ACTUALLY holds now. A framework that rejected the write
+      // shows up here as a value that is not what was asked for, which is a fact
+      // the caller can act on instead of a "performed: true" that is not true.
+      return { landed: editable ? (e.innerText ?? e.textContent ?? "") : (e.value ?? "") };
+    })()`);
+    if (!result) return { performed: false, reason: "target-not-found", target };
+    const wanted = String(text ?? "");
+    const landed = String(result.landed ?? "");
+    return {
+      performed: landed.includes(wanted),
+      landed,
+      length: wanted.length,
+      target,
+      ...(landed.includes(wanted) ? {} : { reason: "the field did not keep what was typed" })
+    };
+  }
+
+  // A SEARCH BOX WITH TEXT IN IT HAS NOT BEEN SEARCHED.
+  //
+  // `type` sets the value and fires input/change, which is everything an
+  // ordinary form field needs and nothing a search box does: the page waits for
+  // Enter. Without a key primitive the only route was to find and click a submit
+  // control, and most search interfaces do not publish one — so typing into
+  // Google, YouTube or a site's own search left the query sitting in the box and
+  // the next read saw the page that was already there.
+  //
+  // Dispatched through CDP Input rather than a synthetic KeyboardEvent, for the
+  // same reason click is: a synthetic event does not carry user activation, and
+  // pages routinely ignore one that does not.
+  async pressKey({ key = "Enter", target = null } = {}) {
+    const named = String(key ?? "Enter").trim().toLowerCase();
+    const KEYS = {
+      enter: { key: "Enter", code: "Enter", keyCode: 13, text: "\r" },
+      tab: { key: "Tab", code: "Tab", keyCode: 9, text: "\t" },
+      escape: { key: "Escape", code: "Escape", keyCode: 27 },
+      backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+      delete: { key: "Delete", code: "Delete", keyCode: 46 },
+      arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+      arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+      arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+      arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+      home: { key: "Home", code: "Home", keyCode: 36 },
+      end: { key: "End", code: "End", keyCode: 35 },
+      pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 },
+      pageup: { key: "PageUp", code: "PageUp", keyCode: 33 }
+    };
+    const spec = KEYS[named.replace(/^(down|up|left|right)$/, "arrow$1")];
+    if (!spec) {
+      return { performed: false, reason: `unsupported-key:${named}`, supported: Object.keys(KEYS) };
+    }
+    // Focus first when a target was named, so the key lands where it is meant to
+    // rather than on whatever the page focused last.
+    if (target) {
+      const selector = this._targetSelector(target);
+      await this._evaluate(`(() => { const e=document.querySelector(${selector}); if(e) e.focus(); return true; })()`);
+    }
+    const base = { key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.keyCode, nativeVirtualKeyCode: spec.keyCode };
+    await this.connection.send("Input.dispatchKeyEvent", {
+      type: spec.text ? "keyDown" : "rawKeyDown",
+      ...base,
+      ...(spec.text ? { text: spec.text, unmodifiedText: spec.text } : {})
+    });
+    await this.connection.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+    return { performed: true, key: spec.key };
   }
 
   async select({ target, value } = {}) {
@@ -845,9 +1010,31 @@ export class CdpBrowserAdapter {
     return { matched: false, reason: "browser-wait-timeout", condition, selector, value };
   }
 
+  // `textContent` IS NOT THE PAGE, IT IS THE PAGE PLUS ITS SOURCE CODE.
+  //
+  // This read `innerText||value||textContent`, and innerText is empty for a
+  // fraction of a second while a framework hydrates — so on any Next.js or
+  // similar site the chain fell through to textContent, which unlike innerText
+  // includes the contents of every inline <script>. Live, asking nodejs.org for
+  // the current version returned a minified theme-switcher closure as "the page
+  // text": the model read four hundred characters of JavaScript, correctly
+  // concluded it had learned nothing, and spent another step and ten seconds
+  // opening a different page.
+  //
+  // So: innerText when there is any, and when there is not, textContent with the
+  // code taken out — a page that has not painted yet still has readable prose in
+  // it, and that prose is what was asked for.
   async read({ target = null, selector = null } = {}) {
     const selected = target ? this._targetSelector(target) : JSON.stringify(selector ?? "body");
-    const result = await this._evaluate(`(() => { const e=document.querySelector(${selected}); return e ? (e.innerText||e.value||e.textContent||"").trim() : null; })()`);
+    const result = await this._evaluate(`(() => {
+      const e=document.querySelector(${selected}); if(!e) return null;
+      if (e.tagName === "INPUT" || e.tagName === "TEXTAREA") return String(e.value ?? "").trim();
+      const inner = (e.innerText || "").trim();
+      if (inner) return inner;
+      const clone = e.cloneNode(true);
+      for (const node of clone.querySelectorAll("script,style,noscript,template,svg")) node.remove();
+      return (clone.textContent || "").replace(/\\n{3,}/g, "\\n\\n").trim();
+    })()`);
     return { found: result != null, text: result };
   }
 

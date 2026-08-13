@@ -3153,6 +3153,34 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     });
   }
   registerBrowserPrimitive({
+    name: "browser.dismissCookieNotice",
+    description: "Dismiss a consent interstitial using the least-permissive available choice, never accepting optional tracking",
+    inputSchema: { type: "object", properties: { timeoutMs: { type: "number" } }, required: [] },
+    operation: "dismissCookieNotice", permissionType: "WRITE", detectedChanges: ["browser.document"]
+  });
+  registerBrowserPrimitive({
+    name: "browser.findField",
+    description: "Find an editable field by its placeholder, accessible name or label and return a grounded target",
+    inputSchema: { type: "object", properties: { text: { type: "string" } }, required: [] },
+    operation: "findField"
+  });
+  registerBrowserPrimitive({
+    name: "browser.findBest",
+    description: "Find the DOM target whose text best covers the requested words",
+    inputSchema: {
+      type: "object",
+      properties: { selector: { type: "string" }, text: { type: "string" }, minCoverage: { type: "number" } },
+      required: ["selector", "text"]
+    },
+    operation: "findBest"
+  });
+  registerBrowserPrimitive({
+    name: "browser.key",
+    description: "Press a key such as Enter or Tab in the controlled page, optionally focusing a target first",
+    inputSchema: { type: "object", properties: { key: { type: "string" }, target: { type: "object" } }, required: [] },
+    operation: "pressKey", permissionType: "WRITE", detectedChanges: ["browser.document"]
+  });
+  registerBrowserPrimitive({
     name: "browser.scroll",
     description: "Scroll the page or bring a runtime-observed DOM target into view",
     inputSchema: { type: "object", properties: { target: { type: "object" }, x: { type: "number" }, y: { type: "number" } }, required: [] },

@@ -270,18 +270,31 @@ export class VisionProvider {
 
     const window = await this._resolveWindow(request);
     if (!window?.windowId) return { available: false, reason: "active-window-not-grounded" };
-    const cached = this.cache.get(window.windowId);
+    // Keyed by mode as well as window: a reading taken without pixels must never
+    // be handed to a caller that asked for them.
+    const cacheKey = `${window.windowId}:${request.includeOcr === false ? "uia" : "full"}`;
+    const cached = this.cache.get(cacheKey);
     if (request.forceVision !== true && cached && cached.expiresAt > this.clock()) {
       return { ...cached.raw, cached: true };
     }
 
-    // Looking at a window is three separate operations, and only two of them
-    // depend on each other: OCR needs the PNG, the accessibility tree needs
-    // nothing. Awaiting the capture before starting the UIA inspection made
-    // every look cost their sum — measured on this machine at 1.5s + 1.8s —
-    // when the wall-clock cost is the slower of the two chains. Perception runs
-    // before and after every action, so this is a per-step tax, not a one-off.
-    const visual = (async () => {
+    // THE CHEAPEST LOOK IS THE ONE THAT DOES NOT TAKE A PHOTOGRAPH.
+    //
+    // Capturing the window and running OCR over it costs roughly 1.5s + 1.8s and
+    // is the slower of the two chains here, so it sets the wall-clock cost of
+    // every look. For an ordinary application it also adds nothing: UI Automation
+    // already returns the controls with their names and exact bounds, while OCR
+    // returns the same words a second time, misread — "Va1ues", "dflff.tx",
+    // "printf("Va1ues" — as a second pile of unclickable elements sitting on top
+    // of the real ones.
+    //
+    // So a caller that only needs to know what is there and where to click asks
+    // for `includeOcr: false` and gets the accessibility tree alone. Pixels stay
+    // the default for everyone who needs them — the before/after evidence around
+    // a drag, a window with no accessible tree at all — and the screen tool falls
+    // back to them the moment UIA comes back thin.
+    const wantsPixels = request.includeOcr !== false;
+    const visual = !wantsPixels ? Promise.resolve({ capture: null, ocr: null, pixelHash: null }) : (async () => {
       const capture = await this.adapter.captureScreen({
         windowId: window.windowId,
         application: window.processName ?? request.application,
@@ -330,7 +343,7 @@ export class VisionProvider {
       capturedAt,
       cached: false
     };
-    this.cache.set(window.windowId, { expiresAt: this.clock() + this.ttlMs, raw });
+    this.cache.set(cacheKey, { expiresAt: this.clock() + this.ttlMs, raw });
     return raw;
   }
 
