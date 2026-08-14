@@ -348,6 +348,20 @@ export class AgentRuntime {
         timestamp: new Date().toISOString(),
         details: event.details ?? {}
       };
+      // PROGRESS IS FOR THE PERSON WATCHING, NOT FOR THE RECORD.
+      //
+      // A bar that moves is a hundred events over a forty-second install, and
+      // every one of them is superseded by the next. Keeping them would put a
+      // hundred rows in the session history and the audit log to say what the
+      // command's own output says once, in full, when it finishes — and the
+      // session record is replayed to rebuild a transcript, where a stale 43%
+      // means nothing at all.
+      //
+      // So they go to whoever is watching right now and nowhere else.
+      if (event.type === "TOOL_PROGRESS") {
+        this.onSessionEvent?.(session.sessionId, record);
+        return;
+      }
       session.events.push(record);
       this.onSessionEvent?.(session.sessionId, record);
       this.auditRepository?.append?.(session.sessionId, event.type, record.details).catch?.(() => {});

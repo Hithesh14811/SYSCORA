@@ -393,6 +393,42 @@ body {
 }
 .step-error { margin-top: 6px; color: var(--danger); font-size: 13px; }
 
+/* How far a long command has got, drawn under the command line it belongs to.
+   Only appears for the calls that actually report progress — an install, a
+   download — so an ordinary one-second step is unchanged. */
+.step-progress { margin: 8px 0 0; }
+.progress-track {
+  position: relative;
+  height: 6px;
+  border-radius: 999px;
+  background: #0a0e14;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 180ms ease-out;
+}
+/* A phase that reports no percentage — "Verifying installer hash" — gets a
+   moving band rather than a number, because inventing one would misreport how
+   far along it is. */
+.progress-track.indeterminate .progress-fill {
+  width: 35%;
+  animation: progress-sweep 1.2s ease-in-out infinite;
+}
+@keyframes progress-sweep {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(340%); }
+}
+.progress-label {
+  margin-top: 5px;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
 /* The answer. Plain assistant text — the transcript above already reported what
    happened, so a success badge over every reply would carry no information. */
 .agent-answer {

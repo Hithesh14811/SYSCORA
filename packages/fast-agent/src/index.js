@@ -60,8 +60,10 @@ CHOOSING A TOOL
 - To OPEN AN APPLICATION, use \`launch\`, not \`run\`. It already knows how to resolve a name to whatever the machine actually has — a Start menu entry, a packaged app, a registered path, a shortcut — and it hands you back the window it opened. \`Start-Process "WhatsApp"\` fails because that is not a file; working out the packaged app's identity by hand costs five commands and half a minute, and \`launch WhatsApp\` does it in one.
 - For anything on the WEB, there are two routes and they are not interchangeable. \`web_open\` drives a controlled browser through the page's own structure: a page arrives in a fraction of a second as its real text and its actual links, and \`web_click\`/\`web_type\` act on them by name. Use it for looking things up, reading, searching, prices, documentation, research — anything where you need to know what a page SAYS.
 - THE CONTROLLED BROWSER IS NOT THE ONE THE USER IS LOOKING AT. It is a separate window with its own empty profile, signed in to nothing, and the user cannot follow what you are doing in it. So the moment a task is about to touch their accounts, logins, messages, subscriptions, a booking or a purchase, do it in THEIR browser with \`open_url\` and the screen tools — from the start, not after filling half a form somewhere they cannot see. Working invisibly and then starting again in the real browser is slower than beginning there, and it looks like the agent has wandered off.
+- THE INSTALLED APP BEATS THE WEBSITE, EVERY TIME. If there is a desktop application for it on this machine — the list below says which — \`launch\` it and work there. A desktop app is already signed in; its website is a login screen. Asked to send a WhatsApp message, opening web.whatsapp.com produced a QR code and a request for the user's phone, when the WhatsApp app was installed, signed in, and one \`launch\` away. Website only when there is no app, or when the task is genuinely about a web page.
 - For anything on screen: \`screen\` to see it, then \`click\`, \`type\`, \`key\`, \`scroll\`, \`drag\`, \`draw\`. Click by the element's LABEL, copied exactly from the reading — \`click {text: "Eight"}\`, not \`click {element: 41}\` and never a coordinate you made up. Counting rows in a long list is how you press 7 when you meant 8.
-- Selecting a range, moving a slider or dragging one thing onto another is \`drag\`. Anything with a SHAPE to it is \`draw\`: name the shape and its measurements — \`draw {shape: "circle", cx: 900, cy: 600, radius: 200}\` — and it arrives as one continuous stroke. Do not spell a curve out as a series of drags; the button comes up between drags, so what you get is disconnected straight lines. Pick the drawing tool FIRST; \`draw\` only moves the mouse.
+- Selecting a range, moving a slider or dragging one thing onto another is \`drag\`. Anything with a SHAPE to it is \`draw\`: name the shape and its measurements — \`draw {shape: "circle", cx: 900, cy: 600, radius: 200}\`. Do not spell a curve out as a series of drags; the button comes up between drags, so what you get is disconnected straight lines.
+- DRAWING SOMETHING THAT LOOKS RIGHT: pick the tool first, then READ THE SCREEN, then draw. The reading names the active tool, and that is what \`draw\` needs to send the correct motion — a shape tool's own ellipse or rectangle, or a pencil's traced path. Build a picture out of the application's real shapes rather than sketching outlines by hand: an oval for a wheel, a rectangle for a carriage, a line for a rail. Use one \`draw\` with \`strokes\` for a whole figure instead of a call per part, choose a colour before each group of shapes rather than after, and give the parts sizes that are in proportion to each other and to the canvas before you start.
 - \`screen\` re-reads the window you are working in. The user may be looking at something else entirely; that is not your window and does not concern you. Only pass \`desktop: true\` if you genuinely need to know what is in front of them.
 - Before typing into a field, click it. Text goes wherever focus happens to be, and where focus happens to be is not something you know.
 - An application that was already running hands you the window the user was already using, with their work still in it. Opening it is not the same as getting a blank one. When the task is to write something NEW, call \`new_document\` first; only type into what is already open when the task is genuinely about that document.
@@ -84,7 +86,7 @@ WHEN SOMETHING FAILS
 - Do not report failure until you have actually run out of approaches.
 
 DO THE WHOLE THING, THE WAY A PERSON WOULD
-- Finish the request. "Most viewed video" means open the channel, sort by most popular, and play the first one — not search the channel name and play whatever comes up first. "Delete it after sending" is part of the same task, not an optional extra. Stopping one step short and reporting success is the commonest way this goes wrong.
+- Finish the request. "Most viewed video" means open the channel, sort by most popular, and play the first one — not search the channel name and play whatever comes up first. "The second most popular" means the second one in that sorted list, and when the counts are on screen SAY THEM: "Exams Ka Mausam, 145M views — second after Tuition Classes aur Bache at 187M" is checkable, where "playing the second most popular" is something the user has to take on trust. "Delete it after sending" is part of the same task, not an optional extra. Stopping one step short and reporting success is the commonest way this goes wrong.
 - A guessed URL that lands somewhere unexpected is a wrong guess, not a broken page. Read what actually loaded; if it is a different channel, account or article than the one asked for, find the right one by name instead of opening the same guess again.
 - Check the last step as carefully as the first. A calculation is not done until the result is on screen; a message is not sent until you have seen it in the conversation.
 - THE APPLICATION'S ANSWER IS THE ANSWER. If you were asked to use a program, report what that program shows — not what you worked out yourself. When the two disagree, say so and say why: Windows Calculator in Standard mode has no operator precedence, so it evaluates left to right and \`a × b + c ÷ d\` is not what you would get on paper.
@@ -144,8 +146,21 @@ export class FastAgent {
     // machine; what it saw on screen last time does not survive the user having
     // had the keyboard in between.
     this.toolset.beginTurn?.();
+    // WHERE IT IS, BEFORE IT DECIDES ANYTHING.
+    //
+    // The prompt described how a Windows machine works in general. This machine
+    // keeps its Documents inside OneDrive, and the difference is not academic:
+    // every search of `%USERPROFILE%\Documents` succeeded and returned nothing,
+    // so a file the user was looking at was reported as not existing. The same
+    // gap sent it to WhatsApp Web — and a QR code — on a machine with the
+    // WhatsApp desktop app installed and signed in.
+    //
+    // One cached PowerShell call answers both. It goes in the system message
+    // rather than a tool result so it is in front of the model for the FIRST
+    // decision, which is the one that picked the wrong folder and the wrong app.
+    const machine = await this.toolset.machineFacts?.().catch(() => "") ?? "";
     const messages = [
-      { role: "system", content: this.systemPrompt },
+      { role: "system", content: machine ? `${this.systemPrompt}\n\n${machine}` : this.systemPrompt },
       ...history.slice(-12).map((turn) => ({
         role: String(turn?.role ?? "user") === "assistant" ? "assistant" : "user",
         content: String(turn?.text ?? turn?.content ?? "").slice(0, 2000)
@@ -305,7 +320,21 @@ export class FastAgent {
           continue;
         }
 
-        const result = await this.toolset.execute(call.name, args);
+        // WHAT IT IS DOING WHILE IT IS DOING IT.
+        //
+        // A tool call was a spinner and then an answer, which is right for the
+        // ones that take a second and wrong for the ones that do not. Installing
+        // Canva took forty seconds of downloading with the byte count on winget's
+        // own stdout the whole time, and the user saw none of it — a slow
+        // download and a hung command looked identical.
+        const result = await this.toolset.execute(call.name, args, {
+          onProgress: (progress) => {
+            this._emit({
+              type: "TOOL_PROGRESS",
+              details: { callId: call.id, tool: call.name, ...progress }
+            });
+          }
+        });
         // A FAILURE IS ONLY FINAL UNTIL SOMETHING CHANGES.
         //
         // Recorded failures used to be permanent, which is wrong in the ordinary

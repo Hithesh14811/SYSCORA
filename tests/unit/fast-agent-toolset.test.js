@@ -475,7 +475,11 @@ test("a decided sequence runs in one call instead of one round trip per keystrok
   assert.equal(result.ok, true);
   assert.equal(clicked.length, 5, "all five actions happen without going back to the model");
   assert.match(result.text, /All 5 steps ran/);
-  assert.match(result.text, /1\. click: Clicked at 40,540/);
+  // A click says WHAT it hit, not only where. A coordinate has nothing in it to
+  // notice a mistake by: `click {element: 6}` against a reading that had been
+  // superseded landed on Redo and reported "Clicked at 927,277", so the model
+  // carried on believing it had selected the Rectangle tool.
+  assert.match(result.text, /1\. click: Clicked "Four" at 40,540/);
 });
 
 // A sequence that carries on after a step missed is how a password gets typed
@@ -1183,7 +1187,14 @@ test("a stroke the application did not record is reported as having drawn nothin
 
   const nothing = await withUndo([false, false]).execute("draw", spec);
   assert.match(nothing.text, /NOTHING TO UNDO/);
-  assert.match(nothing.text, /nothing was drawn/);
+  // A circle is a CLOSED path, and a closed path traced under a shape tool
+  // presses and releases in the same place — so it asks for a zero-size shape
+  // and gets one. That is a specific cause with a specific fix, and saying
+  // "nothing was drawn, check the tool is selected" instead sent the agent
+  // through Paint's Shapes and Shape fill menus looking for a fault that was
+  // not there. The verdict is unchanged; the diagnosis is the point.
+  assert.match(nothing.text, /zero-size shape/);
+  assert.match(nothing.text, /ends where it began/);
 
   const something = await withUndo([false, true]).execute("draw", spec);
   assert.match(something.text, /the document changed, so it drew/);

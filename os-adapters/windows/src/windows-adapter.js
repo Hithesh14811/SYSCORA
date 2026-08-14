@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { getWindowsAutomationHost } from "../../windows-host/src/client.js";
 import { CdpBrowserAdapter } from "../../browser/src/cdp-browser-adapter.js";
 import { classifyShellCommand, ShellVerdict } from "../../../packages/policy-engine/src/shell-rules.js";
@@ -72,7 +72,7 @@ function expandWindowsEnvironmentPath(value) {
   environment.set("TEMP", process.env.TEMP || os.tmpdir());
   environment.set("TMP", process.env.TMP || os.tmpdir());
   const lookup = (key) => environment.get(String(key).toUpperCase());
-  return String(value ?? "")
+  const expanded = String(value ?? "")
     .replace(/%([^%]+)%/g, (match, key) => lookup(key) ?? match)
     // `$env:USERPROFILE\Desktop` is how a Windows path is written in PowerShell,
     // and it is what a model writes when it has just been running PowerShell
@@ -83,6 +83,69 @@ function expandWindowsEnvironmentPath(value) {
     // same thing; both are accepted. `${env:VAR}` is the braced form.
     .replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/gi, (match, key) => lookup(key) ?? match)
     .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (match, key) => lookup(key) ?? match);
+  return redirectKnownFolder(expanded);
+}
+
+// "MY DOCUMENTS" IS WHEREVER WINDOWS SAYS IT IS.
+//
+// `%USERPROFILE%\Documents` expands to a directory that exists on every Windows
+// machine and, on a machine with OneDrive, is not the user's Documents. Both are
+// real, both list without error, and the wrong one is nearly empty — so a
+// listing of it looks like a thorough answer and is a wrong one. The same is
+// true of Desktop and Pictures.
+//
+// This rewrites the profile-relative spelling of the three folders Windows
+// itself redirects — `<home>\Documents`, `\Desktop`, `\Pictures`, however they
+// were spelled — to wherever Windows currently says they are. It does nothing on
+// a machine with no redirection, nothing to Downloads (which Windows does not
+// redirect), and nothing to any other path.
+//
+// It applies to a literal `C:\Users\<name>\Documents` as well as to the
+// `%USERPROFILE%` form, and that is deliberate: on a redirected machine that
+// literal path is a vestigial directory Windows does not consider Documents, and
+// anyone naming it means the folder they see in Explorer. The cost is that the
+// leftover cannot be listed through here; the alternative is the failure this
+// exists to stop, where listing it succeeds and reports nothing.
+const REDIRECTABLE = new Map([
+  ["documents", "MyDocuments"],
+  ["desktop", "Desktop"],
+  ["pictures", "MyPictures"]
+]);
+const knownFolderCache = new Map();
+
+function knownFolderPath(specialFolder) {
+  if (knownFolderCache.has(specialFolder)) return knownFolderCache.get(specialFolder);
+  let resolved = "";
+  try {
+    const probe = spawnSync(
+      "powershell.exe",
+      [
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-Command", `[Environment]::GetFolderPath('${specialFolder}')`
+      ],
+      { encoding: "utf8", timeout: 8000, windowsHide: true }
+    );
+    resolved = String(probe.stdout ?? "").trim();
+  } catch {
+    resolved = "";
+  }
+  knownFolderCache.set(specialFolder, resolved);
+  return resolved;
+}
+
+function redirectKnownFolder(value) {
+  const home = process.env.USERPROFILE || os.homedir();
+  if (!home) return value;
+  const prefix = `${home.replace(/\\+$/, "")}\\`;
+  if (!value.toLowerCase().startsWith(prefix.toLowerCase())) return value;
+  const rest = value.slice(prefix.length);
+  const [first, ...tail] = rest.split(/[\\/]/);
+  const special = REDIRECTABLE.get(String(first ?? "").toLowerCase());
+  if (!special) return value;
+  const known = knownFolderPath(special);
+  // Same place by another name, or a lookup that failed: leave it alone.
+  if (!known || known.toLowerCase() === path.join(home, first).toLowerCase()) return value;
+  return tail.length ? path.join(known, ...tail) : known;
 }
 
 // PRESSING A KEY BY ITS NAME.
@@ -212,6 +275,43 @@ function tokenSimilarity(left, right) {
   if (!a.size || !b.size) return 0;
   const overlap = [...a].filter((token) => b.has(token)).length;
   return overlap / Math.max(1, Math.min(a.size, b.size));
+}
+
+// DOES THIS WINDOW BELONG TO THIS APPLICATION?
+//
+// One rule, used everywhere, because answering it four different ways is how
+// the same bug kept coming back in a new place. A window's TITLE is chosen by
+// its content, not by the application: a Notepad file called
+// "send message to amma on whatsapp sa.txt" is titled
+// "*send message to amma on whatsapp sa - Notepad", and every title-substring
+// test in this codebase said that window was WhatsApp.
+//
+// Live, `launch WhatsApp` returned that Notepad window — the user's own
+// 200,000-character prompt file — and the next `type` would have written into
+// it. The same test put a Chrome tab showing "Spotify - Web Player" forward as
+// the Spotify desktop client.
+//
+// So the PROCESS is what identifies an application. The one exception is a
+// generic host — ApplicationFrameHost and friends run somebody else's packaged
+// UI and have no identity of their own, so for those, and only those, the title
+// is the only identity available and is trusted.
+const GENERIC_WINDOW_HOST = /^(applicationframehost|shellexperiencehost|windowsapp|runtimebroker)$/;
+
+function compactName(value) {
+  return String(value ?? "").toLowerCase().replace(/\.exe$/, "").replace(/[^a-z0-9]/g, "");
+}
+
+export function applicationWindowScore(window, application) {
+  const needle = compactName(application);
+  if (!needle) return 0;
+  const process = compactName(window?.ProcessName ?? window?.processName);
+  if (process) {
+    if (process === needle) return 3;
+    if (process.includes(needle) || needle.includes(process)) return 2;
+    if (!GENERIC_WINDOW_HOST.test(process)) return 0;
+  }
+  const title = compactName(window?.MainWindowTitle ?? window?.title);
+  return title && title.includes(needle) ? 1 : 0;
 }
 
 export function correlateLaunchWindow({
@@ -409,11 +509,31 @@ export class WindowsAdapter {
         clearTimeout(timeout);
         if (signal) signal.removeEventListener?.("abort", onAbort);
       };
+      // OUTPUT AS IT ARRIVES, NOT ONLY WHEN IT IS OVER.
+      //
+      // A command's output was invisible until it exited, which for anything
+      // quick is the same thing. For an install it is not: `winget install`
+      // downloads a two-hundred-megabyte package and prints a progress bar the
+      // whole way, and all of that was buffered and thrown at the transcript
+      // afterwards. The user watched a spinner for forty seconds with no way to
+      // tell a slow download from a hung one.
+      //
+      // `onOutput` is optional and costs nothing when nobody is listening; an
+      // observer that throws must not kill the command it is watching.
+      const onOutput = typeof options.onOutput === "function" ? options.onOutput : null;
+      const publish = (text, stream) => {
+        if (!onOutput) return;
+        try { onOutput({ text, stream }); } catch { /* watching must not break running */ }
+      };
       child.stdout.on("data", (chunk) => {
-        stdout += chunk.toString();
+        const text = chunk.toString();
+        stdout += text;
+        publish(text, "stdout");
       });
       child.stderr.on("data", (chunk) => {
-        stderr += chunk.toString();
+        const text = chunk.toString();
+        stderr += text;
+        publish(text, "stderr");
       });
       child.on("close", (code) => {
         cleanup();
@@ -1047,14 +1167,55 @@ export class WindowsAdapter {
     };
   }
 
+  // WHERE "DOCUMENTS" IS, ON THIS MACHINE.
+  //
+  // `homedir()/Documents` is where Documents lives on a machine nobody has
+  // configured. On a machine with OneDrive — which is the default state of a
+  // signed-in Windows 11 install, not an exotic one — the Documents, Desktop and
+  // Pictures known folders are redirected into the OneDrive tree, and
+  // `C:\Users\<name>\Documents` survives as a near-empty leftover.
+  //
+  // So this returned a real, existing, wrong directory. Saving a document put it
+  // somewhere the user does not look, and searching it for a file they were
+  // looking at came back empty — successfully, which is worse than failing.
+  //
+  // `SHGetKnownFolderPath`, which is what `Environment.GetFolderPath` calls,
+  // answers the question properly. It is read once and cached because a known
+  // folder does not move while the process is running, and the fallback is the
+  // old guess so a machine where the lookup fails still works as it did.
+  _knownFolder(specialFolder, fallbackName) {
+    this._knownFolders ??= new Map();
+    if (this._knownFolders.has(specialFolder)) return this._knownFolders.get(specialFolder);
+    let resolved = "";
+    try {
+      const probe = spawnSync(
+        "powershell.exe",
+        [
+          "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+          "-Command", `[Environment]::GetFolderPath('${specialFolder}')`
+        ],
+        { encoding: "utf8", timeout: 8000, windowsHide: true }
+      );
+      resolved = String(probe.stdout ?? "").trim();
+    } catch {
+      resolved = "";
+    }
+    const value = resolved || path.join(os.homedir(), fallbackName);
+    this._knownFolders.set(specialFolder, value);
+    return value;
+  }
+
   getDocumentsPath() {
-    return path.join(os.homedir(), "Documents");
+    return this._knownFolder("MyDocuments", "Documents");
   }
 
   getDesktopPath() {
-    return path.join(os.homedir(), "Desktop");
+    return this._knownFolder("Desktop", "Desktop");
   }
 
+  // Downloads is the one known folder with no SpecialFolder member, so the
+  // profile-relative path is all there is without going to its GUID. It is also
+  // the one Windows almost never redirects.
   getDownloadsPath() {
     return path.join(os.homedir(), "Downloads");
   }
@@ -1768,10 +1929,7 @@ public static class SyscoraAudio {
     let window = null;
     while (Date.now() < deadline) {
       const windows = await this.listWindows();
-      const named = windows.filter((w) => {
-        const process = String(w.ProcessName ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
-        return process && compact && (process.includes(compact) || compact.includes(process));
-      });
+      const named = windows.filter((w) => applicationWindowScore(w, needle) > 0);
       window = named[0] ?? null;
       if (!window && matchTitle) {
         window = windows.find((w) =>
@@ -1870,28 +2028,35 @@ public static class SyscoraAudio {
     // named "Play <title> by <artist>" instead of a title label containing a
     // nested generic Play button. Try the general compound-name selector first.
     if (this.automationHost) {
-      try {
-        const semantic = await this.findAndInvokeSemanticControl({
-          application: "spotify",
-          windowId: windowHandle,
-          actionPrefix: "Play ",
-          objectName: String(query).trim(),
-          controlType: "Button"
-        });
-        if (semantic.invoked) {
-          return {
-            found: true,
-            invoked: true,
-            name: semantic.target?.name ?? null,
-            matchedLabel: semantic.target?.name ?? null,
-            matchedBounds: semantic.target?.boundingRect ?? null,
-            reason: null,
-            semantic
-          };
+      // Button first, because when a row IS a button that is the least ambiguous
+      // possible match. Then again with no control-type constraint at all: the
+      // rows in Spotify's search results are DataItems, not buttons, and a name
+      // that both starts with "Play " and contains the requested track is
+      // already specific enough to stand on its own.
+      for (const controlType of ["Button", null]) {
+        try {
+          const semantic = await this.findAndInvokeSemanticControl({
+            application: "spotify",
+            windowId: windowHandle,
+            actionPrefix: "Play ",
+            objectName: String(query).trim(),
+            controlType
+          });
+          if (semantic.invoked) {
+            return {
+              found: true,
+              invoked: true,
+              name: semantic.target?.name ?? null,
+              matchedLabel: semantic.target?.name ?? null,
+              matchedBounds: semantic.target?.boundingRect ?? null,
+              reason: null,
+              semantic
+            };
+          }
+        } catch {
+          // The bounded legacy UIA path below also tolerates minor spelling
+          // corrections and keeps compatibility when the host is unavailable.
         }
-      } catch {
-        // The bounded legacy UIA path below also tolerates minor spelling
-        // corrections and keeps compatibility when the host is unavailable.
       }
     }
     const encodedTokens = Buffer.from(JSON.stringify(tokens), "utf8").toString("base64");
@@ -1906,7 +2071,33 @@ public static class SyscoraAudio {
       "$windowHandle=" + Number(windowHandle || 0) + ";",
       "if($windowHandle -eq 0){ [pscustomobject]@{found=$false;invoked=$false;reason='no-window'} | ConvertTo-Json -Compress; return };",
       "$root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$windowHandle);",
-      "$buttonCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button);",
+      // THE ONE RESULT SPOTIFY ITSELF PICKED WAS THE ONE THIS COULD NOT PRESS.
+      //
+      // Every search for a play control was restricted to ControlType.Button.
+      // Spotify's search page does not use buttons for its rows: the list rows
+      // come back as DataItem ("Play Tu Chahiye"), and the big top-result card —
+      // the one Spotify chose as the best match, and the one a person clicks —
+      // exposes its play control as a bare DataItem named "Play".
+      //
+      // So asked for "Dildara", with "Dildaara (Stand By Me)" sitting in the top
+      // card, this walked the tree, found no Button, and returned
+      // matching-track-not-found. Playback never started, the previous song kept
+      // playing, and the honest report of that ("still playing Stand By Me") was
+      // read as a matching failure. The model then re-typed the query by hand,
+      // read the screen, and clicked the very control this had skipped — which
+      // is how we know the control was there and clickable the whole time.
+      //
+      // Control type was never the right filter. What makes something pressable
+      // is that it is named for the action and carries an Invoke pattern, and
+      // both are checked below regardless of what kind of element Chromium chose
+      // to call it.
+      "$playableTypes=@([System.Windows.Automation.ControlType]::Button," +
+        "[System.Windows.Automation.ControlType]::DataItem," +
+        "[System.Windows.Automation.ControlType]::ListItem," +
+        "[System.Windows.Automation.ControlType]::Hyperlink);",
+      "$buttonCond=$null; foreach($t in $playableTypes){ $c=New-Object System.Windows.Automation.PropertyCondition(" +
+        "[System.Windows.Automation.AutomationElement]::ControlTypeProperty,$t); " +
+        "if($buttonCond){$buttonCond=New-Object System.Windows.Automation.OrCondition($buttonCond,$c)}else{$buttonCond=$c} };",
       `$tokens=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedTokens}')) | ConvertFrom-Json);`,
       `$query=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedQuery}'));`,
       `$displayQuery=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedDisplayQuery}'));`,
@@ -2282,8 +2473,10 @@ public static class SyscoraAudio {
     const limit = clampInt(maxElements, 1, 500, 120);
     const windows = await this.listWindows();
     const needle = application ? String(application).toLowerCase() : null;
+    // Inspecting "WhatsApp" must not walk a Notepad document that happens to be
+    // named after the task. One rule for what belongs to an application.
     const selected = needle
-      ? windows.filter((w) => String(w.ProcessName ?? "").toLowerCase().includes(needle) || String(w.MainWindowTitle ?? "").toLowerCase().includes(needle))
+      ? windows.filter((w) => applicationWindowScore(w, needle) > 0)
       : windows;
     const handles = selected.map((w) => Number(w.WindowHandle)).filter((n) => Number.isFinite(n) && n > 0);
     const windowMeta = selected.map((window) => ({
@@ -2347,7 +2540,12 @@ public static class SyscoraAudio {
     }
     const windows = await this.listWindows();
     const needle = app.toLowerCase();
-    const window = windows.find((w) => String(w.ProcessName ?? "").toLowerCase().includes(needle) || String(w.MainWindowTitle ?? "").toLowerCase().includes(needle));
+    // Acting on a control inside "WhatsApp" must never land in another
+    // application whose title merely mentions it.
+    const window = windows
+      .map((candidate) => ({ candidate, score: applicationWindowScore(candidate, needle) }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score)[0]?.candidate;
     if (!window?.WindowHandle) return { performed: false, reason: "application-window-not-found", application: app };
     const selector = {
       name: typeof target.name === "string" ? target.name.slice(0, 300) : null,

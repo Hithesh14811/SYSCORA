@@ -379,7 +379,13 @@ test("a screen reading indexes its elements so a click never needs a guessed coo
 
   const click = await toolset.execute("click", { element: 1 });
   assert.equal(click.ok, true);
-  assert.match(click.text, /Clicked at 100,90/);
+  assert.match(click.text, /at 100,90/);
+  // A click by index also says WHAT it landed on. Indices renumber on every
+  // look, and a bare coordinate has nothing in it to notice a stale one by:
+  // `click {element: 6}` against a superseded reading landed on Redo, reported
+  // "Clicked at 927,277", and the model carried on believing it had selected
+  // the Rectangle tool.
+  assert.match(click.text, /Clicked "Text Editor"/);
 });
 
 test("clicking an element that was never observed fails instead of clicking somewhere", async () => {
@@ -431,9 +437,9 @@ test("clicking by label lands on that control, whatever its position in the list
   await toolset.execute("screen", { application: "the app under test" });
   const eight = await toolset.execute("click", { text: "Eight" });
   assert.equal(eight.ok, true);
-  assert.match(eight.text, /Clicked at 660,1089/);
+  assert.match(eight.text, /Clicked "Eight" at 660,1089/);
   const multiply = await toolset.execute("click", { text: "Multiply by" });
-  assert.match(multiply.text, /Clicked at 1009,580/);
+  assert.match(multiply.text, /Clicked "Multiply by" at 1009,580/);
 });
 
 test("clicking a label that is not on screen refuses rather than clicking the nearest thing", async () => {

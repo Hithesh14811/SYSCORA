@@ -375,6 +375,44 @@ class Turn {
     return step;
   }
 
+  // A LONG COMMAND, SHOWN MOVING.
+  //
+  // `winget install` runs for the better part of a minute and printed its byte
+  // count the whole way; the transcript showed a spinner. There was nothing on
+  // screen to tell a download in progress from a hung command, which is the one
+  // thing a person watching an install wants to know.
+  //
+  // The bar is drawn INSIDE the step it belongs to, under the command line, so
+  // it reads as "this is how far that has got" rather than as a separate event.
+  // It is created on the first report rather than on every step, because most
+  // steps never have one.
+  progressStep({ key, capability, percent, label, phase }) {
+    const pending = this.pendingSteps.find((step) => (key != null && step.key === key))
+      ?? this.pendingSteps.find((step) => step.capability === capability);
+    if (!pending) return;
+    if (!pending.progress) {
+      const wrap = el("div", "step-progress");
+      const track = el("div", "progress-track");
+      const fill = el("div", "progress-fill");
+      track.appendChild(fill);
+      const text = el("div", "progress-label", "");
+      wrap.appendChild(track);
+      wrap.appendChild(text);
+      pending.node.appendChild(wrap);
+      pending.progress = { wrap, track, fill, text };
+    }
+    const { fill, track, text } = pending.progress;
+    const known = Number.isFinite(Number(percent));
+    // A phase with no measurable percentage — "Verifying" — is honest as an
+    // indeterminate bar. Claiming a number nobody reported would be a lie about
+    // how far along it is, and this row exists to be believed.
+    track.classList.toggle("indeterminate", !known);
+    if (known) fill.style.width = `${Math.max(0, Math.min(100, Number(percent)))}%`;
+    text.textContent = [phase, label].filter(Boolean).join(" — ")
+      || (known ? `${Math.round(Number(percent))}%` : "Working…");
+    scrollToEnd();
+  }
+
   // Match a completion to the row it belongs to. Prefer the exact key the
   // runtime quoted; fall back to the oldest unresolved row for that capability,
   // then to the oldest unresolved row at all — a completion with no row is worse
@@ -388,6 +426,9 @@ class Turn {
 
   finishStep({ key, capability, ok, message, preview, durationMs }) {
     const pending = this._takeStep(key, capability);
+    // The command's own output is a better answer than the bar that was
+    // standing in for it, so the bar goes when the output arrives.
+    pending?.progress?.wrap?.remove();
     const step = pending?.node ?? this.startStep({ key, capability, inputs: {} });
     const head = pending?.head ?? step.querySelector(".step-head");
     step.classList.remove("running");
@@ -468,6 +509,12 @@ function handleEvent(turn, event) {
   if (type === "TOOL_STARTED") {
     turn.usesAdaptiveSteps = true;
     turn.startStep({ key: d.callId, capability: d.tool, inputs: d.args, arg: d.preview });
+    return;
+  }
+  // How far through it is, for the calls long enough that the question arises.
+  // Drawn on the row that is already open, underneath the command it belongs to.
+  if (type === "TOOL_PROGRESS") {
+    turn.progressStep({ key: d.callId, capability: d.tool, percent: d.percent, label: d.label, phase: d.phase });
     return;
   }
   if (type === "TOOL_FINISHED") {

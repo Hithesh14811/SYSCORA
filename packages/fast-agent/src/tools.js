@@ -21,8 +21,12 @@
 
 import fs from "node:fs/promises";
 import { matchesTrackQuery } from "../../capability-registry/src/index.js";
+import { applicationWindowScore } from "../../../os-adapters/windows/src/windows-adapter.js";
 import { VISIBLE_CHANGE, changedFraction, gridRegion, screenSignature } from "./screen-signature.js";
 import { buildPath, flattenPath } from "./stroke-path.js";
+import { describeMachine, readMachineProfile } from "./machine-profile.js";
+import { createProgressReader, reportsProgress } from "./command-progress.js";
+import { createWingetWatcher, isWingetInstall } from "./winget-progress.js";
 
 const MAX_OUTPUT_CHARS = 6000;
 const MAX_SCREEN_TEXT_CHARS = 2500;
@@ -299,6 +303,141 @@ export function findCanvas(elements) {
   return best?.bounds ?? null;
 }
 
+// A SHAPE TOOL DOES NOT DRAW THE PATH YOU GIVE IT.
+//
+// This is the whole reason the drawings came out badly, and it is a property of
+// the applications rather than of the model. Paint has two kinds of tool:
+//
+//   Pencil, Brush, Eraser  — trace the pointer. The path IS the mark.
+//   Oval, Rectangle, Line  — ignore the path entirely. They take where the
+//                            button went DOWN and where it came UP and draw
+//                            their own shape in the box between the two.
+//
+// `draw` builds a traced path for every shape, and the path for a circle or a
+// rectangle is a CLOSED LOOP: it ends where it began. Handed to the Oval tool,
+// the press and the release are the same point, the box between them is zero
+// wide and zero tall, and Paint draws nothing at all — correctly.
+//
+// Live, that produced "the application still has NOTHING TO UNDO" three times in
+// a row with the Oval tool confirmed active on screen. The message blamed tool
+// selection, so the agent went hunting through the Shapes group and the Shape
+// fill menu — setting Solid fill, reselecting Rectangle — none of which was
+// wrong and none of which was the problem. It only got a shape on the canvas
+// when it gave up on `draw` and used `drag`, which is a press and a release and
+// therefore exactly what a shape tool wants. Every shape in that train was then
+// drawn one `drag` at a time, with a screen read between them to check.
+//
+// So: read which tool is holding the mouse — Paint publishes it, as "Using Oval
+// tool on Canvas" — and let `draw` do the right thing for it. With a shape tool
+// active a circle becomes one corner-to-corner drag, which is both correct and
+// better: Paint's own ellipse is a clean anti-aliased curve, where a traced loop
+// is a polygon of pointer samples.
+const TOOL_STATUS = /\bUsing\s+(?:the\s+)?([A-Za-z][A-Za-z0-9 '-]*?)\s+tool\b/i;
+
+// Tools that draw their own geometry inside the drag's bounding box, keyed by
+// the shapes they can produce. Anything not named here traces.
+const BOX_SHAPE_TOOLS = /^(oval|ellipse|circle|rectangle|rounded rectangle|square|diamond|triangle|right triangle|pentagon|hexagon|heart|lightning|star|four-point star|five-point star|six-point star|arrow|right arrow|left arrow|up arrow|down arrow|callout|oval callout|cloud callout|rounded rectangular callout)$/i;
+const LINE_SHAPE_TOOLS = /^(line|curve|arrow)$/i;
+// Tools that follow the pointer, so a traced path is exactly right for them.
+const TRACING_TOOLS = /^(pencil|brush|brushes|eraser|marker|crayon|calligraphy|calligraphy brush|oil brush|watercolour brush|watercolor brush|airbrush|natural pencil|highlighter|pen|ink)$/i;
+
+export function findActiveTool(elements) {
+  for (const element of elements ?? []) {
+    const label = String(element.text ?? element.name ?? "");
+    const match = TOOL_STATUS.exec(label);
+    if (!match) continue;
+    const name = match[1].trim();
+    if (!name) continue;
+    return {
+      name,
+      // Unknown tools are treated as tracing, because tracing is what `draw`
+      // has always done and an unrecognised name must not change behaviour.
+      kind: BOX_SHAPE_TOOLS.test(name) ? "box"
+        : LINE_SHAPE_TOOLS.test(name) ? "line"
+          : TRACING_TOOLS.test(name) ? "trace" : "unknown"
+    };
+  }
+  return null;
+}
+
+// A URL THAT DOES NOT EXIST IS A WRONG NAME, NOT A BROKEN READER.
+//
+// `youtube.com/@ashishchanchlani/videos` was a guess — the channel's actual
+// handle is `@ashishchanchlanivines` — and YouTube answered it with a real 404.
+// The reading was empty, so the empty-page message said it might still be
+// rendering or blocking automated browsers, and suggested reading it again.
+// Both suggestions were wrong and both were followed: it re-read, then opened
+// the SAME wrong URL in the user's browser, got the same 404 there, and only
+// then went looking for the channel by name. Five steps to rediscover what the
+// page title had said the first time.
+const NOT_FOUND_TITLE = /^\s*404\b|\bnot found\b|page (?:isn'?t|is not) available|no longer available/i;
+
+export function wrongUrlNotice(title, url) {
+  if (!NOT_FOUND_TITLE.test(String(title ?? ""))) return null;
+  return `Page: "${title}" — ${url}\n` +
+    "THAT URL DOES NOT EXIST. The site answered, so this is not a network problem and not a page that " +
+    "is still rendering — the name in the URL is wrong. Do not open it again, here or in the user's " +
+    "browser, and do not guess another spelling: search for the thing by name and follow the result.";
+}
+
+// A path that ends where it started. Handed to a shape tool it is a zero-size
+// shape; that is the whole defect this pair of helpers exists for.
+function isClosedPath(path) {
+  if (!Array.isArray(path) || path.length < 3) return false;
+  const first = path[0];
+  const last = path[path.length - 1];
+  return Math.abs(first.x - last.x) <= 2 && Math.abs(first.y - last.y) <= 2;
+}
+
+/**
+ * The press/release pairs a shape tool needs, or null when the path should be
+ * traced as given.
+ *
+ * A box tool gets the bounding box of the path — which is precisely the shape
+ * that was asked for, because the path was generated to fill it. A line tool
+ * gets the path's own endpoints. Anything else traces.
+ */
+function shapeToolDrags(tool, paths) {
+  const kind = tool?.kind;
+  if (kind !== "box" && kind !== "line") return null;
+  const drags = [];
+  for (const path of paths) {
+    if (!Array.isArray(path) || path.length < 2) return null;
+    if (kind === "line") {
+      drags.push({ from: path[0], to: path[path.length - 1] });
+      continue;
+    }
+    const xs = path.map((point) => point.x);
+    const ys = path.map((point) => point.y);
+    const from = { x: Math.min(...xs), y: Math.min(...ys) };
+    const to = { x: Math.max(...xs), y: Math.max(...ys) };
+    // A degenerate box would draw nothing whichever route it took, so it is not
+    // something to hide behind a shape tool.
+    if (to.x - from.x < 2 || to.y - from.y < 2) return null;
+    drags.push({ from, to });
+  }
+  return drags.length ? drags : null;
+}
+
+function describeActiveTool(tool) {
+  if (!tool) return null;
+  if (tool.kind === "box") {
+    return `Active tool: ${tool.name} — a SHAPE tool. It ignores the path and draws its own shape in the ` +
+      "box between where the button goes down and where it comes up. `draw` handles that for you: ask " +
+      "for the shape you want and it sends the one motion this tool needs. The result is the " +
+      "application's own clean shape, so prefer it over tracing an outline by hand.";
+  }
+  if (tool.kind === "line") {
+    return `Active tool: ${tool.name} — draws a straight segment from where the button goes down to ` +
+      "where it comes up. One `draw {shape: \"line\"}` per segment.";
+  }
+  if (tool.kind === "trace") {
+    return `Active tool: ${tool.name} — it follows the pointer, so the path IS the mark. Any shape or ` +
+      "freehand path draws exactly as given.";
+  }
+  return `Active tool: ${tool.name}.`;
+}
+
 function describeCanvas(elements) {
   const bounds = findCanvas(elements);
   if (!bounds) return null;
@@ -371,7 +510,17 @@ export function buildToolset({
     needsPixels: new Set(),
     // The drawing surface found in the last reading, so a stroke can be checked
     // against it before the mouse moves.
-    lastCanvas: null
+    lastCanvas: null,
+    // WHICH DRAWING TOOL IS HOLDING THE MOUSE.
+    //
+    // A pencil traces the path it is given. A shape tool does not: it takes the
+    // BOUNDING BOX of the drag and draws its own shape inside it. Which of the
+    // two is active decides what a stroke must be, and until this was recorded
+    // nothing in the loop knew. See the `draw` tool for what went wrong.
+    lastTool: null,
+    // Resolved once, on the first turn that needs it.
+    machineFacts: null,
+    machineProfile: null
   };
 
   // What a window is called for the purpose of remembering things about it.
@@ -526,17 +675,32 @@ export function buildToolset({
       return String(window.MainWindowTitle ?? window.title ?? "").trim()
         && Number(bounds.width ?? 0) > 10 && Number(bounds.height ?? 0) > 10;
     });
+    // BEING IN FRONT IS NOT BEING THE APPLICATION. (AGAIN.)
+    //
+    // The foreground bonus used to be added to a score of ZERO and the filter was
+    // `score > 0`, so any window that happened to be in front scored 0.5 and was
+    // returned for ANY name asked for. The window in front is almost always
+    // SYSCORA's own chat, because that is what the user is watching — so
+    // `launch WhatsApp` came back "WhatsApp was ALREADY RUNNING (windowId
+    // 984410, SYSCORA)" and the agent then read, clicked and typed into this
+    // application instead of WhatsApp.
+    //
+    // This is the same mistake as the one already fixed in
+    // correlateLaunchWindow, in a second place that short-circuits before it:
+    // `launch` asks this first, so the fix there never got a chance to run.
+    // Identity has to come from the process or the title; foreground only breaks
+    // ties between windows that ALREADY answer to the name.
+    // Identity comes from applicationWindowScore, which is the ONE place that
+    // decides whether a window belongs to an application. This used to score a
+    // title substring as identity, and a Notepad document named after the task
+    // ("*send message to amma on whatsapp sa - Notepad") was therefore returned
+    // as WhatsApp. Foreground only breaks ties between windows that already
+    // answer to the name; it never confers identity on its own.
     const scored = usable.map((window) => {
-      const process = String(window.ProcessName ?? window.processName ?? "")
-        .toLowerCase().replace(/\.exe$/, "").replace(/[^a-z0-9]/g, "");
-      const title = String(window.MainWindowTitle ?? window.title ?? "").toLowerCase();
-      let score = 0;
-      if (process && process === needle) score = 3;
-      else if (process && (process.includes(needle) || needle.includes(process))) score = 2;
-      else if (title.includes(needle)) score = 1;
-      if (window.Foreground ?? window.foreground) score += 0.5;
-      return { window, score };
-    }).filter((entry) => entry.score > 0).sort((left, right) => right.score - left.score);
+      const identity = applicationWindowScore(window, application);
+      const foreground = (window.Foreground ?? window.foreground) ? 0.5 : 0;
+      return { window, identity, score: identity > 0 ? identity + foreground : 0 };
+    }).filter((entry) => entry.identity > 0).sort((left, right) => right.score - left.score);
     return scored[0]?.window ?? null;
   };
 
@@ -836,12 +1000,32 @@ export function buildToolset({
         );
       }
       const { element } = ranked[0];
-      return { x: element.center.x, y: element.center.y, windowId: element.windowId ?? state.lastWindow?.windowId };
+      return {
+        x: element.center.x, y: element.center.y,
+        windowId: element.windowId ?? state.lastWindow?.windowId,
+        label: element.text ?? null
+      };
     }
     if (Number.isFinite(Number(args.element))) {
       const element = state.elements[Number(args.element)];
       if (!element) throw new Error(`No element ${args.element} in the last screen reading. Call screen again.`);
-      return { x: element.center.x, y: element.center.y, windowId: element.windowId ?? state.lastWindow?.windowId };
+      return {
+        x: element.center.x, y: element.center.y,
+        windowId: element.windowId ?? state.lastWindow?.windowId,
+        // AN INDEX IS ONLY MEANINGFUL AGAINST THE READING IT CAME FROM.
+        //
+        // Indices renumber on every look, and the reading the model is quoting
+        // is often not the one this table holds. Live, `click {element: 6}`
+        // meant Rectangle in the reading with Paint's shape palette open, and
+        // by the time it ran the palette had closed and index 6 was Redo. It
+        // clicked Redo. The result said "Clicked at 927,277" — a coordinate,
+        // with nothing in it to notice by — so the model believed it had
+        // selected the Rectangle tool and drew nothing, twice, before working
+        // out what had happened. Naming what was actually under the index makes
+        // the mistake visible in the same breath as it is made.
+        label: element.text ?? null,
+        byIndex: Number(args.element)
+      };
     }
     if (Number.isFinite(Number(args.x)) && Number.isFinite(Number(args.y))) {
       return { x: Math.round(Number(args.x)), y: Math.round(Number(args.y)), windowId: args.windowId };
@@ -937,6 +1121,20 @@ export function buildToolset({
     // indistinguishable from one with nothing on it — so the model concluded the
     // site was broken and went looking for another. Naming which of the two it
     // is makes the next move obvious.
+    // A URL THAT DOES NOT EXIST IS A WRONG NAME, NOT A BROKEN READER.
+    //
+    // `youtube.com/@ashishchanchlani/videos` was a guess — the channel's actual
+    // handle is `@ashishchanchlanivines` — and YouTube answered it with a real
+    // 404. The reading was empty, so this said the page might be still
+    // rendering or blocking automated browsers, and suggested reading it again.
+    // Both suggestions were wrong and both were followed: it re-read, then
+    // opened the SAME wrong URL in the user's browser, got the same 404 there,
+    // and only then went looking for the channel by name. Five steps to
+    // rediscover what the title said the first time.
+    //
+    // The page said 404. Say 404, and say what that means about the URL.
+    const missing = wrongUrlNotice(state.title, state.url);
+    if (missing) return missing;
     if (!text && lines.length === 0) {
       return `Page: ${state.title ? `"${state.title}" — ` : ""}${state.url}\n` +
         "It loaded, but there is NOTHING readable on it — no text and no controls. Either it is still " +
@@ -985,7 +1183,7 @@ export function buildToolset({
       // The same is true of every dev server, watcher, tunnel and daemon, so
       // this is a category rather than an application: something the user wants
       // RUNNING is started detached and reported as started.
-      execute: async (args) => {
+      execute: async (args, { onProgress = null } = {}) => {
         if (args.cwd) state.cwd = args.cwd;
         const written = String(args.command ?? "");
         const unwrapped = unwrapNestedShell(written);
@@ -1008,9 +1206,42 @@ export function buildToolset({
           );
           return { ...launched, background: true, command };
         }
-        const result = await adapter.executeCommand(state.cwd, command, [], {
-          timeoutMs: Number(args.timeoutMs) || 90000
-        });
+        // A LONG INSTALL SHOULD LOOK LIKE A LONG INSTALL.
+        //
+        // `winget install` prints where it has got to for the whole minute it
+        // runs, and none of that reached the user: the transcript showed the
+        // command line and a spinner, then everything at once at the end. The
+        // reader below turns those redraws into a percentage the row can draw as
+        // a bar underneath the command. Only attached for commands that actually
+        // report progress, so nothing changes for the ordinary one-second call.
+        //
+        // Two readers, because the two kinds of command say where they are in
+        // two different ways. pip, npm and curl print their bars straight down
+        // the pipe and only need parsing. winget suppresses its bar the moment
+        // its output is redirected, so its progress is measured from the file it
+        // is writing against the size the server reports — see winget-progress.
+        const watch = onProgress && reportsProgress(command) ? createProgressReader() : null;
+        const winget = onProgress && isWingetInstall(command)
+          ? createWingetWatcher({ onProgress })
+          : null;
+        let result;
+        try {
+          result = await adapter.executeCommand(state.cwd, command, [], {
+            timeoutMs: Number(args.timeoutMs) || 90000,
+            ...(watch || winget
+              ? {
+                  onOutput: ({ text }) => {
+                    winget?.note(text);
+                    const progress = watch?.(text);
+                    if (progress) onProgress(progress);
+                  }
+                }
+              : {})
+          });
+        } finally {
+          // The poll must not outlive the command, whatever ended it.
+          winget?.stop();
+        }
         return { ...result, command, notes };
       },
       render: (result) => {
@@ -1216,6 +1447,14 @@ export function buildToolset({
           // nothing else sits inside. Naming its rectangle turns "draw a circle
           // somewhere in the middle" from a guess into arithmetic.
           ((state.lastCanvas = findCanvas(result.elements ?? [])), describeCanvas(result.elements ?? [])),
+          // WHICH TOOL HAS THE MOUSE, AND WHAT THAT MEANS FOR A STROKE.
+          //
+          // The application says so and the reading already contained it —
+          // "Using Oval tool on Canvas" — but as one unremarkable group among a
+          // hundred elements it was never read as the operative fact it is. A
+          // shape tool and a pencil need completely different motions, and until
+          // this line the agent had no way to know which it was holding.
+          ((state.lastTool = findActiveTool(result.elements ?? [])), describeActiveTool(state.lastTool)),
           result.visibleText?.trim() ? `Visible text:\n${clip(result.visibleText.trim(), MAX_SCREEN_TEXT_CHARS)}` : null,
           lines.length ? `Elements (index| role "text" @x,y):\n${lines.join("\n")}` : null
         ].filter(Boolean).join("\n\n");
@@ -1243,7 +1482,7 @@ export function buildToolset({
       preview: (args) => (args.text ? `"${args.text}"` : args.element != null ? `element ${args.element}` : `(${args.x}, ${args.y})`),
       execute: async (args) => {
         const target = resolveTarget(args);
-        return runCapability("pointer.clickAt", {
+        const clicked = await runCapability("pointer.clickAt", {
           ...target,
           // Only name the application when there is no handle. Sending both lets
           // a general name compete with an exact one, and with two windows of the
@@ -1253,10 +1492,19 @@ export function buildToolset({
           button: args.button ?? "left",
           doubleClick: args.doubleClick === true
         });
+        return { ...clicked, label: target.label ?? null, byIndex: target.byIndex ?? null };
       },
-      render: (result) => (result.performed === false
-        ? `Click did not land: ${result.reason ?? "unknown"}`
-        : `Clicked at ${result.x},${result.y}.`)
+      render: (result) => {
+        if (result.performed === false) return `Click did not land: ${result.reason ?? "unknown"}`;
+        if (!result.label) return `Clicked at ${result.x},${result.y}.`;
+        // Say what it hit. When the index was stale this is the sentence that
+        // catches it, and when it was right it costs six words.
+        return result.byIndex != null
+          ? `Clicked "${result.label}" — element ${result.byIndex} in the last reading — at ${result.x},${result.y}. ` +
+            "If that is not what you meant, the reading you took the index from is not the current one: " +
+            "read the screen and click by label."
+          : `Clicked "${result.label}" at ${result.x},${result.y}.`;
+      }
     },
     {
       name: "type",
@@ -1358,31 +1606,56 @@ export function buildToolset({
     },
     {
       name: "scroll",
-      description: "Scroll a window with the mouse wheel. Negative notches scroll down.",
+      // "NEGATIVE NOTCHES SCROLL DOWN" IS A TRAP, AND IT WAS SPRUNG REPEATEDLY.
+      //
+      // The wheel's own convention is that positive is up, so the tool asked for
+      // a negative number to go down. Every model reads "scroll down 6" and
+      // sends 6 — which scrolled UP. Live, hunting for a flight at the bottom of
+      // a list, the agent sent 6, then 12, then 20 notches, was returned to the
+      // top of the page each time, concluded "the scroll tool isn't moving the
+      // page content", and finally dragged the scrollbar by hand. Fifteen steps
+      // and about a minute, for a page it could have reached in one.
+      //
+      // A direction nobody has to remember the sign of cannot be got wrong, so
+      // `notches` is now only ever a distance and `direction` says which way.
+      description:
+        "Scroll a window with the mouse wheel. Say which way with `direction` — \"down\" moves further " +
+        "through the page, \"up\" moves back towards the top. `notches` is only the distance.",
       parameters: {
         type: "object",
         properties: {
-          notches: { type: "number" },
+          direction: { type: "string", enum: ["down", "up"], description: "Default down" },
+          notches: { type: "number", description: "How far, as wheel notches. Default 5. The sign is ignored" },
           application: { type: "string" },
           untilText: { type: "string", description: "Stop as soon as this text becomes visible" }
         },
-        required: ["notches"]
+        required: []
       },
-      preview: (args) => `${args.notches} notches`,
-      execute: async (args) => runCapability("pointer.wheel", {
-        notches: args.notches,
-        untilText: args.untilText,
-        application: args.application ?? state.lastWindow?.application,
-        windowId: state.lastWindow?.windowId
-      }),
+      preview: (args) => `${String(args.direction ?? "down")} ${Math.abs(Number(args.notches) || 5)} notches`,
+      execute: async (args) => {
+        const distance = Math.abs(Number(args.notches)) || 5;
+        const direction = String(args.direction ?? "down").toLowerCase() === "up" ? "up" : "down";
+        // The wheel underneath still speaks in signs; nothing above it has to.
+        const result = await runCapability("pointer.wheel", {
+          notches: direction === "up" ? distance : -distance,
+          untilText: args.untilText,
+          application: args.application ?? state.lastWindow?.application,
+          windowId: state.lastWindow?.windowId
+        });
+        return { ...result, direction, distance };
+      },
+      // "Scrolled." told the agent nothing, so when it had been going the wrong
+      // way for four steps there was no signal at all — it blamed the tool.
+      // Saying which way it actually went is what makes the next step correct.
       render: (result) => {
         if (result.performed === false) return `Scroll failed: ${result.reason ?? "unknown"}`;
+        const moved = `Scrolled ${result.direction ?? "down"} ${result.distance ?? "?"} notches`;
         if (result.untilText) {
           return result.stoppedOnText
-            ? `Scrolled until "${result.untilText}" came into view.`
-            : `Scrolled, but "${result.untilText}" did not appear. Read the screen to see where you are.`;
+            ? `${moved}, until "${result.untilText}" came into view.`
+            : `${moved}, but "${result.untilText}" did not appear. Read the screen to see where you are.`;
         }
-        return "Scrolled.";
+        return `${moved}. Read the screen to see what is in view now.`;
       }
     },
     {
@@ -1484,10 +1757,12 @@ export function buildToolset({
       // model round trip and one undo entry each. This is the verb for the thing
       // the request actually names: a shape, drawn in one motion.
       description:
-        "Draw in one continuous motion, with the button held down the whole way — the verb for anything " +
-        "drawn rather than clicked. Name a `shape` (circle, ellipse, arc, rect, square, polygon, line, " +
-        "polyline, freehand) with its measurements, or give `points`. Use `strokes` to draw a figure that " +
-        "lifts the pen, in one call. Select the tool you want first; this only moves the mouse.",
+        "Draw a shape. Name a `shape` (circle, ellipse, arc, rect, square, polygon, line, polyline, " +
+        "freehand) with its measurements, or give `points`; use `strokes` to draw a whole figure in one " +
+        "call. Select the drawing tool FIRST, then read the screen — this adapts to whichever tool is " +
+        "active: with a shape tool (Oval, Rectangle, Line) it sends the single press-and-release that " +
+        "tool needs, so you get the application's own clean shape, and with a pencil or brush it traces " +
+        "the path in one continuous motion.",
       parameters: {
         type: "object",
         properties: {
@@ -1538,6 +1813,19 @@ export function buildToolset({
           : [args];
         const paths = specs.map((spec) => buildPath(spec));
         const points = paths.reduce((total, path) => total + path.length, 0);
+        // THE MOTION A SHAPE TOOL NEEDS IS NOT THE SHAPE.
+        //
+        // With Oval, Rectangle or Line selected, the application draws its own
+        // geometry between the press and the release and throws the path away.
+        // A traced circle presses and releases in the same place, so it asked
+        // for a zero-size oval and got one — which is why every `draw` with a
+        // shape tool active reported nothing drawn, while `drag` worked first
+        // time. Reduce each stroke to the two points that tool reads.
+        //
+        // This is not a workaround for a broken tool; it is the better drawing.
+        // Paint's ellipse is a real anti-aliased curve, and the traced version
+        // was a many-sided polygon of pointer samples.
+        const boxDrags = shapeToolDrags(state.lastTool, paths);
         // OUTSIDE THE CANVAS IS NOT A DRAWING, IT IS A CLICK ON THE TOOLBAR.
         //
         // A stroke that lands outside the drawing surface changes nothing, and
@@ -1581,11 +1869,33 @@ export function buildToolset({
         // pixels over the area the stroke covered answer it when there is not.
         const undoBefore = await undoAvailable(target);
         const before = undoBefore === false ? null : await windowLook(target);
-        const result = await adapter.pointerStroke({
-          ...target,
-          paths: paths.map(flattenPath),
-          pacingMicros
-        });
+        let result;
+        if (boxDrags) {
+          // One press-move-release per shape, which is what the tool reads. Run
+          // in sequence so a figure of several shapes is still a single call —
+          // the whole point of `strokes` — without a model round trip between
+          // them and without the screen read that a manual `drag` needed.
+          const performed = [];
+          for (const drag of boxDrags) {
+            performed.push(await adapter.pointerAction("drag", {
+              ...target,
+              fromX: drag.from.x, fromY: drag.from.y,
+              toX: drag.to.x, toY: drag.to.y
+            }));
+          }
+          result = {
+            ...(performed[performed.length - 1] ?? {}),
+            performed: performed.every((step) => step?.performed !== false),
+            strokes: performed.length,
+            durationMs: performed.reduce((total, step) => total + (Number(step?.durationMs) || 0), 0)
+          };
+        } else {
+          result = await adapter.pointerStroke({
+            ...target,
+            paths: paths.map(flattenPath),
+            pacingMicros
+          });
+        }
         const undoAfter = await undoAvailable(target);
         const after = before ? await windowLook(target) : null;
         // The whole figure's bounding box, so the comparison looks where the
@@ -1603,15 +1913,41 @@ export function buildToolset({
           box,
           undoBefore,
           undoAfter,
+          usedShapeTool: boxDrags ? (state.lastTool?.name ?? "shape tool") : null,
+          // Only meaningful when the path was traced. A closed traced path under
+          // an unrecognised tool is the exact failure the shape-tool handling
+          // above exists to prevent, and when the tool could not be identified
+          // it can still happen — so the render can name the real cause instead
+          // of sending the agent back to the Shapes menu.
+          tracedClosedPath: !boxDrags && paths.some(isClosedPath),
+          activeTool: state.lastTool?.name ?? null,
           changedFraction: region ? changedFraction(before.cells, after.cells, { region }) : null
         };
       },
       render: (result) => {
         if (result.performed === false) return `Nothing was drawn: ${result.reason ?? "unknown"}`;
-        const what = `Drew ${result.shape} — ${result.plannedPoints} points in ${result.strokes ?? 1} ` +
-          `stroke${(result.strokes ?? 1) === 1 ? "" : "s"} over ${Math.round(result.durationMs ?? 0)}ms, ` +
-          `from ${result.box.from.x},${result.box.from.y} to ${result.box.to.x},${result.box.to.y}`;
+        const how = result.usedShapeTool
+          ? `Drew ${result.shape} with the ${result.usedShapeTool} tool's own geometry — ` +
+            `${result.strokes ?? 1} press-and-release${(result.strokes ?? 1) === 1 ? "" : "s"}, ` +
+            `from ${result.box.from.x},${result.box.from.y} to ${result.box.to.x},${result.box.to.y}`
+          : `Drew ${result.shape} — ${result.plannedPoints} points in ${result.strokes ?? 1} ` +
+            `stroke${(result.strokes ?? 1) === 1 ? "" : "s"} over ${Math.round(result.durationMs ?? 0)}ms, ` +
+            `from ${result.box.from.x},${result.box.from.y} to ${result.box.to.x},${result.box.to.y}`;
+        const what = how;
         if (result.undoAfter === false) {
+          // NAME THE ACTUAL CAUSE, NOT THE COMMONEST ONE.
+          //
+          // This used to say "the tool you meant to use is not actually active"
+          // in every case, and when the tool WAS active — confirmed on screen —
+          // that sent the agent through the Shapes group and the Shape fill menu
+          // looking for a fault that was not there. A closed path under a shape
+          // tool has a specific cause and a specific fix; say those.
+          if (result.tracedClosedPath) {
+            return `${what}, but the application still has NOTHING TO UNDO. The path was traced and it ` +
+              "ends where it began — so if a SHAPE tool is selected (Oval, Rectangle, Line), it read the " +
+              "press and the release as the same point and drew a zero-size shape. Read the screen: the " +
+              "reading names the active tool, and once it does this tool sends the right motion by itself.";
+          }
           return `${what}, but the application still has NOTHING TO UNDO — so the document did not change ` +
             "and nothing was drawn. Almost always the tool you meant to use is not actually active: in " +
             "Paint, opening the Shapes group is not the same as selecting a shape from it. Read the " +
@@ -2609,6 +2945,25 @@ export function buildToolset({
 
     has: (name) => byName.has(name),
 
+    // THE MACHINE, DESCRIBED ONCE.
+    //
+    // Read on the first turn and kept for the life of the process: known folders
+    // and installed applications do not change between two messages, and paying
+    // a PowerShell round trip per turn to be told the same thing would be the
+    // same waste this whole file exists to remove. A failed read is cached as
+    // "nothing to say" rather than retried every turn.
+    async machineFacts() {
+      if (!state.machineFacts) {
+        state.machineFacts = readMachineProfile(adapter)
+          .then((profile) => {
+            state.machineProfile = profile;
+            return describeMachine(profile);
+          })
+          .catch(() => "");
+      }
+      return state.machineFacts;
+    },
+
     // A NEW TURN INVALIDATES WHAT IS ON SCREEN, AND NOTHING ELSE.
     //
     // The toolset outlives a single request so the agent keeps its place on the
@@ -2621,6 +2976,7 @@ export function buildToolset({
     beginTurn() {
       state.elements = [];
       state.lastCanvas = null;
+      state.lastTool = null;
     },
 
     previewOf(name, args) {
@@ -2632,7 +2988,7 @@ export function buildToolset({
      * Run one tool call. Never throws: a failure is a result the model reads and
      * works around, exactly like a non-zero exit code.
      */
-    async execute(name, args = {}) {
+    async execute(name, args = {}, { onProgress = null } = {}) {
       const tool = byName.get(name);
       if (!tool) {
         return { ok: false, text: `There is no tool called "${name}". Use one of: ${[...byName.keys()].join(", ")}.` };
@@ -2641,7 +2997,9 @@ export function buildToolset({
       try {
         // `say` is narration for the user, not an input to the operation.
         const { say, saw, ...inputs } = args;
-        const result = await tool.execute(inputs);
+        // A tool that has something to report while it runs takes this and uses
+        // it; every other tool ignores the second argument entirely.
+        const result = await tool.execute(inputs, { onProgress });
         const text = tool.render(result ?? {});
         return { ok: true, text, raw: result, durationMs: Date.now() - startedAt };
       } catch (error) {
