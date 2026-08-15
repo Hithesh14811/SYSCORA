@@ -486,7 +486,10 @@ test("a refused command comes back as the reason, not as a crash", async () => {
   });
 
   const result = await toolset.execute("run", { command: "format C:" });
-  assert.equal(result.ok, true);
+  // It comes back as text the model reads rather than as an exception — and it
+  // is a failure, so sending the identical command again is refused by the
+  // loop's repeat guard instead of being tried a second and third time.
+  assert.equal(result.ok, false);
   assert.match(result.text, /^REFUSED: I won't run this/);
 });
 
@@ -500,4 +503,65 @@ test("command output is passed back with its exit code and clipped, not dumped w
   assert.ok(result.text.length < 8000, `tool output must be bounded, got ${result.text.length}`);
   assert.match(result.text, /more characters/);
   assert.match(result.text, /exit 0/);
+});
+
+// NOTHING IS CHANGING, AND IT HAS NOT NOTICED.
+//
+// Asked to add an emoji reaction in WhatsApp, the agent hovered, read, clicked a
+// guessed coordinate, read, hovered four pixels away, read — 48 steps and
+// 692,000 tokens, with the reading saying "nothing at all has changed on screen"
+// over and over. The react button is an icon with no text: invisible to a text
+// reading, and no amount of hovering was ever going to reveal it.
+//
+// The repeat guard could not catch it, because every call was slightly
+// different. What was identical was the OUTCOME.
+test("a screen that never changes ends the run instead of being hunted forever", async () => {
+  const unchanging = [{
+    role: "text", text: "Team Rezoni", clickable: true,
+    bounds: { x: 1100, y: 1350, width: 200, height: 24 }
+  }];
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "198130", application: "WhatsApp", title: "WhatsApp",
+        visibleText: "", elements: unchanging
+      })
+    }),
+    adapter: {}
+  });
+
+  // Hover somewhere a few pixels away, read, repeat — exactly the live shape.
+  const turns = [];
+  for (let index = 0; index < 30; index += 1) {
+    turns.push({ text: "trying", toolCalls: [{ name: "move_mouse", args: { x: 1300 + index * 4, y: 400 - index * 3 } }] });
+    turns.push({ text: "checking", toolCalls: [{ name: "screen", args: { application: "WhatsApp" } }] });
+  }
+
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 60 });
+  const outcome = await agent.run("react 😊 on the latest message");
+
+  assert.ok(outcome.steps < 25, `it must give up early, took ${outcome.steps} steps`);
+  assert.equal(outcome.status, "PARTIALLY_COMPLETED");
+  assert.match(outcome.message, /has not changed/);
+  assert.match(outcome.message, /icon/, "and it must say WHY, because this is not a failure the user can guess");
+  assert.match(outcome.message, /Nothing was changed/);
+});
+
+// Repetition is how a long list gets scrolled and how a picture gets drawn, so
+// the guards above must not mistake either for going in circles.
+test("scrolling and drawing may repeat as much as they need to", async () => {
+  const scrolls = [];
+  const toolset = stubToolset({
+    scroll: async (args) => { scrolls.push(args); return { ok: true, text: "Scrolled." }; }
+  });
+  const turns = Array.from({ length: 8 }, () => ({
+    text: "looking further down",
+    toolCalls: [{ name: "scroll", args: { direction: "down", notches: 6 } }]
+  }));
+  turns.push({ text: "found it", toolCalls: [] });
+
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });
+  await agent.run("find the thing at the bottom of the list");
+
+  assert.equal(scrolls.length, 8, "every identical scroll must actually run");
 });

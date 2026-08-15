@@ -1,7 +1,8 @@
 import { redactSensitiveData } from "../../shared-types/src/redaction.js";
 import {
   authorizeExternalAITransfer,
-  sanitizeExternalContext
+  sanitizeExternalContext,
+  ExternalAIConsentScope
 } from "../../shared-types/src/external-context.js";
 import crypto from "crypto";
 import tls from "node:tls";
@@ -105,7 +106,21 @@ export async function openAiCompatibleChat({
   timeoutMs = 60000,
   signal = null,
   onTextDelta = null,
-  stream = true
+  stream = true,
+  // BEING RATE-LIMITED IS A WAIT, NOT A FAILURE.
+  //
+  // There was no handling here at all: a 429 came straight back as an error, the
+  // loop retried once 400ms later into the same closed window, and the task
+  // ended with "your model provider is rate-limiting this account" — after about
+  // a second of waiting, on a limit that usually clears in two. With a fallback
+  // chain configured it was hidden, because the request simply went to another
+  // account; on a single provider, which is what this now runs on, it is the
+  // difference between a pause and a dead task.
+  //
+  // Only retried when NOTHING has been emitted yet. Once prose has reached the
+  // user, sending the request again would say it twice.
+  rateLimitRetries = 2,
+  onRetry = null
 }) {
   if (!apiKey) throw new Error("No API key");
   // ONLY THE FIELDS THIS WIRE FORMAT DECLARES.
@@ -125,8 +140,57 @@ export async function openAiCompatibleChat({
         }))
       }
     : message));
+  const deadline = Date.now() + timeoutMs;
+  const attemptOptions = {
+    baseUrl, apiKey, model, headers, wireMessages, tools,
+    temperature, maxTokens, stream, onTextDelta, signal, deadline
+  };
+
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await sendChatOnce(attemptOptions);
+    } catch (error) {
+      const remainingMs = deadline - Date.now();
+      const throttled = error?.status === 429;
+      // A gateway that was briefly unavailable is worth one more try, but only
+      // if the turn had not started arriving.
+      const unavailable = [500, 502, 503, 504].includes(error?.status) && error?.emitted !== true;
+      if (signal?.aborted
+        || error?.emitted === true
+        || attempt >= rateLimitRetries
+        || !(throttled || unavailable)
+        // Not worth waiting if there is no time left to spend the wait in.
+        || remainingMs <= 2000) {
+        throw error;
+      }
+      const backoffMs = Math.min(8000, 500 * 2 ** attempt) + Math.round(Math.random() * 250);
+      const waitMs = Math.max(0, Math.min(error?.retryAfterMs || backoffMs, remainingMs - 1500));
+      // The surface draws this as one line that counts up, so the user sees a
+      // wait rather than a hang. Without it the transcript simply stops.
+      onRetry?.({
+        reason: throttled ? "rate-limited" : "provider-unavailable",
+        waitMs,
+        attempt: attempt + 1,
+        status: error?.status ?? null
+      });
+      await sleepUnlessAborted(waitMs, signal);
+      attempt += 1;
+    }
+  }
+}
+
+/**
+ * One attempt at one turn. Throws with `status` set on an HTTP failure, and with
+ * `emitted` true when part of the turn had already reached the caller — which is
+ * what decides whether the attempt above may be repeated.
+ */
+async function sendChatOnce({
+  baseUrl, apiKey, model, headers, wireMessages, tools,
+  temperature, maxTokens, stream, onTextDelta, signal, deadline
+}) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), Math.max(1000, deadline - Date.now()));
   const onOuterAbort = () => controller.abort();
   if (signal) {
     if (signal.aborted) controller.abort();
@@ -183,6 +247,11 @@ export async function openAiCompatibleChat({
     let usage = null;
     const pending = new Map();
     let done = false;
+    // Whether anything has already reached the caller. Once it has, this turn
+    // cannot be retried: the user would hear the first half of the sentence
+    // twice. See the retry loop at the bottom of this function.
+    let emitted = false;
+    try {
     while (!done) {
       const { value, done: streamDone } = await reader.read();
       if (streamDone) break;
@@ -204,6 +273,7 @@ export async function openAiCompatibleChat({
         const delta = choice.delta ?? {};
         if (typeof delta.content === "string" && delta.content) {
           text += delta.content;
+          emitted = true;
           onTextDelta?.(delta.content);
         }
         for (const [index, call] of (delta.tool_calls ?? []).entries()) {
@@ -215,6 +285,12 @@ export async function openAiCompatibleChat({
           pending.set(key, existing);
         }
       }
+    }
+    } catch (error) {
+      // A socket that dies mid-stream. Whether it can be retried depends on
+      // whether anything already went out.
+      error.emitted = emitted;
+      throw error;
     }
     await reader.cancel().catch(() => {});
     // A CUT CONNECTION IS NOT A FINISHED ANSWER.
@@ -230,6 +306,7 @@ export async function openAiCompatibleChat({
     if (!done && !finishReason) {
       const error = new Error("The model stream ended before the turn was complete (connection dropped).");
       error.status = 503;
+      error.emitted = emitted;
       throw error;
     }
     const toolCalls = [...pending.entries()]
@@ -245,6 +322,26 @@ export async function openAiCompatibleChat({
     clearTimeout(timeout);
     if (signal) signal.removeEventListener?.("abort", onOuterAbort);
   }
+}
+
+// A wait that a stop press cuts short. Rejecting rather than resolving means the
+// caller sees the cancellation instead of quietly issuing another request.
+function sleepUnlessAborted(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Cancelled"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("Cancelled"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
 }
 
 export function isRetryableProviderError(error) {
@@ -597,6 +694,10 @@ export function getProviderIdentity(provider) {
   };
 }
 
+// One sanitized copy per message object, held weakly so a finished conversation
+// is collected with it. See ConsentAwareModelProvider.chat.
+const SANITIZED_MESSAGES = new WeakMap();
+
 export class ConsentAwareModelProvider extends LanguageModelProvider {
   constructor({ provider, consentScopes = [], onProvenance = null } = {}) {
     super();
@@ -672,18 +773,50 @@ export class ConsentAwareModelProvider extends LanguageModelProvider {
     }
   }
 
-  supportsChat() { return Boolean(this.provider?.supportsChat?.()); }
+  // THE KILL SWITCH HAD NO WIRE ATTACHED TO IT.
+  //
+  // Every scope check lived on generateStructured — the staged pipeline's path —
+  // and the agent loop calls chat(), which checked nothing. So a configuration
+  // saying EXTERNAL_AI_DISABLED disabled nothing at all on the route every
+  // request actually takes: screen readings, window titles, file contents and
+  // command output went to the model exactly as before.
+  //
+  // Enforced here rather than per turn: the loop is one continuing request, and
+  // an agent that stops being allowed to think halfway through a task is worse
+  // than one that never started. With chat refused, the runtime routes to the
+  // staged pipeline, which plans from typed capabilities and needs no model —
+  // which is precisely what "no external AI" has to mean for this product.
+  supportsChat() {
+    if (this.consentScopes.includes(ExternalAIConsentScope.DISABLED)) return false;
+    return Boolean(this.provider?.supportsChat?.());
+  }
 
   // The consent boundary applies to the CONTENT that leaves this machine, so it
   // redacts each message the same way it redacts a structured prompt. It does
   // not re-authorize per turn: the loop is one continuing request, authorized
   // when it started.
+  //
+  // SCRUB EACH MESSAGE ONCE, NOT ONCE PER STEP.
+  //
+  // The loop re-sends the whole conversation on every step, and this used to
+  // re-run the redaction regexes over all of it every time — so the cost grew
+  // with the square of the conversation, for an answer that cannot change: the
+  // message objects are the same ones, and sanitizing is deterministic.
+  // Remembering the result against the message object itself makes it linear.
+  // Pruning replaces a message with a NEW object, which misses the map and is
+  // scrubbed once more — which is exactly right, because its content changed.
   async chat(request = {}) {
-    const messages = (request.messages ?? []).map((message) => (
-      typeof message.content === "string"
-        ? { ...message, content: sanitizeExternalContext(message.content, { maxStringLength: 32000 }) }
-        : message
-    ));
+    const messages = (request.messages ?? []).map((message) => {
+      if (typeof message.content !== "string") return message;
+      const remembered = SANITIZED_MESSAGES.get(message);
+      if (remembered) return remembered;
+      const scrubbed = {
+        ...message,
+        content: sanitizeExternalContext(message.content, { maxStringLength: 32000 })
+      };
+      SANITIZED_MESSAGES.set(message, scrubbed);
+      return scrubbed;
+    });
     return this.provider.chat({ ...request, messages });
   }
 
@@ -1045,7 +1178,12 @@ export class MistralModelProvider extends LanguageModelProvider {
           apiKey: this.apiKey,
           model: request.model || this.model,
           maxTokens: request.maxTokens ?? this.maxTokens,
-          ...request
+          ...request,
+          // ONE OWNER FOR THE WAIT. The transport retries a 429 by itself for
+          // providers that have no loop of their own; this provider does, with a
+          // longer budget, and two of them stacked would double every backoff
+          // and report each wait twice.
+          rateLimitRetries: 0
         });
         this._usage.tokensIn += result.usage?.prompt_tokens ?? 0;
         this._usage.tokensOut += result.usage?.completion_tokens ?? 0;
@@ -1471,12 +1609,28 @@ export class AgentRouterModelProvider extends LanguageModelProvider {
     // compatible root so `${baseUrl}/chat/completions` is correct.
     const rawBase = config.baseUrl || "https://agentrouter.org/v1";
     this.baseUrl = /\/v\d+$/.test(rawBase.replace(/\/$/, "")) ? rawBase.replace(/\/$/, "") : `${rawBase.replace(/\/$/, "")}/v1`;
+    this.name = config.providerName || "agentrouter";
     // AgentRouter fronts its gateway with a WAF that rejects requests which do
     // not look like the Claude Code CLI (a plain Bearer call returns HTTP 401
     // "unauthorized client detected"). A Claude-Code-style User-Agent clears it.
-    // Overridable via config for forward-compat if the gateway changes policy.
-    this.userAgent = config.userAgent || "claude-cli/1.0.0 (external)";
-    this.name = config.providerName || "agentrouter";
+    //
+    // ONLY FOR THAT GATEWAY. This class is reused as the OpenAI-compatible
+    // transport for other endpoints — Baseten is what SYSCORA runs on now — and
+    // sending them a User-Agent claiming to be somebody else's CLI is both
+    // untrue and pointless: they have no such WAF, and nothing about the request
+    // needs it. Overridable via config either way.
+    this.userAgent = config.userAgent
+      ?? (this.name === "agentrouter" ? "claude-cli/1.0.0 (external)" : null);
+  }
+
+  // Only sent when there is one. See the constructor.
+  _headers(extra = {}) {
+    return {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${this.apiKey}`,
+      ...(this.userAgent ? { "User-Agent": this.userAgent } : {}),
+      ...extra
+    };
   }
 
   async healthCheck() {
@@ -1486,7 +1640,7 @@ export class AgentRouterModelProvider extends LanguageModelProvider {
     try {
       const response = await fetch(`${this.baseUrl}/models`, {
         method: "GET",
-        headers: { Authorization: `Bearer ${this.apiKey}`, "User-Agent": this.userAgent },
+        headers: this._headers(),
         signal: controller.signal
       });
       return { ok: response.ok, status: response.status, type: "AgentRouterModelProvider", model: this.model };
@@ -1509,7 +1663,7 @@ export class AgentRouterModelProvider extends LanguageModelProvider {
       baseUrl: this.baseUrl,
       apiKey: this.apiKey,
       model: request.model || this.model,
-      headers: { "User-Agent": this.userAgent },
+      headers: this.userAgent ? { "User-Agent": this.userAgent } : {},
       ...request
     });
     this._usage.tokensIn += result.usage?.prompt_tokens ?? 0;
@@ -1530,7 +1684,7 @@ export class AgentRouterModelProvider extends LanguageModelProvider {
       try {
         const response = await fetch(`${this.baseUrl}/chat/completions`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}`, "User-Agent": this.userAgent },
+          headers: this._headers(),
           body: JSON.stringify({
             model: options.model || this.model,
             messages: [

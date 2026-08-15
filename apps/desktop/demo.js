@@ -17,13 +17,20 @@
 import { readIntentSession } from "./intent-client.js";
 
 const TOKEN_STORAGE_KEY = "syscora_token";
-// Matches .claude/launch.json's SYSCORA_API_TOKEN, so a plain browser launch
-// doesn't need a manual paste for local dev. The Connect panel below only
-// appears if this gets rejected (e.g. the daemon used a different token).
-const DEV_FALLBACK_TOKEN = "syscora-dev-local-token-do-not-use-in-prod";
+// A KNOWN TOKEN IS NOT A TOKEN.
+//
+// This used to fall back to a fixed string that the dev launch configuration
+// also set as the daemon's real SYSCORA_API_TOKEN — so on any machine started
+// that way, the credential guarding an API that can run commands, type into
+// windows and delete files was a constant published in this file. Anything able
+// to reach 127.0.0.1 could drive the agent with it.
+//
+// The Electron shell injects the real token in-process (window.syscora), and a
+// plain browser gets the Connect panel, which is one paste from the line the
+// daemon prints on startup.
 let apiToken = (window.syscora && window.syscora.apiToken)
   || sessionStorage.getItem(TOKEN_STORAGE_KEY)
-  || DEV_FALLBACK_TOKEN;
+  || null;
 
 const connectPanel = document.getElementById("connectPanel");
 const connectForm = document.getElementById("connectForm");
@@ -49,6 +56,9 @@ function handleUnauthorized() {
   sessionStorage.removeItem(TOKEN_STORAGE_KEY);
   showConnect("Token was rejected. Paste the current token from the daemon console.");
 }
+
+// Ask for it before the first request rather than after one fails.
+if (!apiToken) showConnect();
 
 connectForm.addEventListener("submit", (e) => {
   e.preventDefault();
@@ -464,11 +474,70 @@ class Turn {
     this.pendingSteps = [];
   }
 
+  // ONE CLICK, IN THE PLACE THEY ARE ALREADY LOOKING.
+  //
+  // Only for the handful of things that cannot be undone — deleting files,
+  // uninstalling, stopping a service, restarting the machine. It shows the exact
+  // command rather than a description of it, because the command is what is
+  // being agreed to, and because "delete some files" and
+  // `Remove-Item -Recurse C:\Users\me\Documents` are not the same sentence.
+  askApproval(details) {
+    this.clearStatus();
+    this._closeStream(null);
+    const card = el("div", "approval-card");
+    card.appendChild(el("h3", null, `Can I ${details.summary ?? "do this"}?`));
+    if (details.reason) card.appendChild(el("p", "what", `${details.reason[0].toUpperCase()}${details.reason.slice(1)}.`));
+    if (details.detail) card.appendChild(el("pre", "step-output", String(details.detail)));
+    const actions = el("div", "actions");
+    const approve = el("button", "approve", "Allow");
+    const reject = el("button", "secondary", "Don't");
+    actions.appendChild(approve);
+    actions.appendChild(reject);
+    card.appendChild(actions);
+    const answer = async (approved) => {
+      approve.disabled = true;
+      reject.disabled = true;
+      await respondToApproval(details.approvalId, approved);
+    };
+    approve.addEventListener("click", () => answer(true));
+    reject.addEventListener("click", () => answer(false));
+    this.approvals = this.approvals ?? new Map();
+    this.approvals.set(details.approvalId, card);
+    this.root.appendChild(card);
+    scrollToEnd();
+  }
+
+  // Answered, or timed out, or the run ended. Either way the buttons stop being
+  // live and the card says what was decided, because it stays in the transcript.
+  settleApproval(approvalId, approved) {
+    const card = this.approvals?.get(approvalId);
+    if (!card) return;
+    this.approvals.delete(approvalId);
+    card.querySelector(".actions")?.remove();
+    card.classList.add(approved ? "approved" : "rejected");
+    card.appendChild(el("p", "agent-detail", approved ? "You allowed this." : "You said no — it was not run."));
+    scrollToEnd();
+  }
+
   append(node) {
     this.root.appendChild(node);
     scrollToEnd();
     return node;
   }
+}
+
+// The answer travels on its own route, straight to the loop that is waiting for
+// it. A failure here is not worth surfacing: the agent times the question out on
+// its own and treats silence as no.
+async function respondToApproval(approvalId, approved) {
+  if (!runningSessionId) return;
+  try {
+    await fetch(`/api/intents/${encodeURIComponent(runningSessionId)}/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approvalId, approved })
+    });
+  } catch { /* the question times out by itself */ }
 }
 
 // ---- Events → the turn -------------------------------------------------------
@@ -526,6 +595,15 @@ function handleEvent(turn, event) {
       durationMs: d.durationMs
     });
     return;
+  }
+  // The agent is about to do something it cannot take back, and has stopped to
+  // ask. The command is shown verbatim, because that is the thing being agreed
+  // to — a summary of a delete is not a delete.
+  if (type === "APPROVAL_REQUIRED") {
+    return turn.askApproval(d);
+  }
+  if (type === "APPROVAL_RESOLVED") {
+    return turn.settleApproval(d.approvalId, d.approved);
   }
   if (type === "AGENT_ERROR") {
     return turn.note(`Model call failed: ${d.reason ?? "unknown"} — retrying or stopping.`);
@@ -598,6 +676,25 @@ function handleEvent(turn, event) {
 
 const GOOD_STATUS = new Set(["COMPLETED", "COMPLETED_WITH_WARNINGS", "ANSWERED", "ROLLED_BACK", "VERIFIED"]);
 
+// What the request cost, on one line under it. Not a dashboard: the numbers that
+// answer "was that expensive, and why" — how many decisions it made, how long it
+// took, and how many tokens those decisions cost. Every one of these was already
+// being measured and none of it was ever shown.
+function renderCost(turn, metrics) {
+  if (!metrics) return;
+  const parts = [];
+  if (metrics.steps) parts.push(`${metrics.steps} step${metrics.steps === 1 ? "" : "s"}`);
+  if (metrics.toolCalls) parts.push(`${metrics.toolCalls} tool call${metrics.toolCalls === 1 ? "" : "s"}`);
+  if (Number.isFinite(metrics.elapsedMs) && metrics.elapsedMs > 0) parts.push(`${(metrics.elapsedMs / 1000).toFixed(1)}s`);
+  const tokens = (Number(metrics.tokensIn) || 0) + (Number(metrics.tokensOut) || 0);
+  // Providers do not all report usage. A missing number is left out rather than
+  // shown as a zero that looks like a measurement.
+  if (tokens > 0) {
+    parts.push(`${tokens.toLocaleString()} tokens (${(Number(metrics.tokensIn) || 0).toLocaleString()} in, ${(Number(metrics.tokensOut) || 0).toLocaleString()} out)`);
+  }
+  if (parts.length) turn.append(el("div", "turn-cost", parts.join(" · ")));
+}
+
 function renderFinal(turn, session) {
   turn.settle();
   const fr = session.finalResponse ?? {};
@@ -620,6 +717,7 @@ function renderFinal(turn, session) {
   // Printing it a second time as an "answer" is the receipt this surface exists
   // to avoid.
   if (String(message).trim() === String(turn.lastSaid ?? "").trim()) {
+    renderCost(turn, fr.metrics);
     if (debug) turn.append(el("pre", "debug-only rawjson", JSON.stringify(session, null, 2)));
     return;
   }
@@ -636,6 +734,8 @@ function renderFinal(turn, session) {
     card.appendChild(el("p", null, message));
     turn.append(card);
   }
+
+  renderCost(turn, fr.metrics);
 
   if (debug) {
     const pre = el("pre", "debug-only rawjson", JSON.stringify(session, null, 2));
@@ -692,13 +792,302 @@ function getPayload(json) { return json?.envelope?.payload ?? json; }
 // Only what was actually SAID goes in here — the user's words and the reply they
 // saw. Internal events, plans and evidence stay out: they are large, they are
 // already in the session, and they are not what a follow-up refers to.
-const conversation = [];
+// CHATS ------------------------------------------------------------------------
+//
+// More than one conversation, kept between sessions, with a list to move between
+// them — the shape every assistant has, and the reason a long-running piece of
+// work does not have to share a thread with "is python installed".
+//
+// There is NO ACCOUNT SYSTEM yet, so "your chats" means the chats in this
+// browser profile or this desktop application, on this machine. That is a real
+// limitation and the panel says so rather than implying a sync that does not
+// exist. Everything below is deliberately one small module over localStorage: it
+// is the whole of the persistence, so moving it to the daemon later is one file
+// and the shape it already stores.
+//
+// A chat holds two things:
+//   `conversation` — the {role, text} pairs sent to the daemon as history. This
+//     is what makes "now maximize it" resolve three messages later.
+//   `turns` — the EVENTS each turn streamed, so re-opening a chat replays the
+//     transcript through the same renderers that drew it live, tool rows and
+//     all, rather than showing a flattened summary of what once happened.
+const CHATS_KEY = "syscora_chats";
+const ACTIVE_CHAT_KEY = "syscora_active_chat";
+const LEGACY_CONVERSATION_KEY = "syscora_conversation";
+// Bounds, because localStorage is a few megabytes and a screen reading is a few
+// thousand characters. Old chats fall off the end rather than the store failing.
+const MAX_CHATS = 25;
+const MAX_TURNS_PER_CHAT = 40;
+const MAX_STORED_OUTPUT = 1200;
+
+const newId = () => `chat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+
+function loadChats() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CHATS_KEY) ?? "[]");
+    return Array.isArray(saved) ? saved : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveChats(list) {
+  try {
+    localStorage.setItem(CHATS_KEY, JSON.stringify(list.slice(0, MAX_CHATS)));
+  } catch {
+    // Out of room. Drop the oldest half and try once more; losing the oldest
+    // chats is much better than silently losing the one being written.
+    try {
+      localStorage.setItem(CHATS_KEY, JSON.stringify(list.slice(0, Math.ceil(list.length / 2))));
+    } catch { /* storage is unavailable entirely; the session still works */ }
+  }
+}
+
+let chats = loadChats();
+let activeChatId = localStorage.getItem(ACTIVE_CHAT_KEY);
+
+// One-time carry-over from when there was a single conversation.
+if (chats.length === 0) {
+  let legacy = [];
+  try {
+    const saved = JSON.parse(localStorage.getItem(LEGACY_CONVERSATION_KEY) ?? "[]");
+    if (Array.isArray(saved)) legacy = saved;
+  } catch { /* nothing to carry over */ }
+  chats = [{
+    id: newId(),
+    title: titleFrom(legacy.find((entry) => entry.role === "user")?.text) || "New chat",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    conversation: legacy.slice(-24),
+    turns: []
+  }];
+  localStorage.removeItem(LEGACY_CONVERSATION_KEY);
+  saveChats(chats);
+}
+if (!chats.some((chat) => chat.id === activeChatId)) activeChatId = chats[0].id;
+
+function activeChat() {
+  return chats.find((chat) => chat.id === activeChatId) ?? chats[0];
+}
+
+// The chat's name, taken from the first thing asked in it — which is what the
+// chat is about far more reliably than anything that could be generated for it.
+function titleFrom(text) {
+  const clean = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  return clean.length > 44 ? `${clean.slice(0, 43)}…` : clean;
+}
+
+// The live history for the CURRENT chat. Mutated in place rather than replaced,
+// because everything that reads it holds this same array.
+const conversation = activeChat().conversation.slice(-24);
+
+function touchActiveChat() {
+  const chat = activeChat();
+  chat.conversation = conversation.slice(-24);
+  chat.updatedAt = Date.now();
+  // Most recent first, which is the order the list is read in.
+  chats.sort((left, right) => right.updatedAt - left.updatedAt);
+  saveChats(chats);
+  localStorage.setItem(ACTIVE_CHAT_KEY, chat.id);
+}
+
 function remember(role, text) {
   const trimmed = String(text ?? "").trim();
   if (!trimmed) return;
   conversation.push({ role, text: trimmed });
   if (conversation.length > 24) conversation.splice(0, conversation.length - 24);
+  const chat = activeChat();
+  if (role === "user" && (!chat.title || chat.title === "New chat")) chat.title = titleFrom(trimmed);
+  touchActiveChat();
+  renderChatList();
 }
+
+// The events of one finished turn, so it can be drawn again exactly as it was.
+// Tool output is clipped for storage only — a screen reading is thousands of
+// characters and twenty of them would fill the store on their own.
+function recordTurn(userText, events, session) {
+  const chat = activeChat();
+  chat.turns.push({
+    user: userText,
+    at: Date.now(),
+    events: events.map((event) => {
+      const details = { ...(event.details ?? {}) };
+      if (typeof details.output === "string" && details.output.length > MAX_STORED_OUTPUT) {
+        details.output = `${details.output.slice(0, MAX_STORED_OUTPUT)}\n… [clipped when this chat was saved]`;
+      }
+      return { type: event.type ?? event.eventType, details };
+    }),
+    session: session ? { finalResponse: session.finalResponse ?? null } : null
+  });
+  if (chat.turns.length > MAX_TURNS_PER_CHAT) {
+    chat.turns.splice(0, chat.turns.length - MAX_TURNS_PER_CHAT);
+  }
+  touchActiveChat();
+}
+
+// ---- The chats panel ---------------------------------------------------------
+
+const chatsPanel = document.getElementById("chatsPanel");
+const chatsBackdrop = document.getElementById("chatsBackdrop");
+const chatListEl = document.getElementById("chatList");
+const chatsButton = document.getElementById("chatsButton");
+const newChatButton = document.getElementById("newChatButton");
+
+function whenLabel(at) {
+  const ms = Date.now() - Number(at ?? 0);
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return days < 7 ? `${days}d ago` : new Date(Number(at)).toLocaleDateString();
+}
+
+function renderChatList() {
+  if (!chatListEl) return;
+  chatListEl.textContent = "";
+  const listed = chats.filter((chat) => chat.turns.length > 0 || chat.id === activeChatId);
+  if (listed.length === 0) {
+    chatListEl.appendChild(el("li", "empty", "No chats yet."));
+    return;
+  }
+  for (const chat of listed) {
+    const row = el("li", chat.id === activeChatId ? "active" : null);
+    const open = el("button", "chat-open");
+    open.type = "button";
+    open.appendChild(el("span", "chat-title", chat.title || "New chat"));
+    open.appendChild(el("span", "chat-when", whenLabel(chat.updatedAt)));
+    open.addEventListener("click", () => switchToChat(chat.id));
+    const remove = el("button", "icon-button chat-delete", "✕");
+    remove.type = "button";
+    remove.title = "Delete this chat";
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation();
+      deleteChat(chat.id);
+    });
+    row.appendChild(open);
+    row.appendChild(remove);
+    chatListEl.appendChild(row);
+  }
+}
+
+function openChatsPanel(open) {
+  chatsPanel.hidden = !open;
+  chatsBackdrop.hidden = !open;
+  if (open) renderChatList();
+}
+
+// A run is bound to the transcript it is streaming into, so it must finish (or
+// be stopped) before the transcript can be swapped underneath it.
+function busyWithRun() {
+  if (!runningSessionId) return false;
+  openChatsPanel(false);
+  addBubble("syscora", textNode(
+    "I'm in the middle of a request — stop it first, then start or open another chat."
+  ));
+  return true;
+}
+
+function showWelcome() {
+  chatLog.textContent = "";
+  const welcome = el("div", "welcome");
+  welcome.appendChild(el("h2", null, "What would you like SYSCORA to do?"));
+  welcome.appendChild(el("p", "muted",
+    "Ask naturally. SYSCORA can answer, inspect, and act while keeping you updated in the same conversation."));
+  chatLog.appendChild(welcome);
+}
+
+// Draw a stored chat back onto the screen, through the SAME renderers that drew
+// it live. Storing the events rather than a summary is what makes this possible:
+// the tool rows, the narration and the final answer come back as they were.
+function renderStoredChat(chat) {
+  chatLog.textContent = "";
+  if (chat.turns.length === 0) {
+    showWelcome();
+    return;
+  }
+  for (const stored of chat.turns) {
+    if (stored.user) addBubble("user", textNode(stored.user));
+    const turn = new Turn();
+    for (const event of stored.events ?? []) {
+      try {
+        handleEvent(turn, event);
+      } catch { /* one unreplayable event must not lose the rest of the chat */ }
+    }
+    if (stored.session) renderFinal(turn, stored.session);
+    else turn.settle();
+    // A card from a finished run has nothing left to answer.
+    for (const button of turn.root.querySelectorAll(".approval-card button")) button.disabled = true;
+  }
+  const mark = el("div", "chat-resumed");
+  mark.appendChild(el("span", null, "Carrying on from here"));
+  chatLog.appendChild(mark);
+  scrollToEnd();
+}
+
+function switchToChat(id) {
+  if (busyWithRun()) return;
+  const target = chats.find((chat) => chat.id === id);
+  if (!target || id === activeChatId) {
+    openChatsPanel(false);
+    return;
+  }
+  activeChatId = id;
+  localStorage.setItem(ACTIVE_CHAT_KEY, id);
+  // In place: everything that sends history holds this array.
+  conversation.splice(0, conversation.length, ...(target.conversation ?? []).slice(-24));
+  renderStoredChat(target);
+  openChatsPanel(false);
+  renderChatList();
+}
+
+function startNewChat() {
+  if (busyWithRun()) return;
+  // An untouched "New chat" is not worth a second one.
+  const current = activeChat();
+  if (current && current.turns.length === 0) {
+    openChatsPanel(false);
+    showWelcome();
+    return;
+  }
+  const chat = { id: newId(), title: "New chat", createdAt: Date.now(), updatedAt: Date.now(), conversation: [], turns: [] };
+  chats.unshift(chat);
+  if (chats.length > MAX_CHATS) chats.length = MAX_CHATS;
+  activeChatId = chat.id;
+  localStorage.setItem(ACTIVE_CHAT_KEY, chat.id);
+  conversation.splice(0, conversation.length);
+  saveChats(chats);
+  showWelcome();
+  openChatsPanel(false);
+  renderChatList();
+}
+
+function deleteChat(id) {
+  if (busyWithRun()) return;
+  chats = chats.filter((chat) => chat.id !== id);
+  if (chats.length === 0) {
+    chats = [{ id: newId(), title: "New chat", createdAt: Date.now(), updatedAt: Date.now(), conversation: [], turns: [] }];
+  }
+  saveChats(chats);
+  if (id === activeChatId) {
+    activeChatId = chats[0].id;
+    localStorage.setItem(ACTIVE_CHAT_KEY, activeChatId);
+    conversation.splice(0, conversation.length, ...(chats[0].conversation ?? []).slice(-24));
+    renderStoredChat(chats[0]);
+  }
+  renderChatList();
+}
+
+chatsButton?.addEventListener("click", () => openChatsPanel(chatsPanel.hidden));
+document.getElementById("chatsClose")?.addEventListener("click", () => openChatsPanel(false));
+chatsBackdrop?.addEventListener("click", () => openChatsPanel(false));
+newChatButton?.addEventListener("click", startNewChat);
+document.getElementById("panelNewChat")?.addEventListener("click", startNewChat);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !chatsPanel.hidden) openChatsPanel(false);
+});
 
 // What the user was actually told, which is the only part of a turn a follow-up
 // can refer to. A failure is recorded too — "why did that not work?" is a
@@ -747,6 +1136,10 @@ async function submit(text) {
   const history = conversation.slice();
   remember("user", text);
   const turn = new Turn();
+  // Kept so this turn can be drawn again when the chat is re-opened. Progress
+  // events are skipped: a percentage that finished an hour ago is noise, and
+  // they are by far the most numerous thing on the wire.
+  const streamed = [];
 
   try {
     const res = await fetch("/api/intents", {
@@ -769,7 +1162,10 @@ async function submit(text) {
     });
     const session = await readIntentSession(res, {
       onStart: (sessionId) => setRunning(sessionId),
-      onEvent: (event) => handleEvent(turn, event),
+      onEvent: (event) => {
+        if ((event.type ?? event.eventType) !== "TOOL_PROGRESS") streamed.push(event);
+        handleEvent(turn, event);
+      },
       // Only reached when the event stream could not be opened at all.
       onProgress: (status) => {
         const type = status?.latestEvent?.eventType;
@@ -778,6 +1174,7 @@ async function submit(text) {
     });
     renderFinal(turn, session);
     remember("assistant", replyTextOf(session));
+    recordTurn(text, streamed, session);
   } catch (err) {
     turn.settle();
     // "Worth trying again" was the whole diagnosis, and the real reason — the
@@ -794,6 +1191,9 @@ async function submit(text) {
     } else {
       turn.append(el("div", "agent-answer", `Something went wrong while running that: ${err.message}`));
     }
+    // A turn that failed is still part of the conversation — "why did that not
+    // work?" is an ordinary next message, and it needs the turn to be there.
+    recordTurn(text, streamed, null);
   } finally {
     setRunning(null);
   }
@@ -868,3 +1268,11 @@ suggestions.addEventListener("click", (e) => {
   // path a typed request uses (no bypass).
   submit(text);
 });
+
+// ---- Opening on what you were last doing --------------------------------------
+//
+// A reload used to land on an empty welcome screen with the conversation still
+// silently in memory: the agent remembered the thread and the user could not see
+// it. Now the transcript comes back with it.
+renderChatList();
+if (activeChat().turns.length > 0) renderStoredChat(activeChat());

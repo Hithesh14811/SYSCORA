@@ -242,6 +242,21 @@ body {
 .approval-card .approve { background: var(--accent); color: white; }
 .approval-card .secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
 .approval-card .detail { color: var(--muted); padding-left: 20px; }
+/* Answered. The card stays in the transcript, saying what was decided, but it
+   stops looking like something still waiting on the reader. */
+.approval-card.approved { border-color: var(--border); }
+.approval-card.rejected { border-color: var(--border); opacity: 0.75; }
+.approval-card button[disabled] { opacity: 0.45; cursor: default; }
+.approval-card .step-output { margin: 10px 0 0; }
+
+/* What the request cost. Quiet on purpose: it is there when you look for it and
+   never competes with the answer above it. */
+.turn-cost {
+  margin: 8px 0 2px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 .result-card { min-width: 280px; }
 .result-card p { margin: 8px 0 0; }
 .result-card .badge { font-size: 12px; font-weight: 650; color: var(--ok); }
@@ -464,4 +479,147 @@ body:not(.debug) .debug-only { display: none; }
   .bubble { max-width: 92%; }
   .turn { max-width: 100%; }
   .suggestions { display: grid; grid-template-columns: 1fr 1fr; }
+}
+
+/* ---- Chats: this client's own conversation history --------------------------
+   There is no account system yet, so these live in localStorage and belong to
+   this machine. The panel SLIDES OVER the transcript rather than sitting beside
+   it, so the chat column keeps every pixel it has today at any window width. */
+
+.topbar-actions { display: flex; align-items: center; gap: 10px; }
+
+.topbar-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.topbar-button:hover { border-color: var(--accent); }
+.topbar-button[disabled] { opacity: 0.45; cursor: default; border-color: var(--border); }
+
+.chats-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 40;
+}
+
+.chats-panel {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 300px;
+  max-width: 85vw;
+  z-index: 41;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  gap: 10px;
+}
+.chats-panel[hidden] { display: none; }
+
+.chats-panel-head { display: flex; align-items: center; justify-content: space-between; }
+.chats-panel-head h2 { margin: 0; font-size: 15px; }
+
+.icon-button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 15px;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 7px;
+}
+.icon-button:hover { color: var(--text); background: var(--panel-2); }
+
+.new-chat-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.new-chat-row:hover { border-color: var(--accent); border-style: solid; }
+
+.chat-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-list li { display: flex; align-items: center; gap: 4px; }
+
+.chat-open {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.chat-open:hover { background: var(--panel-2); }
+.chat-list li.active .chat-open { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--accent); }
+.chat-open .chat-title {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-open .chat-when { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+.chat-delete { visibility: hidden; }
+.chat-list li:hover .chat-delete,
+.chat-list li.active .chat-delete { visibility: visible; }
+
+.chat-list .empty { color: var(--muted); font-size: 13px; padding: 10px 2px; }
+
+.chats-note { font-size: 11px; line-height: 1.5; margin: 0; }
+
+/* A conversation restored from storage. The live tool rows are replayed exactly
+   as they were streamed; this only marks where one session ended. */
+.chat-resumed {
+  text-align: center;
+  font-size: 11px;
+  color: var(--muted);
+  margin: 14px 0 4px;
+}
+.chat-resumed span {
+  padding: 0 10px;
+  background: var(--bg);
+  position: relative;
+}
+.chat-resumed::before {
+  content: "";
+  display: block;
+  border-top: 1px solid var(--border);
+  position: relative;
+  top: 8px;
 }

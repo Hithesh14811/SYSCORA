@@ -20,11 +20,20 @@
 // result as text sized to what the next decision needs.
 
 import fs from "node:fs/promises";
+import {
+  classifyShellCommand,
+  requiresClickConfirmation,
+  requiresConfirmation,
+  requiresSendConfirmation,
+  ShellVerdict
+} from "../../policy-engine/src/shell-rules.js";
 import { matchesTrackQuery } from "../../capability-registry/src/index.js";
 import { applicationWindowScore } from "../../../os-adapters/windows/src/windows-adapter.js";
 import { VISIBLE_CHANGE, changedFraction, gridRegion, screenSignature } from "./screen-signature.js";
 import { buildPath, flattenPath } from "./stroke-path.js";
 import { describeMachine, readMachineProfile } from "./machine-profile.js";
+import { describeNotes, forgetNote, readNotes, rememberNote } from "./notes.js";
+import { extractDocumentText, isDocumentPath } from "./documents.js";
 import { createProgressReader, reportsProgress } from "./command-progress.js";
 import { createWingetWatcher, isWingetInstall } from "./winget-progress.js";
 
@@ -136,6 +145,11 @@ function renderElements(elements, table) {
       .slice(0, MAX_ELEMENTS)
       .map((entry) => entry.index)
   );
+  // The section headings on screen, so each row can say which list it is in.
+  const headings = candidates
+    .filter(({ text }) => SECTION_HEADING.test(text))
+    .map(({ text, center }) => ({ text, center }));
+
   for (const [index, { element, text, center }] of candidates.entries()) {
     if (!shown.has(index)) continue;
     const role = String(element.role ?? element.controlType ?? "").replace(/^ControlType\./, "");
@@ -148,9 +162,105 @@ function renderElements(elements, table) {
     // They stay in the TABLE, so an index still resolves; they are simply not
     // read out.
     if (!text && STRUCTURAL_ROLES.test(role)) continue;
-    lines.push(`${index}| ${role}${text ? ` "${text.slice(0, 80)}"` : ""} @${center.x},${center.y}${element.enabled === false ? " (disabled)" : ""}`);
+    // OCR DEBRIS IS NOT A CONTROL.
+    //
+    // A live WhatsApp reading contained `text "O"`, `text "c"`, `text "p"`,
+    // `text "D"`, `text "IttD"`, `text "0"` and eleven separate timestamps —
+    // read counts, avatar initials and clock faces that OCR turned into single
+    // letters. None of it can be clicked by name and none of it means anything,
+    // and it was a third of the listing, re-sent on every step for the rest of
+    // the task. It stays in the TABLE so a coordinate still resolves; it is
+    // simply not read out.
+    if (isReadingNoise(text, element)) continue;
+    // A LABEL THAT IS CUT OFF IS NOT A LABEL.
+    //
+    // The chat list read "Chi...", "Chinnakka...", "Polaroid - ..." — names the
+    // window was too narrow to show. Nothing said so, and a cut-off name reads
+    // exactly like a short one. So the agent went to the search results instead,
+    // picked the one entry with a full name, and that entry was a MESSAGE inside
+    // somebody else's chat rather than the chat it wanted. The message went to
+    // the wrong person. Twice.
+    //
+    // Marking it costs four characters and turns an invisible ambiguity into a
+    // visible one.
+    const truncated = TRUNCATED_LABEL.test(text);
+    const section = SECTION_HEADING.test(text) ? null : sectionOf(center, headings);
+    lines.push(
+      `${index}| ${role}${text ? ` "${text.slice(0, 80)}"` : ""}` +
+      `${truncated ? " ⟨CUT OFF⟩" : ""} @${center.x},${center.y}` +
+      `${section ? ` [under "${section.text}"]` : ""}` +
+      `${element.enabled === false ? " (disabled)" : ""}`
+    );
   }
   return lines;
+}
+
+// A name the window was too narrow to finish: a trailing ellipsis, or the same
+// thing spelled with full stops.
+const TRUNCATED_LABEL = /(?:…|\.\.\.)\s*$/;
+
+// A bare clock face, with or without OCR's guess at the delivery ticks.
+const BARE_TIMESTAMP = /^\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?\s*[vV'/\\|_.·•]*$/;
+
+// WHICH LIST IS THIS ROW IN?
+//
+// This is the whole of the WhatsApp disaster, twice over. A search shows two
+// sections — "Chats" (people you can message) and "Messages" (text found INSIDE
+// somebody's conversation) — and the reading listed both as a flat run of text
+// with coordinates:
+//
+//     19| text "Messages" @695,1020
+//     20| text "Amma"     @686,1103
+//     21| text "Chintu jeppu" @718,1151
+//
+// "Chintu jeppu" is a message Amma once sent. Clicking it opens AMMA's chat. The
+// agent read it as a contact called Chintu, opened it, verified against a message
+// bubble, and typed. The section heading was right there in the reading and
+// belonged to nothing.
+const SECTION_HEADING = /^(?:chats?|messages?|contacts?|groups?|results?|recent|suggestions?|people|files?|folders?|apps?|documents?|photos?|songs?|albums?|artists?|playlists?|videos?|podcasts?(?: & shows)?|mail|emails?|favourites?|favorites?|archived|top hit|best match)$/i;
+
+// Sections whose rows are CONTENT found inside something else, rather than the
+// something else. Opening one of these takes you to whatever contains it.
+const CONTENT_SECTION = /^(?:messages?|results?|files?|documents?|photos?|videos?)$/i;
+
+function sectionOf(center, headings) {
+  let best = null;
+  for (const heading of headings) {
+    if (heading.center.y >= center.y) continue;
+    // Same column, so a heading in the sidebar does not claim rows in the
+    // conversation pane beside it.
+    if (Math.abs(heading.center.x - center.x) > 400) continue;
+    if (!best || heading.center.y > best.center.y) best = heading;
+  }
+  return best;
+}
+
+function isReadingNoise(text, element) {
+  if (!text) return false;
+  // Something the application says is a real control keeps its line whatever it
+  // is called: a one-character button is still a button.
+  if (element.clickable === true && /button|menuitem|tab|link|hyperlink/i.test(String(element.role ?? element.controlType ?? ""))) {
+    return false;
+  }
+  // One or two characters of OCR: avatar initials, unread dots read as "O",
+  // sidebar glyphs read as "p" or "IttD".
+  if (text.length <= 2 && !/^\d+$/.test(text)) return true;
+  if (BARE_TIMESTAMP.test(text)) return true;
+  return false;
+}
+
+export function hasTruncatedLabels(lines) {
+  return lines.some((line) => line.includes("⟨CUT OFF⟩"));
+}
+
+/** The sections in this listing whose rows are content found inside something else. */
+export function contentSectionsIn(lines) {
+  const found = new Set();
+  for (const line of lines) {
+    const section = /\[under "([^"]+)"\]/.exec(line)?.[1];
+    if (section && CONTENT_SECTION.test(section)) found.add(section);
+  }
+  return [...found];
 }
 
 // YOU ARE ALREADY IN POWERSHELL.
@@ -198,18 +308,21 @@ export function unwrapNestedShell(command) {
 const CMD_BUILTIN_ALIAS = /(^|[;|&(]\s*)(where|sort)(\s+(?!-|\$|\{))/gi;
 
 export function repairCmdIsms(command) {
-  const notes = [];
+  // Said once however many times it was repaired. A command with three `where`s
+  // in it printed the same sentence three times, because the note was pushed
+  // from inside a global replace.
+  const notes = new Set();
   let repaired = String(command ?? "").replace(CMD_BUILTIN_ALIAS, (whole, lead, name, tail) => {
-    notes.push(`\`${name}\` is PowerShell's ${name === "where" ? "Where-Object" : "Sort-Object"} alias, not cmd's — ran \`${name}.exe\` instead.`);
+    notes.add(`\`${name}\` is PowerShell's ${name === "where" ? "Where-Object" : "Sort-Object"} alias, not cmd's — ran \`${name}.exe\` instead.`);
     return `${lead}${name}.exe${tail}`;
   });
   if (/%\w+%/.test(repaired)) {
-    notes.push("`%VAR%` is cmd syntax; in PowerShell an environment variable is `$env:VAR`.");
+    notes.add("`%VAR%` is cmd syntax; in PowerShell an environment variable is `$env:VAR`.");
   }
   if (/&&|\|\|/.test(repaired)) {
-    notes.push("`&&` and `||` are not valid in Windows PowerShell 5.1 — separate the commands with `;`.");
+    notes.add("`&&` and `||` are not valid in Windows PowerShell 5.1 — separate the commands with `;`.");
   }
-  return { command: repaired, notes };
+  return { command: repaired, notes: [...notes] };
 }
 
 // Commands whose whole purpose is to keep running. Not an exhaustive list and
@@ -267,6 +380,28 @@ export function hasUnreadableScript(text) {
 // Paint's canvas without knowing what Paint is, and does the same for an image
 // editor, a whiteboard or a game nobody has heard of. Anything with a name
 // is a control and is already listed.
+// Applications where a big unlabelled rectangle really is something to draw on.
+const DRAWING_APP = /paint|photoshop|illustrator|gimp|krita|inkscape|figma|sketch|whiteboard|excalidraw|canva|blender|clip studio|affinity/i;
+
+/**
+ * Is it worth telling the model where the drawing surface is?
+ *
+ * SPOTIFY IS NOT A CANVAS. The geometry heuristic below falls back to "the
+ * biggest unlabelled box", and in a music player that is the album art pane — so
+ * every single reading of Spotify carried "Drawing surface (the large unlabelled
+ * area — this is what you draw on)", which is both wrong and paid for on every
+ * later step of the task.
+ *
+ * The geometry is still computed, because `draw` needs it if drawing does turn
+ * out to be the job. It just is not announced unless the window is somewhere a
+ * person would draw.
+ */
+export function shouldDescribeCanvas(elements, application, title) {
+  const named = (elements ?? []).some((element) =>
+    /\b(canvas|drawing (surface|area)|artboard)\b/i.test(String(element.text ?? element.name ?? "")));
+  return named || DRAWING_APP.test(`${application ?? ""} ${title ?? ""}`);
+}
+
 export function findCanvas(elements) {
   const boundsOf = (element) => element.bounds ?? element.boundingRect ?? null;
   const areaOf = (element) => {
@@ -478,6 +613,10 @@ export function buildToolset({
   registry,
   adapter,
   basePath = process.cwd(),
+  // How to ask the user before doing something that cannot be taken back. Given
+  // by whoever owns a surface that can ask — the runtime wires it to a card in
+  // the transcript. See askPermission.
+  confirm = null,
   // Seam for tests: turning a captured PNG into a brightness grid. The real one
   // decodes the file; a test hands back a prepared grid rather than having to
   // synthesise valid PNGs.
@@ -520,7 +659,47 @@ export function buildToolset({
     lastTool: null,
     // Resolved once, on the first turn that needs it.
     machineFacts: null,
-    machineProfile: null
+    machineProfile: null,
+    // Set per run by whoever can put a question in front of the user.
+    confirm,
+    // The last thing typed, so a send confirmation can show it.
+    lastTyped: null,
+    // What the previous reading of a window looked like, so an identical one can
+    // be reported as identical instead of repeated in full.
+    // The previous reading's lines and which window they came from, so a
+    // near-identical re-read can be reported as a handful of changed lines
+    // rather than repeated in full.
+    lastReadingLines: null,
+    lastReadingWindow: null,
+    lastReadingTitle: null
+  };
+
+  // ONE CLICK IN FRONT OF THE THINGS THAT CANNOT BE TAKEN BACK.
+  //
+  // The loop runs commands immediately, which is the whole reason it is quick,
+  // and the only thing standing under it is the DENY floor — formatting a disk,
+  // wiping shadow copies, piping a download into a shell. Everything between
+  // "reads a file" and "formats the disk" ran unattended, including deleting the
+  // user's documents, uninstalling their applications and force-pushing over
+  // their work.
+  //
+  // The middle ground is small and specific (see requiresConfirmation): things
+  // that are gone for good if this was not what they meant. Everything else —
+  // installing, writing, launching, clicking, typing, changing settings they
+  // asked to change — is untouched and just as fast.
+  //
+  // With no confirmer wired, the surface has no way to ask, and a gate that
+  // cannot ask must not refuse: it proceeds, exactly as it did before. Every
+  // surface a person is actually watching wires one.
+  const askPermission = async (request) => {
+    if (typeof state.confirm !== "function") return { approved: true, asked: false };
+    try {
+      const approved = await state.confirm(request);
+      return { approved: approved === true, asked: true };
+    } catch {
+      // Nobody answered, or the channel broke. Not approved.
+      return { approved: false, asked: true };
+    }
   };
 
   // What a window is called for the purpose of remembering things about it.
@@ -766,6 +945,40 @@ export function buildToolset({
           y: Math.round(bounds.y + bounds.height / 2)
         }
       };
+    } catch {
+      return null;
+    }
+  };
+
+  // WHAT IS STILL SITTING IN THE BOX.
+  //
+  // "sybau" was typed into a WhatsApp chat, Enter was pressed, the tool said
+  // "Sent.", the agent read the screen, saw the word on it and reported the
+  // message delivered. It had not been sent. In a text-only reading, a word in
+  // the INPUT BOX and the same word in a SENT BUBBLE are the same six letters at
+  // some coordinates — there is nothing to tell them apart, and the agent
+  // guessed the flattering one.
+  //
+  // There is a real answer available and it is one call: the application knows
+  // what its focused control currently holds. After a send the message box is
+  // EMPTY. If the text is still in there, it did not go anywhere.
+  //
+  // Null means the control publishes no value — not evidence either way, so the
+  // caller says "unconfirmed" rather than inventing a verdict.
+  const focusedValue = async () => {
+    if (typeof adapter.inspectUi !== "function") return null;
+    const windowId = state.lastWindow?.windowId;
+    const application = state.lastWindow?.application;
+    if (!windowId && !application) return null;
+    try {
+      const ui = await adapter.inspectUi({
+        ...(windowId ? { windowId: String(windowId) } : { application }),
+        maxElements: 240
+      });
+      const focused = (ui?.elements ?? ui?.targets ?? []).find((element) => element.focused === true);
+      if (!focused) return null;
+      const value = focused.value ?? focused.Value ?? null;
+      return value == null ? null : String(value);
     } catch {
       return null;
     }
@@ -1046,12 +1259,16 @@ export function buildToolset({
   // are fetched together because they are one CDP connection multiplexing by
   // request id, so they cost one round trip rather than three.
   const readOnce = async (selector) => {
-    const [state, elements, body] = await Promise.all([
+    // `pageState`, not `state`: the module-level `state` — the working window,
+    // the last reading, the terminal's directory — is in scope here, and naming
+    // a local the same thing shadows it. Nothing depends on that today, which is
+    // exactly why it would be found the hard way.
+    const [pageState, elements, body] = await Promise.all([
       runCapability("browser.currentState", {}).catch(() => null),
       runCapability("browser.inspect", { limit: 140 }).catch(() => []),
       runCapability("browser.read", { selector: selector ?? "body" }).catch(() => null)
     ]);
-    return { state, elements: Array.isArray(elements) ? elements : [], text: body?.text ?? "" };
+    return { state: pageState, elements: Array.isArray(elements) ? elements : [], text: body?.text ?? "" };
   };
 
   // A URL IS NOT A PAGE YET.
@@ -1153,9 +1370,8 @@ export function buildToolset({
     {
       name: "run",
       description:
-        "Run a command line in PowerShell and get back stdout, stderr and the exit code. This is the " +
-        "fastest way to do almost anything on Windows — installing software (winget), files, services, " +
-        "processes, network, registry, scheduled tasks, opening apps and URLs. Prefer it over clicking.",
+        "Run a command line in PowerShell; returns stdout, stderr and the exit code. The fastest route to " +
+        "software, files, processes, services, network, registry and settings. Prefer it over clicking.",
       parameters: {
         type: "object",
         properties: {
@@ -1164,8 +1380,8 @@ export function buildToolset({
           background: {
             type: "boolean",
             description:
-              "For anything that stays running rather than finishing — a server, a notebook, a watcher, a " +
-              "tunnel. Starts it and returns immediately instead of waiting for an exit that never comes."
+              "For anything that stays running — a server, a notebook, a watcher, a tunnel. Starts it and " +
+              "returns immediately instead of waiting for an exit that never comes."
           },
           timeoutMs: { type: "number", description: "Kill the command after this long (default 90000)" }
         },
@@ -1183,7 +1399,7 @@ export function buildToolset({
       // The same is true of every dev server, watcher, tunnel and daemon, so
       // this is a category rather than an application: something the user wants
       // RUNNING is started detached and reported as started.
-      execute: async (args, { onProgress = null } = {}) => {
+      execute: async (args, { onProgress = null, signal = null } = {}) => {
         if (args.cwd) state.cwd = args.cwd;
         const written = String(args.command ?? "");
         const unwrapped = unwrapNestedShell(written);
@@ -1193,6 +1409,28 @@ export function buildToolset({
             "You are already in PowerShell, so `powershell -Command \"…\"` was removed — nesting it makes " +
             "the outer shell expand `$_` and your own variables to nothing before the inner one runs."
           );
+        }
+        // Asked before anything is spawned, and only for the handful of command
+        // shapes that cannot be undone.
+        //
+        // NOT ASKED IF THE ANSWER CANNOT MATTER. The floor below refuses some
+        // commands outright, and it is checked where the process is spawned —
+        // so a command that was going to be refused anyway still put a card in
+        // front of the user, who clicked Allow and got "REFUSED" for their
+        // trouble. An approval that changes nothing teaches people to stop
+        // reading them.
+        const gate = classifyShellCommand(command).verdict === ShellVerdict.DENY
+          ? { confirm: false }
+          : requiresConfirmation(command);
+        if (gate.confirm) {
+          const { approved } = await askPermission({
+            kind: "command",
+            summary: gate.summary,
+            reason: gate.reason,
+            rule: gate.rule,
+            detail: command
+          });
+          if (!approved) return { refusedByUser: true, command, gate };
         }
         const background = args.background === true || KEEPS_RUNNING.test(command);
         if (background) {
@@ -1228,6 +1466,13 @@ export function buildToolset({
         try {
           result = await adapter.executeCommand(state.cwd, command, [], {
             timeoutMs: Number(args.timeoutMs) || 90000,
+            // STOP HAS TO REACH THE CHILD PROCESS.
+            //
+            // The loop checks for a stop between tool calls, so pressing stop
+            // during a ninety-second install returned control to the user and
+            // left the install running with nobody watching it. The adapter has
+            // supported cancellation all along; nothing was passing it one.
+            ...(signal ? { signal } : {}),
             ...(watch || winget
               ? {
                   onOutput: ({ text }) => {
@@ -1244,8 +1489,31 @@ export function buildToolset({
         }
         return { ...result, command, notes };
       },
+      // A non-zero exit is NOT a failure of the tool — `where.exe python`
+      // exiting 1 is the answer to the question. Being refused, or never
+      // finishing, is.
+      failed: (result) => result.blocked === true || result.timedOut === true || result.refusedByUser === true,
       render: (result) => {
-        if (result.blocked) return `REFUSED: ${result.stderr}`;
+        if (result.refusedByUser) {
+          return `The user was asked before running this, and said NO.\n` +
+            `\`${result.command}\` would ${result.gate?.summary ?? "make a change that cannot be undone"}, ` +
+            "and it has NOT run — nothing was changed.\n" +
+            "Do not try it again, here or by another route. Carry on with the rest of the task without it, " +
+            "and if it was essential, say plainly what you cannot do and why.";
+        }
+        if (result.blocked) {
+          // AND DO NOT GO LOOKING FOR ANOTHER WAY IN.
+          //
+          // Without this, a refusal read as an obstacle rather than an answer:
+          // observed live, the model met one and tried cmd's rmdir, then a pipe
+          // into Remove-Item, then an elevated process, then the .NET API — four
+          // routes around a decision that had already been made. The rules cover
+          // those routes now, but the instinct is the thing worth naming.
+          return `REFUSED: ${result.stderr}\n` +
+            "This is a decision, not an obstacle. Do not look for another way to do the same thing — " +
+            "not a different command, not a pipe, not an elevated process, not a different API. " +
+            "Carry on with the rest of the task, and tell the user plainly what you did not do.";
+        }
         if (result.background) {
           const pid = String(result.stdout ?? "").trim().split(/\s+/).pop();
           return result.exitCode === 0
@@ -1257,7 +1525,9 @@ export function buildToolset({
         const parts = [];
         if (result.stdout?.trim()) parts.push(clip(result.stdout.trim()));
         if (result.stderr?.trim()) parts.push(`stderr: ${clip(result.stderr.trim(), 1500)}`);
-        if (result.timedOut) {
+        if (result.cancelled) {
+          parts.push("(stopped — the user pressed stop, and this command was killed partway through)");
+        } else if (result.timedOut) {
           parts.push(
             "(timed out — if this is a server, a notebook or anything else that stays running, it was " +
             "never going to exit: start it again with background: true)"
@@ -1282,9 +1552,8 @@ export function buildToolset({
     {
       name: "screen",
       description:
-        "Look at the screen: reads a window's visible text (OCR) and lists what is on it, each with a " +
-        "label you can click by. Use it to see what is there, to find something to click, and to check " +
-        "what an action actually did — a delivered keystroke is not proof anything happened.",
+        "Read a window: its visible text, and every element with a label you can click by. Use it to see " +
+        "what is there and to check what an action did — a delivered keystroke is not proof of anything.",
       parameters: {
         type: "object",
         properties: {
@@ -1379,8 +1648,10 @@ export function buildToolset({
         // again, or relaunch the application it already has open.
         if (!result?.read) {
           const windows = await adapter.listWindows?.().catch(() => []) ?? [];
-          result.openWindows = describeWindows(windows);
-          return result;
+          // Built fresh rather than assigned onto `result`, which may be null or
+          // undefined — the optional chain above says so, and the line under it
+          // used to assume otherwise.
+          return { ...(result ?? {}), read: false, openWindows: describeWindows(windows) };
         }
         // "Window: ? — ?" IS A READING THAT WILL NOT SAY WHERE IT IS.
         //
@@ -1401,6 +1672,7 @@ export function buildToolset({
         }
         return result;
       },
+      failed: (result) => result.read === false,
       render: (result) => {
         if (!result.read) {
           // Whatever was last seen is no longer evidence of anything. Drop it,
@@ -1431,6 +1703,84 @@ export function buildToolset({
             : summarizeWorkspace(result.elements ?? [], String(result.title ?? ""))
         };
         const lines = renderElements(result.elements ?? [], state.elements);
+
+        // THE SAME HUNDRED AND TWENTY LINES, AGAIN.
+        //
+        // A GUI task reads the window after every action, and most of those
+        // readings are byte-for-byte what was read a moment ago — the check
+        // after a click that changed one button's label, or after one that did
+        // nothing at all. Each of those is around three thousand tokens, it is
+        // re-sent on every subsequent step for the rest of the task, and one
+        // session in the transcript spent 570,000 tokens largely this way.
+        //
+        // When nothing whatsoever has changed, say that instead. The indices are
+        // the same indices — the element table was rebuilt from an identical
+        // list — so everything the model read last time is still valid, and it
+        // can still click by index or by label. And "nothing changed" is often
+        // the most useful sentence available: it is what a click that missed
+        // looks like.
+        //
+        // Only ever on an EXACT match. A reading that differs by one character
+        // is printed in full, because working out which character it was is the
+        // model's job and it cannot do that from a summary.
+        // AN EXACT MATCH ALMOST NEVER HAPPENS, AND THAT WAS THE MISTAKE.
+        //
+        // The first version of this only shortened a reading that was
+        // BYTE-IDENTICAL to the previous one. On a real screen that is close to
+        // never: a clock ticks from 9:33 to 9:34, an unread badge goes 140 to
+        // 141, a draft appears in the sidebar — and one character of difference
+        // sent the whole two-thousand-token listing again. Over a live session of
+        // forty-eight steps it fired ONCE. It optimized the rare case and left
+        // the common one exactly as expensive as it was before.
+        //
+        // What actually happens is a window that is NEARLY the same: two lines
+        // different out of sixty. So say which two. That is strictly more useful
+        // than the full listing — "here is what changed" is the question the
+        // window was re-read to answer — and it costs a twentieth of the tokens.
+        const previous = state.lastReadingLines;
+        const previousWindow = state.lastReadingWindow;
+        // THE TITLE IS NOT DECORATION. Spotify's window title IS what is playing,
+        // and File Explorer's is which folder you are in — so a reading whose
+        // elements are identical but whose title changed is the most important
+        // kind of change there is. Reported as "identical", it would hide the one
+        // fact the window was re-read to find.
+        const previousTitle = state.lastReadingTitle;
+        const title = String(result.title ?? "");
+        state.lastReadingLines = lines;
+        state.lastReadingWindow = String(result.windowId ?? "");
+        state.lastReadingTitle = title;
+        if (previous && previousWindow === String(result.windowId ?? "") && previousTitle === title) {
+          const before = new Set(previous);
+          const after = new Set(lines);
+          const gone = previous.filter((line) => !after.has(line));
+          const arrived = lines.filter((line) => !before.has(line));
+          const changed = gone.length + arrived.length;
+          // Recorded on the result so the LOOP can see it too, not just the
+          // model. Fifteen readings in a row that say "nothing changed" is the
+          // clearest possible signal that whatever is being tried cannot work —
+          // and it is the loop's job to act on that, because the model demonstrably
+          // does not. See the no-progress guard in the agent loop.
+          result.screenUnchanged = changed === 0;
+          // Summarized only while the change is small. Past that the window has
+          // genuinely become a different window, and reading it out in full is
+          // the honest thing to do.
+          if (changed <= Math.max(6, Math.floor(lines.length * 0.25))) {
+            return [
+              `Window: ${result.application ?? "?"} — ${result.title ?? "?"} (windowId ${result.windowId})`,
+              changed === 0
+                ? "IDENTICAL to your last reading of this window — nothing at all has changed on screen."
+                : `SAME as your last reading of this window except for ${changed} line${changed === 1 ? "" : "s"}:`,
+              ...gone.map((line) => `  GONE  ${line}`),
+              ...arrived.map((line) => `  NEW   ${line}`),
+              "Everything else is exactly as you read it, and those indices are still correct — use them.",
+              changed === 0
+                ? "If you have acted since, this is proof the action did NOT do anything: do not read again " +
+                  "and expect a different answer. Work out why, or do something different."
+                : "If what you were trying to change is not in that list, your action did not change it."
+            ].join("\n");
+          }
+        }
+
         return [
           `Window: ${result.application ?? "?"} — ${result.title ?? "?"} (windowId ${result.windowId})`,
           // WHERE IS THE CANVAS? NOBODY EVER SAID.
@@ -1446,7 +1796,10 @@ export function buildToolset({
           // The drawing surface IS in the reading — it is the big unnamed pane
           // nothing else sits inside. Naming its rectangle turns "draw a circle
           // somewhere in the middle" from a guess into arithmetic.
-          ((state.lastCanvas = findCanvas(result.elements ?? [])), describeCanvas(result.elements ?? [])),
+          ((state.lastCanvas = findCanvas(result.elements ?? [])),
+            shouldDescribeCanvas(result.elements ?? [], result.application, result.title)
+              ? describeCanvas(result.elements ?? [])
+              : null),
           // WHICH TOOL HAS THE MOUSE, AND WHAT THAT MEANS FOR A STROKE.
           //
           // The application says so and the reading already contained it —
@@ -1456,16 +1809,34 @@ export function buildToolset({
           // this line the agent had no way to know which it was holding.
           ((state.lastTool = findActiveTool(result.elements ?? [])), describeActiveTool(state.lastTool)),
           result.visibleText?.trim() ? `Visible text:\n${clip(result.visibleText.trim(), MAX_SCREEN_TEXT_CHARS)}` : null,
-          lines.length ? `Elements (index| role "text" @x,y):\n${lines.join("\n")}` : null
+          lines.length ? `Elements (index| role "text" @x,y):\n${lines.join("\n")}` : null,
+          // And say what to do about it. The window was resizable the whole
+          // time, and `window_state` has been there all along — it was simply
+          // never the obvious move, because nothing said the names were short
+          // for a reason.
+          hasTruncatedLabels(lines)
+            ? "Some labels are marked ⟨CUT OFF⟩ — the window is too narrow to show them in full, so you " +
+              "CANNOT tell those apart. If your next action depends on which one it is, maximize the " +
+              "window (window_state \"maximize\") and read again before choosing."
+            : null,
+          // A row's section is the difference between a person and a sentence
+          // somebody sent. Both read as a name.
+          contentSectionsIn(lines).length
+            ? `Rows marked [under "${contentSectionsIn(lines).join('" / "')}"] are things found INSIDE ` +
+              "something else — a line of text within somebody's conversation, a file within a folder. " +
+              "They are NOT the thing itself: opening one takes you to whatever contains it, which is " +
+              "usually a different person or place than the row's words suggest. To reach a person or a " +
+              "chat, use a row under \"Chats\", \"Contacts\" or \"People\"."
+            : null
         ].filter(Boolean).join("\n\n");
       }
     },
     {
       name: "click",
       description:
-        "Click something from the last screen reading. Prefer `text` — the element's exact label — over " +
-        "`element` (its index), and use x,y only for a place with no label at all. The window is brought " +
-        "to the front first.",
+        "Click something from the last screen reading. Prefer `text` (its exact label) over `element` (its " +
+        "index); use x,y only for a place with no label. button:\"right\" opens a context menu. The window " +
+        "is brought to the front first.",
       parameters: {
         type: "object",
         properties: {
@@ -1482,6 +1853,20 @@ export function buildToolset({
       preview: (args) => (args.text ? `"${args.text}"` : args.element != null ? `element ${args.element}` : `(${args.x}, ${args.y})`),
       execute: async (args) => {
         const target = resolveTarget(args);
+        // A handful of labels push something out to another person and cannot be
+        // taken back. "Delete for everyone" was clicked twice in one session
+        // without anybody being asked.
+        const gate = requiresClickConfirmation(target.label);
+        if (gate.confirm) {
+          const { approved } = await askPermission({
+            kind: "click",
+            summary: gate.summary,
+            reason: gate.reason,
+            rule: gate.rule,
+            detail: `${state.lastWindow?.application ?? "this window"} — clicking "${target.label}"`
+          });
+          if (!approved) return { refusedByUser: true, label: target.label, gate };
+        }
         const clicked = await runCapability("pointer.clickAt", {
           ...target,
           // Only name the application when there is no handle. Sending both lets
@@ -1494,7 +1879,12 @@ export function buildToolset({
         });
         return { ...clicked, label: target.label ?? null, byIndex: target.byIndex ?? null };
       },
+      failed: (result) => result.performed === false || result.refusedByUser === true,
       render: (result) => {
+        if (result.refusedByUser) {
+          return `The user was asked before clicking "${result.label}", and said NO. It was not clicked, ` +
+            "and nothing was changed.\nDo not do the same thing another way. Tell them what you have not done.";
+        }
         if (result.performed === false) return `Click did not land: ${result.reason ?? "unknown"}`;
         if (!result.label) return `Clicked at ${result.x},${result.y}.`;
         // Say what it hit. When the index was stale this is the sentence that
@@ -1509,9 +1899,8 @@ export function buildToolset({
     {
       name: "type",
       description:
-        "Type text into whatever has keyboard focus. Click the field first if focus is not already there. " +
-        "If the window already contains a document that is not yours, this refuses and tells you so — " +
-        "start a fresh one with new_document, or say what you meant with `existing`.",
+        "Type into whatever has keyboard focus; name the field in `into` to click it first. Refuses if the " +
+        "window holds a document that is not yours — start a fresh one with new_document.",
       parameters: {
         type: "object",
         properties: {
@@ -1522,8 +1911,8 @@ export function buildToolset({
             type: "string",
             enum: ["append", "replace"],
             description:
-              "Only when you mean to write into a document that is already open: \"append\" to add to it, " +
-              "\"replace\" when you have selected what this will overwrite."
+              "Only when you mean to write into a document already open: \"append\" to add to it, " +
+              "\"replace\" when you have selected what this overwrites."
           },
           application: { type: "string" }
         },
@@ -1561,6 +1950,10 @@ export function buildToolset({
           application: args.application ?? state.lastWindow?.application,
           windowId: state.lastWindow?.windowId
         });
+        // Remembered so that if the next thing is Enter in a messaging app, the
+        // confirmation can show what is about to be sent rather than asking
+        // about an abstract keystroke.
+        state.lastTyped = String(args.text ?? "");
         return { ...typed, unreadableScript: hasUnreadableScript(args.text) };
       },
       render: (result) => {
@@ -1597,12 +1990,70 @@ export function buildToolset({
         required: ["keys"]
       },
       preview: (args) => args.keys,
-      execute: async (args) => runCapability("keyboard.press", {
-        keys: args.keys,
-        application: args.application ?? state.lastWindow?.application,
-        windowId: state.lastWindow?.windowId
-      }),
-      render: (result) => (result.performed === false ? `Key press failed: ${result.reason ?? "unknown"}` : "Sent.")
+      execute: async (args) => {
+        const application = args.application ?? state.lastWindow?.application;
+        // Enter in a text editor is a newline. Enter in WhatsApp is a message
+        // arriving on somebody's phone, in whichever conversation happens to be
+        // open — which, live, was twice the wrong one.
+        const gate = requiresSendConfirmation(args.keys, `${application ?? ""} ${state.lastWindow?.title ?? ""}`);
+        if (gate.confirm) {
+          const { approved } = await askPermission({
+            kind: "send",
+            summary: gate.summary,
+            reason: gate.reason,
+            rule: gate.rule,
+            detail: state.lastTyped
+              ? `${application ?? "this window"} — sending: ${JSON.stringify(clip(state.lastTyped, 300))}`
+              : `${application ?? "this window"} — pressing Enter to send`
+          });
+          if (!approved) return { refusedByUser: true, keys: args.keys, gate };
+        }
+        const pressed = await runCapability("keyboard.press", {
+          keys: args.keys,
+          application,
+          windowId: state.lastWindow?.windowId
+        });
+        // A DELIVERED KEYSTROKE IS NOT A DELIVERED MESSAGE.
+        //
+        // Only for the send, and only because it silently failed: the box is
+        // read back, and whether the text left it is the whole answer.
+        if (gate.confirm && state.lastTyped) {
+          const stillInBox = await focusedValue();
+          const sent = stillInBox === null
+            ? null
+            : !stillInBox.includes(state.lastTyped.trim().slice(0, 40));
+          if (sent === true) state.lastTyped = null;
+          return { ...pressed, sendChecked: true, sent, stillInBox, typed: state.lastTyped };
+        }
+        return pressed;
+      },
+      failed: (result) => result.performed === false
+        || result.refusedByUser === true
+        || result.sent === false,
+      render: (result) => {
+        if (result.refusedByUser) {
+          return "The user was asked before sending this, and said NO. Nothing was sent.\n" +
+            "Do not send it again by another route. Ask them what they wanted instead.";
+        }
+        if (result.performed === false) return `Key press failed: ${result.reason ?? "unknown"}`;
+        if (result.sendChecked) {
+          if (result.sent === false) {
+            return "NOT SENT. The text is still sitting in the box — the application read it back to me " +
+              `as ${JSON.stringify(clip(result.stillInBox ?? "", 120))}. Enter was delivered but nothing ` +
+              "went anywhere, which usually means the typing landed somewhere other than the message box " +
+              "(a search field, for instance).\nDo NOT report this as sent. Read the screen, find the real " +
+              "message box, click it, and check the text is in THAT before pressing Enter again.";
+          }
+          if (result.sent === null) {
+            return "Enter was delivered. Whether it SENT is unconfirmed — the box does not publish its " +
+              "contents, so I cannot see whether the text left it.\nBefore you say it was sent, check the " +
+              "screen for BOTH: the message in the conversation with a timestamp, AND an empty input box. " +
+              "The words being on screen is not enough — they look the same sitting in the box unsent.";
+          }
+          return "Sent — the message box is empty again, so the text left it.";
+        }
+        return "Sent.";
+      }
     },
     {
       name: "scroll",
@@ -1619,8 +2070,8 @@ export function buildToolset({
       // A direction nobody has to remember the sign of cannot be got wrong, so
       // `notches` is now only ever a distance and `direction` says which way.
       description:
-        "Scroll a window with the mouse wheel. Say which way with `direction` — \"down\" moves further " +
-        "through the page, \"up\" moves back towards the top. `notches` is only the distance.",
+        "Scroll a window with the wheel. `direction` says which way — \"down\" moves further through the " +
+        "page. `notches` is only the distance; its sign is ignored.",
       parameters: {
         type: "object",
         properties: {
@@ -1667,9 +2118,8 @@ export function buildToolset({
       // motion the task consists of — so it looked, waited, looked again, and
       // reported that nothing had happened. It was right.
       description:
-        "Press the mouse at one point, move to another, and release — the motion behind drawing a shape, " +
-        "selecting a range, moving a slider, or dragging something onto something else. Give from/to as " +
-        "element labels from the last reading, or as coordinates.",
+        "Press at one point, move, release — the motion behind selecting a range, moving a slider, or " +
+        "dragging one thing onto another. from/to are labels from the last reading, or coordinates.",
       parameters: {
         type: "object",
         properties: {
@@ -1721,6 +2171,12 @@ export function buildToolset({
           changedFraction: region ? changedFraction(before.cells, after.cells, { region }) : null
         };
       },
+      // Nothing to undo afterwards means the document did not change, which is
+      // the whole question a drag on a canvas is asking. An unmeasurable result
+      // stays a non-failure: unconfirmed is not failed.
+      failed: (result) => result.performed === false
+        || result.undoAfter === false
+        || (result.undoAfter == null && result.changedFraction != null && result.changedFraction < VISIBLE_CHANGE),
       render: (result) => {
         if (result.performed === false) return `The drag did not happen: ${result.reason ?? "unknown"}`;
         const where = `from ${result.from?.x},${result.from?.y} to ${result.to?.x},${result.to?.y}`;
@@ -1757,12 +2213,10 @@ export function buildToolset({
       // model round trip and one undo entry each. This is the verb for the thing
       // the request actually names: a shape, drawn in one motion.
       description:
-        "Draw a shape. Name a `shape` (circle, ellipse, arc, rect, square, polygon, line, polyline, " +
-        "freehand) with its measurements, or give `points`; use `strokes` to draw a whole figure in one " +
-        "call. Select the drawing tool FIRST, then read the screen — this adapts to whichever tool is " +
-        "active: with a shape tool (Oval, Rectangle, Line) it sends the single press-and-release that " +
-        "tool needs, so you get the application's own clean shape, and with a pencil or brush it traces " +
-        "the path in one continuous motion.",
+        "Draw a shape: name a `shape` with its measurements, or give `points`; `strokes` draws a whole " +
+        "figure in one call. Select the drawing tool and READ THE SCREEN first — the reading names the " +
+        "active tool, and this then sends whatever motion that tool needs (a shape tool's own geometry, " +
+        "or a traced path for a pencil).",
       parameters: {
         type: "object",
         properties: {
@@ -1784,7 +2238,7 @@ export function buildToolset({
           toX: { type: "number" },
           toY: { type: "number" },
           sides: { type: "number", description: "Polygon side count" },
-          startDegrees: { type: "number", description: "Arc start, 0 is east and angles run clockwise" },
+          startDegrees: { type: "number", description: "Arc start, 0 is east, clockwise" },
           sweepDegrees: { type: "number", description: "Arc extent" },
           points: {
             type: "array",
@@ -1794,7 +2248,7 @@ export function buildToolset({
           closed: { type: "boolean", description: "Join the last point back to the first" },
           strokes: {
             type: "array",
-            description: "Several strokes, each one of these shapes, drawn in a single call with the pen lifted between them",
+            description: "Several of these shapes, drawn in one call with the pen lifted between them",
             items: { type: "object" }
           },
           durationMs: { type: "number", description: "Roughly how long the whole motion should take" },
@@ -1924,6 +2378,11 @@ export function buildToolset({
           changedFraction: region ? changedFraction(before.cells, after.cells, { region }) : null
         };
       },
+      // Same question, same answer: the application having nothing to undo means
+      // nothing was drawn, whatever the pointer did.
+      failed: (result) => result.performed === false
+        || result.undoAfter === false
+        || (result.undoAfter == null && result.changedFraction != null && result.changedFraction < VISIBLE_CHANGE),
       render: (result) => {
         if (result.performed === false) return `Nothing was drawn: ${result.reason ?? "unknown"}`;
         const how = result.usedShapeTool
@@ -2034,6 +2493,9 @@ export function buildToolset({
         }
         return runCapability("application.launch", { application: wanted });
       },
+      // No window is no application: "started but nothing appeared" is not
+      // something to build the next step on.
+      failed: (result) => !(result.windowIdentity ?? result.window),
       render: (result) => {
         const window = result.windowIdentity ?? result.window;
         if (!window) {
@@ -2075,9 +2537,8 @@ export function buildToolset({
       // exactly one route — type into whatever was on screen — so that is what
       // happened, to a document the user had open.
       description:
-        "Start a fresh document, tab or file in the application you are working in, so you write somewhere " +
-        "new instead of into work that is already open. Uses the application's own New/New tab control when " +
-        "it publishes one, and Ctrl+N when it does not.",
+        "Start a fresh document or tab in the application you are working in, so you write somewhere new " +
+        "instead of into work already open. Uses the application's own New control, or Ctrl+N.",
       parameters: {
         type: "object",
         properties: { application: { type: "string" }, windowId: { type: "string" } },
@@ -2117,6 +2578,12 @@ export function buildToolset({
           : null;
         return { route, before, after, movedWindow, windowId, application };
       },
+      // A window that still holds the same characters is a new document that did
+      // not open — and typing into it is the exact accident this tool exists to
+      // prevent.
+      failed: (result) => !result.movedWindow
+        && Boolean(result.after)
+        && (Number(result.after.contentChars) > 0 || result.after.undoEnabled === true),
       render: (result) => {
         const target = result.movedWindow ?? { windowId: result.windowId };
         const workspace = result.movedWindow ? null : result.after;
@@ -2179,6 +2646,7 @@ export function buildToolset({
         }
         return { ...launch, window };
       },
+      failed: (result) => result.exitCode !== 0,
       render: (result) => {
         if (result.exitCode !== 0) return `Could not open it: ${clip(result.stderr, 400)}`;
         if (!result.window) return "Opened in the browser. Read the screen to see where it landed.";
@@ -2241,17 +2709,40 @@ export function buildToolset({
     },
     {
       name: "read_file",
-      description: "Read a text file from disk.",
+      // A .docx IS A FILE THE USER WILL ASK ABOUT.
+      //
+      // This read text and nothing else, so a request about somebody's report,
+      // spreadsheet, deck or bank statement handed the model the raw bytes of a
+      // zip archive. It read that as a corrupt file and said so — about a
+      // document that opens perfectly in Word.
+      description:
+        "Read a file's text. Handles Word, Excel, PowerPoint and PDF documents as well as plain text.",
       parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
       preview: (args) => args.path,
-      execute: async (args) => runCapability("filesystem.read", { filePath: args.path }),
-      render: (result) => clip(result.contents ?? result.content ?? JSON.stringify(result))
+      execute: async (args) => {
+        const filePath = String(args.path ?? "");
+        if (!isDocumentPath(filePath)) {
+          return { ...(await runCapability("filesystem.read", { filePath })), filePath };
+        }
+        // Read as BYTES, because none of these are text. The capability's read
+        // is a UTF-8 read by contract, so this goes to the file directly.
+        const buffer = await fs.readFile(filePath);
+        return { ...extractDocumentText(filePath, buffer), filePath, document: true };
+      },
+      render: (result) => {
+        if (!result.document) return clip(result.contents ?? result.content ?? JSON.stringify(result));
+        if (!result.text) {
+          return `${result.filePath} could not be read as text: ${result.reason}.\n` +
+            "If you need what is in it, open it in the application that owns it and read the screen.";
+        }
+        return `${result.filePath} (${result.format}):\n${clip(result.text)}`;
+      }
     },
     {
       name: "write_file",
       description:
-        "Write a text file to disk. Creates it, or — if a file with something in it is already there — " +
-        "stops and tells you, so you can say whether to replace it or add to it.",
+        "Write a text file. Creates it, or stops and tells you if a file with something in it is already " +
+        "there, so you can say whether to replace it or add to it.",
       parameters: {
         type: "object",
         properties: {
@@ -2260,9 +2751,7 @@ export function buildToolset({
           existing: {
             type: "string",
             enum: ["replace", "append"],
-            description:
-              "Only when a file is already there: \"replace\" to overwrite it, \"append\" to add to the end " +
-              "of what it already holds."
+            description: "Only when a file is already there: overwrite it, or add to the end of it."
           }
         },
         required: ["path", "contents"]
@@ -2330,10 +2819,9 @@ export function buildToolset({
       // the safe one: it fails when the text is not found or is ambiguous, so it
       // cannot silently write over the wrong part of the file.
       description:
-        "Change part of a text file by replacing an exact snippet with another. Use this for editing code " +
-        "and documents instead of rewriting the whole file. `old` must appear EXACTLY once — include " +
-        "enough surrounding lines to make it unique. To add something new, make `old` the line you want " +
-        "to insert after and repeat it at the start of `new`.",
+        "Change part of a text file by replacing an exact snippet — use this rather than rewriting the " +
+        "whole file. `old` must appear EXACTLY once; include surrounding lines to make it unique. To " +
+        "insert, make `old` the line to insert after and repeat it at the start of `new`.",
       parameters: {
         type: "object",
         properties: {
@@ -2432,6 +2920,15 @@ export function buildToolset({
         const result = await runCapability("spotify.track.play", { query: args.query });
         return { ...result, requested: args.query };
       },
+      // "Something is playing" is not "the requested track is playing" — the
+      // same distinction the render draws, said to the loop as well so a track
+      // that never started cannot be reported as done.
+      failed: (result) => result.available === false
+        || result.playback?.playing !== true
+        || !matchesTrackQuery(
+          result.playback?.nowPlaying ?? result.playback?.title ?? result.title ?? "",
+          result.requested
+        ),
       // "SOMETHING IS PLAYING" IS NOT "THE REQUESTED TRACK IS PLAYING".
       //
       // Asked for Señorita while Hamari Adhuri Kahani was already playing, this
@@ -2466,7 +2963,8 @@ export function buildToolset({
         }
         if (!matchesTrackQuery(nowPlaying, result.requested)) {
           return `Spotify is still playing "${nowPlaying}", which is NOT what was asked for ` +
-            `("${result.requested}"). The track did not start. Read the screen and click the right result.`;
+            `("${result.requested}"). The track did not start. The search results ARE now on screen: read ` +
+            "them and click the Play control on the row you want — do not call this tool again for this track.";
         }
         // A PODCAST ABOUT THE SONG IS NOT THE SONG.
         //
@@ -2505,10 +3003,10 @@ export function buildToolset({
     {
       name: "web_open",
       description:
-        "Open a URL in a controlled browser and read the page back as structured text and links — far " +
-        "faster and more exact than opening Chrome and reading the screen. Use it for looking things up, " +
-        "reading pages, searching and research. It is a SEPARATE browser signed in to NOTHING: for " +
-        "anything needing the user's own accounts or logins, use launch/open_url and the desktop tools.",
+        "Open a URL in a controlled browser and read the page back as text and links — far faster and more " +
+        "exact than reading a browser window on screen. Use it for looking things up, reading and " +
+        "research. It is a SEPARATE browser signed in to NOTHING: for the user's own accounts, use " +
+        "launch/open_url and the desktop tools.",
       parameters: {
         type: "object",
         properties: {
@@ -2540,8 +3038,8 @@ export function buildToolset({
     {
       name: "web_read",
       description:
-        "Re-read the controlled browser's current page: its URL, its text, and the links, buttons and " +
-        "fields on it. Use it after clicking or typing to see what the page became.",
+        "Re-read the controlled browser's page: its URL, text, links, buttons and fields. Use it after " +
+        "clicking or typing to see what the page became.",
       parameters: {
         type: "object",
         properties: {
@@ -2560,7 +3058,7 @@ export function buildToolset({
       name: "web_click",
       description:
         "Click a link or button on the controlled browser's page by its visible text. Reports the label it " +
-        "actually matched and where the page went, so you can tell whether it was the one you meant.",
+        "matched and where the page went, so you can tell whether it was the one you meant.",
       parameters: {
         type: "object",
         properties: { text: { type: "string", description: "The visible text of the link or button" } },
@@ -2627,9 +3125,8 @@ export function buildToolset({
     {
       name: "web_type",
       description:
-        "Type into a field on the controlled browser's page, found by its placeholder or label. Set " +
-        "submit: true to press Enter afterwards, which is what a search box needs — text sitting in a " +
-        "search box has not been searched for.",
+        "Type into a field on the controlled browser's page, found by its placeholder or label. " +
+        "submit: true presses Enter — text sitting in a search box has not been searched for.",
       parameters: {
         type: "object",
         properties: {
@@ -2691,8 +3188,7 @@ export function buildToolset({
       // loop could not name any of them, so the only route was the Settings app
       // through the GUI, for a thing that is one call.
       description:
-        "Read or set the system volume. With no arguments it reports the current level; give percent to " +
-        "set it, or mute true/false.",
+        "Read or set the system volume. No arguments reports the level; give percent, or mute true/false.",
       parameters: {
         type: "object",
         properties: {
@@ -2711,6 +3207,7 @@ export function buildToolset({
           : Math.max(0, Math.min(100, Number(args.percent)));
         return runCapability("system.volume.set", { percent, ...(args.mute == null ? {} : { mute: args.mute }) });
       },
+      failed: (result) => result.available === false || result.applied === false,
       render: (result) => {
         if (result.available === false) return "I could not read the audio endpoint.";
         if (result.applied === false) {
@@ -2742,12 +3239,59 @@ export function buildToolset({
           String(entry?.ProcessName ?? entry?.name ?? "").toLowerCase().replace(/\.exe$/, "") === needle);
         return { ...result, application: name, stillRunning, checked: list.length > 0 };
       },
+      // Still in the process list is still running, whatever the close returned.
+      failed: (result) => result.checked === true && result.stillRunning === true,
       render: (result) => {
         if (!result.checked) return `Asked ${result.application} to close, but I could not check whether it did.`;
         return result.stillRunning
           ? `${result.application} is STILL RUNNING — it did not close. It may be holding an unsaved document ` +
             "and asking about it; read the screen."
           : `${result.application} is closed.`;
+      }
+    },
+    {
+      name: "remember",
+      // ACROSS SESSIONS IT KNEW NOTHING, EVERY TIME.
+      //
+      // The machine profile is read from Windows and the screen from the screen,
+      // so the agent always knows where it is — and never anything about who it
+      // is working for. Which folder they mean by "my project", that their
+      // mother's chat is filed under a name that is not "Amma", which of two
+      // accounts is the work one: all of it was worked out at cost, used once,
+      // and thrown away when the request ended.
+      //
+      // Deliberately something the model DECIDES to do rather than something
+      // extracted afterwards: extraction means a second model call per turn,
+      // which is exactly the kind of invisible tax this loop exists without.
+      description:
+        "Write down something worth knowing next time — a path, a name, a preference, how this person " +
+        "likes something done. Kept permanently and shown to you on every later request. Pass forget: true " +
+        "with a few words to remove what you wrote before, when it turns out to be wrong.",
+      parameters: {
+        type: "object",
+        properties: {
+          fact: { type: "string", description: "One short sentence, specific enough to act on later" },
+          forget: { type: "boolean", description: "Remove remembered facts containing these words instead" }
+        },
+        required: ["fact"]
+      },
+      preview: (args) => (args.forget === true ? `forget "${args.fact}"` : String(args.fact ?? "")),
+      execute: async (args) => (args.forget === true
+        ? { ...(await forgetNote(basePath, args.fact)), forgot: true }
+        : rememberNote(basePath, args.fact)),
+      render: (result) => {
+        if (result.forgot) {
+          return result.removed.length
+            ? `Forgotten: ${result.removed.map((note) => `"${note}"`).join(", ")}.`
+            : "Nothing remembered matches that, so nothing was removed.";
+        }
+        if (!result.added) {
+          return result.reason === "already-known"
+            ? "Already remembered — nothing to add."
+            : "There was nothing to remember in that.";
+        }
+        return `Remembered: "${result.note}".` +
+          (result.dropped?.length ? ` (Oldest dropped to make room: "${result.dropped[0]}".)` : "");
       }
     },
     {
@@ -2765,6 +3309,34 @@ export function buildToolset({
   ];
 
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
+
+  // DID THIS TOOL ACTUALLY DO THE THING?
+  //
+  // "It did not throw" was the only definition of success here, and almost
+  // nothing in this file throws: a click that lands outside the window, a window
+  // that could not be read, a drag that drew nothing, a track that never started
+  // — every one of them RETURNS, with an honest sentence explaining what did not
+  // happen, and every one of them was recorded as a success.
+  //
+  // Two things went wrong because of that, both silent. The repeat guard in the
+  // loop only remembers calls that failed, so an identical click could be sent
+  // again and again for as long as the model kept choosing it. And worse, a
+  // successful call CLEARS that memory — so a click that missed erased the
+  // record of the calls that had genuinely failed, and the guard protecting
+  // against a loop was disabled by exactly the failure it exists to catch.
+  //
+  // The sentence the model reads is unchanged. What changes is that the loop is
+  // now told the same thing the sentence says.
+  const failedByDefault = (result) => result?.performed === false || result?.blocked === true;
+  const isFailure = (tool, result) => {
+    try {
+      return tool.failed ? tool.failed(result ?? {}) === true : failedByDefault(result);
+    } catch {
+      // A predicate that cannot decide must not turn a working call into a
+      // failure; the rendered text still says whatever happened.
+      return false;
+    }
+  };
 
   // ONE ROUND TRIP PER KEYSTROKE IS THE WHOLE LATENCY BUDGET.
   //
@@ -2786,9 +3358,8 @@ export function buildToolset({
     name: "batch",
     description:
       "Run several steps in one go, in order, with no round trip between them. Use this whenever the next " +
-      "few actions are already decided — entering a number, filling a form, a menu path, a keyboard " +
-      "sequence. Each step is {tool, args} using the same tools and arguments you would call directly. " +
-      "It stops at the first step that fails and tells you which one.",
+      "few actions are already decided — entering a number, filling a form, a menu path. Each step is " +
+      "{tool, args}, exactly as you would call it directly. It stops at the first step that fails.",
     parameters: {
       type: "object",
       properties: {
@@ -2810,7 +3381,15 @@ export function buildToolset({
     preview: (args) => (Array.isArray(args.steps)
       ? args.steps.map((step) => step?.tool).filter(Boolean).join(" → ")
       : ""),
-    execute: async (args) => {
+    // A STEP THAT DID NOT WORK STOPS THE SEQUENCE — INCLUDING THE QUIET ONES.
+    //
+    // This used to stop only on a THROWN error, and the failures that matter
+    // most here do not throw: a click reported "did not land: outside the
+    // window" and the batch went straight on to the keystrokes meant for the
+    // dialog that click was supposed to open. That is precisely the "typing a
+    // password into a window that never opened" this tool's own note warns
+    // about, and it was live.
+    execute: async (args, { onProgress = null, signal = null } = {}) => {
       const steps = Array.isArray(args.steps) ? args.steps.slice(0, 40) : [];
       if (steps.length === 0) throw new Error("batch needs steps: a list of {tool, args}.");
       const done = [];
@@ -2827,8 +3406,13 @@ export function buildToolset({
         }
         const { say: _s, saw: _w, ...inputs } = step?.args ?? {};
         try {
-          const result = await tool.execute(inputs);
-          done.push({ tool: name, text: tool.render(result ?? {}) });
+          // A long step inside a batch is as long as it is outside one, so its
+          // progress belongs on the row just the same — an install run this way
+          // used to show nothing at all.
+          const result = await tool.execute(inputs, { onProgress, signal });
+          const text = tool.render(result ?? {});
+          if (isFailure(tool, result)) return { done, failedAt: index, failure: text };
+          done.push({ tool: name, text });
         } catch (error) {
           return {
             done,
@@ -2839,6 +3423,7 @@ export function buildToolset({
       }
       return { done, failedAt: null, failure: null };
     },
+    failed: (result) => result.failedAt != null,
     render: (result) => {
       const lines = result.done.map((entry, index) => `${index + 1}. ${entry.tool}: ${entry.text}`);
       if (result.failedAt == null) {
@@ -2900,20 +3485,23 @@ export function buildToolset({
   // A field NAMED for the backward reference cannot be filled in with a plan.
   // "saw" has to be about something that already happened, and quoting it is the
   // one thing that proves the last result was actually read.
+  //
+  // SAID ONCE, NOT TWENTY-NINE TIMES.
+  //
+  // These two descriptions are attached to every tool, so a paragraph here is a
+  // paragraph sent N times on every step of every task. Measured at their fullest
+  // they were 20,184 of the 35,591 characters of tool schema — 57% of everything
+  // the model was told about its tools was these same two fields repeated. The
+  // guidance itself is not lost: it is in the system prompt, with the same
+  // examples, where it costs one copy instead of twenty-nine.
   const SAW_PARAMETER = {
     type: "string",
     description:
-      "What you are working from RIGHT NOW, quoted concretely. If a tool has just run, it is that result — " +
-      "the number, the name, the error, what is on screen: \"Port 3000 is held by PID 41292.\" " +
-      "\"Three things match Amma: the search box, the header, and a chat.\" " +
-      "\"Rejected: the coordinate is outside the Restore pages dialog, which is in front.\" " +
-      "On your very first action, it is what the request itself tells you. Always backward-looking, never a plan."
+      "What you are working from right now, quoted from the last result. Always backward-looking, never a plan."
   };
   const SAY_PARAMETER = {
     type: "string",
-    description:
-      "What you are doing about it, in one short first-person sentence. \"Looking up what that process is.\" " +
-      "\"Opening the chat rather than the search box.\" \"Closing the dialog first.\""
+    description: "What you are doing about it, in one short first-person sentence."
   };
 
   return {
@@ -2964,6 +3552,20 @@ export function buildToolset({
       return state.machineFacts;
     },
 
+    // WHAT IT LEARNED LAST TIME.
+    //
+    // Read fresh per turn rather than cached with the machine profile: a fact
+    // written down in the middle of a conversation has to be in front of the
+    // model for the rest of it, and this is one small file read against a
+    // request that is about to spend a second on the network anyway.
+    async notes() {
+      try {
+        return describeNotes(await readNotes(basePath));
+      } catch {
+        return "";
+      }
+    },
+
     // A NEW TURN INVALIDATES WHAT IS ON SCREEN, AND NOTHING ELSE.
     //
     // The toolset outlives a single request so the agent keeps its place on the
@@ -2979,6 +3581,13 @@ export function buildToolset({
       state.lastTool = null;
     },
 
+    // How to reach the person watching THIS run. Set before each turn by the
+    // runtime, because the question has to appear in the transcript they are
+    // looking at; cleared after it, so a stale channel can never be asked.
+    setConfirmer(fn) {
+      state.confirm = typeof fn === "function" ? fn : null;
+    },
+
     previewOf(name, args) {
       const tool = byName.get(name);
       try { return tool?.preview?.(args ?? {}) ?? ""; } catch { return ""; }
@@ -2988,7 +3597,7 @@ export function buildToolset({
      * Run one tool call. Never throws: a failure is a result the model reads and
      * works around, exactly like a non-zero exit code.
      */
-    async execute(name, args = {}, { onProgress = null } = {}) {
+    async execute(name, args = {}, { onProgress = null, signal = null } = {}) {
       const tool = byName.get(name);
       if (!tool) {
         return { ok: false, text: `There is no tool called "${name}". Use one of: ${[...byName.keys()].join(", ")}.` };
@@ -2999,9 +3608,11 @@ export function buildToolset({
         const { say, saw, ...inputs } = args;
         // A tool that has something to report while it runs takes this and uses
         // it; every other tool ignores the second argument entirely.
-        const result = await tool.execute(inputs, { onProgress });
+        const result = await tool.execute(inputs, { onProgress, signal });
         const text = tool.render(result ?? {});
-        return { ok: true, text, raw: result, durationMs: Date.now() - startedAt };
+        // `ok` is whether the thing happened, not whether the code got to the
+        // end. See isFailure.
+        return { ok: !isFailure(tool, result), text, raw: result, durationMs: Date.now() - startedAt };
       } catch (error) {
         return {
           ok: false,

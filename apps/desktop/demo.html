@@ -15,17 +15,46 @@
           <p>Tell your computer what you want done.</p>
         </div>
       </div>
-      <label class="debug-toggle">
-        <!-- This said "Ready", in green, always — it was markup, not a reading.
-             With the daemon stopped it went on saying Ready while every request
-             failed, which is the worst thing a status indicator can do. It is
-             now driven by /api/health. -->
-        <span id="healthDot" class="status-dot" aria-hidden="true"></span>
-        <span id="healthLabel">Connecting…</span>
-        <input id="debugToggle" type="checkbox" />
-        Developer mode
-      </label>
+      <div class="topbar-actions">
+        <!-- Conversations are kept in this client's own storage. There is no
+             account yet, so "your chats" means the chats on this machine, in
+             this browser or this desktop application. -->
+        <button id="chatsButton" class="topbar-button" type="button" title="Previous chats">
+          <span aria-hidden="true">☰</span> Chats
+        </button>
+        <button id="newChatButton" class="topbar-button" type="button" title="Start a new chat">
+          <span aria-hidden="true">✚</span> New chat
+        </button>
+        <label class="debug-toggle">
+          <!-- This said "Ready", in green, always — it was markup, not a reading.
+               With the daemon stopped it went on saying Ready while every request
+               failed, which is the worst thing a status indicator can do. It is
+               now driven by /api/health. -->
+          <span id="healthDot" class="status-dot" aria-hidden="true"></span>
+          <span id="healthLabel">Connecting…</span>
+          <input id="debugToggle" type="checkbox" />
+          Developer mode
+        </label>
+      </div>
     </header>
+
+    <!-- Slides over the transcript rather than sitting beside it, so the chat
+         column keeps every pixel it has today whatever the window width. -->
+    <div id="chatsBackdrop" class="chats-backdrop" hidden></div>
+    <aside id="chatsPanel" class="chats-panel" hidden aria-label="Previous chats">
+      <header class="chats-panel-head">
+        <h2>Chats</h2>
+        <button id="chatsClose" class="icon-button" type="button" aria-label="Close">✕</button>
+      </header>
+      <button id="panelNewChat" class="new-chat-row" type="button">
+        <span aria-hidden="true">✚</span> New chat
+      </button>
+      <ul id="chatList" class="chat-list"></ul>
+      <p class="chats-note muted">
+        Kept on this machine only. There are no accounts yet, so these do not follow you to another
+        computer — and clearing this browser's storage clears them.
+      </p>
+    </aside>
 
     <!-- Connect panel: shown only for browser-only launch (no injected token). -->
     <section id="connectPanel" class="connect-panel" hidden>

@@ -1,0 +1,128 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import zlib from "node:zlib";
+import { extractDocumentText, isDocumentPath } from "../../packages/fast-agent/src/documents.js";
+
+// A real ZIP, written here rather than checked in as a fixture, so the reader is
+// tested against the format itself instead of against a file produced by the
+// same assumptions it makes.
+function zip(files) {
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+  for (const [name, contentText] of Object.entries(files)) {
+    const content = Buffer.from(contentText, "utf8");
+    const deflated = zlib.deflateRawSync(content);
+    const nameBuffer = Buffer.from(name, "utf8");
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt32LE(deflated.length, 18);
+    local.writeUInt32LE(content.length, 22);
+    local.writeUInt16LE(nameBuffer.length, 26);
+    chunks.push(local, nameBuffer, deflated);
+
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02014b50, 0);
+    entry.writeUInt16LE(20, 6);
+    entry.writeUInt16LE(8, 10);
+    entry.writeUInt32LE(deflated.length, 20);
+    entry.writeUInt32LE(content.length, 24);
+    entry.writeUInt16LE(nameBuffer.length, 28);
+    entry.writeUInt32LE(offset, 42);
+    central.push(entry, nameBuffer);
+    offset += local.length + nameBuffer.length + deflated.length;
+  }
+  const centralBuffer = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(Object.keys(files).length, 8);
+  end.writeUInt16LE(Object.keys(files).length, 10);
+  end.writeUInt32LE(centralBuffer.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...chunks, centralBuffer, end]);
+}
+
+test("only the formats that need unpacking take the document route", () => {
+  for (const name of ["report.docx", "budget.XLSX", "deck.pptx", "statement.pdf"]) {
+    assert.equal(isDocumentPath(name), true, `${name} is a document`);
+  }
+  for (const name of ["notes.txt", "index.js", "data.csv", "photo.png", "noextension"]) {
+    assert.equal(isDocumentPath(name), false, `${name} is not`);
+  }
+});
+
+// A Word document arrives as one run per formatting change, so a bolded word is
+// its own element. Joined without regard to paragraphs it is one endless line;
+// split per run it is one word per line. Neither is the document.
+test("a Word document comes back as its paragraphs", () => {
+  const docx = zip({
+    "word/document.xml":
+      "<w:document><w:body>" +
+      "<w:p><w:r><w:t>Quarterly report</w:t></w:r></w:p>" +
+      "<w:p><w:r><w:t>Revenue rose </w:t></w:r><w:r><w:t>12%</w:t></w:r><w:r><w:t> on last year.</w:t></w:r></w:p>" +
+      "</w:body></w:document>"
+  });
+  const read = extractDocumentText("report.docx", docx);
+  assert.equal(read.format, "docx");
+  assert.equal(read.text, "Quarterly report\nRevenue rose 12% on last year.");
+});
+
+// Cell text lives once in a shared table and the sheet points at it by index, so
+// a sheet read on its own is a grid of integers where the words should be.
+test("a spreadsheet resolves its shared strings", () => {
+  const xlsx = zip({
+    "xl/sharedStrings.xml": "<sst><si><t>Rent</t></si><si><t>Food</t></si></sst>",
+    "xl/worksheets/sheet1.xml":
+      '<worksheet><sheetData>' +
+      '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>18000</v></c></row>' +
+      '<row r="2"><c r="A2" t="s"><v>1</v></c><c r="B2"><v>6400</v></c></row>' +
+      "</sheetData></worksheet>"
+  });
+  const read = extractDocumentText("budget.xlsx", xlsx);
+  assert.match(read.text, /A: Rent \| B: 18000/);
+  assert.match(read.text, /A: Food \| B: 6400/);
+});
+
+test("a deck comes back slide by slide, in order", () => {
+  const pptx = zip({
+    "ppt/slides/slide2.xml": "<p:sld><a:t>Results</a:t></p:sld>",
+    "ppt/slides/slide1.xml": "<p:sld><a:t>Title slide</a:t><a:t>by Hithesh</a:t></p:sld>"
+  });
+  const read = extractDocumentText("deck.pptx", pptx);
+  assert.match(read.text, /--- Slide 1 ---\nTitle slide\nby Hithesh/);
+  assert.match(read.text, /--- Slide 2 ---\nResults/);
+  assert.ok(read.text.indexOf("Slide 1") < read.text.indexOf("Slide 2"), "slides must be in their own order, not the archive's");
+});
+
+test("text in a PDF is found whether or not the stream is compressed", () => {
+  const page = "BT /F1 12 Tf 72 720 Td (Statement of account) Tj ET\n" +
+    "BT /F1 12 Tf 72 700 Td (Closing balance 4,210.55) Tj ET";
+  const uncompressed = Buffer.from(`%PDF-1.4\n1 0 obj\n<< /Length ${page.length} >>\nstream\n${page}\nendstream\nendobj\n`, "latin1");
+  const plain = extractDocumentText("statement.pdf", uncompressed);
+  assert.match(plain.text, /Statement of account/);
+  assert.match(plain.text, /Closing balance 4,210\.55/);
+
+  const deflated = zlib.deflateSync(Buffer.from(page, "latin1"));
+  const compressed = Buffer.concat([
+    Buffer.from("%PDF-1.4\n1 0 obj\n<< /Filter /FlateDecode >>\nstream\n", "latin1"),
+    deflated,
+    Buffer.from("\nendstream\nendobj\n", "latin1")
+  ]);
+  assert.match(extractDocumentText("statement.pdf", compressed).text, /Statement of account/);
+});
+
+// A scan is a photograph of a page. Returning empty space for one would read as
+// an empty document, which is a different and much worse answer than "there is
+// no text in here to read".
+test("a document with nothing readable says which of the two it is", () => {
+  const scan = Buffer.from("%PDF-1.4\n1 0 obj\n<< /Type /XObject /Subtype /Image >>\nendobj\n", "latin1");
+  const read = extractDocumentText("scan.pdf", scan);
+  assert.equal(read.text, "");
+  assert.match(read.reason, /scan|photograph/i);
+
+  const broken = extractDocumentText("report.docx", Buffer.from("this is not a zip at all"));
+  assert.equal(broken.text, "");
+  assert.match(broken.reason, /archive could not be read/);
+});

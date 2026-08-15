@@ -5,3 +5,4 @@ dist/
 *.log
 *.tap
 probe-*.json
+anaconda_projects/

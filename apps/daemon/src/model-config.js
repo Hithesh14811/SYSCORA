@@ -35,12 +35,16 @@ export function loadModelConfig(basePath = process.cwd()) {
     ))
     : [];
 
+  // LLM_* is the vendor-neutral spelling used by most local .env files and by
+  // the provider dashboards themselves, so it is accepted alongside the
+  // SYSCORA_* names rather than requiring the key to be renamed on the way in.
+  // SYSCORA_* still wins, because it is the more specific of the two.
+  const provider = process.env.SYSCORA_MODEL_PROVIDER || process.env.LLM_PROVIDER || fileConfig.provider || "mock";
+  // Anything that is not the deterministic offline Mock reaches the network.
+  const remoteProvider = String(provider).toLowerCase() !== "mock";
+
   return {
-    // LLM_* is the vendor-neutral spelling used by most local .env files and by
-    // the provider dashboards themselves, so it is accepted alongside the
-    // SYSCORA_* names rather than requiring the key to be renamed on the way in.
-    // SYSCORA_* still wins, because it is the more specific of the two.
-    provider: process.env.SYSCORA_MODEL_PROVIDER || process.env.LLM_PROVIDER || fileConfig.provider || "mock",
+    provider,
     apiKey:
       process.env.SYSCORA_MODEL_API_KEY ||
       process.env.LLM_API_KEY ||
@@ -74,10 +78,25 @@ export function loadModelConfig(basePath = process.cwd()) {
       process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS || fileConfig.fallbackProviders || "",
     fallbackProviderConfigs,
     externalAIConsent: {
+      // CONFIGURING A REMOTE MODEL IS THE CONSENT DECISION.
+      //
+      // The default here was EXTERNAL_AI_DISABLED whether or not a remote model
+      // had been set up — which was harmless only for as long as nothing checked
+      // it. Now that the kill switch is actually wired to the agent loop (see
+      // ConsentAwareModelProvider.supportsChat), that default would silently
+      // demote anyone who configured a provider through environment variables to
+      // the offline pipeline, for a switch they never set.
+      //
+      // Pointing SYSCORA at a hosted model IS choosing to send it what it needs
+      // to work; there is no version of this product that talks to a remote model
+      // without doing so. So the default follows the provider: a real one implies
+      // the scopes it cannot run without, and Mock — no network — implies none.
+      // Setting the scopes explicitly always wins, including setting them to
+      // EXTERNAL_AI_DISABLED, which now genuinely disables it.
       scopes: String(
         process.env.SYSCORA_EXTERNAL_AI_CONSENT_SCOPES ||
         (Array.isArray(consentConfig.scopes) ? consentConfig.scopes.join(",") : consentConfig.scopes) ||
-        "EXTERNAL_AI_DISABLED"
+        (remoteProvider ? "EXTERNAL_AI_SANITIZED_REASONING,EXTERNAL_AI_STRUCTURED_UI_CONTEXT" : "EXTERNAL_AI_DISABLED")
       ).split(",").map((scope) => scope.trim()).filter(Boolean)
     }
   };

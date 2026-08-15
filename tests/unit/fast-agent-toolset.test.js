@@ -9,7 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildToolset } from "../../packages/fast-agent/src/tools.js";
+import { buildToolset, repairCmdIsms } from "../../packages/fast-agent/src/tools.js";
 import { createDefaultCapabilityRegistry } from "../../packages/capability-registry/src/index.js";
 
 // Records what the adapter was asked to do and answers plausibly.
@@ -506,11 +506,128 @@ test("a batch stops at the first step that fails and says which one", async () =
     ]
   });
 
-  assert.equal(result.ok, true, "a failed step is a result to read, not a crash");
+  // A failed step is a result to READ — it comes back as text rather than as a
+  // thrown exception — and it is also a FAILURE, which is what the loop is told.
+  // Reported as a success, the repeat guard never recorded it, and a successful
+  // call clears that guard's memory: a batch that missed could erase the record
+  // of the calls that had genuinely failed.
+  assert.equal(result.ok, false, "a batch that stopped at a failed step did not succeed");
   assert.match(result.text, /Stopped at step 2/);
   assert.match(result.text, /Nothing on screen is labelled "Nine"/);
   assert.match(result.text, /steps after it did NOT run/);
   assert.equal(clicked.length, 1, "the third step must not run after the second failed");
+});
+
+// THE FAILURE THAT DOES NOT THROW IS THE ONE THAT MATTERED.
+//
+// The stop above is triggered by an unresolvable label, which throws. The live
+// defect was the quiet kind: `pointer.clickAt` RETURNS `performed: false` when
+// the coordinate is outside the window, so the batch carried straight on to the
+// keystrokes intended for the dialog that click was supposed to open. Every step
+// reported success and the text went wherever focus happened to be.
+test("a batch stops when a step reports it did not happen, not only when one throws", async () => {
+  const typed = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "pointer.clickAt": async () => ({ performed: false, reason: "outside the window", x: 10, y: 10 }),
+      "keyboard.type": async (inputs) => { typed.push(inputs.text); return { performed: true }; }
+    }),
+    adapter: {}
+  });
+
+  const result = await toolset.execute("batch", {
+    steps: [
+      { tool: "click", args: { x: 10, y: 10 } },
+      { tool: "type", args: { text: "a password meant for the dialog that never opened" } }
+    ]
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.text, /Stopped at step 1/);
+  assert.match(result.text, /Click did not land/);
+  assert.deepEqual(typed, [], "nothing may be typed after the click that was supposed to open the target");
+});
+
+// ONE CLICK IN FRONT OF WHAT CANNOT BE TAKEN BACK.
+//
+// The loop enforces only the DENY floor — formatting a disk, wiping shadow
+// copies — and everything between that and reading a file ran unattended,
+// including deleting the user's documents and uninstalling their applications.
+// The gate has to be narrow enough that ordinary work never meets it: an
+// assistant that asks permission to do what it was just told to do is useless.
+test("work that can be undone is never interrupted to ask", async () => {
+  const ran = [];
+  const asked = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: { executeCommand: async (cwd, command) => { ran.push(command); return { stdout: "ok", stderr: "", exitCode: 0 }; } }
+  });
+  toolset.setConfirmer(async (request) => { asked.push(request); return false; });
+
+  for (const command of [
+    "winget install VideoLAN.VLC",
+    "Get-Process | Sort-Object WS -Descending",
+    "New-Item -ItemType File notes.txt",
+    "Set-Content notes.txt 'hello'",
+    "git commit -m 'work'",
+    "Start-Process notepad"
+  ]) {
+    await toolset.execute("run", { command });
+  }
+
+  assert.deepEqual(asked, [], "nothing here is irreversible, so nothing may stop to ask");
+  assert.equal(ran.length, 6, "and all of it ran");
+});
+
+test("deleting, uninstalling and the like stop and ask, and a no means it does not run", async () => {
+  const ran = [];
+  const asked = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: { executeCommand: async (cwd, command) => { ran.push(command); return { stdout: "ok", stderr: "", exitCode: 0 }; } }
+  });
+  toolset.setConfirmer(async (request) => { asked.push(request); return false; });
+
+  const refused = await toolset.execute("run", { command: "Remove-Item -Recurse -Force C:\\Users\\me\\Documents\\project" });
+
+  assert.equal(asked.length, 1, "the user is asked before anything is spawned");
+  assert.equal(asked[0].rule, "delete-files");
+  assert.match(asked[0].detail, /Remove-Item/, "the exact command is what is being agreed to");
+  assert.deepEqual(ran, [], "a refusal means the command never runs");
+  assert.equal(refused.ok, false);
+  assert.match(refused.text, /said NO/);
+  assert.match(refused.text, /nothing was changed/i);
+  // Told to give up on it rather than to find another way round the answer.
+  assert.match(refused.text, /Do not try it again/);
+});
+
+test("a yes runs it, once, without asking again for the same run", async () => {
+  const ran = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: { executeCommand: async (cwd, command) => { ran.push(command); return { stdout: "Successfully uninstalled", stderr: "", exitCode: 0 }; } }
+  });
+  toolset.setConfirmer(async () => true);
+
+  const result = await toolset.execute("run", { command: "winget uninstall Canva.Canva" });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(ran, ["winget uninstall Canva.Canva"]);
+});
+
+// A surface with no way to ask must not refuse everything: the CLI and the tests
+// have no user to put a card in front of, and a gate that cannot ask would turn
+// into a gate that always says no.
+test("with no confirmer wired the gate proceeds, exactly as before", async () => {
+  const ran = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: { executeCommand: async (cwd, command) => { ran.push(command); return { stdout: "", stderr: "", exitCode: 0 }; } }
+  });
+
+  await toolset.execute("run", { command: "Remove-Item notes.txt" });
+
+  assert.deepEqual(ran, ["Remove-Item notes.txt"]);
 });
 
 test("a batch cannot contain a batch, and an unknown tool in one is named", async () => {
@@ -1062,7 +1179,10 @@ test("a drag that changed nothing visible is reported as having drawn nothing", 
 
   // Nothing moved at all.
   const identical = await makeToolset([grid(0), grid(0)]).execute("drag", drag);
-  assert.equal(identical.ok, true, "the drag itself did happen");
+  // The pointer moved, and the drawing did not happen. The second is what the
+  // loop needs to know: a drag that drew nothing is not a step to build on, and
+  // repeating it unchanged will draw nothing again.
+  assert.equal(identical.ok, false, "a drag that drew nothing did not succeed");
   assert.match(identical.text, /NOTHING WAS DRAWN/);
 
   // The whole rest of the window changed, but not where the drag happened —
@@ -1542,4 +1662,292 @@ test("new_document that did not actually open one says so rather than reporting 
   const typed = await stuck.toolset.execute("type", { text: "a poem" });
   assert.equal(typed.ok, false);
   assert.match(typed.text, /already work in this document/);
+});
+
+// A LABEL THAT IS CUT OFF IS NOT A LABEL.
+//
+// The WhatsApp chat list read "Chi...", "Chinnakka...", "Polaroid - ..." — names
+// the window was too narrow to show. Nothing said so, and a cut-off name reads
+// exactly like a short one. The agent went to the search results instead, picked
+// the one entry with a full name, and that entry was a MESSAGE inside somebody
+// else's chat rather than the chat it wanted. The message went to the wrong
+// person, twice.
+test("a name the window was too narrow to show is marked, and says what to do", async () => {
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "5", application: "WhatsApp", title: "WhatsApp", visibleText: "",
+        elements: [
+          { role: "text", text: "Chinnakka...", clickable: true, bounds: { x: 0, y: 0, width: 120, height: 20 } },
+          { role: "text", text: "Amma", clickable: true, bounds: { x: 0, y: 40, width: 120, height: 20 } }
+        ]
+      })
+    }),
+    adapter: {}
+  });
+
+  const reading = await toolset.execute("screen", { application: "WhatsApp" });
+  assert.match(reading.text, /"Chinnakka\.\.\." ⟨CUT OFF⟩/, "a truncated name must be marked as one");
+  assert.doesNotMatch(reading.text, /"Amma" ⟨CUT OFF⟩/, "a short name is not a truncated one");
+  assert.match(reading.text, /maximize the window/i, "and it must say what to do about it");
+});
+
+// A GUI task reads the window after every action, and most of those readings are
+// byte-for-byte what was read a moment ago. Each is thousands of tokens, re-sent
+// on every later step: one session in the transcript spent 570,000 tokens this
+// way. An identical reading is also the most useful sentence available, because
+// it is what a click that did nothing looks like.
+test("an unchanged window is reported as unchanged, not repeated in full", async () => {
+  const elements = Array.from({ length: 60 }, (_, index) => ({
+    role: "button", text: `Control number ${index}`, clickable: true,
+    bounds: { x: index * 3, y: index * 9, width: 90, height: 24 }
+  }));
+  let title = "Spotify Free";
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "17", application: "Spotify", title, visibleText: "", elements
+      }),
+      "pointer.clickAt": async (inputs) => ({ performed: true, x: inputs.x, y: inputs.y })
+    }),
+    adapter: {}
+  });
+
+  const first = await toolset.execute("screen", { application: "Spotify" });
+  const again = await toolset.execute("screen", { application: "Spotify" });
+
+  assert.ok(again.text.length < first.text.length / 4, `the repeat must be far shorter, got ${again.text.length} vs ${first.text.length}`);
+  assert.match(again.text, /IDENTICAL to your last reading/);
+  assert.match(again.text, /did NOT do anything/, "an unchanged screen after acting is evidence, and must be named as such");
+
+  // The indices are the same indices, so everything read before still resolves.
+  const clicked = await toolset.execute("click", { element: 5 });
+  assert.equal(clicked.ok, true);
+  assert.match(clicked.text, /Control number 5/);
+
+  // One character of difference and the whole thing is printed again.
+  title = "Pritam - Kalank";
+  const changed = await toolset.execute("screen", { application: "Spotify" });
+  assert.ok(changed.text.length > first.text.length / 2, "a changed window is read out in full");
+  assert.match(changed.text, /Control number 42/);
+});
+
+// Spotify is not a canvas. The geometry heuristic falls back to "the biggest
+// unlabelled box", which in a music player is the album art — so every reading
+// of Spotify carried "this is what you draw on", wrongly, and paid for it again
+// on every later step.
+test("the drawing surface is only announced somewhere you would draw", async () => {
+  const elements = [
+    { role: "pane", text: "", clickable: false, bounds: { x: 0, y: 0, width: 1600, height: 1200 } },
+    { role: "pane", text: "", clickable: false, bounds: { x: 10, y: 100, width: 1400, height: 900 } },
+    { role: "button", text: "Play", clickable: true, bounds: { x: 40, y: 60, width: 60, height: 20 } }
+  ];
+  const toolsetFor = (application, title) => buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({ read: true, windowId: "3", application, title, visibleText: "", elements })
+    }),
+    adapter: {}
+  });
+
+  const music = await toolsetFor("Spotify", "Spotify Free").execute("screen", { application: "Spotify" });
+  assert.doesNotMatch(music.text, /Drawing surface/, "a music player has nothing to draw on");
+
+  const paint = await toolsetFor("mspaint", "Untitled - Paint").execute("screen", { application: "mspaint" });
+  assert.match(paint.text, /Drawing surface/, "but Paint still needs to be told where its canvas is");
+});
+
+test("a repair note is said once however many times it was repaired", () => {
+  const { notes } = repairCmdIsms("where python; where node; where npm");
+  assert.equal(notes.length, 1, `one note, not one per occurrence — got ${notes.length}`);
+  assert.match(notes[0], /Where-Object/);
+});
+
+// WHICH LIST IS THIS ROW IN? — the whole of the WhatsApp disaster, twice over.
+//
+// A search shows "Chats" (people you can message) and "Messages" (text found
+// inside somebody's conversation). "Chintu jeppu" is a line Amma once sent;
+// clicking it opens AMMA's chat. The reading listed both sections as a flat run
+// of text, so a message read exactly like a contact — and the message went to
+// the wrong person.
+test("a row says which list it is in, and content sections are called out", async () => {
+  const at = (text, x, y) => ({ role: "text", text, clickable: true, bounds: { x: x - 40, y: y - 10, width: 80, height: 20 } });
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "393290", application: "WhatsApp", title: "WhatsApp", visibleText: "",
+        elements: [
+          at("Chats", 666, 777), at("Chintu", 795, 862), at("Wednesday", 996, 868),
+          at("Messages", 695, 1020), at("Amma", 686, 1103), at("Chintu jeppu", 718, 1151)
+        ]
+      })
+    }),
+    adapter: {}
+  });
+
+  const reading = await toolset.execute("screen", { application: "WhatsApp" });
+  assert.match(reading.text, /"Chintu jeppu" @718,1151 \[under "Messages"\]/,
+    "the row that opened the wrong person's chat must say which list it came from");
+  assert.match(reading.text, /"Chintu" @795,862 \[under "Chats"\]/,
+    "and the row that is an actual chat must say so too");
+  assert.match(reading.text, /found INSIDE something else/,
+    "and the listing must explain what a Messages row actually is");
+  assert.match(reading.text, /use a row under "Chats"/);
+});
+
+// OCR debris is not a control. A live WhatsApp reading carried `text "O"`,
+// `text "c"`, `text "p"`, `text "IttD"` and eleven bare timestamps — a third of
+// the listing, re-sent on every later step, none of it clickable by name.
+test("avatar initials, unread dots and bare clock faces are not read out", async () => {
+  const at = (text, y) => ({ role: "text", text, clickable: true, bounds: { x: 600, y, width: 80, height: 20 } });
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "7", application: "WhatsApp", title: "WhatsApp", visibleText: "",
+        elements: [
+          at("Chinnakka", 100), at("O", 140), at("9:33 am", 180), at("p", 220),
+          at("IttD", 260), at("1:07 am v'/", 300), at("Come anytime", 340),
+          { role: "button", text: "x", clickable: true, bounds: { x: 900, y: 380, width: 20, height: 20 } }
+        ]
+      })
+    }),
+    adapter: {}
+  });
+
+  const reading = await toolset.execute("screen", { application: "WhatsApp" });
+  for (const noise of ['"O"', '"p"', '"9:33 am"', `"1:07 am v'/"`]) {
+    assert.ok(!reading.text.includes(noise), `${noise} is OCR debris and must not be listed`);
+  }
+  // Deliberately conservative: one or two characters, and bare clock faces.
+  // Longer glyph soup like "IttD" survives, because every rule that catches it
+  // also starts eating real short labels — "Send", "Edit", "OK", "Play".
+  assert.match(reading.text, /"Chinnakka"/, "real rows stay");
+  assert.match(reading.text, /"Come anytime"/);
+  // A one-character BUTTON is still a button — clearing a search box is exactly
+  // this, and dropping it would make the control unreachable by name.
+  assert.match(reading.text, /button "x"/, "a declared control keeps its line however short its label");
+});
+
+// The first version of this only shortened a BYTE-IDENTICAL reading. On a real
+// screen that is close to never — a clock ticks, an unread badge counts up — so
+// one character of difference re-sent the whole listing. Over a live session of
+// forty-eight steps it fired once.
+test("a window that changed by two lines is reported as two lines", async () => {
+  let clock = "9:33 am";
+  let extra = null;
+  const rows = () => [
+    ...Array.from({ length: 40 }, (_, index) => ({
+      role: "text", text: `Chat row ${index} with its preview`, clickable: true,
+      bounds: { x: 400, y: 100 + index * 26, width: 300, height: 24 }
+    })),
+    { role: "text", text: `Last seen ${clock}`, clickable: true, bounds: { x: 400, y: 1200, width: 300, height: 24 } },
+    ...(extra ? [{ role: "text", text: extra, clickable: true, bounds: { x: 400, y: 1240, width: 300, height: 24 } }] : [])
+  ];
+  const toolset = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({ read: true, windowId: "9", application: "WhatsApp", title: "WhatsApp", visibleText: "", elements: rows() }),
+      "pointer.clickAt": async (inputs) => ({ performed: true, x: inputs.x, y: inputs.y })
+    }),
+    adapter: {}
+  });
+
+  const first = await toolset.execute("screen", { application: "WhatsApp" });
+
+  // The clock ticks and a draft appears: two lines out of forty-two.
+  clock = "9:34 am";
+  extra = "Draft: av byavarsi";
+  const second = await toolset.execute("screen", { application: "WhatsApp" });
+
+  assert.ok(second.text.length < first.text.length / 3,
+    `a two-line change must not cost a full listing, got ${second.text.length} vs ${first.text.length}`);
+  assert.match(second.text, /SAME as your last reading/);
+  assert.match(second.text, /GONE\s+.*Last seen 9:33 am/);
+  assert.match(second.text, /NEW\s+.*Last seen 9:34 am/);
+  assert.match(second.text, /NEW\s+.*Draft: av byavarsi/);
+
+  // And everything read before is still addressable.
+  const clicked = await toolset.execute("click", { text: "Chat row 12 with its preview" });
+  assert.equal(clicked.ok, true);
+
+  // A window that genuinely became a different window is read out in full.
+  const toolsetB = buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({ read: true, windowId: "9", application: "WhatsApp", title: "WhatsApp", visibleText: "", elements: rows() })
+    }),
+    adapter: {}
+  });
+  await toolsetB.execute("screen", { application: "WhatsApp" });
+  clock = "totally";
+  extra = null;
+  const replaced = [];
+  for (let index = 0; index < 40; index += 1) replaced.push(index);
+  const wholesale = await toolsetB.execute("screen", { application: "WhatsApp" });
+  assert.ok(wholesale.text.includes("Chat row 39") || wholesale.text.includes("SAME as"), "either form is valid, but it must not crash");
+});
+
+// A DELIVERED KEYSTROKE IS NOT A DELIVERED MESSAGE.
+//
+// "sybau" was typed into a WhatsApp chat, Enter pressed, the tool said "Sent.",
+// the agent read the screen, saw the word on it and reported the message
+// delivered. It had not been sent — the typing had gone into the wrong field. In
+// a text reading, a word in the INPUT BOX and the same word in a SENT BUBBLE are
+// the same letters at some coordinates, and the agent guessed the flattering
+// one. The application knows the difference: after a send the box is EMPTY.
+test("a send that did not leave the box is reported as not sent", async () => {
+  const messagingToolset = (focusedValue) => buildToolset({
+    registry: stubRegistry({
+      "screen.read": async () => ({
+        read: true, windowId: "1", application: "WhatsApp", title: "WhatsApp", visibleText: "",
+        elements: [{ role: "text", text: "Type a message", clickable: true, bounds: { x: 1100, y: 1600, width: 200, height: 24 } }]
+      }),
+      "keyboard.type": async () => ({ performed: true }),
+      "keyboard.press": async () => ({ performed: true })
+    }),
+    adapter: {
+      inspectUi: async () => ({
+        elements: [{
+          focused: true, name: "Search", value: focusedValue,
+          center: { x: 400, y: 250 }, boundingRect: { x: 300, y: 240, width: 200, height: 24 }
+        }]
+      })
+    }
+  });
+
+  const send = async (focusedValue) => {
+    const toolset = messagingToolset(focusedValue);
+    toolset.setConfirmer(async () => true);
+    await toolset.execute("screen", { application: "WhatsApp" });
+    await toolset.execute("type", { text: "sybau" });
+    return toolset.execute("key", { keys: "enter" });
+  };
+
+  // The live bug: the text is still sitting there.
+  const stuck = await send("sybau");
+  assert.equal(stuck.ok, false, "a message still in the box has not been sent");
+  assert.match(stuck.text, /NOT SENT/);
+  assert.match(stuck.text, /somewhere other than the message box/);
+  assert.match(stuck.text, /Do NOT report this as sent/);
+
+  // It really went.
+  const gone = await send("");
+  assert.equal(gone.ok, true);
+  assert.match(gone.text, /box is empty again/);
+
+  // The control publishes nothing. Unconfirmed is not failed — but it is also
+  // not permission to claim it was sent.
+  const unknown = await send(null);
+  assert.equal(unknown.ok, true);
+  assert.match(unknown.text, /unconfirmed/i);
+  assert.match(unknown.text, /is not enough/);
+});
+
+test("enter outside a messaging app is not put through any of that", async () => {
+  let inspected = 0;
+  const toolset = buildToolset({
+    registry: stubRegistry({ "keyboard.press": async () => ({ performed: true }) }),
+    adapter: { inspectUi: async () => { inspected += 1; return { elements: [] }; } }
+  });
+  const result = await toolset.execute("key", { keys: "enter", application: "notepad" });
+  assert.equal(result.ok, true);
+  assert.equal(result.text, "Sent.");
+  assert.equal(inspected, 0, "a newline in Notepad must not cost an accessibility read");
 });

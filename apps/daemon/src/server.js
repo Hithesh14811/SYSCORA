@@ -82,6 +82,23 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
     return intentRuns.get(sessionId);
   };
 
+  // A SETTLED RUN IS NOT NEEDED FOREVER.
+  //
+  // Every request ever submitted stayed in this map, holding its whole event
+  // list, for as long as the daemon ran — which for the desktop application is
+  // as long as the machine is on. The client reads /status once more after the
+  // stream settles (a second or two), and nothing reads it after that.
+  const SETTLED_RUN_TTL_MS = 10 * 60 * 1000;
+  const MAX_RETAINED_RUNS = 200;
+
+  const forgetSettledRuns = () => {
+    if (intentRuns.size <= MAX_RETAINED_RUNS) return;
+    for (const [sessionId, run] of intentRuns) {
+      if (intentRuns.size <= MAX_RETAINED_RUNS) break;
+      if (run.settled) intentRuns.delete(sessionId);
+    }
+  };
+
   const settleRun = (sessionId, session, error = null) => {
     const run = ensureRun(sessionId);
     run.session = session ?? null;
@@ -93,6 +110,12 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
     publish(sessionId, { type: "STREAM_END", sessionId, status: run.status });
     for (const subscriber of run.subscribers) subscriber.end();
     run.subscribers.clear();
+    // Long enough that a reconnecting client still finds it; short enough that a
+    // daemon left running for a week is not holding a week of transcripts. The
+    // session store is the durable record either way.
+    const expiry = setTimeout(() => intentRuns.delete(sessionId), SETTLED_RUN_TTL_MS);
+    expiry.unref?.();
+    forgetSettledRuns();
   };
 
   // The session store is the durable source of truth. Reconcile polling with
@@ -124,6 +147,11 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         if (!ready) console.log("SYSCORA desktop automation host is unavailable; GUI actions will be degraded.");
       })
       .catch(() => {});
+  }
+  // And what machine this is, for the same reason: read here it is free, read
+  // inside the first request it is several seconds before the user sees a word.
+  if (warmHost !== false && typeof runtime.warmMachineFacts === "function") {
+    runtime.warmMachineFacts(basePath).catch(() => {});
   }
   // Opt-in signed capability plugins (SYSCORA_PLUGIN_DIR + trusted keys). Loading
   // is best-effort at startup and never blocks the server; a failure to load a
@@ -176,6 +204,31 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         }
         run.canceller?.abort(new Error("STOPPED_BY_USER"));
         sendJson(response, 202, { sessionId, stopping: true, settled: run.settled });
+        return;
+      }
+
+      // The answer to a question the agent asked mid-run, before doing something
+      // that cannot be undone. Deliberately its own route, like stop: it has to
+      // reach a loop that is already running and waiting, not a session being
+      // resumed. An unknown or already-answered id is reported as such rather
+      // than silently accepted — a late click must not authorize anything.
+      const approveMatch = requestUrl.pathname.match(/^\/api\/intents\/([^/]+)\/approve$/);
+      if (request.method === "POST" && approveMatch) {
+        const [, sessionId] = approveMatch;
+        const body = await readJsonBody(request);
+        const approvalId = String(body?.approvalId ?? "");
+        if (!approvalId) {
+          sendJson(response, 400, { error: "approvalId is required." });
+          return;
+        }
+        const delivered = runtime.resolveApproval?.(approvalId, body?.approved === true) === true;
+        sendJson(response, delivered ? 200 : 409, {
+          sessionId,
+          approvalId,
+          approved: body?.approved === true,
+          delivered,
+          ...(delivered ? {} : { error: "That question is no longer waiting for an answer." })
+        });
         return;
       }
 
@@ -244,6 +297,26 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         const payload = parsed.payload;
         if (!payload.text) {
           sendJson(response, 400, { error: "text is required." });
+          return;
+        }
+        // ONE MACHINE, ONE TASK AT A TIME.
+        //
+        // Two requests running together share one pointer, one focused window
+        // and one agent state — which window is being worked in, what the last
+        // reading found, where the terminal is. They would interleave clicks and
+        // keystrokes into each other's windows, and the transcripts would each
+        // describe half of what happened. The chat surface already turns its
+        // send button into a stop button while a request runs; this is the same
+        // rule at the API, where nothing else was enforcing it.
+        const active = [...intentRuns.values()].find((run) => !run.settled);
+        if (active) {
+          sendJson(response, 409, {
+            error: "SYSCORA is already working on something.",
+            message: "There is one screen and one pointer, so requests run one at a time. " +
+              "Stop the running request first, or wait for it to finish.",
+            sessionId: active.sessionId,
+            statusUrl: `/api/intents/${active.sessionId}/status`
+          });
           return;
         }
         const runOptions = {

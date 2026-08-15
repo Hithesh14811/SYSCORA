@@ -1995,7 +1995,15 @@ public static class SyscoraAudio {
     steps.push({ step: "activate-play", ok: uia.invoked, detail: uia.reason ?? null });
 
     // 5. Let playback start, then read the live title for an honest result.
-    await new Promise((r) => setTimeout(r, 1200));
+    //
+    // Unless nothing was clicked. If the matching row could not be found there
+    // is no Play button that was pressed, so waiting a second and a bit to see
+    // whether it started is waiting for something that cannot happen — and this
+    // is the common case: three music requests in one session each paid the full
+    // wait before falling back to reading the screen and clicking, which worked
+    // every time. The search results are populated by now either way, so that
+    // fallback is one click away.
+    if (uia.invoked) await new Promise((r) => setTimeout(r, 1200));
     const playback = await this.readSpotifyPlayback();
 
     return {

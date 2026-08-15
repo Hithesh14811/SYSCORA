@@ -45,15 +45,81 @@ const DEFAULT_MAX_ELAPSED_MS = 6 * 60 * 1000;
 // unbounded prompt is how this codebase previously reached four million
 // characters for a request whose answer was one number.
 const MAX_CONVERSATION_CHARS = 60000;
+// How long the first turn of a cold process will wait for the machine profile
+// before starting without it. See _machineFacts.
+const MACHINE_FACTS_DEADLINE_MS = 2500;
+
+// Things that can only be true because a tool said so.
+//
+// Past-tense claims of having acted, and specific facts about THIS machine — a
+// version number, a path, "it is installed". Deliberately narrow and anchored on
+// the first person or a direct assertion, so ordinary conversation ("I can pause
+// it if you like", "Python is a programming language") does not match.
+const ACTION_CLAIMED = /\b(?:i(?:'ve| have)? (?:just )?(?:paused|resumed|opened|closed|deleted|removed|sent|installed|uninstalled|created|saved|renamed|moved|copied|typed|clicked|played|stopped|started|set|changed|updated|cleared|maximi[sz]ed|minimi[sz]ed)|(?:paused|resumed|opened|closed|deleted|removed|sent|installed|created|saved|played|stopped|started|set|changed|cleared) (?:it|that|the|your|them)\b)/i;
+// A version number, or a Windows path, asserted with nothing behind it.
+const MACHINE_FACT_CLAIMED = /\bv?\d+\.\d+(?:\.\d+)+\b|\b[a-z]:\\[^\s"']+/i;
+
+// Collapse the previous reading of the same window. See the call site.
+//
+// Marked on the message so a reading is only ever collapsed once, and so the
+// stub is recognisable if this runs again.
+const SUPERSEDED = "… [an earlier reading of this window, now out of date — it was read again below]";
+
+function supersedeEarlierReading(messages, toolName, windowId) {
+  if (toolName !== "screen" || !windowId) return;
+  const tag = `(windowId ${windowId})`;
+  // Walk back from the one just added, and stop at the first match: anything
+  // older than that was already collapsed when IT was superseded.
+  for (let index = messages.length - 2; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "tool" || typeof message.content !== "string") continue;
+    if (!message.content.includes(tag)) continue;
+    if (message.content.endsWith(SUPERSEDED)) return;
+    const heading = message.content.split("\n")[0];
+    messages[index] = { ...message, content: `${heading}\n${SUPERSEDED}` };
+    return;
+  }
+}
+
+// FOUR PIXELS TO THE LEFT IS NOT A DIFFERENT IDEA.
+//
+// The guards below key on the call and its arguments, so `move_mouse(1300,400)`
+// and `move_mouse(1300,300)` counted as two separate attempts — and an agent
+// hunting for an invisible button generates an endless supply of them. Live, it
+// produced forty-seven of these in one request. Coordinates are rounded into
+// buckets so that aiming at the same PLACE counts as the same attempt, however
+// many pixels apart the guesses are.
+const COORDINATE_BUCKET_PX = 60;
+
+function coarse(args) {
+  const rounded = { ...args };
+  for (const key of ["x", "y", "fromX", "fromY", "toX", "toY", "cx", "cy"]) {
+    if (typeof rounded[key] === "number") {
+      rounded[key] = Math.round(rounded[key] / COORDINATE_BUCKET_PX) * COORDINATE_BUCKET_PX;
+    }
+  }
+  return rounded;
+}
+
+function claimsWithoutEvidence(text) {
+  const said = String(text ?? "").trim();
+  if (!said) return false;
+  return ACTION_CLAIMED.test(said) || MACHINE_FACT_CLAIMED.test(said);
+}
 
 const SYSTEM_PROMPT = `You are SYSCORA, an agent with full control of this Windows machine. You do things; you do not describe how the user could do them.
 
 HOW YOU WORK
 - Act immediately. Never ask for permission, confirmation or clarification unless the request is genuinely ambiguous in a way that would make you do the wrong thing. "Install X", "book me a flight", "play Y", "set up Z" are instructions, not questions.
-- THINK OUT LOUD, ABOUT WHAT YOU ACTUALLY SEE. Every tool takes "saw" and "say", and both are required. "saw" is what you are working from right now, quoted concretely — "Port 3000 is held by PID 41292.", "Three things match Amma: the search box, the header, and a chat." "say" is what you are doing about it — "Looking up what that process is." The user is watching these, and they are how they know you read what came back rather than carrying on regardless.
+- THINK OUT LOUD, ABOUT WHAT YOU ACTUALLY SEE. Every tool takes "saw" and "say", and both are required. "saw" is what you are working from right now, quoted concretely — "Port 3000 is held by PID 41292.", "Three things match Amma: the search box, the header, and a chat.", "Rejected: the coordinate is outside the Restore pages dialog, which is in front." It is always backward-looking and never a plan; on your very first action it is what the request itself tells you. "say" is what you are doing about it, in one short first-person sentence — "Looking up what that process is.", "Opening the chat rather than the search box." The user is watching these, and they are how they know you read what came back rather than carrying on regardless.
 - ONE DECISION, MANY ACTIONS. The moment the next few steps are already decided, put them in a single \`batch\` — digits into a calculator, a form, a menu path, a keyboard sequence. Deciding costs seconds; acting costs milliseconds. Clicking twelve digits one call at a time is a minute of waiting for a sum that should take three seconds.
 - Reach for the keyboard before the mouse. Calculator, editors, browsers and dialogs all take typed input: \`type {text: "45*6664533365="}\` is one action where clicking is twelve, and it cannot land on the wrong button.
 - When the job is done, say what is now true in one or two sentences. If you found something out, give the answer itself — not a description of how you found it.
+- YOU CANNOT SEE ICONS. A reading is text and control names; a button that is only a picture — an emoji react, a paperclip, a three-dot menu with no label — does not appear in it at all, and hovering will not make it appear. If what you need is one of those and it is not in the reading, you cannot find it by guessing coordinates. Try the keyboard or a menu instead, and if neither works say plainly that you cannot see that control and ask the user to click it.
+- SENDING IS NOT TYPING. Words on the screen do not mean a message was sent — text sitting unsent in the box looks exactly the same. It is sent when the box is EMPTY and the message is in the conversation with a timestamp. Check both before you say it went.
+- WHEN YOU ARE STUCK, ASK. If you have tried the same idea twice and you are no closer, the answer is not a third variation — it is a question. Say what you looked for, what you actually found, and what you need from the user, and stop. Two wrong attempts at somebody's WhatsApp contact is worth a question; ten is not.
+- YOU HAVE NOT DONE IT UNTIL A TOOL HAS DONE IT, AND YOU DO NOT KNOW IT UNTIL A TOOL HAS TOLD YOU. Asked to pause, open, close, send, install or delete something, you call a tool — saying "Paused it" without one is a lie, and the user finds out immediately. The same goes for facts about THIS machine: a version number, a path, whether something is installed, what is in a file. Never state one from memory. If you find yourself about to write "v22.14.0" or "it's installed" or "I've paused it" without a tool result in front of you, stop and call the tool instead. You are allowed to know general things about the world; you are not allowed to guess about this computer.
+- WRITE DOWN WHAT YOU HAD TO WORK OUT. When you learn something that would save the work next time — which folder they mean by "my project", the real name a contact is filed under, which of two accounts is theirs, how they like something done — call \`remember\` with it, in one sentence. You start every conversation knowing only what is below; this is the only way anything reaches the next one.
 
 CHOOSING A TOOL
 - The terminal is almost always fastest and most reliable. Installing software, files, processes, services, network, registry, settings: use \`run\`. A GUI is for what genuinely has no command.
@@ -103,9 +169,34 @@ function messageChars(messages) {
 // of a long conversation and the oldest are the least likely to matter; the
 // user's request and the model's own reasoning are never trimmed, because those
 // are what keep it on task.
+//
+// TRIM IN ONE BITE, RARELY, RATHER THAN A LITTLE ON EVERY STEP.
+//
+// Rewriting a message changes the prompt PREFIX, and every provider-side prefix
+// cache keys on the prefix being identical to last time. Trimming just enough to
+// get under the ceiling meant trimming one more message on every step from then
+// on — so from the moment a task got long, every single step re-sent a prompt
+// that differed from the previous one near its start, and nothing after that
+// point could be reused. Cutting down to well under the ceiling in one pass
+// makes this an occasional event instead of a permanent one.
+//
+// The most recent results are never trimmed: they are what the next decision is
+// actually made from.
+const PRUNE_TARGET_FRACTION = 0.6;
+const NEVER_TRIM_RECENT_TOOL_RESULTS = 4;
+
 function pruneConversation(messages) {
   if (messageChars(messages) <= MAX_CONVERSATION_CHARS) return;
-  for (let index = 0; index < messages.length && messageChars(messages) > MAX_CONVERSATION_CHARS; index += 1) {
+  const target = Math.floor(MAX_CONVERSATION_CHARS * PRUNE_TARGET_FRACTION);
+  // The tail that stays whatever happens.
+  let protectedFrom = messages.length;
+  let recent = 0;
+  for (let index = messages.length - 1; index >= 0 && recent < NEVER_TRIM_RECENT_TOOL_RESULTS; index -= 1) {
+    if (messages[index].role !== "tool") continue;
+    recent += 1;
+    protectedFrom = index;
+  }
+  for (let index = 0; index < protectedFrom && messageChars(messages) > target; index += 1) {
     const message = messages[index];
     if (message.role !== "tool" || String(message.content ?? "").length < 400) continue;
     messages[index] = { ...message, content: `${String(message.content).slice(0, 300)}\n… [earlier output trimmed]` };
@@ -158,9 +249,13 @@ export class FastAgent {
     // One cached PowerShell call answers both. It goes in the system message
     // rather than a tool result so it is in front of the model for the FIRST
     // decision, which is the one that picked the wrong folder and the wrong app.
-    const machine = await this.toolset.machineFacts?.().catch(() => "") ?? "";
+    const machine = await this._machineFacts();
+    // And what it has been told before. Same argument as the machine profile:
+    // in front of the model for the FIRST decision, because that is the one
+    // that goes looking in the wrong folder or messages the wrong person.
+    const notes = await Promise.resolve(this.toolset.notes?.()).catch(() => "") ?? "";
     const messages = [
-      { role: "system", content: machine ? `${this.systemPrompt}\n\n${machine}` : this.systemPrompt },
+      { role: "system", content: [this.systemPrompt, machine, notes].filter(Boolean).join("\n\n") },
       ...history.slice(-12).map((turn) => ({
         role: String(turn?.role ?? "user") === "assistant" ? "assistant" : "user",
         content: String(turn?.text ?? turn?.content ?? "").slice(0, 2000)
@@ -171,8 +266,23 @@ export class FastAgent {
     let steps = 0;
     let toolCalls = 0;
     let lastText = "";
+    // Asked for evidence at most once per run. See the no-tool-calls branch.
+    let nudgedForEvidence = false;
+    // What this request cost. The provider reports it per call and it was
+    // counted internally and never shown, so the one number that tells you
+    // whether a task was expensive was invisible to the person paying for it.
+    // On the instance rather than in a local, so every exit from the loop
+    // reports it without threading it through each of them.
+    this._tokens = { in: 0, out: 0 };
     // Calls that have already failed, by tool + arguments, with what they said.
     const failedCalls = new Map();
+    // How many times each call has been made this run, whether or not it worked.
+    // See the going-in-circles guard.
+    const callCounts = new Map();
+    // Consecutive readings that found the screen exactly as it was. See the
+    // no-progress guard.
+    let unchangedReadings = 0;
+    let nudgedForProgress = false;
 
     while (steps < this.maxSteps) {
       if (this.signal?.aborted) {
@@ -226,12 +336,42 @@ export class FastAgent {
         );
       }
 
+      this._tokens.in += Number(turn.usage?.prompt_tokens ?? turn.usage?.promptTokenCount ?? 0) || 0;
+      this._tokens.out += Number(turn.usage?.completion_tokens ?? turn.usage?.candidatesTokenCount ?? 0) || 0;
+
       if (turn.text.trim()) {
         lastText = turn.text.trim();
         await this._emit({ type: "AGENT_SAYS", details: { text: lastText } });
       }
 
       if (turn.toolCalls.length === 0) {
+        // AN ANSWER WITH NO EVIDENCE BEHIND IT.
+        //
+        // A turn with no tool calls is normally the model finishing, and most of
+        // the time that is exactly what it is. But it is also how two lies got
+        // out: asked "what about node?" it answered "Node.js v22.14.0" without
+        // looking — the real answer was v22.23.1 — and asked to pause the music
+        // it replied "Paused the song." having done nothing at all. Both took
+        // one step and about twenty output tokens, and both were confident.
+        //
+        // The prompt now forbids this. This is the backstop for when the prompt
+        // loses, and it is deliberately narrow: it only fires when NOTHING has
+        // been done this whole run and the answer nonetheless claims something
+        // about this machine. One nudge, once, then the loop carries on — so the
+        // worst case is a single extra step on a request that was about to get a
+        // made-up answer.
+        if (toolCalls === 0 && !nudgedForEvidence && claimsWithoutEvidence(lastText)) {
+          nudgedForEvidence = true;
+          messages.push({ role: "assistant", content: turn.text || "" });
+          messages.push({
+            role: "user",
+            content: "[SYSTEM] You have not called a single tool this turn, so you have no evidence for that. " +
+              "If you claimed to have done something, you have not done it — do it now. If you stated a fact " +
+              "about this machine, you guessed — check it now. If it was genuinely just conversation, say so " +
+              "again and nothing else."
+          });
+          continue;
+        }
         return this._settle("COMPLETED", lastText || "Done.", { steps, toolCalls, startedAt });
       }
 
@@ -320,6 +460,44 @@ export class FastAgent {
           continue;
         }
 
+        // GOING IN CIRCLES IS NOT THE SAME AS FAILING.
+        //
+        // The guard above catches a call that FAILED being sent again. It could
+        // not catch this: searching for a contact, clicking the result, finding
+        // the wrong chat, clearing the search and doing all of it again — four
+        // times. Every one of those calls SUCCEEDED. The click landed, the text
+        // was typed. What failed was the plan, and nothing was counting plans.
+        //
+        // Twenty-one steps and 337,000 tokens went that way, on a search whose
+        // answer was that no such contact exists. The third time round, the
+        // useful move is not a fourth attempt — it is a question.
+        // Counted with coordinates rounded into buckets, so that aiming at the
+        // same PLACE is one attempt however many pixels apart the guesses are.
+        // Only for the pointer-hunting tools: a drawing is made of strokes that
+        // are deliberately near each other, and must not be mistaken for a loop.
+        const attemptSignature = /^(click|move_mouse)$/.test(call.name)
+          ? `${call.name}:${JSON.stringify(coarse(shown))}`
+          : signature;
+        const attempts = (callCounts.get(attemptSignature) ?? 0) + 1;
+        callCounts.set(attemptSignature, attempts);
+        // Repetition is normal and correct for these: scrolling a long list,
+        // pressing a key, waiting for something to appear, drawing a picture.
+        const mayRepeat = /^(scroll|key|wait|screen|windows|run|draw|drag)$/.test(call.name);
+        if (!mayRepeat && attempts >= 3) {
+          const refusal =
+            `This is the ${attempts}${attempts === 3 ? "rd" : "th"} time you have run exactly this in one ` +
+            "request, and it has not got you anywhere.\n" +
+            "STOP and ask the user. Do not try a fourth variation of the same idea. Tell them plainly what " +
+            "you looked for, what you actually found, and what you need them to tell you to carry on — " +
+            "then end your turn without calling another tool.";
+          await this._emit({
+            type: "TOOL_FINISHED",
+            details: { callId: call.id, tool: call.name, ok: false, output: refusal, durationMs: 0, repeated: true }
+          });
+          messages.push({ role: "tool", tool_call_id: call.id, content: refusal });
+          continue;
+        }
+
         // WHAT IT IS DOING WHILE IT IS DOING IT.
         //
         // A tool call was a spinner and then an answer, which is right for the
@@ -333,7 +511,11 @@ export class FastAgent {
               type: "TOOL_PROGRESS",
               details: { callId: call.id, tool: call.name, ...progress }
             });
-          }
+          },
+          // Stop must reach INSIDE a running step, not just between steps. A
+          // ninety-second install is ninety seconds during which the button
+          // did nothing.
+          signal: this.signal
         });
         // A FAILURE IS ONLY FINAL UNTIL SOMETHING CHANGES.
         //
@@ -361,6 +543,71 @@ export class FastAgent {
           }
         });
         messages.push({ role: "tool", tool_call_id: call.id, content: result.text || "(no output)" });
+
+        // NOTHING IS CHANGING, AND IT HAS NOT NOTICED.
+        //
+        // Asked to add an emoji reaction in WhatsApp, the agent hovered, read,
+        // clicked a guessed coordinate, read, hovered somewhere a pixel away,
+        // read — forty-eight steps and 692,000 tokens, with the reading saying
+        // "nothing at all has changed on screen" over and over. The react button
+        // is an icon with no text, so it is invisible to a text reading and no
+        // amount of hovering was ever going to reveal it.
+        //
+        // The repeat guard could not catch this: every call was slightly
+        // different, because moving the pointer four pixels makes a new
+        // signature. What was identical was the OUTCOME — nothing. So that is
+        // what gets counted.
+        if (call.name === "screen") {
+          unchangedReadings = result.raw?.screenUnchanged ? unchangedReadings + 1 : 0;
+        } else if (call.name !== "wait" && call.name !== "move_mouse") {
+          // A real action resets the count; hovering and waiting do not, because
+          // hovering and waiting are what the loop above is made of.
+          unchangedReadings = 0;
+        }
+        if (unchangedReadings >= 3 && !nudgedForProgress) {
+          nudgedForProgress = true;
+          messages.push({
+            role: "user",
+            content: "[SYSTEM] The last three readings found the screen completely unchanged. Whatever you " +
+              "are aiming at is not responding, and it is very likely something a text reading CANNOT see " +
+              "— an icon with no label, which no amount of hovering or guessing at coordinates will reveal. " +
+              "Stop. Do not try another position. Tell the user what you were trying to click, that you " +
+              "cannot see it, and ask them how they would like to proceed — then end your turn."
+          });
+        }
+        // And if it carries on regardless, end it. Eight readings in a row of an
+        // unchanged screen is not a task in progress, it is a task that cannot
+        // be done this way — and the alternative to stopping is what actually
+        // happened live: forty-eight steps, 692,000 tokens, and no reaction.
+        if (unchangedReadings >= 8) {
+          return this._settle(
+            "PARTIALLY_COMPLETED",
+            `${lastText ? `${lastText}\n\n` : ""}I stopped: the screen has not changed once in my last ` +
+            "eight readings, so what I am aiming at is not responding to anything I can do. It is most " +
+            "likely a control with no label — an icon — which I cannot see in a text reading and cannot " +
+            "reliably hit by guessing coordinates. Nothing was changed. Tell me where it is, or click it " +
+            "yourself and I will carry on from there.",
+            { steps, toolCalls, startedAt }
+          );
+        }
+        // A SCREEN READING IS ONLY TRUE UNTIL THE NEXT ONE.
+        //
+        // This is where a GUI task's tokens actually go. A reading of WhatsApp
+        // is around two thousand tokens, a task takes ten of them, and every one
+        // stays in the conversation and is re-sent on every step for the rest of
+        // the run — so the fifth reading is paid for alongside four descriptions
+        // of a window that no longer looks like that. One session in the
+        // transcript spent 337,000 tokens over twenty-one steps this way.
+        //
+        // The moment a window is read again, the earlier reading of THAT window
+        // is not just redundant, it is WRONG: it describes a screen that has
+        // since changed, which is the entire reason it was read again. Nothing
+        // should be deciding anything from it. So it collapses to one line, and
+        // the newest reading — the only one that is true — stays in full.
+        //
+        // Only ever the same window: a reading of Notepad does not supersede a
+        // reading of WhatsApp.
+        supersedeEarlierReading(messages, call.name, result.raw?.windowId);
       }
 
       pruneConversation(messages);
@@ -371,6 +618,36 @@ export class FastAgent {
       `${lastText ? `${lastText}\n\n` : ""}I stopped after ${this.maxSteps} steps without finishing. Anything already done is still in place.`,
       { steps, toolCalls, startedAt }
     );
+  }
+
+  // WHAT MACHINE THIS IS — BUT NOT AT THE COST OF THE FIRST SENTENCE.
+  //
+  // The profile is read once per process and kept, so this is normally an
+  // already-resolved promise and costs nothing. The exception is the very first
+  // request after a cold start, where it is a PowerShell round trip the user
+  // waits through before anything at all appears — the one moment the product
+  // is being judged on how quickly it answers.
+  //
+  // The daemon now warms this at startup (see startServer), so by the time
+  // anybody types, it is there. This deadline is the backstop for the case where
+  // it is not: start without the facts rather than hold the turn. They are
+  // valuable, not load-bearing — every path that needs a real folder or a real
+  // application still asks the machine directly.
+  async _machineFacts() {
+    const reading = this.toolset.machineFacts?.();
+    if (!reading) return "";
+    let timer = null;
+    try {
+      return await Promise.race([
+        Promise.resolve(reading).catch(() => ""),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(""), MACHINE_FACTS_DEADLINE_MS);
+          timer.unref?.();
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async _callModel(messages, remainingMs) {
@@ -400,7 +677,15 @@ export class FastAgent {
   }
 
   _settle(status, message, { steps, toolCalls, startedAt }) {
-    const settled = { status, message, steps, toolCalls, elapsedMs: Date.now() - startedAt };
+    const settled = {
+      status,
+      message,
+      steps,
+      toolCalls,
+      elapsedMs: Date.now() - startedAt,
+      tokensIn: this._tokens?.in ?? 0,
+      tokensOut: this._tokens?.out ?? 0
+    };
     this._emit({ type: "AGENT_DONE", details: settled });
     return settled;
   }

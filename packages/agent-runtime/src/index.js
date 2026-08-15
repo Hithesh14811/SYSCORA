@@ -78,6 +78,12 @@ const RECOVERY_VOLATILE_KEYS = new Set([
 // itself just did invalidates it, because a post-action reading never uses it.
 const SCREEN_MEMO_TTL_MS = 2500;
 
+// How long the agent waits for an answer before treating silence as "no". Long
+// enough that the user can read the command and think about it; short enough
+// that a question asked while nobody is watching does not hold a run open until
+// its own six-minute budget runs out.
+const APPROVAL_TIMEOUT_MS = 120000;
+
 function stableRecoveryFingerprint(value) {
   const normalize = (item) => {
     if (Array.isArray(item)) return item.map(normalize);
@@ -193,6 +199,8 @@ export class AgentRuntime {
     if (typeof this.capabilityRegistry?.setRollbackManager === "function") {
       this.capabilityRegistry.setRollbackManager(this.rollbackManager);
     }
+    // Questions the agent has asked and nobody has answered yet, by id.
+    this._approvals = new Map();
   }
 
   setDeveloperIntelligence(engine) {
@@ -255,6 +263,57 @@ export class AgentRuntime {
     if (options.fast === false) return false;
     const provider = this.reasoningEngine?.modelProvider;
     return typeof provider?.chat === "function" && provider.supportsChat?.() === true;
+  }
+
+  /**
+   * Answer a question the agent asked before doing something irreversible.
+   *
+   * Returns false when the approval is unknown — already answered, timed out, or
+   * from a run that has since finished — so a late click cannot authorize
+   * anything.
+   */
+  resolveApproval(approvalId, approved) {
+    const settle = this._approvals?.get(String(approvalId));
+    if (!settle) return false;
+    settle(approved === true);
+    return true;
+  }
+
+  _resolveAllApprovals(approved) {
+    if (!this._approvals?.size) return;
+    for (const settle of [...this._approvals.values()]) settle(approved === true);
+  }
+
+  _ensureToolset(workspacePath = null) {
+    if (!this._toolset) {
+      this._toolset = buildToolset({
+        registry: this.capabilityRegistry,
+        adapter: this.adapter,
+        basePath: workspacePath ?? process.cwd()
+      });
+    }
+    return this._toolset;
+  }
+
+  /**
+   * Read what machine this is before the user's first message, not inside it.
+   *
+   * The profile — the real Documents/Desktop paths, whether OneDrive holds them,
+   * which desktop applications exist — is one PowerShell call cached for the life
+   * of the process. Read lazily it was paid for inside the FIRST request of every
+   * session, where it is several seconds of silence before a single word appears.
+   * The automation host has been warmed at startup all along; this is the same
+   * argument for the same reason.
+   *
+   * Best-effort and never throws: a machine this cannot be read on is one the
+   * agent still has to work on.
+   */
+  warmMachineFacts(workspacePath = null) {
+    try {
+      return Promise.resolve(this._ensureToolset(workspacePath).machineFacts?.()).catch(() => "");
+    } catch {
+      return Promise.resolve("");
+    }
   }
 
   async submitIntent(rawText, options = {}) {
@@ -381,14 +440,48 @@ export class AgentRuntime {
     //
     // The state is about the MACHINE, and there is one machine. Conversations
     // are the client's to keep; where the pointer and the focus are is not.
-    if (!this._toolset) {
-      this._toolset = buildToolset({
-        registry: this.capabilityRegistry,
-        adapter: this.adapter,
-        basePath: options.workspacePath ?? process.cwd()
+    const toolset = this._ensureToolset(options.workspacePath);
+    // ASKING, WITHOUT A PIPELINE BEHIND IT.
+    //
+    // The staged route had a whole approval apparatus — risk assessment, policy
+    // evaluation, a signed commitment, a token — and it cost several model calls
+    // and several seconds on EVERY action, which is why it is not on this path.
+    // What it was protecting against, though, is real: an agent that deletes the
+    // wrong folder or uninstalls the wrong application cannot put it back.
+    //
+    // So the question is asked where it costs nothing to not ask: one regex over
+    // the command line, and a card in the transcript only for the handful of
+    // shapes that are irreversible. No model call, no plan, no scheduler.
+    const askUser = (request) => new Promise((resolve) => {
+      const approvalId = createId("approval");
+      const settle = (approved) => {
+        if (!this._approvals.delete(approvalId)) return;
+        clearTimeout(timer);
+        emit({ type: "APPROVAL_RESOLVED", details: { approvalId, approved } });
+        resolve(approved);
+      };
+      // Nobody answered. Not approving is the only safe reading of silence, and
+      // it must not hold the run open forever.
+      const timer = setTimeout(() => settle(false), APPROVAL_TIMEOUT_MS);
+      timer.unref?.();
+      this._approvals.set(approvalId, settle);
+      emit({
+        type: "APPROVAL_REQUIRED",
+        details: {
+          approvalId,
+          sessionId: session.sessionId,
+          summary: request.summary,
+          reason: request.reason,
+          rule: request.rule,
+          detail: request.detail,
+          timeoutMs: APPROVAL_TIMEOUT_MS
+        }
       });
-    }
-    const toolset = this._toolset;
+    });
+    // A stop press is an answer too: refuse anything still waiting rather than
+    // leaving the run stuck behind a card nobody is going to click.
+    options.signal?.addEventListener?.("abort", () => this._resolveAllApprovals(false), { once: true });
+    toolset.setConfirmer?.(askUser);
     const agent = new FastAgent({
       provider: this.reasoningEngine.modelProvider,
       toolset,
@@ -410,6 +503,11 @@ export class AgentRuntime {
         toolCalls: 0,
         elapsedMs: 0
       };
+    } finally {
+      // The transcript this could have asked in is finished. Anything still
+      // waiting is refused, and nothing may ask through it again.
+      this._resolveAllApprovals(false);
+      toolset.setConfirmer?.(null);
     }
 
     // The model was configured but could not be reached, and nothing has run —
@@ -450,7 +548,13 @@ export class AgentRuntime {
       status: outcome.status,
       message: outcome.message,
       rawText,
-      metrics: { steps: outcome.steps, toolCalls: outcome.toolCalls, elapsedMs: outcome.elapsedMs }
+      metrics: {
+        steps: outcome.steps,
+        toolCalls: outcome.toolCalls,
+        elapsedMs: outcome.elapsedMs,
+        tokensIn: outcome.tokensIn ?? 0,
+        tokensOut: outcome.tokensOut ?? 0
+      }
     };
     await this.persistSession(session).catch(() => {});
     return session;

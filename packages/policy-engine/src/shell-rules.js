@@ -45,6 +45,34 @@ export const SHELL_CAPABILITIES = Object.freeze(new Set([
 // Each entry carries the reason a person would give for refusing, because that
 // reason is what the user reads — "blocked by rule 7" tells them nothing about
 // whether the agent understood them.
+// Every way to delete something that this codebase has actually seen used,
+// including the ones reached for AFTER a refusal: cmd's rmdir, the .NET API, and
+// a delete handed to an elevated process. Order does not matter — a delete verb
+// anywhere in the line counts, so a pipe cannot separate the verb from its
+// target and slip between them.
+const DELETE_VERB = /\b(?:remove-item|ri|rmdir|rd|del|erase|rm|remove-childitem)\b|\[(?:system\.)?io\.(?:directory|file)\]::delete|\bdirectory\.delete\b|\bunlink\b/i;
+
+// A path that IS one of these, rather than one that merely lives under one.
+// `C:\Users\hithe\Documents\report.docx` is somebody's file and deleting it is an
+// ordinary thing to ask for; `C:\Users\hithe` is their entire profile.
+//
+// The trailing lookahead is what draws that line: the path has to END at the
+// protected root (optionally with a trailing slash or wildcard), followed by a
+// quote, whitespace, a separator, or the end of the line.
+const PROTECTED_ROOT = new RegExp([
+  // A bare drive: C:, C:\, C:\*
+  String.raw`[a-z]:\\?\*?(?=["'\s;,)]|$)`,
+  // The system directories, and the folder that holds every profile.
+  String.raw`[a-z]:\\(?:windows|winnt|program files(?: \(x86\))?|programdata|users|system32)\\?\*?(?=["'\s;,)]|$)`,
+  // One whole user profile: C:\Users\<name>, but not C:\Users\<name>\anything.
+  String.raw`[a-z]:\\users\\[^\\/"'\s;,)]+\\?\*?(?=["'\s;,)]|$)`,
+  // The same places by the names Windows itself uses for them.
+  String.raw`%(?:systemroot|windir|systemdrive|userprofile|homepath)%`,
+  String.raw`\$env:(?:systemroot|windir|systemdrive|userprofile|homepath)\b`,
+  // POSIX shapes, for the shells that accept them.
+  String.raw`(?:^|\s)[/~]\*?(?=\s|$)`
+].join("|"), "i");
+
 const DENY_RULES = Object.freeze([
   {
     id: "disk-format",
@@ -64,11 +92,27 @@ const DENY_RULES = Object.freeze([
   },
   {
     id: "recursive-root-delete",
-    // A recursive delete aimed at a drive root, a user profile root, or a
-    // Windows system directory. A recursive delete of a project folder is an
-    // ordinary thing to want, so this is deliberately anchored on the target.
-    pattern: /(?:remove-item|rd|rmdir|del|erase|rm)\b[^\n]*?(?:[a-z]:\\?(?:\s|$|\*)|[a-z]:\\(?:windows|program files|users|programdata)\b|\/(?:\s|$)|~\/?\s*$)/i,
-    reason: "it recursively deletes a drive root or a Windows system directory"
+    // A delete aimed at a drive root, the folder holding every profile, a user's
+    // whole profile, or a Windows system directory.
+    //
+    // THIS RULE WAS BACKWARDS, AND IT TAUGHT THE MODEL TO ROUTE AROUND IT.
+    //
+    // It matched `C:\users` ANYWHERE in the path, so deleting one file in your
+    // own Documents was refused as "deleting a drive root" — and because it
+    // required the path to follow the verb, `Get-ChildItem <path> | Remove-Item`
+    // sailed straight through, as did `[System.IO.Directory]::Delete(<path>)`.
+    // It refused the safe, direct, readable form and permitted the two most
+    // dangerous ones.
+    //
+    // Live, that is exactly what happened: refused, tried cmd's rmdir, refused,
+    // tried the pipe — which worked — then tried `-Verb RunAs` and the .NET API.
+    // Four attempts to get around a refusal, two of them successful. A gate that
+    // refuses arbitrary things trains the thing it is gating to evade it.
+    //
+    // Now: the verb and the target are matched INDEPENDENTLY, anywhere in the
+    // command, and the target must BE a root rather than merely live under one.
+    match: (commandLine) => DELETE_VERB.test(commandLine) && PROTECTED_ROOT.test(commandLine),
+    reason: "it deletes a drive root, a whole user profile, or a Windows system directory"
   },
   {
     id: "shadow-copy-delete",
@@ -277,7 +321,11 @@ export function classifyShellCommand(command, args = []) {
   // DENY is checked against the whole line first, and it wins outright. A
   // denied fragment anywhere in a pipeline denies the pipeline.
   for (const rule of DENY_RULES) {
-    if (rule.pattern.test(commandLine)) {
+    // Most rules are a single pattern. One needs two independent conditions —
+    // see recursive-root-delete — because requiring them in one expression is
+    // what let a pipe separate the verb from its target.
+    const denied = rule.match ? rule.match(commandLine) : rule.pattern.test(commandLine);
+    if (denied) {
       return {
         verdict: ShellVerdict.DENY,
         rule: rule.id,
@@ -341,4 +389,182 @@ export function classifyShellCommand(command, args = []) {
 // without being seen.
 export function isReadOnlyShellCommand(command, args = []) {
   return classifyShellCommand(command, args).verdict === ShellVerdict.ALLOW;
+}
+
+// THE THINGS WORTH ONE CLICK.
+//
+// ALLOW/ASK/DENY above describes the whole space, and the agent loop enforces
+// only DENY: everything else runs immediately, which is the entire reason it is
+// fast. Enforcing ASK as written would be correct and unusable — ASK is the
+// DEFAULT for anything that changes anything, so installing an application,
+// creating a file or changing a setting the user just asked for would each stop
+// and wait. An assistant that asks permission to do what it was told to do is
+// not an assistant.
+//
+// This is the narrow middle. Not "does it change something" — almost everything
+// does — but "if this is not what they meant, is it gone for good?" Deleting
+// somebody's files, removing an application, rewriting machine-wide registry
+// state, disabling a service, adding a scheduled task, turning the computer off,
+// changing an account, force-pushing over a branch. Each is one click to approve
+// and unrecoverable to get wrong, and none of them is something an ordinary
+// request produces by accident.
+//
+// Everything else — installs, writes, launches, settings, clicks, typing —
+// stays exactly as fast as it is now.
+const CONFIRM_RULES = Object.freeze([
+  {
+    id: "delete-files",
+    // A delete of a drive root is already DENIED. This is the ordinary delete: a
+    // file, a folder, a wildcard. Reversible only if the recycle bin happens to
+    // catch it, which for PowerShell's Remove-Item it does not.
+    //
+    // Every route counts, not just the readable one. Asking about `Remove-Item`
+    // while letting `[System.IO.Directory]::Delete` past would make the question
+    // a formality — and the model has already been observed reaching for exactly
+    // that after a refusal.
+    pattern: new RegExp([
+      String.raw`(?:^|[;|&(]\s*)(?:remove-item|ri\b|del|erase|rd|rmdir|rm)\s+(?!-{0,2}(?:help|\?))\S`,
+      String.raw`\|\s*remove-item\b`,
+      String.raw`\[(?:system\.)?io\.(?:directory|file)\]::delete\s*\(`,
+      String.raw`\bstart-process\b[^\n]*\b(?:rmdir|remove-item|del|erase)\b`
+    ].join("|"), "i"),
+    summary: "delete files or folders",
+    reason: "deleting is not undoable — PowerShell's Remove-Item does not use the recycle bin"
+  },
+  {
+    id: "uninstall-application",
+    pattern: /\bwinget\s+uninstall\b|\buninstall-package\b|\bmsiexec\b[^\n]*\/x|\bremove-appxpackage\b/i,
+    summary: "remove an installed application",
+    reason: "the application and anything it keeps locally would have to be reinstalled and set up again"
+  },
+  {
+    id: "machine-registry-write",
+    pattern: /\breg(?:\.exe)?\s+(?:add|delete|import)\b[^\n]*\bhk(?:lm|ey_local_machine|cr|ey_classes_root)\b|(?:set|new|remove)-item(?:property)?\b[^\n]*\bhklm:/i,
+    summary: "change machine-wide registry settings",
+    reason: "this changes Windows for every account on the machine, and there is no undo"
+  },
+  {
+    id: "service-change",
+    pattern: /\b(?:stop-service|set-service|remove-service)\b|\bsc(?:\.exe)?\s+(?:config|stop|delete)\b|\bnet\s+stop\b/i,
+    summary: "stop or reconfigure a Windows service",
+    reason: "something on the machine depends on it, and a stopped service does not come back on its own"
+  },
+  {
+    id: "scheduled-task",
+    pattern: /\b(?:register|unregister|set)-scheduledtask\b|\bschtasks(?:\.exe)?\s+\/(?:create|delete|change)\b/i,
+    summary: "add or change something that runs automatically",
+    reason: "a scheduled task keeps running long after this conversation, on its own"
+  },
+  {
+    id: "power-state",
+    pattern: /\b(?:stop-computer|restart-computer)\b|\bshutdown(?:\.exe)?\s+\/[rsh]\b/i,
+    summary: "shut down or restart the computer",
+    reason: "anything unsaved in any open application goes with it"
+  },
+  {
+    id: "account-change",
+    pattern: /\bnet\s+user\b[^\n]*\s\S|\b(?:new|set|remove)-localuser\b|\b(?:add|remove)-localgroupmember\b/i,
+    summary: "change a Windows account",
+    reason: "account and password changes can lock the user out of their own machine"
+  },
+  {
+    id: "destructive-git",
+    pattern: /\bgit\b[^\n]*\bpush\b[^\n]*(?:--force(?!-with-lease)|(?:^|\s)-f(?:\s|$))|\bgit\b[^\n]*\breset\b[^\n]*--hard|\bgit\b[^\n]*\bclean\b[^\n]*-[a-z]*f/i,
+    summary: "discard or overwrite work in a git repository",
+    reason: "committed work and uncommitted changes are lost, locally or on the remote"
+  },
+  {
+    id: "firewall-change",
+    pattern: /\bnetsh\b[^\n]*\badvfirewall\b[^\n]*\bset\b|\bset-netfirewall(?:profile|rule)\b|\bnew-netfirewallrule\b/i,
+    summary: "change the firewall",
+    reason: "firewall rules decide what can reach this machine"
+  }
+]);
+
+// THE GATE WAS ON THE WRONG THINGS.
+//
+// Everything above guards the terminal. Meanwhile the same agent, in one
+// session, sent a WhatsApp message to the wrong person twice and clicked "Delete
+// for everyone" twice — and was asked about none of it, while being asked
+// whether it could delete an empty leftover folder. A shell delete is usually
+// recoverable from somewhere. A message to somebody's mother is not.
+//
+// Deliberately tiny. Not "anything that changes something" — clicking, typing,
+// scrolling and opening stay untouched and exactly as fast. Only the controls
+// that push something OUT, to another person, irreversibly.
+const IRREVERSIBLE_CONTROLS = Object.freeze([
+  {
+    id: "delete-for-everyone",
+    pattern: /^\s*(?:delete for everyone|delete for me|unsend|remove for everyone|delete chat|clear chat|empty chat|delete message|delete account|deactivate account)\s*$/i,
+    summary: "delete this for everyone",
+    reason: "it removes the message from the other person's phone too, and cannot be put back"
+  },
+  {
+    id: "send-outward",
+    // The button forms. Enter-to-send is handled separately, by the app it is
+    // being pressed in — see requiresSendConfirmation.
+    pattern: /^\s*(?:send|send message|send now|post|publish|tweet|reply all|send invite|share)\s*$/i,
+    summary: "send this",
+    reason: "once it has gone to somebody else it cannot be taken back"
+  }
+]);
+
+// The applications where pressing Enter sends something to another person. This
+// is the WhatsApp case: the text was typed, Enter was pressed, and it went to
+// whichever chat happened to be open — which twice was the wrong one.
+const MESSAGING_APPS = /whatsapp|telegram|signal|discord|slack|messenger|instagram|teams|outlook|thunderbird|skype|imessage|messages/i;
+
+/**
+ * Is this click on a control that pushes something out irreversibly?
+ *
+ * Matched on the WHOLE label, anchored, so "Delete for everyone" asks and
+ * "More options for Kalank - Title Track Add to Liked Songs" does not.
+ */
+export function requiresClickConfirmation(label) {
+  const text = String(label ?? "").trim();
+  if (!text) return { confirm: false };
+  for (const control of IRREVERSIBLE_CONTROLS) {
+    if (control.pattern.test(text)) {
+      return { confirm: true, rule: control.id, summary: control.summary, reason: control.reason };
+    }
+  }
+  return { confirm: false };
+}
+
+/**
+ * Is this keystroke the one that sends a message?
+ *
+ * Enter in a text editor is a newline; Enter in WhatsApp is irreversible. The
+ * difference is the application, so that is what this asks about.
+ */
+export function requiresSendConfirmation(key, application) {
+  if (!/^(?:enter|return)$/i.test(String(key ?? "").trim())) return { confirm: false };
+  if (!MESSAGING_APPS.test(String(application ?? ""))) return { confirm: false };
+  return {
+    confirm: true,
+    rule: "send-message",
+    summary: "send this message",
+    reason: "it goes to whichever conversation is open on screen — check that it is the right one — " +
+      "and it cannot be unsent once it arrives"
+  };
+}
+
+/**
+ * Does this command need one click before it runs?
+ *
+ * Returns `{ confirm: false }` for the overwhelming majority, including every
+ * read and every ordinary mutation. Matching is on the whole command line, so a
+ * destructive fragment anywhere in a pipeline counts.
+ *
+ * @returns {{confirm: boolean, rule?: string, summary?: string, reason?: string}}
+ */
+export function requiresConfirmation(command, args = []) {
+  const commandLine = [String(command ?? ""), ...(args ?? []).map(String)].join(" ").trim();
+  if (!commandLine) return { confirm: false };
+  for (const rule of CONFIRM_RULES) {
+    if (rule.pattern.test(commandLine)) {
+      return { confirm: true, rule: rule.id, summary: rule.summary, reason: rule.reason };
+    }
+  }
+  return { confirm: false };
 }

@@ -25,17 +25,16 @@ const cancelSession = document.getElementById("cancelSession");
 // API token bootstrap, in priority order:
 //   1. Electron shell — injected in-process via a contextBridge preload.
 //   2. sessionStorage — a token the user entered earlier this tab session.
-//   3. The known local dev token — matches .claude/launch.json's SYSCORA_API_TOKEN,
-//      so a plain browser launch doesn't need a manual paste for local dev.
-//   4. The Connect panel — shown only if that token gets rejected (e.g. the
-//      daemon was started with a different/random token).
+//   3. The Connect panel — one paste of the token the daemon prints on startup.
+// There is deliberately no built-in fallback token: a constant published in a
+// served file is not a credential, and this one guarded an API that can run
+// commands and type into windows.
 // `apiToken` is mutable so a fresh connect (or a 401-triggered re-prompt) updates
 // every call site, which all read it at request time.
 const TOKEN_STORAGE_KEY = "syscora_token";
-const DEV_FALLBACK_TOKEN = "syscora-dev-local-token-do-not-use-in-prod";
 let apiToken = (window.syscora && window.syscora.apiToken)
   || sessionStorage.getItem(TOKEN_STORAGE_KEY)
-  || DEV_FALLBACK_TOKEN;
+  || null;
 
 const connectPanel = document.getElementById("connectPanel");
 const connectForm = document.getElementById("connectForm");
@@ -65,6 +64,9 @@ function handleUnauthorized() {
   sessionStorage.removeItem(TOKEN_STORAGE_KEY);
   showConnectPanel("Token was rejected. Paste the current token from the daemon console.");
 }
+
+// Ask for it before the first request rather than after one fails.
+if (!apiToken && connectPanel) showConnectPanel();
 
 if (connectForm) {
   connectForm.addEventListener("submit", (event) => {
