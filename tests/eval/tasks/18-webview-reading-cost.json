@@ -1,0 +1,15 @@
+{
+  "id": "webview-reading-cost",
+  "category": "perception",
+  "prompt": "Look at my WhatsApp window and tell me what the buttons in the left navigation rail are called.",
+  "why": "What a reading of a webview application COSTS, and whether it can see anything at all. The rail is drawn as bare icons — OCR returns nothing for it — while the accessibility tree of the content window names every one. Before the webview routing, a look at WhatsApp read the frame instead: 6 elements, then a capture and an OCR pass producing 20,250 characters of payload with 'E Eat Sure' and '00.' in it. After, the same look returns 3,743 characters of accurate labels and no capture at all. Watch the tokens and seconds columns; the pass/fail only confirms it read the right window.",
+  "timeoutMs": 180000,
+  "assertFinalMessage": ["Channels", "Communities"],
+  "verify": [
+    {
+      "run": "Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes; $frame = Get-Process WhatsApp.Root -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $frame) { 'WHATSAPP-NOT-RUNNING'; exit }; $content = @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $frame.Id -and $_.Name -eq 'msedgewebview2.exe' } | ForEach-Object { $_.ProcessId }); $root = [System.Windows.Automation.AutomationElement]::RootElement; $names = @(); foreach ($w in $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)) { if ($content -contains $w.Current.ProcessId) { foreach ($e in $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) { $names += [string]$e.Current.Name } } }; if (($names -join '|') -match 'Communities') { 'RAIL-READABLE' } else { 'RAIL-NOT-READABLE' }",
+      "expect": "RAIL-READABLE"
+    }
+  ],
+  "manual": true
+}

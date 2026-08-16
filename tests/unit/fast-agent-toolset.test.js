@@ -773,7 +773,14 @@ test("a bare key name reaches the automation host as a keystroke", async () => {
 
   assert.deepEqual(
     sent.map((entry) => [entry.operation, entry.params.keys ?? entry.params.text]),
-    [["keyboard.press", "{ENTER}"], ["keyboard.press", "^s"], ["keyboard.type", "enter"]]
+    [
+      ["keyboard.press", "{ENTER}"], ["keyboard.press", "^s"], ["keyboard.type", "enter"],
+      // Typing asks what the focused control now holds. That one property read
+      // is what separates "the text landed in the box" from "the box has been
+      // empty the whole time" — and without it an empty box after Enter was
+      // read as proof of a send that never happened.
+      ["ui.focused", undefined]
+    ]
   );
 });
 
@@ -1903,41 +1910,65 @@ test("a send that did not leave the box is reported as not sent", async () => {
       "keyboard.press": async () => ({ performed: true })
     }),
     adapter: {
-      inspectUi: async () => ({
-        elements: [{
-          focused: true, name: "Search", value: focusedValue,
-          center: { x: 400, y: 250 }, boundingRect: { x: 300, y: 240, width: 200, height: 24 }
-        }]
+      focusedElement: async () => ({
+        found: true, name: "Search", publishesValue: focusedValue() !== null, value: focusedValue()
       })
     }
   });
 
-  const send = async (focusedValue) => {
-    const toolset = messagingToolset(focusedValue);
+  // BEFORE AND AFTER, because only the pair means anything. What the box holds
+  // after Enter is not evidence on its own: WhatsApp's message box publishes
+  // value="\n" when EMPTY, so "it is empty now" is equally true of a box that
+  // was never typed into.
+  const send = async ([afterTyping, afterEnter]) => {
+    let current = afterTyping;
+    const toolset = messagingToolset(() => current);
     toolset.setConfirmer(async () => true);
     await toolset.execute("screen", { application: "WhatsApp" });
-    await toolset.execute("type", { text: "sybau" });
-    return toolset.execute("key", { keys: "enter" });
+    const typed = await toolset.execute("type", { text: "sybau" });
+    current = afterEnter;
+    return { typed, pressed: await toolset.execute("key", { keys: "enter" }) };
   };
 
   // The live bug: the text is still sitting there.
-  const stuck = await send("sybau");
-  assert.equal(stuck.ok, false, "a message still in the box has not been sent");
-  assert.match(stuck.text, /NOT SENT/);
-  assert.match(stuck.text, /somewhere other than the message box/);
-  assert.match(stuck.text, /Do NOT report this as sent/);
+  const stuck = await send(["sybau", "sybau"]);
+  assert.equal(stuck.pressed.ok, false, "a message still in the box has not been sent");
+  assert.match(stuck.pressed.text, /NOT SENT/);
+  assert.match(stuck.pressed.text, /CLICK THE SEND BUTTON/, "the text is already in the right box — press the button");
+  assert.match(stuck.pressed.text, /Do NOT report this as sent/);
 
-  // It really went.
-  const gone = await send("");
-  assert.equal(gone.ok, true);
-  assert.match(gone.text, /box is empty again/);
+  // It really went: the box HELD it, and then did not.
+  const gone = await send(["sybau", ""]);
+  assert.equal(gone.pressed.ok, true);
+  assert.match(gone.pressed.text, /left the box/);
 
   // The control publishes nothing. Unconfirmed is not failed — but it is also
   // not permission to claim it was sent.
-  const unknown = await send(null);
-  assert.equal(unknown.ok, true);
-  assert.match(unknown.text, /unconfirmed/i);
-  assert.match(unknown.text, /is not enough/);
+  const unknown = await send([null, null]);
+  assert.equal(unknown.pressed.ok, true);
+  assert.match(unknown.pressed.text, /UNCONFIRMED/);
+  assert.match(unknown.pressed.text, /CONVERSATION/);
+
+  // THE FLAGSHIP FAILURE, AS A TEST. The typing went into the search box, so the
+  // message box was empty before Enter and empty after it. The old check saw
+  // only the "after" and announced the message sent; 157,881 tokens later
+  // nothing had been sent. Emptiness proves nothing without a full box first.
+  // Nothing arrives, twice, with a fresh click in between. That is not a field
+  // the agent can correct its way out of, and saying so is what stops the forty
+  // steps of invented routes that cost 1,160,162 tokens live.
+  const neverLanded = await send(["", ""]);
+  assert.match(neverLanded.typed.text, /INPUT IS NOT REACHING THIS APPLICATION/);
+  assert.match(neverLanded.typed.text, /Do NOT try another way to type/);
+  assert.match(neverLanded.pressed.text, /UNCONFIRMED/);
+  assert.match(neverLanded.pressed.text, /never seen holding this text/);
+  assert.doesNotMatch(neverLanded.pressed.text, /^Sent/);
+
+  // And the other shape: the keystrokes DID arrive, in the wrong field. That one
+  // the agent can fix, so it is told which control took them and what is in it.
+  const wrongField = await send(["a search query", "a search query"]);
+  assert.match(wrongField.typed.text, /NOT IN THE BOX/, "the wrong-field warning comes at typing time");
+  assert.match(wrongField.typed.text, /"Search"/, "and it names the control the text actually went to");
+  assert.match(wrongField.typed.text, /Do not press Enter/);
 });
 
 test("enter outside a messaging app is not put through any of that", async () => {

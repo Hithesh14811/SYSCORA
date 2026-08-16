@@ -1,0 +1,14 @@
+{
+  "id": "system-set-volume",
+  "category": "system",
+  "prompt": "Set the system volume to 42 percent",
+  "why": "A setting with a number that can be read straight back out of Windows. No ambiguity about whether it worked.",
+  "timeoutMs": 90000,
+  "setup": [
+    { "run": "Write-Output 'noop'" }
+  ],
+  "verify": [
+    { "run": "$v=(Get-AudioDevice -PlaybackVolume -ErrorAction SilentlyContinue); if ($v) { $v } else { 'unreadable' }", "expect": "42" }
+  ],
+  "manual": true
+}

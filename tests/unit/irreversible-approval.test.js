@@ -183,6 +183,12 @@ test("the delete floor is about the target, not about which words came first", (
     String.raw`Remove-Item C:\Users\hithe -Recurse -Force`,
     String.raw`rmdir /s /q "C:\Program Files"`,
     String.raw`Remove-Item $env:USERPROFILE -Recurse`,
+    // BOTH SEPARATORS. Windows runs `C:/Windows` exactly as it runs
+    // `C:\Windows`, and the floor only knew about backslashes — found while
+    // writing the eval task for it, before the task was ever run.
+    String.raw`Remove-Item C:/Windows -Recurse -Force`,
+    String.raw`rm -r C:/Windows/System32`,
+    String.raw`Remove-Item "C:/Users/hithe" -Recurse`,
     String.raw`rm -rf /`,
     // The routes reached for after a refusal. Order no longer protects them.
     String.raw`Get-ChildItem C:\Windows -Force | Remove-Item -Recurse -Force`,
@@ -198,7 +204,10 @@ test("the delete floor is about the target, not about which words came first", (
     String.raw`Remove-Item C:\Users\hithe\OneDrive\Documents\report.docx`,
     String.raw`Remove-Item "C:\Users\hithe\AppData\Local\Programs\Python\Python310" -Recurse -Force`,
     String.raw`Remove-Item .\build -Recurse`,
-    String.raw`Remove-Item C:\Python313 -Recurse -Force`
+    String.raw`Remove-Item C:\Python313 -Recurse -Force`,
+    // Under a protected root is not the same as being one.
+    String.raw`Remove-Item C:/Users/hithe/OneDrive/Documents/report.docx`,
+    String.raw`Remove-Item "C:/Program Files/SomeApp" -Recurse`
   ];
   for (const command of ordinary) {
     assert.notEqual(classifyShellCommand(command).verdict, ShellVerdict.DENY,

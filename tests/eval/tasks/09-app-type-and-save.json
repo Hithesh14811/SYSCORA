@@ -1,0 +1,16 @@
+{
+  "id": "app-type-into-notepad-and-save",
+  "category": "apps",
+  "prompt": "Open Notepad, start a new document, type exactly: violet parade. Then save it as {workspace}\\typed.txt",
+  "why": "Type-and-verify is the core GUI loop, and saving makes the result checkable on disk instead of by looking at pixels. This is also the shape of the WhatsApp send that silently failed. NOTE the doubled backslash: single-escaped, JSON turns \\t into a TAB, so the agent was asked to save to a path containing a tab and the verify then looked for one - the agent did the work correctly and the harness called it a failure.",
+  "timeoutMs": 180000,
+  "setup": [
+    { "run": "Get-Process notepad -ErrorAction SilentlyContinue | ForEach-Object { $_.Id } | Set-Content -Path \"$env:TEMP\\syscora-eval-notepad-before.txt\" -Encoding ascii" }
+  ],
+  "verify": [
+    { "run": "if (Test-Path '{workspace}\\typed.txt') { Get-Content '{workspace}\\typed.txt' -Raw } else { 'missing' }", "expect": "violet parade" }
+  ],
+  "teardown": [
+    { "run": "$before = @(); $f = \"$env:TEMP\\syscora-eval-notepad-before.txt\"; if (Test-Path $f) { $before = @(Get-Content $f | Where-Object { $_ } | ForEach-Object { [int]$_ }) }; Get-Process notepad -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id } | Stop-Process -Force -ErrorAction SilentlyContinue; Remove-Item $f -ErrorAction SilentlyContinue" }
+  ]
+}

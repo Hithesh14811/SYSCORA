@@ -6,3 +6,4 @@ dist/
 *.tap
 probe-*.json
 anaconda_projects/
+tests/eval/results/

@@ -1,0 +1,11 @@
+{
+  "id": "files-create-folder-and-file",
+  "category": "files",
+  "prompt": "Create a folder called notes in {workspace} and put a file called hello.txt inside it containing the words blue horizon",
+  "why": "The most ordinary thing anyone will ask. Verified on disk, not by asking the agent whether it worked.",
+  "timeoutMs": 120000,
+  "verify": [
+    { "run": "Test-Path '{workspace}/notes/hello.txt'", "expect": "True" },
+    { "run": "Get-Content '{workspace}/notes/hello.txt' -Raw -ErrorAction SilentlyContinue", "expect": "blue horizon" }
+  ]
+}

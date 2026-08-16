@@ -565,3 +565,81 @@ test("scrolling and drawing may repeat as much as they need to", async () => {
 
   assert.equal(scrolls.length, 8, "every identical scroll must actually run");
 });
+
+// A STOP WITHOUT A QUESTION OR A REASON IS INDISTINGUISHABLE FROM A CRASH.
+//
+// The flagship run, measured: four steps and 43,214 tokens into "send jingalala
+// ho to amma on whatsapp" it settled COMPLETED having only clicked the search
+// box. Nothing had failed and nothing had been asked; the user typed "continue"
+// and it carried straight on, which is the proof it had not finished.
+test("narrating the next step instead of taking it is not finishing", async () => {
+  const clicks = [];
+  const toolset = stubToolset({
+    click: async (args) => { clicks.push(args); return { ok: true, text: "Clicked." }; },
+    type: async () => ({ ok: true, text: "Typed." })
+  });
+  const turns = [
+    { text: "Opening the chat.", toolCalls: [{ name: "click", args: { text: "Amma" } }] },
+    // The stall: prose about what comes next, no call.
+    { text: "I've clicked the search box. Now I'll type the contact's name." },
+    // After the nudge it does the work.
+    { text: "Typed it.", toolCalls: [{ name: "type", args: { text: "Amma" } }] },
+    { text: "Done — the message is in the conversation at 9:52 pm." }
+  ];
+
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });
+  const outcome = await agent.run("send jingalala ho to amma on whatsapp");
+
+  assert.equal(outcome.status, "COMPLETED");
+  assert.equal(clicks.length, 1);
+  assert.match(outcome.message, /9:52 pm/, "it must carry on to the real answer, not stop at the narration");
+});
+
+// One nudge, once. A model that stalls twice is not COMPLETED, and saying it is
+// would also offer the stall to the recorder as a route worth saving.
+test("a run that stalls and stays stalled is reported as unfinished", async () => {
+  const toolset = stubToolset({ click: async () => ({ ok: true, text: "Clicked." }) });
+  const turns = [
+    { text: "Opening it.", toolCalls: [{ name: "click", args: { text: "Amma" } }] },
+    { text: "I've clicked the search box. Now I'll type the name." },
+    { text: "Next, I'll press enter to send it." }
+  ];
+
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });
+  const outcome = await agent.run("send jingalala ho to amma on whatsapp");
+
+  assert.equal(outcome.status, "PARTIALLY_COMPLETED");
+  assert.match(outcome.message, /stopped before finishing/);
+});
+
+// Asking IS a reason to stop. The run is waiting on the user, and nudging a
+// question costs a step and answers nothing.
+test("a question to the user ends the run without a nudge", async () => {
+  const toolset = stubToolset({ click: async () => ({ ok: true, text: "Clicked." }) });
+  const turns = [
+    { text: "Opening it.", toolCalls: [{ name: "click", args: { text: "Amma" } }] },
+    { text: "There are two chats called Amma. Which one did you mean?" }
+  ];
+
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });
+  const outcome = await agent.run("send jingalala ho to amma on whatsapp");
+
+  assert.equal(outcome.status, "COMPLETED");
+  assert.equal(outcome.steps, 2, "no extra step was spent nudging a question");
+  assert.match(outcome.message, /Which one did you mean\?/);
+});
+
+// And an ordinary finished answer must not pay for any of this.
+test("a finished answer settles on the spot", async () => {
+  const toolset = stubToolset({ run: async () => ({ ok: true, text: "v22.23.1" }) });
+  const turns = [
+    { text: "Checking.", toolCalls: [{ name: "run", args: { command: "node -v" } }] },
+    { text: "Node is v22.23.1." }
+  ];
+
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });
+  const outcome = await agent.run("what version of node is installed");
+
+  assert.equal(outcome.status, "COMPLETED");
+  assert.equal(outcome.steps, 2, "a finished answer must not cost an extra model call");
+});

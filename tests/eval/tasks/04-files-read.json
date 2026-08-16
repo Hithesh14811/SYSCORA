@@ -1,0 +1,11 @@
+{
+  "id": "files-read-contents",
+  "category": "files",
+  "prompt": "Read the file {workspace}/secret.txt and tell me the codeword in it",
+  "why": "Reading is the other half of files, and the answer is checkable: the codeword is in the transcript or it is not.",
+  "timeoutMs": 90000,
+  "setup": [
+    { "run": "Set-Content -Path '{workspace}/secret.txt' -Value 'The codeword is marmalade.'" }
+  ],
+  "assertFinalMessage": "marmalade"
+}

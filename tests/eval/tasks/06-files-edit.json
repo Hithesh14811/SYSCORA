@@ -1,0 +1,15 @@
+{
+  "id": "files-edit-in-place",
+  "category": "files",
+  "prompt": "In the file {workspace}/config.txt, change the line that says mode=slow so it says mode=fast instead. Leave everything else alone.",
+  "why": "Editing without rewriting the file is what makes it usable on real work. Both halves are checked: the change landed AND nothing else moved.",
+  "timeoutMs": 120000,
+  "setup": [
+    { "run": "Set-Content '{workspace}/config.txt' @('name=demo','mode=slow','retries=3')" }
+  ],
+  "verify": [
+    { "run": "Get-Content '{workspace}/config.txt' -Raw -ErrorAction SilentlyContinue", "expect": "mode=fast" },
+    { "run": "Get-Content '{workspace}/config.txt' -Raw -ErrorAction SilentlyContinue", "expect": "retries=3" },
+    { "run": "Get-Content '{workspace}/config.txt' -Raw -ErrorAction SilentlyContinue", "expectNot": "mode=slow" }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "id": "files-find-by-name",
+  "category": "files",
+  "prompt": "Find the file called needle.txt somewhere under {workspace} and tell me its full path",
+  "why": "Search is how every 'where did I put that' request works, and the path either appears in the answer or it does not.",
+  "timeoutMs": 120000,
+  "setup": [
+    { "run": "New-Item -ItemType Directory -Force -Path '{workspace}/a/b/c' | Out-Null; Set-Content '{workspace}/a/b/c/needle.txt' 'found me'" }
+  ],
+  "verify": [
+    { "run": "Test-Path '{workspace}/a/b/c/needle.txt'", "expect": "True" }
+  ],
+  "assertFinalMessage": "needle.txt"
+}

@@ -1,0 +1,17 @@
+{
+  "id": "webview-click-icon",
+  "category": "perception",
+  "prompt": "In my WhatsApp window, open the emoji picker in the message box.",
+  "why": "The headline of Phase 1. The emoji button is an ICON - no text, so OCR cannot see it - and it lives in WhatsApp's CONTENT window, a different top-level window from the one named 'WhatsApp'. Impossible before the webview routing landed. Opens a panel and nothing else: nothing is typed and nothing is sent, and the teardown closes it again. CAUTION: the verify below is measured against the CLOSED state only - WhatsApp was closed to the tray before the open state could be recorded - so it is known not to false-pass, but its list of open-state names is unconfirmed. Confirm on the first manual run and delete this sentence.",
+  "timeoutMs": 180000,
+  "verify": [
+    {
+      "run": "Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes; $frame = Get-Process WhatsApp.Root -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $frame) { 'WHATSAPP-NOT-RUNNING'; exit }; $content = @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $frame.Id -and $_.Name -eq 'msedgewebview2.exe' } | ForEach-Object { $_.ProcessId }); $wanted = @('Emoji','Emojis','GIFs','GIF','Stickers','Sticker','Avatars','Recents','Smileys & people','Search emoji','Search GIFs'); $root = [System.Windows.Automation.AutomationElement]::RootElement; $hit = $false; foreach ($w in $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)) { if ($content -notcontains $w.Current.ProcessId) { continue }; foreach ($e in $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) { try { if ($e.Current.IsOffscreen) { continue }; $type = $e.Current.ControlType.ProgrammaticName; if ($type -notmatch 'TabItem|Button|ListItem') { continue }; if ($wanted -contains [string]$e.Current.Name) { $hit = $true; break } } catch {} }; if ($hit) { break } }; if ($hit) { 'PICKER-OPEN' } else { 'PICKER-CLOSED' }",
+      "expect": "PICKER-OPEN"
+    }
+  ],
+  "teardown": [
+    { "run": "Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes; $frame = Get-Process WhatsApp.Root -ErrorAction SilentlyContinue | Select-Object -First 1; if ($frame) { $content = @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $frame.Id -and $_.Name -eq 'msedgewebview2.exe' } | ForEach-Object { $_.ProcessId }); $root = [System.Windows.Automation.AutomationElement]::RootElement; foreach ($w in $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)) { if ($content -notcontains $w.Current.ProcessId) { continue }; foreach ($e in $w.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) { if ([string]$e.Current.Name -eq 'Emojis, GIFs, Stickers') { try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch {}; break } } } }" }
+  ],
+  "manual": true
+}

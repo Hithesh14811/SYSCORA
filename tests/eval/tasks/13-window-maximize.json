@@ -1,0 +1,13 @@
+{
+  "id": "window-maximize",
+  "category": "apps",
+  "prompt": "Open Notepad and maximize its window",
+  "why": "Window state is a precondition every skill will depend on, and Windows reports it independently.",
+  "timeoutMs": 120000,
+  "verify": [
+    { "run": "if (Get-Process notepad -ErrorAction SilentlyContinue) { 'running' } else { 'no' }", "expect": "running" }
+  ],
+  "teardown": [
+    { "run": "Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force" }
+  ]
+}

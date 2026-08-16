@@ -1,0 +1,14 @@
+{
+  "id": "document-read-docx",
+  "category": "documents",
+  "prompt": "What does the document {workspace}\\report.docx say? Give me the text.",
+  "why": "A .docx is what people actually keep their work in. Before this was handled the agent read the zip bytes and called the file corrupt. NOTE the doubled backslash: single-escaped, JSON turns \\r into a carriage return, the fixture lands at a mangled path, and the agent is marked wrong for correctly reporting the file does not exist.",
+  "timeoutMs": 120000,
+  "setup": [
+    { "run": "node tests/eval/fixtures/make-docx.mjs '{workspace}\\report.docx'" }
+  ],
+  "verify": [
+    { "run": "Test-Path '{workspace}\\report.docx'", "expect": "True" }
+  ],
+  "assertFinalMessage": "quarterly"
+}

@@ -1,0 +1,15 @@
+{
+  "id": "skill-replay-file-write",
+  "category": "skills",
+  "prompt": "Create a file called routine.txt in {workspace} containing the word rehearsed",
+  "why": "docs/skills.md §12, and the whole commercial argument: the hundredth run of a request must not cost what the first one did. The runner sends this twice - once to derive and be offered a route, then again with that route saved - and the second run has to pass the SAME independent check, be answered by the route rather than the model, and come in under the token budget. A filesystem task on purpose: the verification is Test-Path, which cannot be fooled by anything the agent believes about itself.",
+  "timeoutMs": 180000,
+  "replayTwice": true,
+  "replayTokenBudget": 1000,
+  "setup": [
+    { "run": "Remove-Item '{workspace}\\routine.txt' -ErrorAction SilentlyContinue" }
+  ],
+  "verify": [
+    { "run": "if (Test-Path '{workspace}\\routine.txt') { Get-Content '{workspace}\\routine.txt' -Raw } else { 'missing' }", "expect": "rehearsed" }
+  ]
+}

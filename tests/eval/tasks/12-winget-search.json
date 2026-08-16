@@ -1,0 +1,8 @@
+{
+  "id": "packages-search-winget",
+  "category": "system",
+  "prompt": "Is VLC available to install through winget? Tell me the exact package id.",
+  "why": "Reads the package catalogue without changing anything, and the id is exact enough to check.",
+  "timeoutMs": 120000,
+  "assertFinalMessage": "VideoLAN.VLC"
+}

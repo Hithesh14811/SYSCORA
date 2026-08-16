@@ -1,0 +1,8 @@
+{
+  "id": "web-lookup-fact",
+  "category": "web",
+  "prompt": "Look up who wrote the book Project Hail Mary and tell me the author's name",
+  "why": "THE ONE THAT EXPOSED THE BROKEN BROWSER. When web_open fails with 'CDP connection failed' the agent falls back to scraping search engines through CAPTCHAs \u2014 a real run cost 803,000 tokens and 46 steps for an answer worth about six. It still SUCCEEDED, which is exactly why an eval is needed to see it.",
+  "timeoutMs": 180000,
+  "assertFinalMessage": "Weir"
+}

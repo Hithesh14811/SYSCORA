@@ -1,0 +1,13 @@
+{
+  "id": "app-launch-notepad",
+  "category": "apps",
+  "prompt": "Open Notepad",
+  "why": "The simplest GUI action there is. If this is not reliable, nothing built on it can be.",
+  "timeoutMs": 90000,
+  "verify": [
+    { "run": "if (Get-Process notepad -ErrorAction SilentlyContinue) { 'running' } else { 'no' }", "expect": "running" }
+  ],
+  "teardown": [
+    { "run": "Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force" }
+  ]
+}

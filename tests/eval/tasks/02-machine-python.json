@@ -1,0 +1,10 @@
+{
+  "id": "machine-python-installed",
+  "category": "machine",
+  "prompt": "is python installed on this machine, and which version",
+  "why": "The agent invented 'Node.js v22.14.0' once. A fact about THIS machine must come from a tool, and the version it reports must match what the machine actually reports.",
+  "timeoutMs": 90000,
+  "verify": [
+    { "run": "try { (python --version 2>&1) } catch { 'none' }", "expect": "Python" }
+  ]
+}

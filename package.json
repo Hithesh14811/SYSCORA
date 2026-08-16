@@ -14,7 +14,9 @@
     "desktop:dev": "electron apps/desktop-shell/src/main.js",
     "test": "node scripts/run-tests-bounded.js",
     "test:raw": "node --test --test-timeout=240000 --test-concurrency=1 --test-force-exit tests/**/*.test.js",
-    "capabilities:validate": "node --test tests/unit/capability-framework.test.js"
+    "capabilities:validate": "node --test tests/unit/capability-framework.test.js",
+    "eval": "node tests/eval/runner.mjs",
+    "eval:mock": "node tests/eval/runner.mjs --mock"
   },
   "devDependencies": {
     "electron": "^35.0.0"

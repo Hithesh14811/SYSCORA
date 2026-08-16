@@ -1,0 +1,11 @@
+{
+  "id": "multi-step-folder-file-report",
+  "category": "multi-step",
+  "prompt": "In {workspace}, create a folder called report, write three files in it named one.txt two.txt three.txt each containing its own name, then tell me how many files are in that folder",
+  "why": "Several dependent actions in one request. This is where a loop either holds its place or loses it, and where batching should show up as fewer steps. NOTE the doubled backslashes: single-escaped, JSON turned \\r and \\t into control characters, so both checks looked at paths that cannot exist and the task failed every run while the three files sat on disk exactly as asked.",
+  "timeoutMs": 180000,
+  "verify": [
+    { "run": "(Get-ChildItem '{workspace}\\report' -File -ErrorAction SilentlyContinue | Measure-Object).Count", "expect": "3" },
+    { "run": "Get-Content '{workspace}\\report\\two.txt' -Raw -ErrorAction SilentlyContinue", "expect": "two" }
+  ]
+}

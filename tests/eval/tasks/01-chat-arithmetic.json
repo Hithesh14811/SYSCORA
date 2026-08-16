@@ -1,0 +1,8 @@
+{
+  "id": "chat-arithmetic",
+  "category": "chat",
+  "prompt": "what is 17 times 23",
+  "why": "A question needing no tools must stay cheap. If this costs more than one step the routing is wrong, and every conversational turn in the product pays for it.",
+  "timeoutMs": 60000,
+  "assertFinalMessage": "391"
+}
