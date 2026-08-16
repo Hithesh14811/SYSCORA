@@ -20,6 +20,9 @@
 // about permission.
 
 import { buildToolset } from "./tools.js";
+import { describeHandover, matchSkill, replaySkill } from "./skill-replay.js";
+import { verifyReplayStep } from "./skill-verify.js";
+import { buildSkillFromRun } from "./skill-recorder.js";
 
 export { buildToolset };
 
@@ -65,19 +68,29 @@ const MACHINE_FACT_CLAIMED = /\bv?\d+\.\d+(?:\.\d+)+\b|\b[a-z]:\\[^\s"']+/i;
 // stub is recognisable if this runs again.
 const SUPERSEDED = "… [an earlier reading of this window, now out of date — it was read again below]";
 
+// EVERY earlier reading, not the first one found walking back.
+//
+// THIS WAS THE SINGLE MOST EXPENSIVE BUG IN THE PRODUCT. It stopped at the first
+// match, on the reasoning that anything older had already been collapsed when IT
+// was superseded. That holds only if every reading is a full listing. It is not:
+// a re-read of an unchanged window returns a THREE-LINE diff summary, which also
+// carries the windowId tag. So the walk found the little summary, collapsed
+// that, and returned — leaving the 110-line listing behind it in the
+// conversation, forever, re-sent on every subsequent step.
+//
+// Measured on "send message to amma on whatsapp", 16 Aug 2026: six full listings
+// accumulated, 66 steps, **1,160,162 tokens**. A collapsed reading is ~100
+// characters against ~5,000.
 function supersedeEarlierReading(messages, toolName, windowId) {
   if (toolName !== "screen" || !windowId) return;
   const tag = `(windowId ${windowId})`;
-  // Walk back from the one just added, and stop at the first match: anything
-  // older than that was already collapsed when IT was superseded.
   for (let index = messages.length - 2; index >= 0; index -= 1) {
     const message = messages[index];
     if (message.role !== "tool" || typeof message.content !== "string") continue;
     if (!message.content.includes(tag)) continue;
-    if (message.content.endsWith(SUPERSEDED)) return;
+    if (message.content.endsWith(SUPERSEDED)) continue;
     const heading = message.content.split("\n")[0];
     messages[index] = { ...message, content: `${heading}\n${SUPERSEDED}` };
-    return;
   }
 }
 
@@ -107,6 +120,97 @@ function claimsWithoutEvidence(text) {
   return ACTION_CLAIMED.test(said) || MACHINE_FACT_CLAIMED.test(said);
 }
 
+// STOPPING IN THE MIDDLE, WITH NOTHING TO SHOW AND NOTHING TO ASK.
+//
+// Measured on the flagship run: after four steps and 43,214 tokens the loop
+// settled COMPLETED having only clicked the search box. No error, no question,
+// no message sent — the user typed "continue" and it carried straight on, which
+// is the proof that it had not finished. A turn with no tool calls was taken as
+// the model finishing, and that is usually true; here it was the model narrating
+// what it was ABOUT to do and being taken at its word.
+//
+// A stop is legitimate when the answer is finished, or when the model needs
+// something only the user can give — and then it asks. Both are visible in the
+// text. What is left is a narration of an intention, and this is the shape of
+// one: it talks about what comes next rather than what happened.
+const ASKS_THE_USER = /\?\s*$|\?["')\]]*\s*$/;
+const NARRATES_AN_INTENTION =
+  /\b(?:i(?:'l+|\s+wil+)\s+(?:now\s+)?\w+|now\s+i(?:'l+|\s+wil+|\s+need|\s+have)|let\s+me\s+(?:now\s+)?\w+|next(?:,|\s+step)|i'?m\s+going\s+to|i\s+am\s+going\s+to|going\s+to\s+(?:click|type|open|search|send|press|read|look)|about\s+to\s+\w+|proceed(?:ing)?\s+to|continuing\s+(?:with|to))\b/i;
+// "Opening WhatsApp to find the chat with Amma." — one tool call, then that, and
+// the run ended COMPLETED. It promises nothing and reports nothing; it is the
+// commentary on a step, left standing where an answer should be. A finished
+// reply says what IS, not what is being done.
+const NARRATES_A_STEP =
+  /^(?:opening|reading|clicking|typing|searching|looking|checking|finding|scrolling|focusing|launching|starting|navigating|selecting|waiting|pressing|confirming|verifying|bringing|switching)\b/i;
+
+/**
+ * Did the model stop mid-task rather than finish?
+ *
+ * Only asked once actions have been taken — a purely conversational reply has
+ * nothing to be in the middle of. A question is never a stall: the run is
+ * waiting on the user, which is a reason, and a reason is all this is looking
+ * for.
+ */
+export function looksUnfinished(text) {
+  const said = String(text ?? "").trim();
+  if (!said) return true;
+  if (ASKS_THE_USER.test(said)) return false;
+  return NARRATES_AN_INTENTION.test(said) || NARRATES_A_STEP.test(said);
+}
+
+// A TOOL CALL THAT ARRIVED AS PROSE IS NOT AN ANSWER.
+//
+// Measured 15 Aug 2026, the type-and-save eval task: the provider emitted its
+// own tool-call sentinels into the CONTENT stream —
+// `<|DSML|parameter name="text" string="true">violet parade</|DSML|parameter>` —
+// so the loop saw a turn with no tool calls and text that looked like a reply,
+// and carried on. Nineteen steps and 238,643 tokens later the file had never
+// been written. The model never made the call; we accepted the wreckage of one.
+//
+// Deterministic to spot and cheap to handle: the sentinels are markup no answer
+// to a user ever contains. Discard the turn and ask for the step again, exactly
+// once, in the same family as the no-evidence backstop above — one extra step
+// against a run that is otherwise going to spend a hundred thousand tokens
+// treating broken markup as progress.
+//
+// It matters more from here on: a recorder that saves a run containing this
+// bakes the garbage into a skill, and the skill replays it forever.
+// The bar is FULL-WIDTH in what the provider actually emitted (U+FF5C, not the
+// ASCII pipe), which the first version of this regex missed entirely — the test
+// holds the captured string verbatim for that reason. Both are accepted.
+const BAR = "[|｜]";
+const TOOL_CALL_SENTINEL = new RegExp(
+  `(${BAR}DSML${BAR}|<${BAR}tool_calls?${BAR}>|<${BAR}function_calls?${BAR}>|<function_calls>|<invoke\\s|<${BAR}im_start${BAR}>|<${BAR}channel${BAR}>|<tool_call>|\\bfunctions\\.[a-z_]+\\s*\\{)`,
+  "i"
+);
+
+export function looksLikeMalformedToolCall(text) {
+  return TOOL_CALL_SENTINEL.test(String(text ?? ""));
+}
+
+// What the user is told when a saved route answered. It has to say a route was
+// used and which one: a reply that appears instantly with no working-out shown
+// is unsettling if nothing explains it, and the skill is the thing they can
+// inspect, correct or delete when it starts doing the wrong thing.
+// A file name for a route, derived from what was asked. Only ever a suggestion:
+// the user renames it in the panel, and two similar requests landing on the same
+// id is a collision they can see rather than a silent overwrite of a route that
+// worked — which is why the recorder returns it and the store, not this, decides.
+function slugFor(userText) {
+  return String(userText ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .split("-")
+    .slice(0, 6)
+    .join("-") || "skill";
+}
+
+function describeReplay(skill, outcome) {
+  return `Done — replayed "${skill.title ?? skill.id}" (${outcome.steps} steps, ` +
+    `${(outcome.elapsedMs / 1000).toFixed(1)}s, no model calls).`;
+}
+
 const SYSTEM_PROMPT = `You are SYSCORA, an agent with full control of this Windows machine. You do things; you do not describe how the user could do them.
 
 HOW YOU WORK
@@ -119,6 +223,7 @@ HOW YOU WORK
 - SENDING IS NOT TYPING. Words on the screen do not mean a message was sent — text sitting unsent in the box looks exactly the same. It is sent when the box is EMPTY and the message is in the conversation with a timestamp. Check both before you say it went.
 - WHEN YOU ARE STUCK, ASK. If you have tried the same idea twice and you are no closer, the answer is not a third variation — it is a question. Say what you looked for, what you actually found, and what you need from the user, and stop. Two wrong attempts at somebody's WhatsApp contact is worth a question; ten is not.
 - YOU HAVE NOT DONE IT UNTIL A TOOL HAS DONE IT, AND YOU DO NOT KNOW IT UNTIL A TOOL HAS TOLD YOU. Asked to pause, open, close, send, install or delete something, you call a tool — saying "Paused it" without one is a lie, and the user finds out immediately. The same goes for facts about THIS machine: a version number, a path, whether something is installed, what is in a file. Never state one from memory. If you find yourself about to write "v22.14.0" or "it's installed" or "I've paused it" without a tool result in front of you, stop and call the tool instead. You are allowed to know general things about the world; you are not allowed to guess about this computer.
+- BUT DO NOT REACH FOR A TOOL TO DO YOUR THINKING. Arithmetic, definitions, translations, what a word means, who wrote a book you already know — answer those yourself, in one step. Measured: "what is 17 times 23" cost three PowerShell calls and 37,000 tokens because the answer was correct and the route was absurd. A tool is for reading or changing THIS machine, or for looking up something you genuinely do not know. It is not a calculator.
 - WRITE DOWN WHAT YOU HAD TO WORK OUT. When you learn something that would save the work next time — which folder they mean by "my project", the real name a contact is filed under, which of two accounts is theirs, how they like something done — call \`remember\` with it, in one sentence. You start every conversation knowing only what is below; this is the only way anything reaches the next one.
 
 CHOOSING A TOOL
@@ -211,7 +316,12 @@ export class FastAgent {
     maxSteps = DEFAULT_MAX_STEPS,
     maxElapsedMs = DEFAULT_MAX_ELAPSED_MS,
     signal = null,
-    systemPrompt = SYSTEM_PROMPT
+    systemPrompt = SYSTEM_PROMPT,
+    // The saved routes, or nothing. DEFAULTS TO NOTHING ON PURPOSE: with no
+    // store wired, not one line of the loop below behaves differently, so a
+    // surface that has not opted in cannot be broken by this and neither can
+    // any existing test. `{ list, recordRun }` — see skills.js.
+    skills = null
   }) {
     this.provider = provider;
     this.toolset = toolset;
@@ -220,10 +330,93 @@ export class FastAgent {
     this.maxElapsedMs = maxElapsedMs;
     this.signal = signal;
     this.systemPrompt = systemPrompt;
+    this.skills = skills;
+  }
+
+  /**
+   * Answer from a saved route, if one fits and it can prove every step.
+   *
+   * Returns a settled run when the replay finished, `{ handover }` when it
+   * stopped part-way and the model should carry on from there, or null when
+   * there was nothing to replay.
+   *
+   * EVERYTHING IN HERE IS BEST-EFFORT. A skill is a speed optimisation; if
+   * anything about it misbehaves — a corrupt file, a store that throws, a match
+   * that goes wrong — the request must still be answered the ordinary way. That
+   * is what the catch is for, and why it swallows rather than reports.
+   */
+  async _tryReplay(userText, startedAt) {
+    if (!this.skills?.list) return null;
+    try {
+      const skills = await this.skills.list();
+      const match = matchSkill(skills, userText);
+      if (!match) return null;
+      await this._emit({ type: "SKILL_REPLAY_STARTED", details: { skill: match.skill.id, parameters: match.parameters } });
+      const outcome = await replaySkill({
+        skill: match.skill,
+        parameters: match.parameters,
+        execute: (tool, args) => this.toolset.execute(tool, args, { signal: this.signal }),
+        verifyStep: (check, context) => verifyReplayStep(check, {
+          execute: (tool, args) => this.toolset.execute(tool, args, { signal: this.signal }),
+          focusedValue: this.toolset.focusedValue ? () => this.toolset.focusedValue() : null,
+          lastResult: context?.result
+        })
+      });
+      await this.skills.recordRun?.(match.skill.id, { clean: outcome.replayed === true });
+      if (outcome.replayed) {
+        await this._emit({ type: "SKILL_REPLAYED", details: { skill: match.skill.id, steps: outcome.steps, elapsedMs: outcome.elapsedMs } });
+        // No model was called, so there are no tokens to report. That zero is
+        // the entire point of the feature and it should show up in the numbers.
+        this._tokens = { in: 0, out: 0 };
+        return {
+          settled: this._settle("COMPLETED", describeReplay(match.skill, outcome), {
+            steps: outcome.steps, toolCalls: outcome.steps, startedAt
+          })
+        };
+      }
+      await this._emit({ type: "SKILL_HANDOVER", details: { skill: match.skill.id, failure: outcome.handover?.failure } });
+      return { handover: describeHandover(outcome.handover) };
+    } catch (error) {
+      await this._emit({ type: "SKILL_FAILED", details: { error: error?.message ?? String(error) } });
+      return null;
+    }
   }
 
   async _emit(event) {
     try { await this.onEvent(event); } catch { /* observers must not break the run */ }
+  }
+
+  /**
+   * Offer a run that worked as a route worth keeping. OFFER — not save.
+   *
+   * Saving silently would put a thing that drives the user's machine on their
+   * disk without them ever agreeing to it, and then replay it. `docs/skills.md`
+   * §9 says offered and §11 says never hide them; both point the same way. The
+   * surface shows it, the user accepts, and only then does anything persist.
+   *
+   * Best-effort like everything else here: a request that succeeded must not be
+   * reported as failed because deciding whether to remember it went wrong.
+   */
+  async _offerSkill(userText, performed, malformedTurns) {
+    if (!this.skills?.list) return;
+    try {
+      const candidate = buildSkillFromRun({
+        id: slugFor(userText),
+        userText,
+        status: "COMPLETED",
+        calls: performed,
+        malformedTurns
+      });
+      if (!candidate.recorded) {
+        // The refusals are the useful part — "step 3 is positional" means
+        // perception could not name a control, which is a bug worth fixing.
+        await this._emit({ type: "SKILL_NOT_OFFERED", details: { reasons: candidate.reasons } });
+        return;
+      }
+      await this._emit({ type: "SKILL_OFFERED", details: { skill: candidate.skill } });
+    } catch (error) {
+      await this._emit({ type: "SKILL_FAILED", details: { error: error?.message ?? String(error) } });
+    }
   }
 
   /**
@@ -249,6 +442,15 @@ export class FastAgent {
     // One cached PowerShell call answers both. It goes in the system message
     // rather than a tool result so it is in front of the model for the FIRST
     // decision, which is the one that picked the wrong folder and the wrong app.
+    // THE SAVED ROUTE FIRST, BEFORE ANYTHING IS PAID FOR.
+    //
+    // Ahead of the machine profile and the notes, because both cost a round trip
+    // and a replay needs neither: it is not deciding anything, it is repeating
+    // something already decided. This is where "twelve steps and a minute, every
+    // time" becomes three seconds and no model call.
+    const replay = await this._tryReplay(userText, startedAt);
+    if (replay?.settled) return replay.settled;
+
     const machine = await this._machineFacts();
     // And what it has been told before. Same argument as the machine profile:
     // in front of the model for the FIRST decision, because that is the one
@@ -262,12 +464,29 @@ export class FastAgent {
       })).filter((turn) => turn.content),
       { role: "user", content: String(userText) }
     ];
+    // A replay that stopped part-way is not a failed request: most of the work
+    // is done and the machine is in the middle of it. Handing the model the
+    // situation is what stops it starting from the top and doing the finished
+    // steps again — which, for a step that already sent something, means sending
+    // it twice.
+    if (replay?.handover) {
+      messages.push({ role: "user", content: `[SYSTEM] ${replay.handover}` });
+    }
 
     let steps = 0;
     let toolCalls = 0;
     let lastText = "";
     // Asked for evidence at most once per run. See the no-tool-calls branch.
     let nudgedForEvidence = false;
+    // One retry for a turn that arrived as tool-call markup. Once, because a
+    // provider that does it twice is broken in a way another prompt will not
+    // fix, and looping on it is the expensive failure this exists to stop.
+    let retriedMalformedTurn = false;
+    // What actually ran, in order, so a run that worked can be offered as a
+    // route. Collected always and used only when a store is wired — it is two
+    // fields per call and it keeps the recording decision out of the hot loop.
+    const performed = [];
+    let malformedTurns = 0;
     // What this request cost. The provider reports it per call and it was
     // counted internally and never shown, so the one number that tells you
     // whether a task was expensive was invisible to the person paying for it.
@@ -283,6 +502,12 @@ export class FastAgent {
     // no-progress guard.
     let unchangedReadings = 0;
     let nudgedForProgress = false;
+    // Set when a reading proves the screen moved. Clears the repeat guard, which
+    // otherwise banned actions that were working. See its call site.
+    let screenChangedSinceLastCall = false;
+    // See looksUnfinished: the loop settling COMPLETED on a turn that was
+    // describing the NEXT step, four steps into the flagship task.
+    let nudgedForUnfinished = false;
 
     while (steps < this.maxSteps) {
       if (this.signal?.aborted) {
@@ -339,6 +564,21 @@ export class FastAgent {
       this._tokens.in += Number(turn.usage?.prompt_tokens ?? turn.usage?.promptTokenCount ?? 0) || 0;
       this._tokens.out += Number(turn.usage?.completion_tokens ?? turn.usage?.candidatesTokenCount ?? 0) || 0;
 
+      // Checked BEFORE the text becomes `lastText`: a settle takes whatever
+      // `lastText` holds, so letting the markup through here is how it reaches
+      // the user as the final answer to their request.
+      if (turn.toolCalls.length === 0 && looksLikeMalformedToolCall(turn.text) && !retriedMalformedTurn) {
+        retriedMalformedTurn = true;
+        malformedTurns += 1;
+        await this._emit({ type: "MALFORMED_TURN", details: { text: String(turn.text).slice(0, 200) } });
+        messages.push({
+          role: "user",
+          content: "[SYSTEM] Your last turn contained tool-call markup as text, so no tool ran and nothing " +
+            "happened. Make the call properly, as a tool call. Do not describe it and do not write markup."
+        });
+        continue;
+      }
+
       if (turn.text.trim()) {
         lastText = turn.text.trim();
         await this._emit({ type: "AGENT_SAYS", details: { text: lastText } });
@@ -372,6 +612,38 @@ export class FastAgent {
           });
           continue;
         }
+        // A STOP WITHOUT A REASON IS INDISTINGUISHABLE FROM A CRASH.
+        //
+        // Same family as the backstop above, same cost: one extra step, once.
+        // The run had done four things and then narrated a fifth it never did.
+        // Asking "have you finished?" is not enough — it invites a yes; this
+        // says what the two honest answers are and makes it pick one.
+        if (toolCalls > 0 && !nudgedForUnfinished && looksUnfinished(lastText)) {
+          nudgedForUnfinished = true;
+          messages.push({ role: "assistant", content: turn.text || "" });
+          messages.push({
+            role: "user",
+            content: "[SYSTEM] You called no tool that turn, which ends the run — but you were describing " +
+              "something you had not done yet. The user sees this as you stopping in the middle for no " +
+              "reason.\nThere are two honest endings: FINISH the task now by calling the tools, or ask the " +
+              "user a direct question if you are genuinely blocked on something only they can answer. " +
+              "Narrating the next step is neither. Do one of the two."
+          });
+          continue;
+        }
+        // A run that stalled and did not recover is not COMPLETED. Saying it is
+        // costs the user the truth AND offers the stall as a route to save,
+        // because §9 only records from a completed run — so this is checked
+        // BEFORE the offer, not after.
+        if (toolCalls > 0 && nudgedForUnfinished && looksUnfinished(lastText)) {
+          return this._settle(
+            "PARTIALLY_COMPLETED",
+            `${lastText ? `${lastText}\n\n` : ""}I stopped before finishing that. What I already did is ` +
+            "still in place, so it is safe to ask again.",
+            { steps, toolCalls, startedAt }
+          );
+        }
+        await this._offerSkill(userText, performed, malformedTurns);
         return this._settle("COMPLETED", lastText || "Done.", { steps, toolCalls, startedAt });
       }
 
@@ -478,6 +750,22 @@ export class FastAgent {
         const attemptSignature = /^(click|move_mouse)$/.test(call.name)
           ? `${call.name}:${JSON.stringify(coarse(shown))}`
           : signature;
+        // "IT HAS NOT GOT YOU ANYWHERE" HAS TO BE TRUE.
+        //
+        // The count was never cleared, so an action that DID something still
+        // counted towards its own ban. Live: click the message box, type, click
+        // Send — each legitimately repeated as the task moved forward — and by
+        // the third round the loop refused `click "Send"` and `click "Type a
+        // message"` outright, on a screen that had changed between every one of
+        // them. It then invented worse routes (raw SendKeys, closing the app)
+        // and the run cost 66 steps and 1,160,162 tokens.
+        //
+        // The guard is about a loop that is going nowhere, so the screen
+        // changing is exactly the evidence that it is not. Every count resets.
+        if (screenChangedSinceLastCall) {
+          callCounts.clear();
+          screenChangedSinceLastCall = false;
+        }
         const attempts = (callCounts.get(attemptSignature) ?? 0) + 1;
         callCounts.set(attemptSignature, attempts);
         // Repetition is normal and correct for these: scrolling a long list,
@@ -532,6 +820,7 @@ export class FastAgent {
         // the one those calls failed in. Consecutive repeats are still refused.
         if (result.ok) failedCalls.clear();
         else failedCalls.set(signature, result.text);
+        performed.push({ tool: call.name, args: shown, ok: result.ok === true, verified: null });
         await this._emit({
           type: "TOOL_FINISHED",
           details: {
@@ -559,6 +848,9 @@ export class FastAgent {
         // what gets counted.
         if (call.name === "screen") {
           unchangedReadings = result.raw?.screenUnchanged ? unchangedReadings + 1 : 0;
+          // A reading that came back DIFFERENT is proof the screen moved, which
+          // is what clears the repeat guard. See its call site above.
+          if (result.raw?.screenUnchanged === false) screenChangedSinceLastCall = true;
         } else if (call.name !== "wait" && call.name !== "move_mouse") {
           // A real action resets the count; hovering and waiting do not, because
           // hovering and waiting are what the loop above is made of.

@@ -59,13 +59,26 @@ const DELETE_VERB = /\b(?:remove-item|ri|rmdir|rd|del|erase|rm|remove-childitem)
 // The trailing lookahead is what draws that line: the path has to END at the
 // protected root (optionally with a trailing slash or wildcard), followed by a
 // quote, whitespace, a separator, or the end of the line.
+//
+// BOTH SEPARATORS. Windows accepts `C:/Windows` exactly as it accepts
+// `C:\Windows`, and PowerShell runs either without complaint — so a floor that
+// only knew about backslashes let `Remove-Item C:/Windows -Recurse -Force`
+// straight through. Found by writing the eval task for it, before the task was
+// ever run.
+const SEP = String.raw`[\\/]`;
 const PROTECTED_ROOT = new RegExp([
-  // A bare drive: C:, C:\, C:\*
-  String.raw`[a-z]:\\?\*?(?=["'\s;,)]|$)`,
-  // The system directories, and the folder that holds every profile.
-  String.raw`[a-z]:\\(?:windows|winnt|program files(?: \(x86\))?|programdata|users|system32)\\?\*?(?=["'\s;,)]|$)`,
+  // A bare drive: C:, C:\, C:/, C:\*
+  String.raw`[a-z]:${SEP}?\*?(?=["'\s;,)]|$)`,
+  // Windows itself, AND anything inside it. Unlike the others this does not have
+  // to end at the root: `C:\Windows\System32` is not a folder somebody is
+  // tidying up, and neither is anything else under there.
+  String.raw`[a-z]:${SEP}(?:windows|winnt)(?:${SEP}[^"'\s;,)]*)?(?=["'\s;,)]|$)`,
+  // The rest are denied as roots only — deleting `C:\Program Files\SomeApp` is a
+  // clumsy uninstall, not an attack on the machine, and it still has to be
+  // confirmed by the CONFIRM table below.
+  String.raw`[a-z]:${SEP}(?:program files(?: \(x86\))?|programdata|users|system32)${SEP}?\*?(?=["'\s;,)]|$)`,
   // One whole user profile: C:\Users\<name>, but not C:\Users\<name>\anything.
-  String.raw`[a-z]:\\users\\[^\\/"'\s;,)]+\\?\*?(?=["'\s;,)]|$)`,
+  String.raw`[a-z]:${SEP}users${SEP}[^\\/"'\s;,)]+${SEP}?\*?(?=["'\s;,)]|$)`,
   // The same places by the names Windows itself uses for them.
   String.raw`%(?:systemroot|windir|systemdrive|userprofile|homepath)%`,
   String.raw`\$env:(?:systemroot|windir|systemdrive|userprofile|homepath)\b`,

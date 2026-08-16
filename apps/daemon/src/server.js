@@ -393,6 +393,37 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         return;
       }
 
+      // THE ROUTES THE AGENT HAS LEARNED, AND THE ONE PLACE THEY ARE CREATED.
+      //
+      // A run that worked is OFFERED (SKILL_OFFERED on the event stream) and
+      // never saved by itself. This is where the user's yes turns into a file:
+      // nothing that drives their machine gets written because a task happened
+      // to succeed. Deleting is one call and needs no ceremony — a skill they
+      // cannot remove is one they cannot correct.
+      if (request.method === "GET" && requestUrl.pathname === "/api/skills") {
+        const skills = await runtime.listSkills();
+        sendJson(response, 200, { envelope: buildEnvelope("skills_response", { skills }), skills });
+        return;
+      }
+
+      if (request.method === "POST" && requestUrl.pathname === "/api/skills") {
+        const body = await readJsonBody(request);
+        const parsed = parseRequestBodyWithEnvelope(body, "skill_save_request");
+        const saved = await runtime.saveSkill(parsed.payload?.skill);
+        sendJson(response, saved.saved ? 200 : 400, {
+          envelope: buildEnvelope("skill_save_response", saved, parsed.requestId),
+          ...saved
+        });
+        return;
+      }
+
+      if (request.method === "DELETE" && requestUrl.pathname.startsWith("/api/skills/")) {
+        const id = decodeURIComponent(requestUrl.pathname.slice("/api/skills/".length));
+        const removed = await runtime.deleteSkill(id);
+        sendJson(response, 200, { envelope: buildEnvelope("skill_delete_response", removed), ...removed });
+        return;
+      }
+
       if (request.method === "GET" && requestUrl.pathname === "/api/system/summary") {
         const summary = await runtime.inspectWindowsSystem();
         sendJson(response, 200, {

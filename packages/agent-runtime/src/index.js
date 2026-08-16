@@ -51,6 +51,7 @@ import { summarizeReadOnlyResults } from "./read-result-summary.js";
 import { PrerequisiteResolver } from "./prerequisite-resolver.js";
 import { EnvironmentModel } from "../../context-engine/src/environment-model.js";
 import { FastAgent, buildToolset } from "../../fast-agent/src/index.js";
+import { deleteSkill, readSkills, recordSkillRun, writeSkill } from "../../fast-agent/src/skills.js";
 
 export {
   InteractiveAgentController,
@@ -286,13 +287,55 @@ export class AgentRuntime {
 
   _ensureToolset(workspacePath = null) {
     if (!this._toolset) {
+      this._basePath = workspacePath ?? process.cwd();
       this._toolset = buildToolset({
         registry: this.capabilityRegistry,
         adapter: this.adapter,
-        basePath: workspacePath ?? process.cwd()
+        basePath: this._basePath
       });
     }
     return this._toolset;
+  }
+
+  /**
+   * The saved routes, as the loop wants them.
+   *
+   * Only `list` and `recordRun`: nothing here can WRITE a skill, because a run
+   * that worked is offered rather than saved (see `_offerSkill`), and the offer
+   * is accepted by the user through the surface. A route that drives somebody's
+   * machine should not appear on their disk because a task happened to succeed.
+   */
+  /** Every saved route. The surface lists these beside the chats. */
+  async listSkills() {
+    this._ensureToolset();
+    return readSkills(this._basePath ?? process.cwd());
+  }
+
+  /**
+   * Keep a route the user has just agreed to.
+   *
+   * The ONLY way a skill reaches the disk. `writeSkill` refuses anything
+   * positional or stepless and says why, and that refusal is passed straight
+   * back rather than softened — a skill saved with a coordinate in it is a macro
+   * that will click a blank pixel one day and report success.
+   */
+  async saveSkill(skill) {
+    this._ensureToolset();
+    if (!skill || typeof skill !== "object") return { saved: false, problems: ["no skill was given"] };
+    return writeSkill(this._basePath ?? process.cwd(), skill);
+  }
+
+  async deleteSkill(id) {
+    this._ensureToolset();
+    return deleteSkill(this._basePath ?? process.cwd(), id);
+  }
+
+  _skillStore() {
+    const basePath = this._basePath ?? process.cwd();
+    return {
+      list: () => readSkills(basePath),
+      recordRun: (id, outcome) => recordSkillRun(basePath, id, outcome)
+    };
   }
 
   /**
@@ -487,6 +530,7 @@ export class AgentRuntime {
       toolset,
       onEvent: emit,
       signal: options.signal ?? null,
+      skills: this._skillStore(),
       ...(Number.isFinite(Number(options.maxElapsedTime)) && Number(options.maxElapsedTime) > 0
         ? { maxElapsedMs: Number(options.maxElapsedTime) }
         : {})
