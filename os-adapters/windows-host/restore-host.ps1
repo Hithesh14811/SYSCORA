@@ -911,6 +911,16 @@ function Get-WindowList {
   })
 }
 
+# The process tree, flat: one row per process, id and parent id, nothing else.
+#
+# Deliberately not Get-Process: parentage is not on the PS 5.1 process object at
+# all, so this is the CIM class, and only the two columns — asking for the whole
+# Win32_Process row costs several times as much for fields nobody reads.
+function Get-ProcessParents {
+  @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId -ErrorAction SilentlyContinue |
+    ForEach-Object { @{ processId=[int]$_.ProcessId; parentProcessId=[int]$_.ParentProcessId } })
+}
+
 # Just the window the user is looking at.
 #
 # Get-WindowList calls Get-Process, Screen.FromHandle and DpiForWindow once per
@@ -981,11 +991,70 @@ function Select-Window($params) {
   return (Resolve-Window $params).window
 }
 
+# ACTIVATING THE CONTENT WINDOW IS NOT ACTIVATING THE APPLICATION.
+#
+# THE BUG BEHIND EVERY "IT TYPED AND NOTHING HAPPENED".
+#
+# A WebView2 application is two unrelated top-level windows: the frame the user
+# sees (WhatsApp.Root) and the Chromium content window that holds the interface
+# (msedgewebview2). Perception follows readings into the content window, so every
+# action afterwards aims at that handle. Activate it and Windows agrees it is the
+# foreground window — GetForegroundWindow returns it, WindowFromPoint says the
+# pixel is its, UIA reports the message box focused and holding text. The
+# APPLICATION SHELL never learns it is active, so its composer draws no caret and
+# discards every keystroke, chord and paste in silence.
+#
+# Measured on a window in exactly that state, 16 Aug 2026:
+#   activate 197286 (content) -> type -> box unchanged ("\n")
+#   activate 198130 (frame)   -> type -> box holds "k"   *** works ***
+#
+# Live this cost one send 66 steps and 1,160,162 tokens. It belongs here rather
+# than in the caller because a caller that names the application instead of the
+# handle — `focus msedgewebview2` — bypasses anything done further up, and that
+# is precisely how it came back after being fixed there.
+$script:FrameOfContent = @{}
+
+function Find-OwningFrame($window) {
+  if (-not $window -or $window.className -notmatch '^Chrome_WidgetWin_\d+$') { return $null }
+  $key = [string]$window.windowId
+  if ($script:FrameOfContent.ContainsKey($key)) { return $script:FrameOfContent[$key] }
+  $frame = $null
+  try {
+    $parents = @{}
+    foreach ($row in (Get-ProcessParents)) { $parents[[int]$row.processId] = [int]$row.parentProcessId }
+    # Walk up from the content window's process; the first OTHER top-level
+    # window belonging to an ancestor is the frame this content is drawn in.
+    $ancestors = @()
+    $current = [int]$window.processId
+    for ($depth = 0; $depth -lt 6; $depth++) {
+      $parent = $parents[$current]
+      if (-not $parent -or $parent -le 0 -or $ancestors -contains $parent) { break }
+      $ancestors += $parent
+      $current = $parent
+    }
+    if ($ancestors.Count -gt 0) {
+      foreach ($candidate in (Get-WindowList)) {
+        if ([string]$candidate.windowId -eq $key) { continue }
+        if ($ancestors -contains [int]$candidate.processId) { $frame = $candidate; break }
+      }
+    }
+  } catch { $frame = $null }
+  $script:FrameOfContent[$key] = $frame
+  return $frame
+}
+
 function Acquire-Foreground($params) {
   $attempts=@()
   for($i=0;$i -lt 3;$i++){
     $resolved=Resolve-Window $params
     if(-not $resolved.resolved){return @{acquired=$false;reason="window-not-found";attempts=$attempts;resolution=$resolved}}
+    # The shell first, so the application knows it is active, then the content
+    # window so the keystrokes have somewhere to land. Both, in that order.
+    $owningFrame = Find-OwningFrame $resolved.window
+    if ($owningFrame -and -not [M4Native]::IsForeground([IntPtr][Int64]$owningFrame.windowId)) {
+      [M4Native]::Activate([IntPtr][Int64]$owningFrame.windowId) | Out-Null
+      Start-Sleep -Milliseconds 60
+    }
     $window=$resolved.window;$handle=[IntPtr][Int64]$window.windowId
     if([M4Native]::IsForeground($handle)){return @{acquired=$true;window=$window;attempts=$attempts;resolution=$resolved}}
     [M4Native]::ShowWindow($handle,9)|Out-Null
@@ -1050,25 +1119,389 @@ function Convert-Element($element, $windowId, $windowIdentity=$null) {
   }
 }
 
+# EVERY `.Current.X` IS A CROSS-PROCESS CALL, AND THERE ARE TWENTY PER ELEMENT.
+#
+# Reading a window this way asks the other process for the name, then the role,
+# then the class, then the rectangle, then each of six patterns, one round trip
+# each. Ninety elements is roughly eighteen hundred round trips, which is where
+# the 1.4 seconds in a WhatsApp reading went — not in finding the elements, in
+# fetching their properties one at a time.
+#
+# A CacheRequest asks for all of it in ONE crossing: everything named below is
+# fetched during FindAll and read afterwards from `.Cached`, in-process and free.
+#
+# Deliberately a separate converter rather than a flag on Convert-Element. Every
+# other caller — ui.find, ui.action, the Spotify queue check — keeps the live
+# `.Current` path it has always had, so the blast radius of this is exactly the
+# one operation it was written to speed up. A property read from `.Cached` that
+# was never added to the request THROWS, so the two lists have to agree; that is
+# the whole reason they sit next to each other here.
+function New-UiCacheRequest {
+  $cache = New-Object System.Windows.Automation.CacheRequest
+  foreach ($property in @(
+    [System.Windows.Automation.AutomationElement]::NameProperty,
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+    [System.Windows.Automation.AutomationElement]::NativeWindowHandleProperty,
+    [System.Windows.Automation.AutomationElement]::BoundingRectangleProperty,
+    [System.Windows.Automation.AutomationElement]::IsEnabledProperty,
+    [System.Windows.Automation.AutomationElement]::IsOffscreenProperty,
+    [System.Windows.Automation.AutomationElement]::HasKeyboardFocusProperty,
+    [System.Windows.Automation.ValuePattern]::ValueProperty,
+    [System.Windows.Automation.TogglePattern]::ToggleStateProperty,
+    [System.Windows.Automation.ExpandCollapsePattern]::ExpandCollapseStateProperty
+  )) { $cache.Add($property) }
+  foreach ($pattern in @(
+    [System.Windows.Automation.InvokePattern]::Pattern,
+    [System.Windows.Automation.ValuePattern]::Pattern,
+    [System.Windows.Automation.SelectionItemPattern]::Pattern,
+    [System.Windows.Automation.ExpandCollapsePattern]::Pattern,
+    [System.Windows.Automation.TogglePattern]::Pattern,
+    [System.Windows.Automation.ScrollItemPattern]::Pattern
+  )) { $cache.Add($pattern) }
+  # Full keeps the live element behind the cached one, so anything downstream
+  # that still reaches for .Current finds a working element rather than an
+  # exception. None is faster and has bitten every codebase that tried it.
+  $cache.AutomationElementMode = [System.Windows.Automation.AutomationElementMode]::Full
+  $cache.TreeScope = [System.Windows.Automation.TreeScope]::Element -bor [System.Windows.Automation.TreeScope]::Descendants
+  return $cache
+}
+
+function Convert-CachedElement($element, $windowId, $windowIdentity=$null) {
+  $r = $element.Cached.BoundingRectangle
+  $validRect = -not [double]::IsInfinity($r.X) -and -not [double]::IsNaN($r.X) -and
+    -not [double]::IsInfinity($r.Y) -and -not [double]::IsNaN($r.Y) -and
+    -not [double]::IsInfinity($r.Width) -and -not [double]::IsNaN($r.Width)
+  if(-not $validRect){$r=[System.Windows.Rect]::new(0,0,0,0)}
+  $patterns = @()
+  foreach ($pattern in @(
+    [System.Windows.Automation.InvokePattern]::Pattern,
+    [System.Windows.Automation.ValuePattern]::Pattern,
+    [System.Windows.Automation.SelectionItemPattern]::Pattern,
+    [System.Windows.Automation.ExpandCollapsePattern]::Pattern,
+    [System.Windows.Automation.TogglePattern]::Pattern,
+    [System.Windows.Automation.ScrollItemPattern]::Pattern
+  )) { try { if ($element.TryGetCachedPattern($pattern, [ref]$null)) { $patterns += $pattern.ProgrammaticName } } catch {} }
+  $currentValue = try { $element.GetCachedPattern([System.Windows.Automation.ValuePattern]::Pattern).Cached.Value } catch { $null }
+  $currentToggleState = try { $element.GetCachedPattern([System.Windows.Automation.TogglePattern]::Pattern).Cached.ToggleState.ToString() } catch { $null }
+  $currentExpandState = try { $element.GetCachedPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Cached.ExpandCollapseState.ToString() } catch { $null }
+  $nativeHandle = $element.Cached.NativeWindowHandle
+  $className = $element.Cached.ClassName
+  [pscustomobject]@{
+    targetId = [guid]::NewGuid().ToString()
+    source = "UIA"
+    windowId = [string]$windowId
+    automationId = $element.Cached.AutomationId
+    name = $element.Cached.Name
+    controlType = $element.Cached.ControlType.ProgrammaticName
+    className = $className
+    nativeWindowHandle = $nativeHandle
+    accessibleChildren = if($nativeHandle -ne 0 -and $className -match "(?i)TabControl"){
+      @([M4Native]::AccessibleChildNames([IntPtr][Int64]$nativeHandle))
+    }else{@()}
+    boundingRect = @{ x=[int]$r.X; y=[int]$r.Y; width=[int]$r.Width; height=[int]$r.Height }
+    enabled = $element.Cached.IsEnabled
+    focused = $element.Cached.HasKeyboardFocus
+    supportedPatterns = $patterns
+    value = $currentValue
+    toggleState = $currentToggleState
+    expandCollapseState = $currentExpandState
+    confidence = 0.95
+    observedAt = [DateTime]::UtcNow.ToString("o")
+    windowIdentity = if($windowIdentity){@{windowId=$windowIdentity.windowId;processId=$windowIdentity.processId;processName=$windowIdentity.processName;title=$windowIdentity.title;className=$windowIdentity.className}}else{$null}
+  }
+}
+
+# CHROMIUM HIDES THE WORDS OF A MESSAGE FROM THE CONTROL VIEW.
+#
+# THE FLAGSHIP BUG. A reading of WhatsApp came back with the conversation as
+# `group "You:"`, `group "Amma❤️:"`, `button "9:37 pm Read"` — the shape of the
+# chat and not one word of it. So a send could never be confirmed by reading the
+# chat, the agent fell back on "the input box is empty", and it reported a
+# message delivered that had never left the machine.
+#
+# Measured on this window, 16 Aug 2026 (scripts/probe-findall-gap.ps1):
+#
+#   FindAll, no cache request:         463   "singapore to sydney…" present: NO
+#   FindAll, default TreeFilter:       463   present: NO
+#   FindAll, RawViewCondition:        1137   present: YES
+#     control=False content=False offscreen=False type=ControlType.Text
+#
+# Chromium publishes message text with IsControlElement=false — raw view only.
+# FindAll under the control view therefore CANNOT return it, at any limit.
+#
+# Reading the whole raw view does find it and costs 1.8x (5848ms against
+# 3224ms), which is the wrong trade for every window that is not a conversation.
+# A CONDITION filters in the provider's process instead, so only the matching
+# nodes ever cross: onscreen Text in the raw view is 103 nodes in 221ms
+# (scripts/probe-rawview-cost.ps1, scripts/probe-text-pass.ps1).
+#
+# Also tried and rejected: TextPattern.GetVisibleRanges() on the document. One
+# call, but 1251ms and 5680 characters of per-node fragments — "St a t u s" —
+# with no coordinates, which is worse than what OCR was already giving us.
+$script:CHROMIUM_TEXT_BUDGET = 60
+
+function Get-HiddenTextTargets($root, $window, [int]$budget) {
+  if ($budget -le 0) { return @() }
+  $cache = New-UiCacheRequest
+  $cache.TreeFilter = [System.Windows.Automation.Automation]::RawViewCondition
+  $condition = New-Object System.Windows.Automation.AndCondition(
+    (New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+      [System.Windows.Automation.ControlType]::Text)),
+    (New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::IsOffscreenProperty, $false)))
+  $activation = $cache.Activate()
+  try {
+    $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+  } catch {
+    return @()
+  } finally {
+    $activation.Dispose()
+  }
+  # A CHAT-LIST PREVIEW IS WIDER THAN THE WINDOW IT IS IN. Rows came back at
+  # x=2382 and x=3480 on a window 2034 wide: the untruncated text behind a row
+  # that shows one clipped line. IsOffscreen says nothing about them, and none of
+  # it is on screen, so the window's own rectangle is what decides.
+  $frame = $window.bounds
+  $rows = @()
+  foreach ($element in $found) {
+    try {
+      $r = $element.Cached.BoundingRectangle
+      if ($r.Width -le 0 -or $r.Height -le 0) { continue }
+      if (-not $element.Cached.Name) { continue }
+      if ($frame -and ($r.X -lt $frame.x -or $r.Y -lt $frame.y -or
+        $r.X -gt ($frame.x + $frame.width) -or $r.Y -gt ($frame.y + $frame.height))) { continue }
+      $rows += [pscustomobject]@{ element = $element; x = [int]$r.X; y = [int]$r.Y }
+    } catch {}
+  }
+  # Top to bottom, so a conversation reads in the order it happened rather than
+  # in whatever order the tree walk found it.
+  return @($rows | Sort-Object y, x | Select-Object -First $budget)
+}
+
+# WHAT HAS THE KEYBOARD, ASKED DIRECTLY.
+#
+# The only reason this exists is that the answer was being reached the expensive
+# way. Reading back what the message box holds — the check that separates "typed"
+# from "sent" — was a whole ui.inspect, scanned for `focused = true`: a full tree
+# walk of the window, 3.9 SECONDS on WhatsApp, to look at one control. Paid once
+# after typing and once after Enter, that is eight seconds per message.
+#
+# UIA publishes the focused element as a property. No walk, no window resolution,
+# no cache request.
+function Get-FocusedElement($params) {
+  try {
+    $element = [System.Windows.Automation.AutomationElement]::FocusedElement
+  } catch {
+    return @{ found=$false; reason="focus-unavailable" }
+  }
+  if (-not $element) { return @{ found=$false; reason="nothing-focused" } }
+  # FOCUS STOPS AT THE WEBVIEW'S FRONT DOOR.
+  #
+  # Measured on WhatsApp with the message box clicked and holding the caret:
+  #
+  #   FocusedElement -> Pane "" class Microsoft.UI.Content.DesktopChildSiteBridge
+  #   the tree       -> Edit "Type a message to Amma❤️" value="\n"
+  #
+  # The desktop-level answer is the HOST for the Chromium content, not the
+  # control inside it — so the send check asked the wrong element and was told
+  # "this publishes no value", which it read as "cannot tell" for every message
+  # ever typed into a webview application. That is most of the modern desktop.
+  #
+  # Chromium does publish HasKeyboardFocus on the real control, and asked as a
+  # CONDITION it comes back in 106ms (scripts/probe-inner-focus.ps1) — the
+  # provider evaluates it in its own process, so nothing but the answer crosses.
+  #
+  # It has to start from the CONTENT window, not from the element we were handed:
+  # searching the bridge pane's descendants returns nothing, because the WebView2
+  # window is a separate TOP-LEVEL window with no parent and no owner — the same
+  # fact webview-windows.js exists for. So the caller passes the window it is
+  # working in, which is already the content window by the time anything is typed.
+  #
+  # Only entered when the element we were handed has no value of its own, so a
+  # native Edit answers on the first try and pays nothing for this.
+  $publishes = $false
+  try {
+    $publishes = $null -ne $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+  } catch {
+    $publishes = $false
+  }
+  if (-not $publishes -and $params -and $params.windowId) {
+    try {
+      $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][Int64]$params.windowId)
+      if ($root) {
+        # MORE THAN ONE ELEMENT CLAIMS THE KEYBOARD, AND THE FIRST IS THE WRONG ONE.
+        #
+        # Focus inside a page is reported all the way up: the Document says it has
+        # the keyboard AND so does the edit box inside it. FindFirst returns the
+        # outermost, and a Chromium Document's "value" is THE PAGE URL — so the
+        # send check compared a message against
+        # "https://web.whatsapp.com/?osBuild=26200&…", concluded the text had not
+        # landed, and sent the agent round the same click-and-type loop nine
+        # times for 891,618 tokens. The text was in the box the whole time.
+        #
+        # So take all of them and prefer one that can actually hold typed text.
+        $focusable = $root.FindAll(
+          [System.Windows.Automation.TreeScope]::Descendants,
+          (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::HasKeyboardFocusProperty, $true)))
+        $chosen = $null
+        foreach ($candidate in $focusable) {
+          try {
+            $type = $candidate.Current.ControlType.ProgrammaticName
+            if ($type -eq "ControlType.Edit" -or $type -eq "ControlType.ComboBox") { $chosen = $candidate; break }
+            # Anything is better than nothing, but a later one is deeper in the
+            # tree and therefore closer to the caret.
+            $chosen = $candidate
+          } catch {}
+        }
+        if ($chosen) { $element = $chosen }
+      }
+    } catch {}
+  }
+  try {
+    $r = $element.Current.BoundingRectangle
+    $value = try { $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { $null }
+    # A control with no ValuePattern publishes nothing, which is NOT the same as
+    # publishing an empty string. The caller has to be able to tell "the box is
+    # empty" from "this box never says what it holds" — conflating them is how a
+    # message that never left the machine got reported as sent.
+    $publishes = $null -ne $value
+    return @{
+      found = $true
+      publishesValue = $publishes
+      value = $value
+      name = $element.Current.Name
+      controlType = $element.Current.ControlType.ProgrammaticName
+      automationId = $element.Current.AutomationId
+      className = $element.Current.ClassName
+      boundingRect = @{ x=[int]$r.X; y=[int]$r.Y; width=[int]$r.Width; height=[int]$r.Height }
+      windowId = [string]([M4Native]::GetForegroundWindow().ToInt64())
+    }
+  } catch {
+    return @{ found=$false; reason="focus-read-failed" }
+  }
+}
+
+# PRESSING A BUTTON WITHOUT THE MOUSE.
+#
+# A SYNTHETIC CLICK IS THE LEAST RELIABLE WAY TO PRESS A CONTROL, and this is the
+# measurement that settles it. Live, 16 Aug 2026, sending one WhatsApp message:
+# `click "Send"` reported performed=true at 1958,1438 — the correct pixel, on a
+# window verified FOREGROUND, with WindowFromPoint confirming the pixel belongs
+# to that window — and nothing happened. Three times. Then the same coordinates
+# clicked without the surrounding activation worked. Reproduced 3/3 in
+# scripts/probe-click-after-steal.mjs: a click delivered after any other window
+# has held the foreground is swallowed, and no settle fixes it (0ms through
+# 500ms, all 0/3 — scripts/probe-settle.mjs).
+#
+# That is every approval-gated action: send, delete, purchase. The ones that
+# matter were the ones that silently did nothing, and the run cost 66 steps and
+# 1,160,162 tokens.
+#
+# InvokePattern is a cross-process call to the control itself. No z-order, no
+# foreground, no DPI, no compositor timing. Measured on this WhatsApp window:
+# FindFirst by name 50-70ms, Invoke 27ms (scripts/probe-invoke.ps1).
+#
+# Deliberately narrow: it presses a NAMED control that publishes InvokePattern.
+# Anything else — a canvas, a coordinate, a control with no Invoke — still goes
+# through the mouse, which is the honest tool for those.
+function Invoke-NamedControl($params) {
+  $windowId = [string]$params.windowId
+  if (-not $windowId) { return @{ performed=$false; reason="no-window" } }
+  $name = [string]$params.name
+  if (-not $name) { return @{ performed=$false; reason="no-name" } }
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][Int64]$windowId)
+    if (-not $root) { return @{ performed=$false; reason="window-not-found" } }
+    $condition = New-Object System.Windows.Automation.PropertyCondition(
+      [System.Windows.Automation.AutomationElement]::NameProperty, $name)
+    $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    if ($matches.Count -eq 0) { return @{ performed=$false; reason="no-such-control" } }
+    # TWO CONTROLS CAN SHARE A NAME. The caller read one of them off the screen
+    # and knows where it was, so the nearest match to that point is the one it
+    # meant — and when no point is given, only a single match is safe to press.
+    $chosen = $null
+    if ($null -ne $params.x -and $null -ne $params.y) {
+      $best = [double]::MaxValue
+      foreach ($candidate in $matches) {
+        try {
+          $r = $candidate.Current.BoundingRectangle
+          $dx = ($r.X + $r.Width / 2) - [double]$params.x
+          $dy = ($r.Y + $r.Height / 2) - [double]$params.y
+          $distance = [Math]::Sqrt($dx * $dx + $dy * $dy)
+          if ($distance -lt $best) { $best = $distance; $chosen = $candidate }
+        } catch {}
+      }
+      # Further than half a screen from where it was read is not the same
+      # control; fall back to the mouse rather than press something else.
+      if ($best -gt 400) { return @{ performed=$false; reason="moved-too-far"; distance=[int]$best } }
+    } elseif ($matches.Count -eq 1) {
+      $chosen = $matches[0]
+    } else {
+      return @{ performed=$false; reason="ambiguous"; matchCount=$matches.Count }
+    }
+    if (-not $chosen) { return @{ performed=$false; reason="no-such-control" } }
+    $r = $chosen.Current.BoundingRectangle
+    $pattern = $null
+    if (-not $chosen.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+      return @{ performed=$false; reason="no-invoke-pattern" }
+    }
+    $pattern.Invoke()
+    return @{
+      performed = $true
+      method = "InvokePattern"
+      name = $chosen.Current.Name
+      controlType = $chosen.Current.ControlType.ProgrammaticName
+      x = [int]($r.X + $r.Width / 2)
+      y = [int]($r.Y + $r.Height / 2)
+    }
+  } catch {
+    return @{ performed=$false; reason="invoke-failed"; detail=$_.Exception.Message }
+  }
+}
+
 function Get-UiElements($params) {
   $window = Select-Window $params
   if (-not $window) { return @{ window=$null; targets=@() } }
   $requestedLimit = if ($null -ne $params.maxElements) { [int]$params.maxElements } else { 200 }
   $limit = [Math]::Min(1000, [Math]::Max(1, $requestedLimit))
   $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][Int64]$window.windowId)
-  $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  $cache = New-UiCacheRequest
+  $activation = $cache.Activate()
+  try {
+    $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  } finally {
+    $activation.Dispose()
+  }
   $targets = @()
+  $seen = @{}
   foreach ($element in $all) {
     try {
-      $r = $element.Current.BoundingRectangle
-      $nativeNavigationContainer = $element.Current.NativeWindowHandle -ne 0 -and
-        ($element.Current.ClassName -match '(?i)(TabControl|Toolbar|Menu|TreeView|ListView)')
-      if (-not $element.Current.IsOffscreen -and $r.Width -gt 0 -and $r.Height -gt 0 -and
-        ($element.Current.Name -or $element.Current.AutomationId -or $nativeNavigationContainer)) {
-        $targets += Convert-Element $element $window.windowId $window
+      $r = $element.Cached.BoundingRectangle
+      $nativeNavigationContainer = $element.Cached.NativeWindowHandle -ne 0 -and
+        ($element.Cached.ClassName -match '(?i)(TabControl|Toolbar|Menu|TreeView|ListView)')
+      if (-not $element.Cached.IsOffscreen -and $r.Width -gt 0 -and $r.Height -gt 0 -and
+        ($element.Cached.Name -or $element.Cached.AutomationId -or $nativeNavigationContainer)) {
+        $targets += Convert-CachedElement $element $window.windowId $window
+        $seen["$([int]$r.X),$([int]$r.Y)|$($element.Cached.Name)"] = $true
         if ($targets.Count -ge $limit) { break }
       }
     } catch {}
+  }
+  # Only for the surfaces that hide text, and only with room left in the budget.
+  # A native window puts its labels in the control view like everything else, and
+  # pays nothing here.
+  if ($window.className -match '^Chrome_WidgetWin_\d+$' -and $targets.Count -lt $limit) {
+    $budget = [Math]::Min($script:CHROMIUM_TEXT_BUDGET, $limit - $targets.Count)
+    foreach ($row in (Get-HiddenTextTargets $root $window $budget)) {
+      $key = "$($row.x),$($row.y)|$($row.element.Cached.Name)"
+      if ($seen.ContainsKey($key)) { continue }
+      $seen[$key] = $true
+      $targets += Convert-CachedElement $row.element $window.windowId $window
+    }
   }
   return @{ window=$window; targets=$targets }
 }
@@ -1360,6 +1793,13 @@ function Invoke-Operation($operation, $params) {
     "host.health" { return @{ ok=$true; pid=$PID; protocol="m4-windows-host/1"; sta=([Threading.Thread]::CurrentThread.ApartmentState.ToString()); inputEngine="SendInput"; dpiAwareness=$script:DpiMode } }
     "window.enumerate" { return @{ windows=(Get-WindowList) } }
     "window.foreground" { return @{ window=(Get-ForegroundWindow) } }
+    # WHICH PROCESS STARTED WHICH. The only thing linking an application's frame
+    # window to the Chromium window holding its actual interface: WhatsApp.Root
+    # and the msedgewebview2 showing all 90 of its elements share no window
+    # handle, no parent and no owner — just a parent process id. Answered here
+    # rather than by spawning a PowerShell, which costs a second the caller is
+    # trying to save.
+    "process.parents" { return @{ processes=(Get-ProcessParents) } }
     "window.resolve" { return Resolve-Window $params }
     "window.wait" {
       $timeout=[Math]::Min(20000,[Math]::Max(100,[int]$params.timeoutMs));$watch=[Diagnostics.Stopwatch]::StartNew();$found=$null
@@ -1371,6 +1811,8 @@ function Invoke-Operation($operation, $params) {
     "window.state" { $w=Select-Window $params;if(-not $w){return @{performed=$false;reason="window-not-found"}};$commands=@{minimize=6;maximize=3;restore=9};$cmd=$commands[[string]$params.state];if(-not $cmd){throw "Unsupported window state"};return @{performed=[M4Native]::ShowWindow([IntPtr][Int64]$w.windowId,$cmd);windowId=$w.windowId;state=$params.state} }
     "window.moveResize" { $w=Select-Window $params;if(-not $w){return @{performed=$false;reason="window-not-found"}};return @{performed=[M4Native]::MoveWindow([IntPtr][Int64]$w.windowId,[int]$params.x,[int]$params.y,[int]$params.width,[int]$params.height,$true);windowId=$w.windowId} }
     "ui.inspect" { return Get-UiElements $params }
+    "ui.focused" { return Get-FocusedElement $params }
+    "ui.invoke" { return Invoke-NamedControl $params }
     "ui.find" { return Find-UiElement $params }
     "ui.action" { return Invoke-UiAction $params }
     "pointer.move" {

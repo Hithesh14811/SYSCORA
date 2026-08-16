@@ -5,6 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { getWindowsAutomationHost } from "../../windows-host/src/client.js";
 import { CdpBrowserAdapter } from "../../browser/src/cdp-browser-adapter.js";
 import { classifyShellCommand, ShellVerdict } from "../../../packages/policy-engine/src/shell-rules.js";
+import { accessibilityLaunchArgs } from "./webview-windows.js";
 
 function parseEnvContents(rawContents) {
   const pairs = new Map();
@@ -1529,9 +1530,26 @@ export class WindowsAdapter {
         { timeoutMs: 8000 }
       );
     }
+    // START IT SO IT CAN BE READ.
+    //
+    // An Electron application publishes NOTHING to the accessibility tree unless
+    // it is told to at launch: VS Code measured 4 elements without this flag and
+    // 157 with it, 3 named controls against 90. There is no way to ask an
+    // already-running one — the system-wide screen-reader flag was tested and
+    // moved nothing — so the one moment it can be fixed is here, and SYSCORA
+    // launches applications constantly. See accessibilityLaunchArgs for why this
+    // is a known list rather than every program.
+    const extraArgs = accessibilityLaunchArgs({
+      application: resolution.application,
+      target: resolution.target,
+      kind: resolution.kind
+    });
+    const argumentList = extraArgs.length
+      ? ` -ArgumentList @(${extraArgs.map((arg) => `'${escapePowerShellSingleQuoted(arg)}'`).join(",")})`
+      : "";
     return this.runPowerShell(
       `$ErrorActionPreference = 'Stop'; ` +
-      `$process = Start-Process -FilePath '${escapedTarget}' -PassThru; ` +
+      `$process = Start-Process -FilePath '${escapedTarget}'${argumentList} -PassThru; ` +
       `[pscustomobject]@{ started = $true; method = '${resolution.kind}'; processId = $process.Id; target = '${escapedTarget}' } | ConvertTo-Json -Compress`,
       { timeoutMs: 8000 }
     );
@@ -2457,6 +2475,41 @@ public static class SyscoraAudio {
   // control types and bounding rectangles are stable targets for an agent and
   // avoid unsafe coordinate guessing.  The caller may scope to one application
   // (recommended) or inspect the foreground-visible windows.
+  /**
+   * The control that has the keyboard right now, and what it holds.
+   *
+   * Null when there is no host to ask — which the caller must read as "could not
+   * check", never as "the box is empty". `publishesValue` false says the control
+   * has no ValuePattern at all, which is a third answer again: it will never
+   * tell us what is in it, so no number of retries will help.
+   */
+  async focusedElement({ windowId = null } = {}) {
+    if (!this.automationHost) return null;
+    try {
+      const focused = await this.hostRequest("ui.focused", { windowId }, { timeoutMs: 4000 });
+      return focused?.found ? focused : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Press a named control through UIA, with no mouse involved.
+   *
+   * Returns `{ performed: false, reason }` rather than throwing whenever this is
+   * not the right way to press this thing — no such name, no InvokePattern, two
+   * controls answering to it — so the caller can fall back to a real click
+   * without having to know why.
+   */
+  async invokeControl({ windowId = null, name = null, x = null, y = null } = {}) {
+    if (!this.automationHost || !windowId || !name) return { performed: false, reason: "unavailable" };
+    try {
+      return await this.hostRequest("ui.invoke", { windowId: String(windowId), name, x, y }, { timeoutMs: 6000 });
+    } catch (error) {
+      return { performed: false, reason: "host-error", detail: error?.message };
+    }
+  }
+
   async inspectUi({ application = null, windowId = null, maxElements = 120 } = {}) {
     if (this.automationHost) {
       try {
@@ -2600,6 +2653,51 @@ public static class SyscoraAudio {
       return result?.window ?? null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Every live process as processId -> parentProcessId.
+   *
+   * Exists for one question: which window really belongs to an application. An
+   * application's frame window and the Chromium window holding its interface
+   * share no handle, no parent window and no owner — only this. See
+   * `pickWebviewWindow`.
+   *
+   * Returns an empty Map rather than throwing when nothing can answer, because
+   * every caller's fallback is "then treat the frame as the application", which
+   * is exactly the old behaviour and never worse than it.
+   */
+  async listProcessParents() {
+    if (this.automationHost) {
+      try {
+        const result = await this.hostRequest("process.parents", {}, { timeoutMs: 6000 });
+        const parents = new Map();
+        for (const row of result?.processes ?? []) {
+          const pid = Number(row.processId);
+          const parent = Number(row.parentProcessId);
+          if (Number.isFinite(pid) && Number.isFinite(parent)) parents.set(pid, parent);
+        }
+        if (parents.size > 0) return parents;
+      } catch {
+        // Fall through: a host that cannot answer is a missed optimisation, not
+        // a failure of the reading that asked.
+      }
+    }
+    try {
+      const ps = await this.runPowerShell(
+        "Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId | " +
+        "ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }",
+        { timeoutMs: 8000 }
+      );
+      const parents = new Map();
+      for (const line of String(ps.stdout ?? "").split(/\r?\n/)) {
+        const [pid, parent] = line.trim().split(/\s+/).map(Number);
+        if (Number.isFinite(pid) && Number.isFinite(parent)) parents.set(pid, parent);
+      }
+      return parents;
+    } catch {
+      return new Map();
     }
   }
 

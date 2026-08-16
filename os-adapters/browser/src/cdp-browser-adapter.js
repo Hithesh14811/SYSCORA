@@ -162,12 +162,45 @@ export class CdpBrowserAdapter {
     return response.json();
   }
 
+  // IS THE BROWSER WE THINK WE HAVE ACTUALLY THERE?
+  //
+  // `this.process` is a ChildProcess object, and it stays truthy forever — a
+  // dead browser leaves it set exactly as a live one does. So does
+  // `this.connection`, whose socket has quietly closed along with the browser.
+  //
+  // That combination is what broke web browsing for a whole session: the user
+  // closed the controlled Chrome window (or it crashed, or the machine slept),
+  // the reuse branch below saw two truthy fields, and every later request tried
+  // to talk down a socket to a process that no longer existed. "CDP connection
+  // failed", permanently, until the daemon restarted. Live, the agent met that
+  // four times and fell back to scraping search engines through CAPTCHAs: 46
+  // steps and 803,000 tokens for a question worth six.
+  //
+  // Liveness is cheap to check and has to be checked, because the browser
+  // belongs to the user and they will close it.
+  _isAlive() {
+    if (!this.process) return false;
+    if (this.process.killed || this.process.exitCode !== null || this.process.signalCode !== null) return false;
+    const socketState = this.connection?.socket?.readyState;
+    return socketState === WebSocket.OPEN || socketState === WebSocket.CONNECTING;
+  }
+
   async launch({ url = "about:blank", headless = false, signal = null } = {}) {
     throwIfAborted(signal);
-    if (this.process && this.connection) {
-      if (url && url !== "about:blank") await this.navigate({ url, signal });
-      return { launched: true, reused: true, target: this.target };
+    if (this.connection && this._isAlive()) {
+      try {
+        if (url && url !== "about:blank") await this.navigate({ url, signal });
+        return { launched: true, reused: true, target: this.target };
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        // It looked alive and was not. Fall through to a fresh browser rather
+        // than reporting a dead session as a navigation failure.
+        this.close();
+      }
     }
+    // Anything left over from a browser that has since died would poison every
+    // later call, so it goes before a new one starts.
+    if (this.process || this.connection) this.close();
     this._transition(BrowserLifecycleState.DISCOVER);
     const executable = this._findExecutable();
     this._transition(BrowserLifecycleState.LAUNCH_CONTROLLED, { executable });

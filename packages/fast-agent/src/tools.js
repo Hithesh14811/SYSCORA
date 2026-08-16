@@ -36,6 +36,7 @@ import { describeNotes, forgetNote, readNotes, rememberNote } from "./notes.js";
 import { extractDocumentText, isDocumentPath } from "./documents.js";
 import { createProgressReader, reportsProgress } from "./command-progress.js";
 import { createWingetWatcher, isWingetInstall } from "./winget-progress.js";
+import { isWebviewHostProcess, normalizeWindow, pickWebviewWindow } from "../../../os-adapters/windows/src/webview-windows.js";
 
 const MAX_OUTPUT_CHARS = 6000;
 const MAX_SCREEN_TEXT_CHARS = 2500;
@@ -79,8 +80,44 @@ function normalizeLabel(value) {
 // loaded correctly every time.
 const CHROME_FURNITURE = /^(minimi[sz]e|maximi[sz]e|restore|close|back|forward|reload|home|stop|bookmark this tab|extensions|tab groups|all bookmarks|separator|new tab|tab search|view site information|install |open account menu|menu containing hidden bookmarks|saved tab groups|address and search bar)/i;
 const STRUCTURAL_ROLES = /^(window|pane|group|document|toolbar|separator|thumb|image)$/i;
+// Controls that hold text a person put there. Only these are worth printing a
+// value for: a button's "value" is noise, an edit box's value is the evidence.
+const EDITABLE_ROLE = /^(edit|combobox|text|spinner|searchbox)$/i;
 
-function elementRank(element, text) {
+// WHERE THE PAGE IS, RATHER THAN WHAT THE BUTTONS ARE CALLED.
+//
+// CHROME_FURNITURE below is a list of Chrome's button names, and a list only
+// knows the browser it was written against. Measured on Avast Secure Browser:
+// the first six rows offered to the model were "Privacy Guard", "Video
+// Downloader", "Your Side Panel" and "Security & Privacy Center" — that
+// browser's own toolbar, none of it in the list, each scoring +6 for being
+// clickable against a page's +2 for being text. On a results page, where the
+// 110-row cap actually binds, that is how a search comes back with every
+// toolbar icon and not one result.
+//
+// The tree already answers this without naming anything: the page lives inside
+// the Document node, so its rectangle separates content from furniture for every
+// browser, including ones nobody has heard of. Falls back to no adjustment when
+// there is no document — a native application has no page, and nothing changes.
+function pageRegion(elements) {
+  let best = null;
+  for (const element of elements ?? []) {
+    const role = String(element.role ?? element.controlType ?? "").replace(/^ControlType\./, "");
+    if (!/^document$/i.test(role)) continue;
+    const bounds = element.bounds ?? element.boundingRect;
+    if (!bounds || !(bounds.width > 0) || !(bounds.height > 0)) continue;
+    if (!best || bounds.width * bounds.height > best.width * best.height) best = bounds;
+  }
+  return best;
+}
+
+function withinRegion(center, region) {
+  if (!region || !center) return false;
+  return center.x >= region.x && center.x <= region.x + region.width
+    && center.y >= region.y && center.y <= region.y + region.height;
+}
+
+function elementRank(element, text, { region = null, center = null } = {}) {
   let score = 0;
   if (element.clickable === true) score += 6;
   if (text) score += 2;
@@ -91,8 +128,16 @@ function elementRank(element, text) {
   // Window chrome is reachable when it is genuinely wanted — "close this
   // window" is a real request — but it must never crowd out the content.
   if (CHROME_FURNITURE.test(text)) score -= 10;
+  // What the user is actually looking at outranks the frame around it. Only
+  // applied when a page was found, so native windows rank exactly as before.
+  if (region) score += withinRegion(center, region) ? 5 : -4;
   return score;
 }
+
+// Exported under a test name rather than as part of the toolset's surface: what
+// a reading LOOKS like to the model is worth pinning down, and it has been wrong
+// in expensive ways twice now.
+export { renderElements as renderElementsForTest };
 
 function renderElements(elements, table) {
   const lines = [];
@@ -103,6 +148,7 @@ function renderElements(elements, table) {
   const seen = new Map();
   const NEAR_PX = 40;
   const candidates = [];
+  const region = pageRegion(elements);
   for (const [order, element] of elements.entries()) {
     const text = String(element.text ?? element.name ?? "").replace(/\s+/g, " ").trim();
     const bounds = element.bounds ?? element.boundingRect;
@@ -112,6 +158,13 @@ function renderElements(elements, table) {
       y: Math.round(bounds.y + bounds.height / 2)
     };
     if (!text && element.clickable !== true) continue;
+    // SCROLLED OUT OF SIGHT IS NOT ON SCREEN.
+    //
+    // A WhatsApp reading listed `group "You:" @1564,-788` and seven more like it
+    // — messages above the top of the conversation, with NEGATIVE coordinates.
+    // They cannot be clicked, they say nothing, and they were paid for on every
+    // step. The application already says so; nothing was asking.
+    if (element.offscreen === true) continue;
     // Same words, near enough the same place: one thing, listed once.
     if (text) {
       const label = normalizeLabel(text);
@@ -121,7 +174,7 @@ function renderElements(elements, table) {
       placed.push(center);
       seen.set(label, placed);
     }
-    candidates.push({ element: { ...element, text, center }, text, center, order, rank: elementRank(element, text) });
+    candidates.push({ element: { ...element, text, center }, text, center, order, rank: elementRank(element, text, { region, center }) });
   }
   // EVERYTHING OBSERVED STAYS CLICKABLE; ONLY THE LISTING IS CUT.
   //
@@ -138,9 +191,39 @@ function renderElements(elements, table) {
   // The listing shows the highest-ranked, each with its real index — a label read
   // out of the visible text still resolves even when its row did not make the cut.
   for (const { element } of candidates) table.push(element);
+  // ONE CHAT ROW, FIVE LINES.
+  //
+  // A single WhatsApp conversation in the list arrived as:
+  //   dataitem "Amma ❤️ 11:32 am jingalala ho"
+  //   dataitem "Amma ❤️ 11:32 am"
+  //   text "Amma"   text "11:32 am"   text "jingalala ho"
+  // — the same row, whole, then partial, then in pieces. The near-duplicate rule
+  // above cannot see it because the strings differ. Every one of those lines was
+  // re-sent on every step of the task.
+  //
+  // A row whose words are wholly contained in a longer row that OVERLAPS it is
+  // that row, said again with less in it. The longest one wins; the pieces stay
+  // in the table so an index still resolves.
+  const contained = new Set();
+  for (const [index, candidate] of candidates.entries()) {
+    const own = normalizeLabel(candidate.text);
+    if (!own || own.length < 3) continue;
+    for (const [otherIndex, other] of candidates.entries()) {
+      if (otherIndex === index) continue;
+      const theirs = normalizeLabel(other.text);
+      if (theirs.length <= own.length) continue;
+      if (!theirs.includes(own)) continue;
+      // Overlapping, not merely similar: two chats can both say "Yesterday".
+      if (Math.abs(other.center.x - candidate.center.x) > 500) continue;
+      if (Math.abs(other.center.y - candidate.center.y) > 60) continue;
+      contained.add(index);
+      break;
+    }
+  }
   const shown = new Set(
     [...candidates]
       .map((candidate, index) => ({ candidate, index }))
+      .filter((entry) => !contained.has(entry.index))
       .sort((left, right) => right.candidate.rank - left.candidate.rank || left.index - right.index)
       .slice(0, MAX_ELEMENTS)
       .map((entry) => entry.index)
@@ -185,8 +268,25 @@ function renderElements(elements, table) {
     // visible one.
     const truncated = TRUNCATED_LABEL.test(text);
     const section = SECTION_HEADING.test(text) ? null : sectionOf(center, headings);
+    // WHAT IS IN THE BOX, NOT JUST WHAT THE BOX IS CALLED.
+    //
+    // An input's NAME is its placeholder, and a placeholder does not change when
+    // you type into it. So a reading of WhatsApp showed
+    // `edit "Type a message to Amma❤️"` before the message was typed and exactly
+    // the same afterwards — and the re-read came back "IDENTICAL to your last
+    // reading", which the agent correctly read as "nothing happened" and
+    // incorrectly concluded about text that may well have landed. It typed,
+    // pasted, clicked and re-read for 42 steps and 599,352 tokens, and never
+    // knew whether the box held its message.
+    //
+    // The value was in the reading's data the whole time and simply not printed.
+    // It is the one piece of evidence that separates "typed" from "sent", which
+    // is the distinction this product is built around.
+    const held = String(element.value ?? "").replace(/\s+/g, " ").trim();
+    const showsValue = held && held !== text && EDITABLE_ROLE.test(role);
     lines.push(
       `${index}| ${role}${text ? ` "${text.slice(0, 80)}"` : ""}` +
+      `${showsValue ? ` holds "${held.slice(0, 120)}"` : ""}` +
       `${truncated ? " ⟨CUT OFF⟩" : ""} @${center.x},${center.y}` +
       `${section ? ` [under "${section.text}"]` : ""}` +
       `${element.enabled === false ? " (disabled)" : ""}`
@@ -242,6 +342,15 @@ function isReadingNoise(text, element) {
   if (element.clickable === true && /button|menuitem|tab|link|hyperlink/i.test(String(element.role ?? element.controlType ?? ""))) {
     return false;
   }
+  // THIS RULE IS ABOUT OCR, AND IT WAS THROWING AWAY THE ONE THING A SEND NEEDS.
+  //
+  // Everything below is a guess about what a blurry glyph probably was. Applied
+  // to a name the APPLICATION published, it is not cleaning up debris, it is
+  // deleting a fact — and the fact it deleted was the timestamp. A message is
+  // confirmed sent by seeing its words in the conversation NEXT TO A CLOCK, so
+  // `text "9:37 pm"` sitting beside the message is the evidence, not noise.
+  // Before this, a WhatsApp reading dropped every one of them.
+  if (String(element.source ?? "").toUpperCase() === "UIA") return false;
   // One or two characters of OCR: avatar initials, unread dots read as "O",
   // sidebar glyphs read as "p" or "IttD".
   if (text.length <= 2 && !/^\d+$/.test(text)) return true;
@@ -647,6 +756,17 @@ export function buildToolset({
     // Windows whose accessibility tree came back empty, so the next look goes
     // straight to the capture instead of walking it again to find out.
     needsPixels: new Set(),
+    // Frame window -> the window actually holding that application's interface,
+    // or null once we have looked and there isn't one. Both answers are worth
+    // keeping: the lookup costs a process-tree query, and a window does not
+    // change which surface it is made of while it is open.
+    webviewWindows: new Map(),
+    // The reverse: a content window -> the name of the application that owns it,
+    // so a later look at that handle is still headed with the application rather
+    // than with the Chromium process hosting it.
+    webviewOwners: new Map(),
+    // Content window -> the frame window that owns it. See inputWindow.
+    webviewFrames: new Map(),
     // The drawing surface found in the last reading, so a stroke can be checked
     // against it before the mouse moves.
     lastCanvas: null,
@@ -706,10 +826,113 @@ export function buildToolset({
   const result_windowKey = (target) =>
     String(target?.windowId ?? "") || `application:${String(target?.application ?? "").toLowerCase()}`;
 
+  // THE HANDLE YOU READ WITH IS NOT THE HANDLE YOU ACT WITH.
+  //
+  // THE BUG BEHIND EVERY "IT TYPED AND NOTHING HAPPENED" IN THIS PROJECT.
+  //
+  // Perception follows a thin reading into the application's CONTENT window —
+  // WhatsApp's msedgewebview2 rather than the WhatsApp.Root frame — and from
+  // then on every action used that same handle. Activating a content window
+  // makes Windows report it foreground, and it is: `GetForegroundWindow` returns
+  // it, `WindowFromPoint` agrees the pixel is its, and UIA reports the message
+  // box focused and holding text. Everything we can ask says the window is
+  // ready. The APPLICATION SHELL does not know it is active, so its composer
+  // draws no caret and discards every keystroke, chord and paste in silence.
+  //
+  // Measured, 16 Aug 2026, on a window in exactly that state:
+  //   activate 197286 (content) -> type -> box unchanged   ("\n")
+  //   activate 198130 (frame)   -> type -> box holds "k"   *** works ***
+  // and once the frame has been activated, the content handle works too.
+  //
+  // Live this cost one request 66 steps and 1,160,162 tokens, and it ended by
+  // reading an OLD message off the screen and reporting the job done.
+  //
+  // So: reads keep the content handle, which is the only one that can see
+  // anything; anything that delivers INPUT is aimed at the frame.
+  const INPUT_CAPABILITY = /^(pointer\.|keyboard\.|window\.activate$)/;
+
+  const inputWindow = (windowId) => {
+    const key = String(windowId ?? "");
+    return state.webviewFrames.get(key) ?? key;
+  };
+
   const runCapability = async (name, inputs, options = {}) => {
     const capability = registry.get(name);
     if (!capability) throw new Error(`Unknown capability ${name}`);
-    return capability.execute(inputs, options);
+    const aimed = INPUT_CAPABILITY.test(name) && inputs?.windowId
+      ? { ...inputs, windowId: inputWindow(inputs.windowId) }
+      : inputs;
+    return capability.execute(aimed, options);
+  };
+
+  /**
+   * The application's interface is sometimes in a window other than the one
+   * named after it. Try that window before paying three seconds for pixels.
+   *
+   * Measured, WhatsApp on this machine: the window called "WhatsApp" holds six
+   * elements — Minimize, Restore, Close — while a sibling window belonging to a
+   * child process holds ninety, including the message box and every icon button.
+   * Reading the frame and then OCRing it, which is what happened before this,
+   * produced a blurry transcript of a window whose sibling was publishing clean
+   * text the whole time.
+   *
+   * Returns a usable reading, or null to leave the caller's fallback alone. It
+   * accepts the redirect ONLY if the other window's tree is genuinely better,
+   * because a wrong window that reads badly is worse than a right one that does.
+   */
+  const readViaWebviewWindow = async (frameWindowId, requestKey = "") => {
+    const frameKey = String(frameWindowId ?? "");
+    if (!frameKey) return null;
+    // Remember the answer under BOTH names the agent uses for this window — the
+    // handle the reading came back with, and the "whatsapp" it typed — or the
+    // next look under the other name pays for the whole lookup again. That is
+    // the same two-names bug the pixels memo below was already fixed for.
+    const remember = (webviewWindowId) => {
+      state.webviewWindows.set(frameKey, webviewWindowId);
+      if (requestKey) state.webviewWindows.set(requestKey, webviewWindowId);
+    };
+    if (state.webviewWindows.has(frameKey)) {
+      const known = state.webviewWindows.get(frameKey);
+      if (!known) return null;
+      const reading = await runCapability("screen.read", { windowId: known, maxElements: 240, includeOcr: false });
+      if (reading?.read && hasUsableContent(reading.elements)) {
+        if (requestKey) state.webviewWindows.set(requestKey, known);
+        // Set on the cached path too: input has to reach the FRAME, and a
+        // process that only ever took this branch would never learn which one.
+        state.webviewFrames.set(String(known), frameKey);
+        return reading;
+      }
+      return null;
+    }
+    const [windows, parentOf] = await Promise.all([
+      adapter.listWindows?.().catch(() => []) ?? [],
+      adapter.listProcessParents?.().catch(() => new Map()) ?? new Map()
+    ]);
+    const candidate = pickWebviewWindow({ frameWindowId: frameKey, windows, parentOf });
+    if (!candidate) {
+      state.webviewWindows.set(frameKey, null);
+      return null;
+    }
+    const reading = await runCapability("screen.read", { windowId: candidate.windowId, maxElements: 240, includeOcr: false });
+    if (!reading?.read || !hasUsableContent(reading.elements)) {
+      state.webviewWindows.set(frameKey, null);
+      return null;
+    }
+    remember(candidate.windowId);
+    // KEEP THE APPLICATION'S NAME ON THE READING. The window that answered
+    // belongs to msedgewebview2, and a reading headed "msedgewebview2" invites
+    // the agent to conclude it is in the wrong application and go looking for
+    // the right one — which is the frame it just came from. The frame's process
+    // owns this window; say so.
+    const frame = normalizeWindow(windows.find((window) =>
+      String(window.WindowHandle ?? window.windowId) === frameKey));
+    if (frame?.processName) {
+      reading.application = frame.processName;
+      state.webviewOwners.set(String(candidate.windowId), frame.processName);
+      // THE HANDLE TO READ WITH IS NOT THE HANDLE TO ACT WITH. See inputWindow.
+      state.webviewFrames.set(String(candidate.windowId), frameKey);
+    }
+    return reading;
   };
 
   // DID THE PICTURE CHANGE?
@@ -916,6 +1139,24 @@ export function buildToolset({
     const process = String(window?.ProcessName ?? window?.processName ?? application ?? "")
       .replace(/\.exe$/i, "");
     if (BROWSER_PROCESS.test(process)) return { editing: false, browser: true };
+    // A CHAT IS NOT A DOCUMENT WITH SOMEBODY'S UNSAVED WORK IN IT.
+    //
+    // The rule above exists because a rendered page publishes a Document control
+    // holding the page's text, and this gate then reads that as an unsaved file.
+    // It was written when only browsers reached here. Then perception started
+    // following a reading into the application's CONTENT window — so WhatsApp
+    // began arriving with `document "(137) WhatsApp"` and 129 characters in it,
+    // and every attempt to type into the message box was refused:
+    //
+    //   "There is already work in this document — its title is "(137) WhatsApp",
+    //    and the document holds 129 characters."
+    //
+    // Live, that cost one request 42 steps and 599,352 tokens and the message
+    // was never sent. Naming WhatsApp here would fix WhatsApp and leave Slack,
+    // Discord and Teams to be discovered the same expensive way; what matters is
+    // that the surface is a rendered page, whoever is hosting it.
+    const redirected = state.webviewOwners.has(String(windowId ?? ""));
+    if (redirected || isWebviewHostProcess(process)) return { editing: false, browser: true };
     return summarizeWorkspace(
       ui?.elements ?? ui?.targets ?? [],
       String(window?.MainWindowTitle ?? window?.title ?? "").trim()
@@ -965,7 +1206,40 @@ export function buildToolset({
   //
   // Null means the control publishes no value — not evidence either way, so the
   // caller says "unconfirmed" rather than inventing a verdict.
-  const focusedValue = async () => {
+  // The focused control as the application describes it: its name, and what it
+  // holds. One host call, so the two callers that need both do not pay twice.
+  const focusedControl = async () => {
+    // ONE PROPERTY, NOT A TREE WALK. This used to scan a whole ui.inspect for
+    // `focused = true`, which on WhatsApp is 3.9 seconds — paid once after
+    // typing and again after Enter, to look at a single control.
+    if (typeof adapter.focusedElement === "function") {
+      try {
+        // The window matters: in a WebView2 application the desktop's idea of
+        // the focused element is the host pane, and the control holding the
+        // caret is inside a separate top-level window that only this id names.
+        const focused = await adapter.focusedElement({ windowId: state.lastWindow?.windowId });
+        if (focused) {
+          const rect = focused.boundingRect ?? null;
+          return {
+            name: String(focused.name ?? "").trim() || null,
+            value: focused.publishesValue === false || focused.value == null ? null : String(focused.value),
+            // Where to click to give it the caret back. See the type retry.
+            center: rect && rect.width > 0 && rect.height > 0
+              ? { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }
+              : null
+          };
+        }
+      } catch {
+        // Fall through: an unreachable host is "cannot check", answered below.
+      }
+    }
+    const value = await focusedValueByWalking();
+    return { name: null, value, center: null };
+  };
+
+  const focusedValue = async () => (await focusedControl()).value;
+
+  const focusedValueByWalking = async () => {
     if (typeof adapter.inspectUi !== "function") return null;
     const windowId = state.lastWindow?.windowId;
     const application = state.lastWindow?.application;
@@ -982,6 +1256,44 @@ export function buildToolset({
     } catch {
       return null;
     }
+  };
+
+  // AN EMPTY BOX IS ONLY EVIDENCE IF THE BOX WAS EVER FULL.
+  //
+  // THE FLAGSHIP LIE, AND IT NEEDED NO BUG AT ALL TO TELL — just this reasoning:
+  // "the message box is now empty, which is how WhatsApp confirms the text has
+  // left the input field." The text had gone into the SEARCH box. The message
+  // box had been empty the entire time, so "it is empty now" was true, useless,
+  // and read as proof.
+  //
+  // Measured on this machine, WhatsApp's message box with nothing typed in it:
+  //
+  //   edit "Type a message to Amma❤️"  value="\n"
+  //
+  // A newline. `.trim()` makes that "", every emptiness check passes, and the
+  // send is announced. So emptiness is only allowed to mean anything when the
+  // same box was SEEN HOLDING THE TEXT first. Recorded at typing time, checked
+  // after Enter, and when it was never seen the verdict is UNCONFIRMED — which
+  // sends the agent to the conversation, where the real answer is.
+  const noteWhatTheBoxHolds = async (typed) => {
+    state.typedLanded = null;
+    state.typedLandedIn = null;
+    const wanted = String(typed ?? "").trim();
+    if (!wanted) return;
+    // WHERE IT WENT INSTEAD IS THE USEFUL HALF OF "IT DID NOT GO HERE".
+    //
+    // The first version said only that the text was not in the focused control,
+    // and live the agent could do nothing with that: it re-clicked the same box
+    // and re-typed the same words nine times. Naming the control and quoting
+    // what it holds turns that into one decision — "that is the search box, click
+    // the message box" — or, when the control IS right and holds the text, into
+    // no step at all.
+    const focused = await focusedControl();
+    state.typedLandedIn = focused.name;
+    state.typedLandedAt = focused.center;
+    if (focused.value === null) return;
+    state.typedLanded = focused.value.includes(wanted.slice(0, 40));
+    state.typedLandedHolds = focused.value;
   };
 
   // Focus lands on the control containing the click, whose centre is rarely the
@@ -1216,7 +1528,8 @@ export function buildToolset({
       return {
         x: element.center.x, y: element.center.y,
         windowId: element.windowId ?? state.lastWindow?.windowId,
-        label: element.text ?? null
+        label: element.text ?? null,
+        role: String(element.role ?? element.controlType ?? "").replace(/^ControlType\./, "")
       };
     }
     if (Number.isFinite(Number(args.element))) {
@@ -1237,6 +1550,7 @@ export function buildToolset({
         // out what had happened. Naming what was actually under the index makes
         // the mistake visible in the same breath as it is made.
         label: element.text ?? null,
+        role: String(element.role ?? element.controlType ?? "").replace(/^ControlType\./, ""),
         byIndex: Number(args.element)
       };
     }
@@ -1624,22 +1938,57 @@ export function buildToolset({
         // later loses no elements, only the chance to skip the capture.
         const memoKey = String(result_windowKey(target));
         let result;
-        if (memoKey && state.needsPixels.has(memoKey)) {
+        // GO STRAIGHT TO THE WINDOW THAT ANSWERED LAST TIME.
+        //
+        // Without this, every look at a WebView2 application read the frame,
+        // found the same three caption buttons it found a minute ago, and only
+        // then read the content window — two accessibility passes per look, and
+        // measurably SLOWER than the OCR route it replaced (1849ms against
+        // 1444ms). Which window holds an application's interface does not change
+        // while it is open, so it is asked once.
+        const knownWebview = memoKey ? state.webviewWindows.get(memoKey) : null;
+        if (knownWebview) {
+          result = await runCapability("screen.read", { windowId: knownWebview, maxElements: 240, includeOcr: false });
+          // The window closed, or the application navigated to something with no
+          // tree. Forget it and take the long route again rather than reporting
+          // an empty reading of a window that is no longer the right one.
+          if (!result?.read || !hasUsableContent(result.elements)) {
+            state.webviewWindows.delete(memoKey);
+            result = null;
+          }
+        }
+        if (result) {
+          // Nothing further to do: the memo answered.
+        } else if (memoKey && state.needsPixels.has(memoKey)) {
           result = await runCapability("screen.read", { ...target, maxElements: 240 });
         } else {
           result = await runCapability("screen.read", { ...target, maxElements: 240, includeOcr: false });
           if (!result?.read || !hasUsableContent(result.elements)) {
-            if (memoKey) state.needsPixels.add(memoKey);
-            result = await runCapability("screen.read", { ...target, maxElements: 240 });
-            // ONE WINDOW, TWO NAMES. The agent asks for "WhatsApp" sometimes and
-            // for the working window's handle other times, and those are
-            // different keys for the same empty tree — so the memo missed every
-            // other look and paid for the probe again. Record both names the
-            // full read gives back, and the window is known however it is asked
-            // for next.
-            if (result?.read) {
-              if (result.windowId) state.needsPixels.add(String(result.windowId));
-              if (result.application) state.needsPixels.add(`application:${String(result.application).toLowerCase()}`);
+            // IS THE APPLICATION IN A DIFFERENT WINDOW? A thin tree used to mean
+            // "this surface is pixels" and went straight to the capture. For
+            // every WebView2 application on the desktop it means something else:
+            // the interface is in a sibling window, published as text, and the
+            // capture was three seconds spent misreading the wrong window.
+            const viaWebview = await readViaWebviewWindow(result?.windowId ?? target.windowId, memoKey);
+            if (viaWebview) {
+              // Falls through to the naming and rendering below rather than
+              // returning here: a reading that skips them is headed
+              // "Window: ? — ?", which is the state this file spends a paragraph
+              // further down explaining is unusable.
+              result = viaWebview;
+            } else {
+              if (memoKey) state.needsPixels.add(memoKey);
+              result = await runCapability("screen.read", { ...target, maxElements: 240 });
+              // ONE WINDOW, TWO NAMES. The agent asks for "WhatsApp" sometimes
+              // and for the working window's handle other times, and those are
+              // different keys for the same empty tree — so the memo missed every
+              // other look and paid for the probe again. Record both names the
+              // full read gives back, and the window is known however it is asked
+              // for next.
+              if (result?.read) {
+                if (result.windowId) state.needsPixels.add(String(result.windowId));
+                if (result.application) state.needsPixels.add(`application:${String(result.application).toLowerCase()}`);
+              }
             }
           }
         }
@@ -1670,6 +2019,16 @@ export function buildToolset({
             result.title = result.title || (match.MainWindowTitle ?? match.title) || null;
           }
         }
+        // "msedgewebview2" IS NOT AN APPLICATION THE USER HAS HEARD OF.
+        //
+        // Once a reading has been redirected into an application's content
+        // window, every later look resolves that handle straight from the window
+        // list and comes back named after the Chromium host. The agent then sees
+        // a heading naming a process it never opened, while it believes it is in
+        // WhatsApp — and "am I in the right window" is the check this heading
+        // exists to support. The frame that owns the window is what to call it.
+        const owner = state.webviewOwners.get(String(result.windowId));
+        if (owner) result.application = owner;
         return result;
       },
       failed: (result) => result.read === false,
@@ -1687,7 +2046,7 @@ export function buildToolset({
           ].join("\n");
         }
         state.elements = [];
-        state.lastWindow = { windowId: result.windowId, application: result.application };
+        state.lastWindow = { windowId: result.windowId, application: result.application, title: result.title };
         // The same reading answers "is there already a document in here", so the
         // gate before the next `type` costs nothing rather than a second
         // accessibility read a second later.
@@ -1695,10 +2054,26 @@ export function buildToolset({
         // control, and reading one must not leave a browser looking like an
         // editor with somebody's unsaved work in it.
         const readProcess = String(result.application ?? "").replace(/\.exe$/i, "");
+        // A READING THAT FOLLOWED INTO A CONTENT WINDOW IS A PAGE, NOT A FILE.
+        //
+        // This is the gate the next `type` actually consults — `workspaceState`
+        // is only the fallback when nothing is cached — and it decides from the
+        // reading's application name. Which the redirect sets to the FRAME's
+        // process, "WhatsApp.Root", precisely so the heading names something the
+        // user recognises. So the browser exclusion stopped matching, the chat's
+        // Document control was read as a file with 129 characters of somebody's
+        // unsaved work in it, and every keystroke aimed at the message box was
+        // refused. 42 steps, 599,352 tokens, no message sent.
+        //
+        // `webviewOwners` holds exactly the windows a reading was redirected
+        // into, which is the same question asked directly.
+        const isRenderedPage = BROWSER_PROCESS.test(readProcess)
+          || state.webviewOwners.has(String(result.windowId ?? ""))
+          || isWebviewHostProcess(readProcess);
         state.lastWorkspace = {
           key: String(result.windowId ?? ""),
           at: Date.now(),
-          workspace: BROWSER_PROCESS.test(readProcess)
+          workspace: isRenderedPage
             ? { editing: false, browser: true }
             : summarizeWorkspace(result.elements ?? [], String(result.title ?? ""))
         };
@@ -1749,22 +2124,51 @@ export function buildToolset({
         state.lastReadingLines = lines;
         state.lastReadingWindow = String(result.windowId ?? "");
         state.lastReadingTitle = title;
+        // Set below when the same window has come back identical twice running.
+        // Read by the full listing, which then says why it is repeating itself.
+        let forgotten = false;
+        // The lines this reading has that the last one did not. See the full
+        // listing, where they are called out as the only proof a change is new.
+        let arrivedLines = [];
         if (previous && previousWindow === String(result.windowId ?? "") && previousTitle === title) {
           const before = new Set(previous);
           const after = new Set(lines);
           const gone = previous.filter((line) => !after.has(line));
           const arrived = lines.filter((line) => !before.has(line));
           const changed = gone.length + arrived.length;
+          // Capped: a window that has genuinely become a different window has
+          // nothing useful to say here, and would say all of it.
+          arrivedLines = arrived.length <= 25 ? arrived : [];
           // Recorded on the result so the LOOP can see it too, not just the
           // model. Fifteen readings in a row that say "nothing changed" is the
           // clearest possible signal that whatever is being tried cannot work —
           // and it is the loop's job to act on that, because the model demonstrably
           // does not. See the no-progress guard in the agent loop.
           result.screenUnchanged = changed === 0;
+          state.identicalReadings = changed === 0 ? (state.identicalReadings ?? 0) + 1 : 0;
+          // ASKING TWICE MEANS IT DOES NOT HAVE THE ANSWER.
+          //
+          // Measured 16 Aug 2026, "what are the last two messages in my WhatsApp
+          // chat with amma": the first reading carried the whole conversation and
+          // the model summarised it correctly. Then it scrolled, re-read, and got
+          // "IDENTICAL — nothing at all has changed on screen" — and read that as
+          // the TOOL being broken rather than the SCREEN being still. It said so
+          // eight times, in those words: "the screen tool isn't returning the
+          // message content". 15 steps, 105 seconds, 194,328 tokens, for two
+          // messages it had already been shown.
+          //
+          // The summary is right for one repeat — that is the case it was written
+          // for, an action that did nothing. A SECOND repeat is different
+          // evidence: the listing is no longer in the model's working context,
+          // and no wording will fix that. So it is sent again, in full, once,
+          // and the counter resets. Costs one listing; the alternative cost
+          // 194,000 tokens.
+          forgotten = changed === 0 && state.identicalReadings >= 2;
+          if (forgotten) state.identicalReadings = 0;
           // Summarized only while the change is small. Past that the window has
           // genuinely become a different window, and reading it out in full is
           // the honest thing to do.
-          if (changed <= Math.max(6, Math.floor(lines.length * 0.25))) {
+          if (!forgotten && changed <= Math.max(6, Math.floor(lines.length * 0.25))) {
             return [
               `Window: ${result.application ?? "?"} — ${result.title ?? "?"} (windowId ${result.windowId})`,
               changed === 0
@@ -1783,6 +2187,29 @@ export function buildToolset({
 
         return [
           `Window: ${result.application ?? "?"} — ${result.title ?? "?"} (windowId ${result.windowId})`,
+          // WHICH OF THESE WAS NOT HERE A MOMENT AGO.
+          //
+          // THE LAST WAY LEFT TO FAKE A SEND. Asked to send "kabhi kushi kabhi
+          // gam" — a message the user had sent before — the agent found those
+          // words in the conversation and reported success. They were the OLD
+          // message. Nothing had been typed at all: every keystroke that run was
+          // discarded, and the tool said so three times.
+          //
+          // Matching text is not evidence; text that WAS NOT THERE BEFORE is.
+          // The diff already knows which lines arrived, and it was only being
+          // shown when the change was small — which is exactly backwards, since
+          // a big change is where a new line is hardest to spot by eye.
+          arrivedLines.length
+            ? `NEW since your last reading of this window (these lines were NOT here before):\n${
+              arrivedLines.map((line) => `  ${line}`).join("\n")}\nAnything else below was already on ` +
+              "screen. If you are checking that something you just did worked, it has to be in THIS list."
+            : null,
+          forgotten
+            ? "You have now read this window three times running and it has not changed once. Here is the " +
+              "whole listing again — THE SCREEN IS STILL, the reading is not broken, and whatever you are " +
+              "looking for is either in the list below or genuinely not on screen. Read it, then either " +
+              "answer from it or do something that changes the screen. Do not read it again."
+            : null,
           // WHERE IS THE CANVAS? NOBODY EVER SAID.
           //
           // Asked to draw a snowman, the agent selected the Oval tool correctly
@@ -1867,6 +2294,40 @@ export function buildToolset({
           });
           if (!approved) return { refusedByUser: true, label: target.label, gate };
         }
+        // ASK THE CONTROL, DON'T AIM AT IT.
+        //
+        // A synthetic click is the least reliable thing in this codebase. Live,
+        // `click "Send"` reported performed=true at the right pixel, on a window
+        // verified foreground, and did nothing — three times running, and the
+        // message sat unsent. Reproduced 3/3: any click delivered after another
+        // window has held the foreground is swallowed, and no settle fixes it
+        // (see Invoke-NamedControl in restore-host.ps1 for the measurements).
+        // That is precisely the approval-gated actions — send, delete, buy.
+        //
+        // A named control that publishes InvokePattern can simply be told to
+        // act: 27ms, cross-process, immune to z-order and foreground. Only for
+        // an ordinary left click — a right click opens a context menu and a
+        // double click means something else, and neither is what Invoke does.
+        const plainLeftClick = (args.button ?? "left") === "left" && args.doubleClick !== true;
+        // ONLY WHERE INVOKE MEANS "PRESS THIS".
+        //
+        // A list row usually publishes InvokePattern and doing nothing visible
+        // is a perfectly legal response to it — Chromium's rows select rather
+        // than invoke. An Invoke that succeeds and changes nothing would be a
+        // NEW silent failure, which is the exact class of bug this whole file
+        // exists to remove. So the fast path is limited to the controls where
+        // pressing is the only thing Invoke can mean, and everything else keeps
+        // the mouse, which is honest about what it did.
+        const pressable = /^(button|menuitem|hyperlink|link|checkbox|radiobutton|splitbutton)$/i.test(target.role ?? "");
+        if (plainLeftClick && pressable && target.label && target.windowId
+          && typeof adapter.invokeControl === "function") {
+          const invoked = await adapter.invokeControl({
+            windowId: target.windowId, name: target.label, x: target.x, y: target.y
+          });
+          if (invoked?.performed === true) {
+            return { ...invoked, label: target.label, byIndex: target.byIndex ?? null, viaInvoke: true };
+          }
+        }
         const clicked = await runCapability("pointer.clickAt", {
           ...target,
           // Only name the application when there is no handle. Sending both lets
@@ -1919,6 +2380,13 @@ export function buildToolset({
         required: ["text"]
       },
       preview: (args) => JSON.stringify(String(args.text).slice(0, 80)),
+      // TEXT THAT NEVER ARRIVED IS A FAILED STEP, not a note in passing. Left as
+      // a success, the loop counted it as progress, the repeat guard never
+      // fired, and a run whose every keystroke was being discarded carried on
+      // inventing routes for forty more steps and 1.16M tokens — then read an
+      // OLD message off the screen and reported the job done.
+      failed: (result) => result.performed === false
+        || (result.landed === false && result.retried === true && !String(result.holds ?? "").trim()),
       execute: async (args) => {
         await documentGate(args);
         if (args.into != null || args.element != null) {
@@ -1945,16 +2413,56 @@ export function buildToolset({
             );
           }
         }
-        const typed = await runCapability("keyboard.type", {
+        const deliver = () => runCapability("keyboard.type", {
           text: args.text,
           application: args.application ?? state.lastWindow?.application,
           windowId: state.lastWindow?.windowId
         });
+        let typed = await deliver();
         // Remembered so that if the next thing is Enter in a messaging app, the
         // confirmation can show what is about to be sent rather than asking
         // about an abstract keystroke.
         state.lastTyped = String(args.text ?? "");
-        return { ...typed, unreadableScript: hasUnreadableScript(args.text) };
+        // And remembered so that "the box is empty" after Enter can be told
+        // apart from "the box was never anything else". One property read.
+        await noteWhatTheBoxHolds(state.lastTyped);
+        // TYPE IT AGAIN RATHER THAN REPORTING THAT IT DID NOT ARRIVE.
+        //
+        // The first keystrokes after any other window has held the foreground
+        // are swallowed — measured, and no settle fixes it. Handing that back to
+        // the model as an error is what produced nine identical click-and-type
+        // rounds and a million tokens: it has no more information than we do,
+        // and the fix is simply to do it once more now that the window has been
+        // in front for a moment. Once, and only when the control is right and
+        // simply does not hold the text — never when it holds something else,
+        // which is a different mistake and must still be reported.
+        const missedEntirely = state.typedLanded === false
+          && !String(state.typedLandedHolds ?? "").trim();
+        if (missedEntirely) {
+          // CLICK IT AGAIN FIRST. Delivering the same keystrokes into the same
+          // nothing is not a retry. Measured on WhatsApp: UIA reports the
+          // message box focused and holding its text while the window draws NO
+          // CARET — the application does not believe it has the keyboard, and
+          // every keystroke, chord and paste is discarded in silence. A real
+          // click on the control is what puts the caret back, and it is the one
+          // thing that has never failed to.
+          if (state.typedLandedAt) {
+            await runCapability("pointer.clickAt", {
+              x: state.typedLandedAt.x, y: state.typedLandedAt.y, windowId: state.lastWindow?.windowId
+            }).catch(() => null);
+            await new Promise((resolve) => setTimeout(resolve, 250));
+          }
+          typed = await deliver();
+          await noteWhatTheBoxHolds(state.lastTyped);
+          typed = { ...typed, retried: true };
+        }
+        return {
+          ...typed,
+          unreadableScript: hasUnreadableScript(args.text),
+          landed: state.typedLanded,
+          landedIn: state.typedLandedIn,
+          holds: state.typedLandedHolds
+        };
       },
       render: (result) => {
         if (result.performed === false) return `Typing did not complete: ${result.reason ?? "unknown"}`;
@@ -1973,10 +2481,55 @@ export function buildToolset({
         if (result.unreadableScript) {
           return "Typed. NOTE: this text is in a script the screen reader cannot read back on this machine, " +
             "so looking for these exact characters on screen will find nothing even when they are there. " +
-            "Do not re-type or re-send on that basis. Confirm it a different way — the input box being " +
-            "empty afterwards, or the conversation/row showing a new entry at the current time.";
+            "Do not re-type or re-send on that basis. Confirm it a different way — the conversation showing " +
+            "a new entry at the current time.";
         }
-        return "Typed. Read the screen back if it matters that the text landed.";
+        // THE BOX THAT TOOK THE TEXT IS NOT ALWAYS THE BOX YOU MEANT.
+        //
+        // Said here, at the moment it is knowable, because after Enter it is too
+        // late: a message typed into WhatsApp's SEARCH box and sent left the
+        // message box empty, which read as success.
+        if (result.landed === false) {
+          // WHERE IT WENT INSTEAD IS THE USEFUL HALF OF "IT DID NOT GO HERE".
+          //
+          // The first version said only that the focused control did not contain
+          // the text, and live the agent could do nothing with that: it clicked
+          // the same box and typed the same words nine times over. Naming the
+          // control and quoting what it holds turns that into one decision.
+          const holds = String(result.holds ?? "");
+          // THE WINDOW IS RIGHT, THE CONTROL IS RIGHT, AND NOTHING ARRIVES.
+          //
+          // Measured on this machine: WhatsApp visible, not minimised, the
+          // FOREGROUND window, the target pixel confirmed to belong to it, UIA
+          // reporting the message box focused — and every keystroke, chord and
+          // paste discarded in silence, twice in a row including a fresh click
+          // on the control. Nothing the agent can type its way out of.
+          //
+          // Live it tried nine more routes over forty steps — raw SendKeys,
+          // WScript.Shell, closing the application — and cost 1,160,162 tokens
+          // to arrive nowhere. Saying plainly that INPUT IS NOT REACHING THE
+          // APPLICATION is the only useful thing left, and it belongs here
+          // rather than in the model's imagination.
+          if (result.retried && !holds.trim()) {
+            return "INPUT IS NOT REACHING THIS APPLICATION. The text was delivered twice, with a fresh click " +
+              `on ${result.landedIn ? JSON.stringify(result.landedIn) : "the control"} in between, and the ` +
+              "box is still empty. The window is in front and the control has the keyboard, so this is not " +
+              "something a different field or a different phrasing fixes.\nDo NOT try another way to type — " +
+              "SendKeys, PowerShell and the clipboard all go down this same path. Stop and tell the user " +
+              "that the application is not accepting input, and that clicking its window once by hand " +
+              "usually restores it.";
+          }
+          return "NOT IN THE BOX. The control with the keyboard is " +
+            `${result.landedIn ? JSON.stringify(result.landedIn) : "unnamed"} and it holds ` +
+            `${JSON.stringify(clip(holds, 120))} — not what you just typed.\n` +
+            "Do not press Enter: it would act on THAT control. Read the screen, click the field you " +
+            "actually want, and check this line says it holds your text before going on.";
+        }
+        if (result.landed === true) {
+          return `Typed, and ${result.landedIn ? JSON.stringify(result.landedIn) : "the focused box"} now holds it.`;
+        }
+        return "Typed. The focused control does not publish what it holds, so I cannot confirm the text " +
+          "landed there — read the screen if it matters.";
       }
     },
     {
@@ -1995,7 +2548,24 @@ export function buildToolset({
         // Enter in a text editor is a newline. Enter in WhatsApp is a message
         // arriving on somebody's phone, in whichever conversation happens to be
         // open — which, live, was twice the wrong one.
-        const gate = requiresSendConfirmation(args.keys, `${application ?? ""} ${state.lastWindow?.title ?? ""}`);
+        // THE GATE WAS ASKING ABOUT A TITLE NOBODY EVER RECORDED.
+        //
+        // `state.lastWindow` held only `{ windowId, application }` — `title` was
+        // never written to it by any of the six places that set it, so this
+        // string was the process name and a trailing space, forever.
+        //
+        // That was survivable while a WhatsApp reading landed on the window
+        // called "WhatsApp.Root": the PROCESS matched the messaging list. Then
+        // perception started following into the content window and the process
+        // became `msedgewebview2`. Measured live, 16 Aug 2026: Enter was pressed
+        // in WhatsApp, NO approval was asked, and the send check was skipped
+        // entirely — the tool answered the bare word "Sent." for a message that
+        // never went. The safety gate and the honesty check were both switched
+        // off by a field that was silently always undefined.
+        const gate = requiresSendConfirmation(
+          args.keys,
+          `${application ?? ""} ${state.lastWindow?.title ?? ""} ${state.lastWindow?.application ?? ""}`
+        );
         if (gate.confirm) {
           const { approved } = await askPermission({
             kind: "send",
@@ -2018,12 +2588,36 @@ export function buildToolset({
         // Only for the send, and only because it silently failed: the box is
         // read back, and whether the text left it is the whole answer.
         if (gate.confirm && state.lastTyped) {
-          const stillInBox = await focusedValue();
-          const sent = stillInBox === null
-            ? null
-            : !stillInBox.includes(state.lastTyped.trim().slice(0, 40));
+          // THE BOX IS CLEARED AFTER THE MESSAGE GOES, NOT WITH IT.
+          //
+          // Measured: Enter sent "aa dekhen zara" to WhatsApp and this read the
+          // box back inside a few milliseconds, while the text was still in it,
+          // and reported NOT SENT. The message had gone. A false negative on a
+          // send is nearly as expensive as a false positive — it sent the agent
+          // to press Send a second time, and only the conversation reading saved
+          // it from sending twice.
+          //
+          // So look again before concluding. Only on the way to a NEGATIVE
+          // verdict: a box that is already empty is answered immediately and
+          // pays nothing.
+          let stillInBox = await focusedValue();
+          const wantedNow = state.lastTyped.trim().slice(0, 40);
+          if (stillInBox !== null && stillInBox.includes(wantedNow)) {
+            await new Promise((resolve) => setTimeout(resolve, 450));
+            stillInBox = await focusedValue();
+          }
+          const wanted = state.lastTyped.trim().slice(0, 40);
+          const landed = state.typedLanded;
+          // Three states, and the third is the honest one most of the time.
+          //   false — the text is demonstrably still in the box. Nothing went.
+          //   true  — the box HELD it and no longer does. It left.
+          //   null  — cannot tell: the box never published, or was never seen
+          //           holding this text, so its emptiness proves nothing.
+          const sent = stillInBox === null || landed !== true
+            ? (stillInBox !== null && stillInBox.includes(wanted) ? false : null)
+            : !stillInBox.includes(wanted);
           if (sent === true) state.lastTyped = null;
-          return { ...pressed, sendChecked: true, sent, stillInBox, typed: state.lastTyped };
+          return { ...pressed, sendChecked: true, sent, landed, stillInBox, typed: state.lastTyped };
         }
         return pressed;
       },
@@ -2038,19 +2632,35 @@ export function buildToolset({
         if (result.performed === false) return `Key press failed: ${result.reason ?? "unknown"}`;
         if (result.sendChecked) {
           if (result.sent === false) {
-            return "NOT SENT. The text is still sitting in the box — the application read it back to me " +
-              `as ${JSON.stringify(clip(result.stillInBox ?? "", 120))}. Enter was delivered but nothing ` +
-              "went anywhere, which usually means the typing landed somewhere other than the message box " +
-              "(a search field, for instance).\nDo NOT report this as sent. Read the screen, find the real " +
-              "message box, click it, and check the text is in THAT before pressing Enter again.";
+            // THE TEXT IS IN THE RIGHT BOX AND ENTER DID NOTHING: PRESS THE
+            // BUTTON INSTEAD. Live, Enter was delivered into WhatsApp's message
+            // box with the message plainly in it and the message did not go —
+            // and the agent read that as "the typing went to the wrong field",
+            // which was false and sent it hunting for a field that was already
+            // correct. A messaging window has a Send control on screen, and
+            // `click` presses it through the accessibility tree rather than the
+            // mouse, so it works where a keystroke did not.
+            return "NOT SENT — but the text IS in the box, read back as " +
+              `${JSON.stringify(clip(result.stillInBox ?? "", 120))}. Enter was delivered and the message ` +
+              "did not go, so Enter is not the way to send in this window.\nDo NOT report this as sent and " +
+              "do NOT retype it — it is already there. Read the screen and CLICK THE SEND BUTTON (it is " +
+              "usually the arrow at the end of the message box, and it only appears once there is text).";
           }
           if (result.sent === null) {
-            return "Enter was delivered. Whether it SENT is unconfirmed — the box does not publish its " +
-              "contents, so I cannot see whether the text left it.\nBefore you say it was sent, check the " +
-              "screen for BOTH: the message in the conversation with a timestamp, AND an empty input box. " +
-              "The words being on screen is not enough — they look the same sitting in the box unsent.";
+            // WHY IT COULD NOT BE TOLD CHANGES WHAT TO DO NEXT, so say which.
+            const because = result.landed === false
+              ? "the box was never seen holding this text — it was typed somewhere else, so the box being " +
+                "empty now means nothing"
+              : result.landed === null
+                ? "the box never published what it holds, so I could not see the text go in or out"
+                : "the box does not publish its contents";
+            return `Enter was delivered. Whether it SENT is UNCONFIRMED: ${because}.\n` +
+              "There is exactly one honest confirmation and it is not the input box: READ THE SCREEN and " +
+              "find the words of the message in the CONVERSATION, with a timestamp next to them. If they " +
+              "are not there, it did not send — say so.";
           }
-          return "Sent — the message box is empty again, so the text left it.";
+          return "The box held this text and no longer does, so it left the box. That is not the same as " +
+            "delivered: read the screen and confirm the message is in the conversation with a timestamp.";
         }
         return "Sent.";
       }
@@ -2212,11 +2822,16 @@ export function buildToolset({
       // circle, the best an agent could do was a ring of disconnected chords, one
       // model round trip and one undo entry each. This is the verb for the thing
       // the request actually names: a shape, drawn in one motion.
+      // EVERY PARAMETER HERE IS PAID FOR ON EVERY STEP OF EVERY TASK, and almost
+      // no task draws. This was 523 tokens of schema — the largest single tool —
+      // mostly descriptions of what `cx` and `radiusX` mean, which the names
+      // already say. The geometry that is NOT obvious from a name is kept; the
+      // rest went, and what a caller gets wrong comes back in the result.
       description:
-        "Draw a shape: name a `shape` with its measurements, or give `points`; `strokes` draws a whole " +
-        "figure in one call. Select the drawing tool and READ THE SCREEN first — the reading names the " +
-        "active tool, and this then sends whatever motion that tool needs (a shape tool's own geometry, " +
-        "or a traced path for a pencil).",
+        "Draw a shape: name a `shape` with its measurements (cx/cy/radius, x/y/width/height, " +
+        "from/to), or give `points`; `strokes` draws a whole figure in one call. Select the drawing " +
+        "tool and READ THE SCREEN first — the reading names the active tool, and this sends whatever " +
+        "motion that tool needs.",
       parameters: {
         type: "object",
         properties: {
@@ -2224,34 +2839,23 @@ export function buildToolset({
             type: "string",
             enum: ["circle", "ellipse", "arc", "rect", "square", "polygon", "line", "polyline", "freehand"]
           },
-          cx: { type: "number", description: "Centre, for circle, ellipse, arc and polygon" },
-          cy: { type: "number" },
-          radius: { type: "number" },
-          radiusX: { type: "number", description: "Ellipse half-width" },
-          radiusY: { type: "number", description: "Ellipse half-height" },
-          x: { type: "number", description: "Top-left, for rect and square" },
-          y: { type: "number" },
-          width: { type: "number" },
-          height: { type: "number" },
-          fromX: { type: "number", description: "Line endpoints" },
-          fromY: { type: "number" },
-          toX: { type: "number" },
-          toY: { type: "number" },
-          sides: { type: "number", description: "Polygon side count" },
-          startDegrees: { type: "number", description: "Arc start, 0 is east, clockwise" },
-          sweepDegrees: { type: "number", description: "Arc extent" },
+          cx: { type: "number" }, cy: { type: "number" },
+          radius: { type: "number" }, radiusX: { type: "number" }, radiusY: { type: "number" },
+          x: { type: "number" }, y: { type: "number" },
+          width: { type: "number" }, height: { type: "number" },
+          fromX: { type: "number" }, fromY: { type: "number" },
+          toX: { type: "number" }, toY: { type: "number" },
+          sides: { type: "number" },
+          startDegrees: { type: "number", description: "0 is east, clockwise" },
+          sweepDegrees: { type: "number" },
           points: {
             type: "array",
             description: "Vertices for polyline, or points to curve through for freehand",
             items: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } } }
           },
-          closed: { type: "boolean", description: "Join the last point back to the first" },
-          strokes: {
-            type: "array",
-            description: "Several of these shapes, drawn in one call with the pen lifted between them",
-            items: { type: "object" }
-          },
-          durationMs: { type: "number", description: "Roughly how long the whole motion should take" },
+          closed: { type: "boolean" },
+          strokes: { type: "array", description: "Several shapes in one call, pen lifted between", items: { type: "object" } },
+          durationMs: { type: "number" },
           application: { type: "string" }
         },
         required: []
@@ -2504,7 +3108,7 @@ export function buildToolset({
             : `${result.application} started but no window was found yet.`;
         }
         const windowId = String(window.windowId ?? window.WindowHandle ?? "");
-        state.lastWindow = { windowId, application: result.application };
+        state.lastWindow = { windowId, application: result.application, title: window.title ?? window.MainWindowTitle };
         // "IT IS OPEN" HIDES THE ONLY THING THAT MATTERED.
         //
         // Launching an application that is already running usually does not
@@ -2593,7 +3197,7 @@ export function buildToolset({
           ? workspace.contentChars === 0 && workspace.undoEnabled !== true
           : null;
         if (result.movedWindow) {
-          state.lastWindow = { windowId: target.windowId, application: result.movedWindow.application };
+          state.lastWindow = { windowId: target.windowId, application: result.movedWindow.application, title: result.movedWindow.title };
           state.emptySurfaces.add(target.windowId);
           return `Used ${result.route}, and a new window is now in front — ${result.movedWindow.application} ` +
             `"${result.movedWindow.title ?? ""}" (windowId ${target.windowId}). That is where typing will go.`;
@@ -2602,7 +3206,7 @@ export function buildToolset({
         // following `type` is judged against it rather than against whatever was
         // last read.
         if (result.windowId) {
-          state.lastWindow = { windowId: String(result.windowId), application: result.application };
+          state.lastWindow = { windowId: String(result.windowId), application: result.application, title: result.title };
         }
         if (empty === true) {
           state.emptySurfaces.add(String(result.windowId));
@@ -2642,7 +3246,7 @@ export function buildToolset({
         await new Promise((resolve) => setTimeout(resolve, 1800));
         const window = await adapter.getForegroundWindow?.().catch(() => null) ?? null;
         if (window?.windowId) {
-          state.lastWindow = { windowId: String(window.windowId), application: window.processName };
+          state.lastWindow = { windowId: String(window.windowId), application: window.processName, title: window.title };
         }
         return { ...launch, window };
       },
@@ -2682,7 +3286,23 @@ export function buildToolset({
       execute: async (args) => {
         const result = await runCapability("window.activate", args);
         if (result?.performed !== false) {
-          state.lastWindow = { windowId: args.windowId ?? result?.windowId, application: args.application };
+          // FOCUSING A WINDOW MUST NOT LOSE IT.
+          //
+          // `window.activate` answers with `foregroundWindowId`, and the id the
+          // caller passed can be absent when it asked by application name — so
+          // this wrote `{ windowId: undefined }` and the very next `screen the
+          // working window` replied "you have not opened or read any window
+          // yet" and printed all sixteen windows on the desktop. Live that cost
+          // three steps and a full window listing, twice, in one run.
+          const windowId = args.windowId
+            ?? result?.window?.windowId
+            ?? result?.foregroundWindowId
+            ?? state.lastWindow?.windowId;
+          state.lastWindow = {
+            windowId: windowId ? String(windowId) : undefined,
+            application: args.application ?? result?.window?.processName ?? state.lastWindow?.application,
+            title: result?.window?.title ?? state.lastWindow?.title
+          };
         }
         return result;
       },
@@ -3494,15 +4114,11 @@ export function buildToolset({
   // the model was told about its tools was these same two fields repeated. The
   // guidance itself is not lost: it is in the system prompt, with the same
   // examples, where it costs one copy instead of twenty-nine.
-  const SAW_PARAMETER = {
-    type: "string",
-    description:
-      "What you are working from right now, quoted from the last result. Always backward-looking, never a plan."
-  };
-  const SAY_PARAMETER = {
-    type: "string",
-    description: "What you are doing about it, in one short first-person sentence."
-  };
+  // Trimmed again 16 Aug: still 7,080 of 22,167 schema characters, 32% of
+  // everything said about the tools, for two sentences repeated thirty times.
+  // The full guidance and its examples live in the system prompt.
+  const SAW_PARAMETER = { type: "string", description: "Quoted from the last result: backward-looking, never a plan." };
+  const SAY_PARAMETER = { type: "string", description: "What you are doing, one short sentence." };
 
   return {
     // The wire format the model is shown.
@@ -3532,6 +4148,13 @@ export function buildToolset({
     })),
 
     has: (name) => byName.has(name),
+
+    // What the focused control holds RIGHT NOW, asked of the application rather
+    // than inferred from pixels. Exposed because a replayed send has to prove
+    // the same thing a derived one does — the box is empty — and null here means
+    // "could not check", which a caller must not read as "empty". See the
+    // three-state verdict in the replayer.
+    focusedValue: () => focusedValue(),
 
     // THE MACHINE, DESCRIBED ONCE.
     //
