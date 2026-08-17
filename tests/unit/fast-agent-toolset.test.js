@@ -15,14 +15,29 @@ import { createDefaultCapabilityRegistry } from "../../packages/capability-regis
 // Records what the adapter was asked to do and answers plausibly.
 function recordingAdapter() {
   const calls = [];
+  // A FILESYSTEM THAT REMEMBERS WHAT WAS WRITTEN TO IT.
+  //
+  // This used to answer every read with the same fixed body whatever had been
+  // written, which made it impossible to tell a working write from one that
+  // wrote nothing — exactly the bug `write_file` reads the file back to catch
+  // (the capability's input is `content`, and a caller sending `contents` wrote
+  // an empty file and reported success).
+  const files = new Map([["c:\\x.txt", "file body"]]);
   const record = (name) => (...args) => {
     calls.push({ name, args });
+    if (name === "writeTextFile") {
+      files.set(String(args[0]).toLowerCase(), String(args[1] ?? ""));
+      return Promise.resolve({ filePath: args[0], existed: true, nextContents: String(args[1] ?? "") });
+    }
+    if (name === "readTextFile") {
+      const key = String(args[0]).toLowerCase();
+      if (!files.has(key)) return Promise.reject(new Error("ENOENT"));
+      return Promise.resolve({ filePath: args[0], contents: files.get(key) });
+    }
     return Promise.resolve(RESPONSES[name] ?? { performed: true });
   };
   const RESPONSES = {
     executeCommand: { stdout: "ok", stderr: "", exitCode: 0 },
-    readTextFile: { filePath: "C:\\x.txt", contents: "file body" },
-    writeTextFile: { filePath: "C:\\x.txt", existed: false, nextContents: "written body" },
     clipboardAction: { text: "clip" },
     launchApplication: { application: "notepad", windowIdentity: { windowId: "42" } },
     listWindows: [{ WindowHandle: 42, ProcessName: "notepad", MainWindowTitle: "Untitled", Bounds: { x: 0, y: 0, width: 800, height: 600 }, Foreground: true }],
@@ -1382,11 +1397,16 @@ function editorToolset({
   pointer = () => ({ performed: true, x: 1, y: 1 })
 } = {}) {
   const calls = [];
+  // A window a launch created is in the window list AFTERWARDS and not before,
+  // which is what `launch` now checks rather than taking the launcher's word for
+  // it. Modelling that here is the difference between a machine and a stub.
+  let launchedYet = false;
   const registry = {
     get: (name) => ({
       execute: async (inputs) => {
         calls.push({ name, inputs });
         if (name === "application.launch") {
+          launchedYet = true;
           return {
             application: "notepad",
             windowIdentity: { windowId: String(launched.WindowHandle), title: launched.title },
@@ -1406,6 +1426,17 @@ function editorToolset({
       inspections.push(next);
       return { windows: [{ MainWindowTitle: launched.title }], elements: next };
     },
+    listWindows: async () => [
+      ...windows,
+      ...(launchedYet
+        ? [{
+            WindowHandle: launched.WindowHandle,
+            ProcessName: "notepad",
+            MainWindowTitle: launched.title,
+            Bounds: { x: 0, y: 0, width: 800, height: 600 }
+          }]
+        : [])
+    ],
     getForegroundWindow: async () => ({
       windowId: String(launched.WindowHandle), title: launched.title, processName: "notepad"
     })
@@ -1979,6 +2010,13 @@ test("enter outside a messaging app is not put through any of that", async () =>
   });
   const result = await toolset.execute("key", { keys: "enter", application: "notepad" });
   assert.equal(result.ok, true);
-  assert.equal(result.text, "Sent.");
+  // THIS USED TO EXPECT THE WORD "Sent.", WHICH WAS THE BUG.
+  //
+  // The send wording was written for Enter in a messaging window and left as the
+  // fallback for every keystroke, so ctrl+s, escape and f5 all rendered as
+  // "Sent." too — a claim about a message, for a keystroke nobody read back.
+  // Outside a messaging app nothing checks what a key did, and that is now what
+  // it says.
+  assert.equal(result.text, "Pressed enter. Nothing here says what it did.");
   assert.equal(inspected, 0, "a newline in Notepad must not cost an accessibility read");
 });

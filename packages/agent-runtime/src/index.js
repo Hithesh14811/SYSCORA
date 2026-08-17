@@ -572,11 +572,52 @@ export class AgentRuntime {
     //
     // Rate limiting, quota and authentication are facts about the account, and
     // re-planning cannot help with any of them.
+    //
+    // A DROPPED CONNECTION IS NOT AN OFFLINE MACHINE EITHER, AND THIS IS THE
+    // COMMON CASE. Measured live, 16 Aug 2026: four requests in a row hit
+    // "deepseek: fetch failed" on a brief network wobble, and every one fell
+    // through to the staged pipeline. Asked "is python installed?", it ran a
+    // WinGet package inspection and answered:
+    //
+    //   Task 1fce993df4344396d96cb860502089b5 failed: Execution exited with
+    //   nonzero code 2316632084.
+    //
+    // A raw Win32 status and an internal GUID, for a question `python --version`
+    // answers in a second. The pipeline plans from typed capabilities, so on
+    // anything it cannot map it produces confident nonsense rather than nothing
+    // — and the loop had already written the truthful message, which was thrown
+    // away to make room for it.
     const accountProblem = /\b(429|401|403)\b|rate.?limit|quota|exceeded|unauthorized|invalid.*api.?key/i
       .test(String(outcome.message ?? ""));
     if (outcome.status === "FAILED" && outcome.toolCalls === 0 && options.fast !== true && !accountProblem) {
       emit({ type: "FAST_AGENT_UNAVAILABLE", details: { reason: outcome.message } });
-      return this._submitIntent(rawText, { ...options, fast: false, existingSession: session });
+      const staged = await this._submitIntent(rawText, { ...options, fast: false, existingSession: session });
+      // AND IF THE FALLBACK CANNOT ANSWER EITHER, SAY THE TRUE THING.
+      //
+      // The staged pipeline plans from typed capabilities, so for a request it
+      // cannot map it does not fall silent — it maps the request to the nearest
+      // capability it has and runs that. Measured live, 16 Aug 2026: four turns
+      // in a row hit "deepseek: fetch failed" on a brief network wobble, and
+      // "is python installed?" came back as
+      //
+      //   Task 1fce993df4344396d96cb860502089b5 failed: Execution exited with
+      //   nonzero code 2316632084
+      //
+      // — a WinGet scan, a raw Win32 status and an internal GUID, for a question
+      // `python --version` answers in a second. The loop had already written the
+      // truthful message and it was thrown away to make room for that.
+      //
+      // Its successes are worth keeping: with the network genuinely down it can
+      // still describe the machine. Only its FAILURES are replaced, and only
+      // with the reason the model could not be reached.
+      if (staged?.finalResponse && staged.finalResponse.status !== "COMPLETED") {
+        staged.finalResponse = {
+          ...staged.finalResponse,
+          message: `${outcome.message}\n\nI tried to answer without the model and could not map that request ` +
+            "to something I can do offline. Nothing on the machine was changed."
+        };
+      }
+      return staged;
     }
 
     // COMPLETED is the only state the runtime can honestly claim here, and it
@@ -597,7 +638,13 @@ export class AgentRuntime {
         toolCalls: outcome.toolCalls,
         elapsedMs: outcome.elapsedMs,
         tokensIn: outcome.tokensIn ?? 0,
-        tokensOut: outcome.tokensOut ?? 0
+        tokensOut: outcome.tokensOut ?? 0,
+        // What was sent versus what was billed at full rate. The endpoint serves
+        // the fixed prefix from its cache at roughly a tenth of the price, and
+        // reporting only `tokensIn` made every long run look an order of
+        // magnitude more expensive than it is. See the fast-agent loop.
+        tokensCached: outcome.tokensCached ?? 0,
+        tokensFresh: outcome.tokensFresh ?? Math.max(0, (outcome.tokensIn ?? 0) - (outcome.tokensCached ?? 0))
       }
     };
     await this.persistSession(session).catch(() => {});

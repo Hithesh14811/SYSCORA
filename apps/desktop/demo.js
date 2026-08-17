@@ -690,7 +690,17 @@ function renderCost(turn, metrics) {
   // Providers do not all report usage. A missing number is left out rather than
   // shown as a zero that looks like a measurement.
   if (tokens > 0) {
-    parts.push(`${tokens.toLocaleString()} tokens (${(Number(metrics.tokensIn) || 0).toLocaleString()} in, ${(Number(metrics.tokensOut) || 0).toLocaleString()} out)`);
+    // MOST OF "IN" WAS NEVER PAID FOR AT FULL PRICE. The endpoint serves the
+    // system prompt and the tool schema from its prefix cache — measured at
+    // 8,320 of 8,613 tokens on every step after the first — and a cached token
+    // costs about a tenth of a fresh one. Showing one big number made every
+    // GUI task look ruinous; the number that matters is the fresh one.
+    const cached = Number(metrics.tokensCached) || 0;
+    const fresh = Number(metrics.tokensFresh) || Math.max(0, (Number(metrics.tokensIn) || 0) - cached);
+    parts.push(cached > 0
+      ? `${tokens.toLocaleString()} tokens (${fresh.toLocaleString()} new in, ` +
+        `${cached.toLocaleString()} cached, ${(Number(metrics.tokensOut) || 0).toLocaleString()} out)`
+      : `${tokens.toLocaleString()} tokens (${(Number(metrics.tokensIn) || 0).toLocaleString()} in, ${(Number(metrics.tokensOut) || 0).toLocaleString()} out)`);
   }
   if (parts.length) turn.append(el("div", "turn-cost", parts.join(" · ")));
 }

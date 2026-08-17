@@ -44,3 +44,108 @@ test("an ordinary answer is never mistaken for markup", () => {
     assert.equal(looksLikeMalformedToolCall(sample), false, sample);
   }
 });
+
+// ---- And it must never reach the user, however many times it happens -------
+//
+// The retry was guarded on "have I already retried once", so a SECOND malformed
+// turn fell straight through to `lastText` — which is what the run is settled
+// with. `<｜DSML｜invoke name="key">` reached a live transcript as visible text
+// exactly that way: detected, retried, and then published.
+//
+// This is the fuzz test docs/production-plan.md W4 asks for. Every sentinel this
+// project has seen, in every position a turn can put it, and one assertion: none
+// of it is ever in the message handed back.
+
+import { FastAgent } from "../../packages/fast-agent/src/index.js";
+
+const SENTINELS = [
+  '<｜DSML｜parameter name="text" string="true">violet parade</｜DSML｜parameter>',
+  "<|tool_call|>{\"name\":\"screen\",\"arguments\":{}}",
+  "<function_calls><invoke name=\"run\">",
+  "<|im_start|>assistant",
+  "functions.volume {\"mute\": true}",
+  "<tool_call>",
+  "<|channel|>commentary"
+];
+
+function providerEmitting(turns) {
+  return {
+    supportsChat: () => true,
+    async chat() {
+      const turn = turns.shift() ?? { text: "Done." };
+      return {
+        text: turn.text ?? "",
+        toolCalls: (turn.toolCalls ?? []).map((call, index) => ({
+          id: `call_${index}`, name: call.name, arguments: JSON.stringify(call.args ?? {})
+        })),
+        finishReason: turn.finishReason ?? (turn.toolCalls?.length ? "tool_calls" : "stop"),
+        usage: {}
+      };
+    }
+  };
+}
+
+const emptyToolset = () => ({
+  definitions: [],
+  has: () => true,
+  previewOf: () => "",
+  beginTurn() {},
+  async execute() { return { ok: true, text: "ok", raw: {} }; }
+});
+
+test("no sentinel ever reaches the user, at any position or repetition", async () => {
+  for (const sentinel of SENTINELS) {
+    // Every shape a broken turn takes: alone, wrapped in prose, and twice
+    // running — the last being the case that actually shipped.
+    const shapes = [
+      [{ text: sentinel }, { text: "Recovered properly." }],
+      [{ text: `Sure, doing that now. ${sentinel}` }, { text: "Recovered properly." }],
+      [{ text: sentinel }, { text: sentinel }],
+      [{ text: sentinel }, { text: sentinel }, { text: "never reached" }]
+    ];
+    for (const [index, turns] of shapes.entries()) {
+      const agent = new FastAgent({
+        provider: providerEmitting([...turns]),
+        toolset: emptyToolset(),
+        maxSteps: 10
+      });
+      const outcome = await agent.run("do the thing");
+      assert.equal(
+        looksLikeMalformedToolCall(outcome.message), false,
+        `shape ${index} of ${JSON.stringify(sentinel.slice(0, 40))} put markup in the answer:\n${outcome.message}`
+      );
+      assert.ok(outcome.message.trim().length > 0, "and it must still say something");
+    }
+  }
+});
+
+test("two malformed turns running is reported as the endpoint misbehaving, not as done", async () => {
+  const agent = new FastAgent({
+    provider: providerEmitting([{ text: SENTINELS[0] }, { text: SENTINELS[0] }]),
+    toolset: emptyToolset(),
+    maxSteps: 10
+  });
+  const outcome = await agent.run("press enter");
+
+  assert.equal(outcome.status, "FAILED");
+  assert.match(outcome.message, /malformed tool calls/);
+  assert.match(outcome.message, /not the machine or the request/);
+});
+
+// A run that had already done real work keeps what it said before the markup.
+test("the last clean sentence survives the markup that follows it", async () => {
+  const agent = new FastAgent({
+    provider: providerEmitting([
+      { text: "Volume is 40%.", toolCalls: [{ name: "volume", args: {} }] },
+      { text: SENTINELS[1] },
+      { text: SENTINELS[1] }
+    ]),
+    toolset: emptyToolset(),
+    maxSteps: 10
+  });
+  const outcome = await agent.run("what is the volume");
+
+  assert.equal(outcome.status, "PARTIALLY_COMPLETED");
+  assert.match(outcome.message, /Volume is 40%/);
+  assert.equal(looksLikeMalformedToolCall(outcome.message), false);
+});

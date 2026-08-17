@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FastAgent, buildToolset } from "../../packages/fast-agent/src/index.js";
+import { FastAgent, buildToolset, claimsWithoutEvidence, looksUnfinished, wasTruncated } from "../../packages/fast-agent/src/index.js";
 
 // A provider that plays back scripted turns. Each turn is what a real endpoint
 // would stream: some prose, then zero or more tool calls.
@@ -22,7 +22,9 @@ function scriptedProvider(turns) {
           name: call.name,
           arguments: JSON.stringify(call.args ?? {})
         })),
-        finishReason: turn.toolCalls?.length ? "tool_calls" : "stop"
+        // A turn can declare its own — "length" is what a provider says when it
+        // cut the reply off at the token ceiling, and the loop has to notice.
+        finishReason: turn.finishReason ?? (turn.toolCalls?.length ? "tool_calls" : "stop")
       };
     }
   };
@@ -642,4 +644,235 @@ test("a finished answer settles on the spot", async () => {
 
   assert.equal(outcome.status, "COMPLETED");
   assert.equal(outcome.steps, 2, "a finished answer must not cost an extra model call");
+});
+
+// THE CHEAPEST LIE IN THE PRODUCT, AND IT COST NOTHING TO TELL.
+//
+// Measured live, 16 Aug 2026, two turns apart. "now up tp 60" was answered with
+// "Volume is now at 60%." in one step and no tool call; "mute" was answered with
+// "Muted." the same way. Both false — the endpoint was at 20% and unmuted. The
+// volume tool itself is honest: it reads Core Audio back after every write. The
+// model simply never called it, and the backstop's patterns were anchored on the
+// first person or a named object, which one-word answers do not have.
+test("a bare acknowledgement with no tool call is not an answer", async () => {
+  for (const said of ["Muted.", "Done.", "Okay, paused.", "Volume is now at 60%.", "It's at 28%."]) {
+    assert.equal(claimsWithoutEvidence(said), true, `${JSON.stringify(said)} claims something`);
+  }
+  // Ordinary conversation still has to pass, or every chat costs an extra step.
+  for (const said of [
+    "I can mute it if you like.",
+    "Muting changes the endpoint, not the app.",
+    "What would you like me to set it to?"
+  ]) {
+    assert.equal(claimsWithoutEvidence(said), false, `${JSON.stringify(said)} is conversation`);
+  }
+});
+
+test("\"mute\" answered without touching anything is chased, then actually done", async () => {
+  const calls = [];
+  const toolset = stubToolset({
+    volume: async (args) => { calls.push(args); return { ok: true, text: "Volume is 28% (muted)." }; }
+  });
+  const turns = [
+    { text: "Muted." },
+    { text: "Muted — the endpoint reads 28% and muted.", toolCalls: [{ name: "volume", args: { mute: true } }] }
+  ];
+
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });
+  // NOT the bare word "mute", which the local fast path now answers without a
+  // model at all (see fast-path.js). This test is about the LOOP's backstop for
+  // a model that claims to have done something without calling anything, so the
+  // request has to be one that actually reaches the model.
+  const outcome = await agent.run("mute everything");
+
+  assert.equal(calls.length, 1, "the tool must actually run");
+  assert.deepEqual(calls[0], { mute: true });
+  assert.equal(outcome.status, "COMPLETED");
+});
+
+// And if it just says it again, the lie must not be handed to the user.
+test("a repeated claim with still no tool call is reported as not done", async () => {
+  const turns = [{ text: "Muted." }, { text: "Muted." }];
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset: stubToolset(), maxSteps: 20 });
+  const outcome = await agent.run("mute");
+
+  assert.equal(outcome.status, "FAILED");
+  assert.match(outcome.message, /I did not do that/);
+  assert.doesNotMatch(outcome.message, /^Muted/);
+});
+
+// ---- A reply that stopped is not a reply that finished ---------------------
+//
+// Measured live, 17 Aug 2026: a run settled COMPLETED on "The Amma chat is open.
+// The last two messages in the chat are:" and nothing after the colon. The
+// provider had cut the turn off at the 2,048-token ceiling (2,062 out) and the
+// loop took the fragment as the finished answer. `looksUnfinished` could never
+// have caught it — a truncated answer is not narration of a next step, it is a
+// correct sentence that simply ends.
+
+test("a cut-off answer is asked for again rather than published as the result", async () => {
+  const turns = [
+    { text: "The last two messages in the chat are:", finishReason: "length" },
+    { text: "Two messages: \"aa dekhen zara\" at 2:53 pm and \"picture abhi baaki hai\" at 2:55 pm." }
+  ];
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset: stubToolset(), maxSteps: 20 });
+  const outcome = await agent.run("what are the last two messages");
+
+  assert.equal(outcome.status, "COMPLETED");
+  assert.match(outcome.message, /picture abhi baaki hai/, "the complete answer is what the user gets");
+  assert.doesNotMatch(outcome.message, /are:$/, "the fragment must not be the final word");
+});
+
+test("a truncated turn is asked to be shorter, and says nothing was used", async () => {
+  const provider = scriptedProvider([
+    { text: "The last two messages are:", finishReason: "length" },
+    { text: "Done." }
+  ]);
+  const agent = new FastAgent({ provider, toolset: stubToolset(), maxSteps: 20 });
+  await agent.run("read them");
+
+  const nudge = provider.seen.at(-1).map((message) => String(message.content ?? "")).join("\n");
+  assert.match(nudge, /hit the output token limit/);
+  assert.match(nudge, /nothing in it was used/);
+  assert.match(nudge, /keep it SHORT/);
+});
+
+// HALF A DECISION IS NOT A DECISION. The arguments of a cut-off tool call are a
+// JSON object the provider stopped writing — either unparseable, or worse,
+// parseable and missing the field that made it safe. This loop runs `type`,
+// `run` and `click` straight onto the user's machine.
+test("the tool calls in a truncated turn do not run", async () => {
+  const ran = [];
+  const toolset = stubToolset({
+    run: async (args) => { ran.push(args); return { ok: true, text: "ok" }; }
+  });
+  const turns = [
+    { text: "Removing the folder.", finishReason: "length", toolCalls: [{ name: "run", args: { command: "Remove-Item -Recurse" } }] },
+    { text: "I did not run anything." }
+  ];
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });
+  const outcome = await agent.run("tidy up");
+
+  assert.deepEqual(ran, [], "a half-written command must never reach the machine");
+  assert.equal(outcome.status, "COMPLETED");
+});
+
+// Twice is a provider that will not be argued out of it. Keep what prose there
+// is — half an answer with a warning on it beats nothing — and never call it
+// done.
+test("truncated twice is PARTIALLY_COMPLETED, with the fragment and a warning", async () => {
+  const turns = [
+    { text: "The messages are:", finishReason: "length" },
+    { text: "The messages are: aa dekhen", finishReason: "length" }
+  ];
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset: stubToolset(), maxSteps: 20 });
+  const outcome = await agent.run("read them");
+
+  assert.equal(outcome.status, "PARTIALLY_COMPLETED");
+  assert.match(outcome.message, /aa dekhen/, "what did arrive is still worth showing");
+  assert.match(outcome.message, /CUT OFF/);
+});
+
+test("an ordinary finish reason is not mistaken for truncation", () => {
+  for (const reason of ["stop", "tool_calls", "STOP", null, undefined, ""]) {
+    assert.equal(wasTruncated({ finishReason: reason }), false, String(reason));
+  }
+  for (const reason of ["length", "MAX_TOKENS", "max_tokens"]) {
+    assert.equal(wasTruncated({ finishReason: reason }), true, reason);
+  }
+});
+
+// ---- An answer that stops on a colon is not a finished answer ---------------
+//
+// Measured live, 17 Aug 2026, and NOT the truncation case above: the provider
+// said "stop" and the output was 1,359 tokens against a 4,096 ceiling. The model
+// announced a list — "The last two messages in the conversation are both ones
+// you sent:" — and ended its turn. Nothing about the words is wrong, which is
+// why every other guard here misses it: they look for a next step being
+// narrated, and this narrates nothing.
+
+test("a reply that ends on the punctuation that promises more is unfinished", () => {
+  for (const said of [
+    "The last two messages in the conversation are both ones you sent:",
+    "Here is what I found:",
+    "I checked three things,",
+    "The window is open —",
+    "It found the file;"
+  ]) {
+    assert.equal(looksUnfinished(said), true, said);
+  }
+});
+
+// The false-positive risk is the whole cost of this guard: it fires a nudge, and
+// a nudge on a complete answer is a wasted step. A finished sentence ends on
+// punctuation that CAN end a thought, and a list that was actually delivered
+// ends with the list rather than with the colon that introduced it.
+test("a complete answer is not mistaken for one that stopped", () => {
+  for (const said of [
+    "The last two messages are both from you:\n\n1. \"aa dekhen zara\"\n2. \"picture abhi baaki hai\"\n\nBoth are marked as read.",
+    "Python 3.12.4 is installed.",
+    "You have 609.7 GB free on C:.",
+    "I could not find that chat — what name is it filed under?",
+    "Done.",
+    "The file is at C:\Users\hithe\notes.txt"
+  ]) {
+    assert.equal(looksUnfinished(said), false, said);
+  }
+});
+
+// ---- The lie wore bold -----------------------------------------------------
+//
+// From the user's own live transcript, 17 Aug 2026:
+//
+//   user: "make it 20"  ->  "Done — volume is now **20%**."
+//                           1 step, ZERO tool calls, 11 output tokens
+//
+// The endpoint was still at 60%. The user had to reply "no iys not" to get the
+// work done. STATE_ASSERTED matches "volume is now 20%" exactly and did not fire
+// — because the model wrote `**20%**` and the pattern wants a digit after "now".
+// A guard one character away from never firing is not a guard.
+
+test("a claim dressed in markdown is still a claim", () => {
+  for (const dressed of [
+    "Done — volume is now **20%**.",
+    "**Muted.**",
+    "Done — the volume is **20%** now.",
+    "I have **sent** it.",
+    "`Volume` is now at **60%**.",
+    "**Done.**",
+    "- Volume is now **20%**",
+    "*Opened* it."
+  ]) {
+    assert.equal(claimsWithoutEvidence(dressed), true, dressed);
+  }
+});
+
+test("stripping the formatting does not invent claims out of ordinary prose", () => {
+  for (const innocent of [
+    "Python is a programming language.",
+    "I can pause it if you like.",
+    "The file uses snake_case names and 3 * 4 arithmetic.",
+    "What would you like me to set it to?",
+    "Would you like me to **send** it?"
+  ]) {
+    assert.equal(claimsWithoutEvidence(innocent), false, innocent);
+  }
+});
+
+// The whole loop, not just the predicate: the turn that produced that sentence
+// must not be allowed to settle as the answer.
+test("\"volume is now **20%**\" with no tool call is chased, then actually done", async () => {
+  const calls = [];
+  const toolset = stubToolset({
+    volume: async (args) => { calls.push(args); return { ok: true, text: "Volume is 20%." }; }
+  });
+  const turns = [
+    { text: "Done — volume is now **20%**." },
+    { text: "Volume is **20%** — the endpoint reads it back.", toolCalls: [{ name: "volume", args: { percent: 20 } }] }
+  ];
+  const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });
+  const outcome = await agent.run("make it 20");
+
+  assert.deepEqual(calls, [{ percent: 20 }], "the endpoint must actually be set");
+  assert.equal(outcome.status, "COMPLETED");
 });

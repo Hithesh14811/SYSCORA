@@ -1754,18 +1754,54 @@ interface IAudioEndpointVolume {
   int SetMute(bool mute, ref Guid ctx);
   int GetMute(out bool mute);
 }
+// WHAT IS ACTUALLY COMING OUT OF THE SPEAKER.
+//
+// The mute FLAG is not the same fact as silence, and the user has now twice
+// reported hearing audio while this reported "(muted)". A flag is what the
+// endpoint was told; the peak meter is what it is emitting. Reading both, from
+// two different interfaces on the same device, is the only way to tell "muted"
+// from "we set a bit and something is still making noise".
+[Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioMeterInformation { int GetPeakValue(out float peak); }
 [Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDevice { int Activate(ref Guid id, int ctx, IntPtr p, out IAudioEndpointVolume ep); }
+interface IMMDevice {
+  int Activate(ref Guid id, int ctx, IntPtr p, [MarshalAs(UnmanagedType.IUnknown)] out object o);
+  // Declared and unused, because the vtable is positional: without this slot
+  // GetId below is called at OpenPropertyStore's index and comes back "Value
+  // does not fall within the expected range" — the same failure this file's
+  // header warns about, made again.
+  int OpenPropertyStore(int access, out IntPtr store);
+  int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+  int GetState(out int state);
+}
 [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IMMDeviceEnumerator { int EnumAudioEndpoints(int f, int m, IntPtr c); int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice dev); }
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject { }
 public static class SyscoraAudio {
-  static IAudioEndpointVolume Endpoint() {
+  static IMMDevice Device() {
     IMMDeviceEnumerator e = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
-    IMMDevice dev; e.GetDefaultAudioEndpoint(0, 1, out dev);
-    Guid id = typeof(IAudioEndpointVolume).GUID; IAudioEndpointVolume ep;
-    dev.Activate(ref id, 23, IntPtr.Zero, out ep); return ep;
+    IMMDevice dev; e.GetDefaultAudioEndpoint(0, 1, out dev); return dev;
   }
+  static IAudioEndpointVolume Endpoint() {
+    Guid id = typeof(IAudioEndpointVolume).GUID; object o;
+    Device().Activate(ref id, 23, IntPtr.Zero, out o); return (IAudioEndpointVolume)o;
+  }
+  // Sampled rather than read once: a waveform crosses zero, so a single sample
+  // of playing audio is silent about a third of the time. Reporting THAT as
+  // silence would be the same class of lie as trusting the flag.
+  public static float Peak() {
+    Guid id = typeof(IAudioMeterInformation).GUID; object o;
+    Device().Activate(ref id, 23, IntPtr.Zero, out o);
+    var meter = (IAudioMeterInformation)o;
+    float highest = 0;
+    for (int i = 0; i < 12; i++) {
+      float p; meter.GetPeakValue(out p);
+      if (p > highest) highest = p;
+      System.Threading.Thread.Sleep(25);
+    }
+    return highest;
+  }
+  public static string DeviceId() { string id; Device().GetId(out id); return id; }
   public static float Get() { float v; Endpoint().GetMasterVolumeLevelScalar(out v); return v; }
   public static bool GetMute() { bool m; Endpoint().GetMute(out m); return m; }
   public static void Set(float v) { Guid g = Guid.Empty; Endpoint().SetMasterVolumeLevelScalar(v, ref g); }
@@ -1774,10 +1810,45 @@ public static class SyscoraAudio {
 '@
 `;
 
+  // THE LONG-LIVED HOST ALREADY HAS THE ENDPOINT COMPILED.
+  //
+  // Both volume calls below spawn a powershell.exe and Add-Type the C# shim
+  // above, every time. Measured 17 Aug 2026: 1,400ms for "what's my volume", of
+  // which ~1,100ms was startup and compilation and 300ms was the peak sample
+  // doing real work. The automation host has the same shim compiled once at
+  // startup, so the same question costs an IPC round trip.
+  //
+  // Null when the host cannot answer — no host, or its Add-Type failed on this
+  // machine — and both callers then take the out-of-process route unchanged. The
+  // fallback is not decoration: this is the only place in the product that can
+  // tell the user whether their machine is making a noise.
+  async _audioViaHost(operation, params = {}) {
+    if (!this.automationHost) return null;
+    try {
+      const answer = await this.hostRequest(operation, params, { timeoutMs: 8000 });
+      return answer?.available === true ? answer : null;
+    } catch {
+      return null;
+    }
+  }
+
   async readSystemVolume() {
+    const viaHost = await this._audioViaHost("audio.read");
+    if (viaHost) {
+      return {
+        available: true,
+        percent: Number(viaHost.percent),
+        muted: viaHost.muted === true,
+        // Null when the endpoint is not muted: the meter is only EVIDENCE when
+        // it contradicts the flag, and sampling it costs 300ms of the host's
+        // single thread. See Read-AudioEndpoint.
+        peak: Number.isFinite(Number(viaHost.peak)) ? Number(viaHost.peak) : null,
+        deviceId: viaHost.deviceId ?? null
+      };
+    }
     const ps = await this.runPowerShell(
       `${WindowsAdapter.AUDIO_ENDPOINT_SHIM}
-[pscustomobject]@{ percent = [math]::Round([SyscoraAudio]::Get()*100,1); muted = [SyscoraAudio]::GetMute() } | ConvertTo-Json -Compress`,
+[pscustomobject]@{ percent = [math]::Round([SyscoraAudio]::Get()*100,1); muted = [SyscoraAudio]::GetMute(); peak = [SyscoraAudio]::Peak(); deviceId = [SyscoraAudio]::DeviceId() } | ConvertTo-Json -Compress`,
       { timeoutMs: 20000 }
     );
     let parsed = null;
@@ -1789,6 +1860,10 @@ public static class SyscoraAudio {
       available: true,
       percent: Number(parsed.percent),
       muted: parsed.muted === true,
+      // Measured output over ~300ms, 0 to 1. The flag says what the endpoint was
+      // told; this says what it is emitting.
+      peak: Number.isFinite(Number(parsed.peak)) ? Number(parsed.peak) : null,
+      deviceId: parsed.deviceId ?? null,
       commandResult: ps
     };
   }
@@ -1800,11 +1875,24 @@ public static class SyscoraAudio {
   async setSystemVolume(percent, { mute = null } = {}) {
     const target = Math.min(100, Math.max(0, Number(percent)));
     if (!Number.isFinite(target)) throw new Error("A volume percentage between 0 and 100 is required");
+    const viaHost = await this._audioViaHost("audio.set", {
+      level: target / 100,
+      ...(mute === null ? {} : { mute: mute === true })
+    });
+    if (viaHost) {
+      return {
+        requestedPercent: target,
+        percent: Number.isFinite(Number(viaHost.percent)) ? Number(viaHost.percent) : null,
+        muted: viaHost.muted === true,
+        peak: Number.isFinite(Number(viaHost.peak)) ? Number(viaHost.peak) : null,
+        applied: viaHost.applied === true
+      };
+    }
     const muteClause = mute === null ? "" : `[SyscoraAudio]::Mute($${mute === true ? "true" : "false"});`;
     const ps = await this.runPowerShell(
       `${WindowsAdapter.AUDIO_ENDPOINT_SHIM}
 [SyscoraAudio]::Set(${(target / 100).toFixed(4)}); ${muteClause}
-[pscustomobject]@{ percent = [math]::Round([SyscoraAudio]::Get()*100,1); muted = [SyscoraAudio]::GetMute() } | ConvertTo-Json -Compress`,
+[pscustomobject]@{ percent = [math]::Round([SyscoraAudio]::Get()*100,1); muted = [SyscoraAudio]::GetMute(); peak = [SyscoraAudio]::Peak() } | ConvertTo-Json -Compress`,
       { timeoutMs: 20000 }
     );
     let parsed = null;
@@ -1814,6 +1902,7 @@ public static class SyscoraAudio {
       requestedPercent: target,
       percent: Number.isFinite(observed) ? observed : null,
       muted: parsed?.muted === true,
+      peak: Number.isFinite(Number(parsed?.peak)) ? Number(parsed.peak) : null,
       // Endpoints quantise, so an exact match is not always achievable. One
       // percentage point is close enough to call the request honoured.
       applied: Number.isFinite(observed) && Math.abs(observed - target) <= 1,

@@ -205,9 +205,17 @@ test("a stroke inside the canvas is traced when a freehand tool has the mouse", 
 
 test("part of a file can be changed without rewriting the whole thing", async () => {
   let written = null;
+  // The file as it actually is, before and AFTER — `edit_file` reads it back to
+  // check the change took, so a fixture whose read always returns the original
+  // is a fixture where every successful edit looks like it did not happen.
+  let contents = "const a = 1;\nconst b = 2;\n";
   const adapter = baseAdapter({
-    readTextFile: async () => ({ filePath: "App.tsx", contents: "const a = 1;\nconst b = 2;\n" }),
-    writeTextFile: async (path, content) => { written = content; return { filePath: path, existed: true }; }
+    readTextFile: async () => ({ filePath: "App.tsx", contents }),
+    writeTextFile: async (path, content) => {
+      written = content;
+      contents = content;
+      return { filePath: path, existed: true };
+    }
   });
   const toolset = toolsetOver(adapter);
   const result = await toolset.execute("edit_file", {

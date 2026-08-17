@@ -851,6 +851,125 @@ public static class M4Native {
 '@
 $script:DpiMode = [M4Native]::EnableDpiAwareness()
 
+# THE AUDIO ENDPOINT, COMPILED ONCE INSTEAD OF ON EVERY CALL.
+#
+# This shim lived in windows-adapter.js and was Add-Type'd into a FRESH
+# powershell.exe every time anybody asked about the volume. Measured 17 Aug 2026:
+# 1,400ms for "what's my volume", of which about 1,100ms was starting PowerShell
+# and compiling this C#, and 300ms was the peak sample below doing real work.
+#
+# "mute" is the request the product most obviously ought to answer instantly, and
+# it cost 1,400ms of which nothing was about the audio.
+#
+# WRAPPED IN A TRY, because this host also serves UI Automation, input and screen
+# capture, and every one of those matters more than the volume. A machine with no
+# audio endpoint, a locked-down COM registration or a broken compiler must lose
+# the volume operations and keep everything else — so a failure here sets a flag
+# and the adapter falls back to the old out-of-process route.
+#
+# IAudioEndpointVolume is declared by vtable ORDER: every method above the one
+# being called must be present and correctly shaped even though it is unused. A
+# missing slot silently calls the wrong function, which is what made an earlier
+# attempt return "value does not fall within the expected range".
+$script:AudioReady = $false
+try {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume {
+  int RegisterControlChangeNotify(IntPtr n);
+  int UnregisterControlChangeNotify(IntPtr n);
+  int GetChannelCount(out uint c);
+  int SetMasterVolumeLevel(float l, ref Guid ctx);
+  int SetMasterVolumeLevelScalar(float l, ref Guid ctx);
+  int GetMasterVolumeLevel(out float l);
+  int GetMasterVolumeLevelScalar(out float l);
+  int SetChannelVolumeLevel(uint ch, float l, ref Guid ctx);
+  int SetChannelVolumeLevelScalar(uint ch, float l, ref Guid ctx);
+  int GetChannelVolumeLevel(uint ch, out float l);
+  int GetChannelVolumeLevelScalar(uint ch, out float l);
+  int SetMute(bool mute, ref Guid ctx);
+  int GetMute(out bool mute);
+}
+// WHAT IS ACTUALLY COMING OUT OF THE SPEAKER. The mute FLAG is not the same fact
+// as silence, and the user has twice reported hearing audio while the flag said
+// muted. Two different interfaces on the same device is the only way to tell
+// "muted" from "we set a bit and something is still making noise".
+[Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioMeterInformation { int GetPeakValue(out float peak); }
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice {
+  int Activate(ref Guid id, int ctx, IntPtr p, [MarshalAs(UnmanagedType.IUnknown)] out object o);
+  // Declared and unused, because the vtable is positional.
+  int OpenPropertyStore(int access, out IntPtr store);
+  int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+  int GetState(out int state);
+}
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator { int EnumAudioEndpoints(int f, int m, IntPtr c); int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice dev); }
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject { }
+public static class SyscoraAudio {
+  static IMMDevice Device() {
+    IMMDeviceEnumerator e = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+    IMMDevice dev; e.GetDefaultAudioEndpoint(0, 1, out dev); return dev;
+  }
+  static IAudioEndpointVolume Endpoint() {
+    Guid id = typeof(IAudioEndpointVolume).GUID; object o;
+    Device().Activate(ref id, 23, IntPtr.Zero, out o); return (IAudioEndpointVolume)o;
+  }
+  // Sampled rather than read once: a waveform crosses zero, so a single sample
+  // of playing audio is silent about a third of the time. Reporting THAT as
+  // silence would be the same class of lie as trusting the flag.
+  //
+  // The sample count is the caller's, because this blocks the host for its
+  // duration and the host is also serving input and perception. See audio.read,
+  // which only pays for it when the flag claims silence.
+  public static float Peak(int samples) {
+    Guid id = typeof(IAudioMeterInformation).GUID; object o;
+    Device().Activate(ref id, 23, IntPtr.Zero, out o);
+    var meter = (IAudioMeterInformation)o;
+    float highest = 0;
+    for (int i = 0; i < samples; i++) {
+      float p; meter.GetPeakValue(out p);
+      if (p > highest) highest = p;
+      System.Threading.Thread.Sleep(25);
+    }
+    return highest;
+  }
+  public static string DeviceId() { string id; Device().GetId(out id); return id; }
+  public static float Get() { float v; Endpoint().GetMasterVolumeLevelScalar(out v); return v; }
+  public static bool GetMute() { bool m; Endpoint().GetMute(out m); return m; }
+  public static void Set(float v) { Guid g = Guid.Empty; Endpoint().SetMasterVolumeLevelScalar(v, ref g); }
+  public static void Mute(bool m) { Guid g = Guid.Empty; Endpoint().SetMute(m, ref g); }
+}
+'@
+  $script:AudioReady = $true
+} catch {
+  # Everything else this host does still works. The adapter checks `available`
+  # and takes the out-of-process route.
+  $script:AudioReady = $false
+}
+
+# ONLY PAY FOR THE METER WHEN THE FLAG CLAIMS SILENCE.
+#
+# The peak sample is 300ms of blocking, and it is only ever EVIDENCE when it
+# contradicts the flag: an endpoint that says it is muted and is still emitting
+# is the thing the user could hear. An unmuted endpoint making noise is not news,
+# and paying 300ms to confirm it is what made "volume 40" as slow as "mute".
+function Read-AudioEndpoint {
+  if (-not $script:AudioReady) { return @{ available = $false; reason = "audio-endpoint-unavailable" } }
+  $muted = [SyscoraAudio]::GetMute()
+  $peak = if ($muted) { [SyscoraAudio]::Peak(12) } else { $null }
+  return @{
+    available = $true
+    percent = [math]::Round([SyscoraAudio]::Get() * 100, 1)
+    muted = $muted
+    peak = $peak
+    deviceId = [SyscoraAudio]::DeviceId()
+  }
+}
+
 function Wait-WinRt($operation, $resultType) {
   $method = [System.WindowsRuntimeSystemExtensions].GetMethods() |
     Where-Object { $_.Name -eq "AsTask" -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 } |
@@ -1792,6 +1911,26 @@ function Invoke-Operation($operation, $params) {
   switch ($operation) {
     "host.health" { return @{ ok=$true; pid=$PID; protocol="m4-windows-host/1"; sta=([Threading.Thread]::CurrentThread.ApartmentState.ToString()); inputEngine="SendInput"; dpiAwareness=$script:DpiMode } }
     "window.enumerate" { return @{ windows=(Get-WindowList) } }
+    # THE VOLUME, WITHOUT STARTING A POWERSHELL TO ASK.
+    #
+    # Measured 17 Aug 2026: 1,400ms out of process, of which ~1,100ms was
+    # spawning powershell.exe and compiling the shim. "mute" is the request this
+    # product most obviously ought to answer instantly.
+    "audio.read" { return Read-AudioEndpoint }
+    "audio.set" {
+      if (-not $script:AudioReady) { return @{ available=$false; reason="audio-endpoint-unavailable" } }
+      $target = [Math]::Min(1.0, [Math]::Max(0.0, [double]$params.level))
+      [SyscoraAudio]::Set([float]$target)
+      # Muting is separate from the level so one call can carry either intent —
+      # "mute" must not move the volume, and "volume 40" must not unmute.
+      if ($null -ne $params.mute) { [SyscoraAudio]::Mute([bool]$params.mute) }
+      # READ IT BACK from the endpoint rather than reporting what we asked for.
+      # The read-back is the evidence; `applied` is what the caller renders on.
+      $state = Read-AudioEndpoint
+      $state.requestedPercent = [math]::Round($target * 100, 1)
+      $state.applied = ([Math]::Abs($state.percent - $state.requestedPercent) -le 1)
+      return $state
+    }
     "window.foreground" { return @{ window=(Get-ForegroundWindow) } }
     # WHICH PROCESS STARTED WHICH. The only thing linking an application's frame
     # window to the Chromium window holding its actual interface: WhatsApp.Root

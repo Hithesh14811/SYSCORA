@@ -59,7 +59,16 @@ function webToolset({ page = {}, elements = [], best = null, field = null, after
             ? { ...state, ...afterClick }
             : state;
         case "inspect": return elements;
-        case "read": return { found: true, text: page.text ?? "Some page text." };
+        // A read WITH a target is a read of that element — and for an input,
+        // that is its value. `web_type` reads the field back through this a tick
+        // after writing it, which is what catches a framework putting the old
+        // value straight back; a stub that answers with the page's prose would
+        // report every successful type as rejected.
+        case "read": {
+          if (!params.target) return { found: true, text: page.text ?? "Some page text." };
+          const typedInto = [...calls].reverse().find((entry) => entry.operation === "type");
+          return { found: true, text: String(typedInto?.params?.text ?? "") };
+        }
         case "findBest": return best ?? { found: false, reason: "matching-dom-target-not-found" };
         case "findField": return field ?? { found: false, reason: "field-not-found", labels: ["Email", "Password"] };
         case "click": return { performed: true, target: params.target };
