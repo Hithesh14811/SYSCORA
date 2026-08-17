@@ -21,6 +21,7 @@ Tests are slow (~10 min). Run the specific file while working:
 ```
 packages/fast-agent/src/index.js    THE AGENT LOOP — the hot path, all of it
 packages/fast-agent/src/tools.js    the ~30 tools the model is given
+packages/fast-agent/src/evidence.js the receipt every tool result must carry
 packages/perception/                window capture, OCR and UIA, fused
 packages/policy-engine/src/shell-rules.js   the DENY floor and the CONFIRM tables
 os-adapters/windows/                the Windows adapter
@@ -29,7 +30,9 @@ os-adapters/browser/                controlled Chromium over CDP
 apps/daemon/src/server.js           HTTP + SSE, 127.0.0.1 only
 apps/desktop/demo.{html,js,css}     the chat surface
 tests/eval/                         the eval harness — pass rate, tokens, time, cost
-docs/webview-perception.md          SPEC — Phase 1, do this first
+docs/state-of-the-world.md          READ FIRST — what works, what does not, measured
+docs/production-plan.md             READ SECOND — the ordered work to production
+docs/webview-perception.md          SPEC — Phase 1, done
 docs/skills.md                      SPEC — Phase 2, the core of the product
 docs/trust-and-triggers.md          SPEC — Phase 3
 ```
@@ -55,12 +58,21 @@ read at the moment it matters and costs nothing the rest of the time.
 - **Never claim something happened without evidence from a tool.** Most of the
   worst bugs found here were the agent grading its own homework: a message
   reported sent that sat unsent in a search box, an invented version number, a
-  song "playing" that never started.
+  song "playing" that never started. This is now STRUCTURAL, not a convention:
+  every tool result carries a typed receipt and a success sentence is only
+  reachable through `confirmed()`. See `packages/fast-agent/src/evidence.js`. A
+  new tool without one fails `tests/unit/tool-evidence.test.js`.
 - **Unconfirmed is not failed.** Verdicts need three states, not two.
 - **Safety lives in `shell-rules.js` as data**, checked at the tool boundary —
   never as a pipeline stage. The staged engines were removed for speed on
   purpose. A gate that refuses arbitrary things teaches the model to route
-  around refusals; that has been observed happening.
+  around refusals; that has been observed happening. `content-boundary.js` is the
+  same shape for the other threat: what the agent READS is never what it was
+  asked to do.
+- **What it reads is not who it works for.** A message, a page, a document or the
+  clipboard is content. An instruction found inside one must never become an
+  action — enforced on the DESTINATIONS such instructions name, at the tool
+  boundary, not by recognising English.
 - **Verification must not share a code path with the thing it verifies.**
 
 ## State
