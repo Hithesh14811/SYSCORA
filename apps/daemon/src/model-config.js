@@ -22,8 +22,27 @@ export function loadModelConfig(basePath = process.cwd()) {
       fileConfig = parsed?.model ?? parsed ?? {};
       consentConfig = parsed?.externalAIConsent ?? fileConfig?.externalAIConsent ?? {};
     }
-  } catch {
+  } catch (error) {
     // A malformed local config must never crash startup; fall back to env/mock.
+    //
+    // BUT IT MUST NOT DO IT QUIETLY, AND FOR MONTHS IT DID.
+    //
+    // Swallowed whole, this catch means: the file has a typo, so the provider
+    // silently becomes Mock and the agent stops using any real model. Observed
+    // 19 Aug 2026 — a key pasted into config.json as a sentence rather than JSON
+    // left the whole product running on the deterministic offline stub, and the
+    // only symptom was that answers went strange. Nothing in any log said the
+    // config had not been read.
+    //
+    // Still not a throw: refusing to start because one file has a comma in the
+    // wrong place is worse than starting degraded. The fix is that degraded is
+    // now VISIBLE. This is the one thing in this file that writes to stderr.
+    process.emitWarning(
+      `SYSCORA: ${configPath} could not be parsed, so NONE of it was used — ` +
+      `${error?.message ?? error}. Falling back to environment variables, then to the offline Mock ` +
+      "provider. If answers look wrong or nothing reaches your model, this is why.",
+      "SyscoraConfigWarning"
+    );
     fileConfig = {};
   }
 

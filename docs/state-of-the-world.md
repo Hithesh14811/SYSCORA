@@ -55,20 +55,41 @@ And one harness defect that made a bad row look like a catastrophe: a task that
 hit its timeout did not stop its session, so the daemon's one-request-at-a-time
 rule answered 409 to everything after it and two whole rounds recorded as zeros.
 
-### Still open, found by measuring, NOT yet fixed
+### Fixed 19 Aug 2026, with the measurement
 
-- **The WhatsApp send does not work.** 0/3, ~137s, 4 steps, `launch → screen →
-  click✗`. It settles honestly rather than lying, which is the invariant holding,
-  but the task fails.
-- **A saved route replays cleanly only 2 times in 3.** The recorder writes a
-  first step whose `verify` is `{kind: "element-present"}` with no needle — "a
-  check with an empty needle is not a check", from this file's own rules — and
-  when it does not hold the replay hands over to the model at step 1 in 62ms.
+- ~~**The WhatsApp send does not work.**~~ **3/3, median 28.7s.** The cause was
+  `autoApprove` never being read on the fast path — see the correction above.
+- ~~**A saved route replays cleanly only 2 times in 3.**~~ **3/3, every replay 0
+  tokens in 0.8s.** The recorder's fallback for any tool it had no rule for was
+  `{kind: "element-present"}` with no needle, and the verifier read an absent
+  needle as "did anything come back at all" — so a `write_file` step verified
+  because the window behind it had buttons on it. **Auditing the rest of the
+  switch found the same hole in `window-title-contains` and `file-contains`**;
+  `"anything".includes("")` is true. Fixed in three layers: the recorder derives
+  a needle from the step's own arguments or writes no check, `validateSkill`
+  refuses a searching check with no needle, and the verifier returns UNCONFIRMED
+  rather than VERIFIED when asked to look for nothing.
+- **A malformed `.syscora/config.json` is now loud.** `loadModelConfig` caught
+  the parse error and silently fell through to the offline Mock provider, so a
+  key pasted as a sentence took the whole product off its real model with no
+  symptom but strange answers. It still starts — refusing to boot over one comma
+  is worse — but it warns on stderr saying exactly that.
+
+### Still open
+
 - **The Baseten account is out of credit** (`HTTP 402: please check your current
-  payment status`), which is what made the first baseline attempt unusable. The
-  primary is now the DeepSeek endpoint directly, with Baseten kept as the
-  fallback entry so the chain is real.
+  payment status`). The primary is the DeepSeek endpoint directly, with Baseten
+  kept as the fallback entry so the chain is real, but there is nothing healthy
+  to fail over TO. `node scripts/probe-failover.mjs` reports the machinery and
+  the billing separately and says which is missing.
+- **There is still no second VENDOR.** Two endpoints serving the same DeepSeek
+  family survive an endpoint outage, not a bad model release.
 - **The leaked `primaryApiKey` still needs rotating by the user.**
+- **A declined irreversible action still settles COMPLETED.** The message is
+  honest — "it was not sent" — but the status beside it is not, and a surface
+  showing a green tick over that sentence is misleading. Not changed here:
+  settle semantics are deliberate (`agent-runtime` says the model's own words
+  carry what was and was not achieved) and changing them is not a one-line fix.
 
 ## What this is
 
@@ -84,15 +105,56 @@ layer. Not yet a production system. The gap is specific and measured below.
 
 ### Measured, 16–17 Aug 2026, real machine, real model (DeepSeek via Baseten)
 
+**These are single hand-runs and several of them are now known to be wrong.**
+Read the scoreboard section above instead; this table is kept because the
+production plan refers to it, not because it should be quoted.
+
 | task | steps | time | tokens | outcome |
 |---|---|---|---|---|
-| WhatsApp send (flagship) | 6 | 35s | 62,417 | sent, confirmed in-conversation |
+| ~~WhatsApp send (flagship)~~ | ~~6~~ | ~~35s~~ | ~~62,417~~ | **see the correction below** |
 | WhatsApp send, 16 Aug baseline | 66 | 309s | 1,160,162 | needed manual coordinate click |
 | read last 2 messages | 6 | 23s | 67,768 | correct |
 | `is python installed?` | 2 | 41s | 19,257 | correct, slow |
 | disk space / top RAM | 2 | ~6s | ~18,300 | correct |
 | play a song on Spotify | 5–7 | 27–47s | 54k–77k | correct, needs a click fallback |
 | draw a train in Paint | 37–54 | 227–365s | 514k–894k | **poor; one run ran out of time** |
+
+#### The flagship row was wrong, and the way it was wrong is the lesson
+
+"6 steps, 35s, 62,417 tokens, sent, confirmed in-conversation" came from a
+`probe-fast-agent.mjs --approve` run — a probe that ANSWERS the approval card.
+Nothing unattended could reproduce it, and the eval task that should have caught
+that verified with `Write-Output 'checked-by-human'` and passed unconditionally.
+So the number was true of one attended run and false of the product, and it sat
+at the top of this document for two days being planned around.
+
+Measured 19 Aug 2026 with an honest check that counts the message text in the
+conversation over the raw UIA tree, in its own process:
+
+| | pass | time | steps | fresh tokens |
+|---|---|---|---|---|
+| before | **0 of 3** | 136.7s · 137.0s · 149.9s | 4–5 | 1,751–3,915 |
+| after | **3 of 3** | 28.0s · 34.9s · 28.7s | 5–7 | 3,270–3,817 |
+
+**The cause was not the click, and not a regression.** `autoApprove` — the
+caller's standing authorization — has never been read on the fast-agent path, in
+any commit, since `d91fd43` first put an approval gate there. The staged pipeline
+honoured it; the route every real request takes did not. So the card went to
+nobody and the 120s timeout read the silence as a refusal, which is the correct
+reading of silence. `probe-fast-agent.mjs` on the send, before the fix:
+
+```
+[ 25470ms] APPROVAL ASKED: send this message
+      rule: send-message — it cannot be unsent once it arrives
+[145470ms] APPROVAL_RESOLVED          <- exactly APPROVAL_TIMEOUT_MS later
+[145471ms] x batch (123706ms)
+```
+
+The agent's own behaviour through all of this was right — it reported the draft
+unsent, named the chat, and refused to retry by another route. **That is what
+disguised it:** an honest report of a plumbing failure reads like a broken click,
+which is why the brief for this session named five click defects and the answer
+was none of them. Diagnose before fixing.
 
 ### THE COST NUMBER THIS PROJECT HAS BEEN QUOTING IS THE WRONG ONE
 
