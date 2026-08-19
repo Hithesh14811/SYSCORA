@@ -153,3 +153,40 @@ test("a check nobody knows how to make is not a pass", async () => {
 test("a step with no check at all still passes, because none was asked for", async () => {
   assert.equal((await verifyReplayStep(null, {})).status, "VERIFIED");
 });
+
+// EVERY CHECK KIND THAT SEARCHES, ASKED TO SEARCH FOR NOTHING.
+//
+// Written as a sweep rather than one case, because the defect was never in one
+// branch — it was in the shape. `"anything".includes("")` is true, so any check
+// built on a substring match verifies against the whole world when its needle is
+// missing. element-present had it, and auditing the rest of the switch after
+// fixing that one found window-title-contains and file-contains with it too.
+// input-empty, message-in-conversation and command-output-contains were already
+// guarded, each after its own live defect.
+//
+// What this FAILS on: any of these returning VERIFIED with no needle. What it
+// must not do: turn them into FAILED — "I was asked to look for nothing" is an
+// absence of evidence, not evidence of absence, and the fast path may only
+// continue on proof. UNCONFIRMED hands over to the model, which is right.
+test("no check kind can verify when it was given nothing to look for", async () => {
+  const alwaysFinds = {
+    execute: async () => ({ ok: true, text: '1| window "Untitled - Notepad"\n2| button "Save"\n3| text "anything"' }),
+    focusedValue: async () => "some text",
+    lastResult: { text: "some output" }
+  };
+  const searching = [
+    "element-present",
+    "element-absent",
+    "window-title-contains",
+    "message-in-conversation",
+    "command-output-contains"
+  ];
+  for (const kind of searching) {
+    const result = await verifyReplayStep({ kind }, alwaysFinds);
+    assert.notEqual(result.status, "VERIFIED",
+      `${kind} verified with nothing to look for — it would pass on any machine in any state`);
+  }
+  // file-contains takes its needle in `contains`, and its subject in `path`.
+  const file = await verifyReplayStep({ kind: "file-contains", path: String.raw`C:\tmp\x.txt` }, alwaysFinds);
+  assert.notEqual(file.status, "VERIFIED", "file-contains verified against any file with any content in it");
+});

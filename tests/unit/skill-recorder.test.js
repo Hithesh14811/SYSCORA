@@ -155,3 +155,80 @@ test("a command step carries no vacuous check", () => {
   const { skill } = buildSkillFromRun(fileRun);
   assert.equal(skill.steps[0].verify, undefined);
 });
+
+// THE RULE, OVER EVERY ROUTE THIS FILE CAN PRODUCE.
+//
+// The test above covers `run`, which was reasoned about correctly when it was
+// written. The same reasoning was never applied to the fallback beside it: any
+// tool without an entry in the table got `{ kind: "element-present" }` with
+// nothing to look for, and so did `type`, `click` and `launch`. The verifier
+// read an absent needle as "did anything come back at all", so those checks
+// passed on any screen in existence — measured 19 Aug 2026 on the first route
+// the eval recorded end to end: two steps, both checked, neither able to fail.
+//
+// Stated as a property rather than case by case, because the defect was in the
+// DEFAULT — the next tool added would have inherited it silently.
+const unknownToolRun = {
+  id: "write-a-file-directly",
+  userText: "put the word rehearsed in routine.txt",
+  status: "COMPLETED",
+  calls: [
+    { tool: "write_file", args: { path: String.raw`C:\tmp\routine.txt`, contents: "rehearsed" }, ok: true, verified: true },
+    { tool: "read_file", args: { path: String.raw`C:\tmp\routine.txt` }, ok: true, verified: true }
+  ]
+};
+
+test("no recorded step ever carries a check with nothing to look for", () => {
+  let checked = 0;
+  for (const run of [goodRun, fileRun, unknownToolRun]) {
+    const { recorded, skill } = buildSkillFromRun(run);
+    assert.equal(recorded, true, `${run.id} should have recorded`);
+    for (const [index, step] of skill.steps.entries()) {
+      if (!step.verify?.kind) continue;
+      checked += 1;
+      const needle = String(step.verify.value ?? step.verify.text ?? "").trim();
+      assert.notEqual(needle, "",
+        `${skill.id} step ${index + 1} (${step.tool}) claims to check "${step.verify.kind}" and looks for nothing`);
+    }
+  }
+  assert.ok(checked > 0, "if nothing carried a check at all this test would be proving nothing");
+});
+
+// A tool the recorder has no rule for gets NO check rather than a hollow one.
+// write_file and read_file confirm themselves by reading the file back, which is
+// a different capability from the one that wrote it; the replayer still requires
+// each step's own result to come back ok. Silence here is honest. The old
+// fallback claimed to have looked at the screen.
+test("a tool with no verification rule is left unchecked, not checked vacuously", () => {
+  const { recorded, skill } = buildSkillFromRun(unknownToolRun);
+  assert.equal(recorded, true);
+  assert.equal(skill.steps.length, 2);
+  for (const step of skill.steps) {
+    assert.equal(step.verify, undefined, `${step.tool} must not carry an invented check`);
+  }
+});
+
+// The needle for a typed step is the words themselves, carrying the SAME
+// placeholder as the argument, so both are filled from one capture at replay.
+// Built from the raw arguments instead, `{p1}` in the step would have been
+// checked against whatever literal happened to be typed when it was recorded.
+test("a typed step is checked against the words it typed, in placeholder form", () => {
+  // goodRun's type step is a SEND, which gets the stronger message-in-conversation
+  // check; this is the ordinary case.
+  const typingRun = {
+    id: "type-a-note",
+    userText: 'write "buy milk" in the note',
+    status: "COMPLETED",
+    calls: [
+      { tool: "launch", args: { application: "Notepad" }, ok: true, verified: true },
+      { tool: "type", args: { text: "buy milk" }, ok: true, verified: true }
+    ]
+  };
+  const { recorded, skill } = buildSkillFromRun(typingRun);
+  assert.equal(recorded, true);
+  const typed = skill.steps.find((step) => step.tool === "type");
+  assert.equal(typed.verify.kind, "element-present");
+  assert.match(typed.args.text, /^\{p\d+\}$/, "the words are a parameter");
+  assert.equal(typed.verify.value, typed.args.text,
+    "the check and the argument must be the same string, placeholders included");
+});

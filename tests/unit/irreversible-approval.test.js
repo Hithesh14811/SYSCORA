@@ -311,7 +311,7 @@ test("a label that merely contains the word delete is not a delete-for-everyone"
 test("a caller that passed autoApprove is not asked to click its own card", async () => {
   const ran = [];
   const provider = scriptedProvider([
-    { text: "Removing it.", toolCalls: [{ name: "run", args: { command: "Remove-Item -Recurse .\build" } }] },
+    { text: "Removing it.", toolCalls: [{ name: "run", args: { command: "Remove-Item -Recurse .\\build" } }] },
     { text: "Removed.", toolCalls: [] }
   ]);
   const runtime = runtimeWith(provider, recordingAdapter(ran));
@@ -323,7 +323,7 @@ test("a caller that passed autoApprove is not asked to click its own card", asyn
   const startedAt = Date.now();
   const session = await runtime.submitIntent("delete the build folder", { fast: true, autoApprove: true });
 
-  assert.deepEqual(ran, ["Remove-Item -Recurse .\build"], "the authorized command must actually run");
+  assert.deepEqual(ran, ["Remove-Item -Recurse .\\build"], "the authorized command must actually run");
   assert.equal(session.finalResponse.status, "COMPLETED");
   assert.ok(Date.now() - startedAt < 30000,
     "it must not sit through the 120s approval timeout — that is the defect this covers");
@@ -346,7 +346,7 @@ test("a caller that passed autoApprove is not asked to click its own card", asyn
 test("a human clicking Allow is not recorded as an automatic approval", async () => {
   const ran = [];
   const provider = scriptedProvider([
-    { text: "Removing it.", toolCalls: [{ name: "run", args: { command: "Remove-Item -Recurse .\build" } }] },
+    { text: "Removing it.", toolCalls: [{ name: "run", args: { command: "Remove-Item -Recurse .\\build" } }] },
     { text: "Removed.", toolCalls: [] }
   ]);
   const runtime = runtimeWith(provider, recordingAdapter(ran));

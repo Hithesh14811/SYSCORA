@@ -14,11 +14,22 @@ import path from "node:path";
 
 import { startServer } from "../../apps/daemon/src/server.js";
 
+// The check carries a NEEDLE. This fixture used to read
+// `verify: { kind: "element-present" }` with nothing to look for, which the
+// verifier read as "did anything come back at all" and passed on any screen in
+// existence — so the fixture standing in for a well-formed route was itself an
+// example of the defect, and every assertion built on it was measuring nothing.
+// `{contact}` is filled from the same capture as the step's own argument, so the
+// check fails if the click did not leave that conversation on screen.
 const goodSkill = {
   id: "open-chintu",
   title: "Open the chat with Chintu",
   match: { examples: ["open the chat with {contact}"] },
-  steps: [{ tool: "click", args: { text: "{contact}", section: "Chats" }, verify: { kind: "element-present" } }]
+  steps: [{
+    tool: "click",
+    args: { text: "{contact}", section: "Chats" },
+    verify: { kind: "element-present", value: "{contact}" }
+  }]
 };
 
 async function withServer(run) {
@@ -92,5 +103,54 @@ test("the skills routes are behind the token like everything else", async () => 
   await withServer(async ({ base }) => {
     const withoutToken = await fetch(`${base}/api/skills`);
     assert.notEqual(withoutToken.status, 200, "no token, no skills");
+  });
+});
+
+// A CHECK WITH AN EMPTY NEEDLE IS NOT A CHECK, AND THIS IS THE ROUTE IT ARRIVED
+// BY. The recorder's fallback for any tool it had no rule for was
+// `{ kind: "element-present" }` with nothing to look for, and the verifier read
+// an absent needle as "did anything come back at all" — so a write_file step was
+// VERIFIED because the window behind it had buttons on it. Refused at the store
+// rather than only in the recorder, so it holds for a route that was
+// hand-edited on disk or offered by a model.
+//
+// What this would FAIL on: any route claiming to search the screen without
+// saying what for. What it must NOT fail on: a step with no check at all, which
+// is honest — the replayer still requires that step's own receipt to come back
+// ok, and that receipt is read by a different capability than the one that acted.
+test("a check with nothing to look for is refused, and no check at all is fine", async () => {
+  await withServer(async ({ call }) => {
+    const hollow = await call("POST", "/api/skills", {
+      skill: {
+        ...goodSkill,
+        id: "hollow-check",
+        steps: [{ tool: "click", args: { text: "{contact}" }, verify: { kind: "element-present" } }]
+      }
+    });
+    assert.equal(hollow.status, 400);
+    const body = await hollow.json();
+    assert.equal(body.saved, false);
+    assert.match(body.problems.join(" "), /nothing to look for/);
+    assert.match(body.problems.join(" "), /passes on any screen/, "the reason must survive to the caller");
+
+    // Whitespace is not a needle either — the check would still match anything.
+    const blank = await call("POST", "/api/skills", {
+      skill: {
+        ...goodSkill,
+        id: "blank-needle",
+        steps: [{ tool: "click", args: { text: "{contact}" }, verify: { kind: "element-present", value: "   " } }]
+      }
+    });
+    assert.equal(blank.status, 400);
+
+    // An unchecked step is a different thing and must still be accepted.
+    const unchecked = await call("POST", "/api/skills", {
+      skill: { ...goodSkill, id: "unchecked-step", steps: [{ tool: "click", args: { text: "{contact}" } }] }
+    });
+    assert.equal((await unchecked.json()).saved, true);
+
+    const listed = await (await call("GET", "/api/skills")).json();
+    assert.deepEqual(listed.skills.map((skill) => skill.id), ["unchecked-step"],
+      "only the honest route survived");
   });
 });

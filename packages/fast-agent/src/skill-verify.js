@@ -48,16 +48,28 @@ export async function verifyReplayStep(check, { execute, focusedValue = null, la
   switch (check.kind) {
     case "element-present":
     case "element-absent": {
+      // AN EMPTY NEEDLE IS NOT A CHECK, AND IT MUST NOT BE ABLE TO VERIFY.
+      //
+      // This used to read an absent `value` as "did anything come back at all"
+      // and return VERIFIED whenever the screen listed any element — so a
+      // `write_file` step passed because the window behind it had buttons on it.
+      // It could not fail on any screen in existence, and every route the
+      // recorder had ever saved was proceeding on it.
+      //
+      // `validateSkill` now refuses to save or load such a route, so this branch
+      // is unreachable for anything recorded from here on. It stays, and it
+      // stays UNCONFIRMED, for the routes already sitting on people's disks:
+      // the honest reading of "I was asked to look for nothing" is that there is
+      // no evidence either way, and UNCONFIRMED hands over to the model instead
+      // of waving the replay through. Unconfirmed is not failed.
+      if (!value) {
+        return UNCONFIRMED(
+          "this step's check was saved with nothing to look for, so it cannot tell success from failure"
+        );
+      }
       const reading = await execute("screen", {});
       if (!reading?.ok) return UNCONFIRMED(`the screen could not be read: ${String(reading?.text ?? "").slice(0, 120)}`);
-      // An empty `value` means "did anything come back at all" — which is what a
-      // launch or a click with nothing specific to look for can honestly claim.
       const labels = labelsFrom(reading.text);
-      if (!value) {
-        return labels.length > 0
-          ? VERIFIED(`${labels.length} elements are on screen`)
-          : UNCONFIRMED("the reading listed nothing, so there is no evidence either way");
-      }
       const present = labels.some((label) => includesFold(label, value));
       if (check.kind === "element-absent") {
         return present ? FAILED(`"${value}" is still on screen`) : VERIFIED(`"${value}" is gone`);
@@ -68,6 +80,11 @@ export async function verifyReplayStep(check, { execute, focusedValue = null, la
     }
 
     case "window-title-contains": {
+      // Same empty-needle hole as element-present had, found by auditing the rest
+      // of this switch after fixing that one: `"Untitled - Notepad".includes("")`
+      // is true, so a check with no value verified against whatever window
+      // happened to be in front.
+      if (!String(value)) return UNCONFIRMED("the check does not say what the title should contain");
       const reading = await execute("screen", {});
       if (!reading?.ok) return UNCONFIRMED("the screen could not be read");
       const title = titleFrom(reading.text);
@@ -135,6 +152,14 @@ export async function verifyReplayStep(check, { execute, focusedValue = null, la
     case "file-contains": {
       const path = check.path ?? value;
       if (!path) return UNCONFIRMED("no path was given to check");
+      // And the third one. `file-exists` names its own subject and can fail on
+      // its own terms; `file-contains` is a SEARCH, and a search for nothing
+      // succeeds against any file with any content in it — including a file
+      // written to a corrupted path, which is the exact way the first route this
+      // project ever replayed reported itself verified.
+      if (check.kind === "file-contains" && !String(check.contains ?? value ?? "")) {
+        return UNCONFIRMED("the check does not say what the file should contain");
+      }
       const result = check.kind === "file-exists"
         ? await execute("run", { command: `Test-Path '${String(path).replace(/'/g, "''")}'` })
         : await execute("run", { command: `Get-Content '${String(path).replace(/'/g, "''")}' -Raw` });

@@ -332,20 +332,36 @@ test("a window with no accessibility tree is only probed once, not before every 
 
 // ---- The agent was handed %USERPROFILE% and could not open anything ---------
 
+// THIS TEST HAD NO BACKSLASHES IN IT, WHICH IS THE ONE THING IT IS ABOUT.
+//
+// Written as `"C:\Users\hithe\OneDrive\…"` — single backslashes in a normal
+// string literal. `\U`, `\h` and `\O` are identity escapes, so the string was
+// actually `C:UsershitheOneDrive…`, and `\b` in `\beautify` was a literal
+// BACKSPACE character. The assertion `/C:\Users\hithe\OneDrive/` collapsed the
+// same way, so both sides were corrupted identically and the test passed —
+// proving that a path with no separators in it survives sanitisation, which
+// nobody ever doubted.
+//
+// The defect it exists for is real: rewriting the home directory to
+// %USERPROFILE% made the agent echo that literal back into PowerShell, which
+// does not expand %VAR%, so every path resolved against the working directory
+// and nothing was found. Catching a regression in that needs the separators.
+// String.raw, so there is nothing left to get wrong.
 test("a real filesystem path reaches the model intact", () => {
-  const path = "C:\Users\hithe\OneDrive\Documents\check\beautify-ecommerce\src\App.tsx";
+  const path = String.raw`C:\Users\hithe\OneDrive\Documents\check\beautify-ecommerce\src\App.tsx`;
+  assert.ok(path.includes("\\"), "if this string has no separators the test below is vacuous");
   const seen = sanitizeExternalContext(`Found it at ${path}`);
-  assert.match(seen, /C:\Users\hithe\OneDrive/,
-    "rewriting the home directory to %USERPROFILE% made the agent echo that literal back into PowerShell, " +
-    "which does not expand %VAR% — so every path resolved against the working directory and nothing was found");
+  assert.ok(seen.includes(String.raw`C:\Users\hithe\OneDrive`),
+    "the home directory must survive with its separators intact");
+  assert.ok(seen.includes(path), "the whole path must reach the model unaltered");
   assert.ok(!/%USERPROFILE%/.test(seen));
 });
 
 test("credentials are still redacted even though paths are not", () => {
   const seen = sanitizeExternalContext(
-    "C:\Users\hithe\.env holds sk-ABCDEFGH12345678 and AKIAIOSFODNN7EXAMPLE"
+    String.raw`C:\Users\hithe\.env holds sk-ABCDEFGH12345678 and AKIAIOSFODNN7EXAMPLE`
   );
-  assert.match(seen, /C:\Users\hithe/);
+  assert.ok(seen.includes(String.raw`C:\Users\hithe\.env`), "the path is not a secret");
   assert.ok(!/sk-ABCDEFGH12345678/.test(seen));
   assert.ok(!/AKIAIOSFODNN7EXAMPLE/.test(seen));
 });

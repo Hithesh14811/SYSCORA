@@ -36,6 +36,18 @@ export const RETIRE_AFTER_RUNS = 5;
 // pixel and reporting success.
 const FORBIDDEN_ARGS = new Set(["x", "y", "element", "windowId", "coordinate", "coordinates"]);
 
+// The check kinds that are a SEARCH, and are therefore meaningless without
+// something to search for. `input-empty` and `file-exists` are not here: they
+// name their own subject and can fail on their own terms. See the refusal below.
+const NEEDLE_REQUIRED = new Set([
+  "element-present",
+  "element-absent",
+  "window-title-contains",
+  "message-in-conversation",
+  "file-contains",
+  "command-output-contains"
+]);
+
 export function skillsDirectory(basePath) {
   return path.join(basePath, ".syscora", "skills");
 }
@@ -78,6 +90,33 @@ export function validateSkill(skill) {
           `step ${index + 1} is positional (${key}). A step that can only be expressed with coordinates or an ` +
           "index is not skill-able: the control could not be named, which is a perception bug to fix rather " +
           "than a route to save."
+        );
+      }
+    }
+    // A CHECK WITH AN EMPTY NEEDLE IS NOT A CHECK, AND IT IS WORSE THAN NO CHECK
+    // BECAUSE IT READS AS ONE.
+    //
+    // The recorder's fallback for any tool it had no rule for was
+    // `{ kind: "element-present" }` with nothing to look for, and the verifier
+    // read an absent needle as "did anything come back at all" — so a
+    // `write_file` step was VERIFIED because the window behind it happened to
+    // have buttons on it. Every saved route was proceeding on that. Measured
+    // 19 Aug 2026 on the first route the eval ever recorded end to end: two
+    // steps, both checked, neither check capable of failing.
+    //
+    // Refused here rather than in the recorder alone, so the rule holds for a
+    // skill that arrived any other way — hand-edited on disk, or offered by a
+    // model. A step with NO check is fine and is not this: the replayer still
+    // requires the step's own result to be ok, and those receipts are typed and
+    // read the world back by a different capability than the one that acted.
+    // What is refused is claiming to check and checking nothing.
+    if (step?.verify?.kind && NEEDLE_REQUIRED.has(step.verify.kind)) {
+      const needle = String(step.verify.value ?? step.verify.text ?? "").trim();
+      if (!needle) {
+        problems.push(
+          `step ${index + 1}: the ${step.verify.kind} check has nothing to look for, so it passes on any screen ` +
+          "at all. Give it the words the step should put on screen, or leave the step unchecked and let its own " +
+          "receipt speak."
         );
       }
     }

@@ -20,12 +20,41 @@ const OBSERVATION_TOOLS = new Set(["screen", "look", "read_screen", "notes", "re
 
 // What a step must prove before the replayer is allowed past it. Derived from
 // the tool, so a recorded route gets verification without the model choosing it.
+// A NEEDLE OR NOTHING. Every entry here is a function of the step's OWN
+// arguments, so a synthesised check is always something that can fail.
+//
+// It used to be a table of `{ kind: "element-present" }` with nothing to look
+// for, plus the same as the fallback for every tool not listed — and the
+// verifier read an absent needle as "did anything come back at all". A
+// `write_file` step was therefore VERIFIED because the window behind it had
+// buttons on it. That is the defect this file already knew about for `run`, two
+// comments down, arriving by a different door.
+//
+// Where no needle can be derived, the answer is NO CHECK, not an empty one, and
+// the reason is the same one `run` gives: the replayer already stops on a step
+// whose own result is not ok, and those results are typed receipts that read the
+// world back through a different capability than the one that acted — a launch
+// against the window list, a write_file by reading the file back, a click by the
+// focused control. That is evidence from the machine. An empty needle is not.
 const DEFAULT_VERIFY = {
-  // Ordinary typing is proved by the words being on screen. A SEND is not — see
-  // sendVerify below.
-  type: { kind: "element-present" },
-  click: { kind: "element-present" },
-  launch: { kind: "element-present" },
+  // Ordinary typing is proved by the words being on screen, and here the words
+  // are known: they are what was typed. A SEND is not — see sendVerify below.
+  type: (args) => {
+    const text = String(args?.text ?? "").trim();
+    return text ? { kind: "element-present", value: text } : null;
+  },
+  // NOTHING, DELIBERATELY, for both of these.
+  //
+  // A click cannot be proved by looking for its own target afterwards: pressing
+  // a button, opening a menu or sending a message all REMOVE the thing that was
+  // clicked, so the check would fail on exactly the clicks that worked. And a
+  // launch cannot be proved by the window title — "Code.exe" opens a window
+  // called "… - Visual Studio Code" — so a title check would refuse to replay
+  // routes that are fine. Both tools already confirm themselves against the
+  // machine: `click` through the focused control read back over UIA, `launch`
+  // through the window list.
+  click: () => null,
+  launch: () => null,
   // NOTHING, DELIBERATELY. A shell command reports its own exit code, and the
   // replayer already stops on a step that comes back not-ok — that is a signal
   // from the machine, not the agent's opinion of itself, which is what makes it
@@ -33,7 +62,7 @@ const DEFAULT_VERIFY = {
   // `command-output-contains` with no value to look for, and an empty needle
   // matches everything: the first route ever replayed here wrote to a corrupted
   // path and reported the step verified.
-  run: null
+  run: () => null
 };
 
 // §4.2. These are the ones that cannot be un-run, and the replayer has to name
@@ -202,9 +231,18 @@ export function buildSkillFromRun({ id, title, userText, status, calls = [], mal
     const { args } = parameterise(call.args ?? {}, values, names);
     for (const [value, name] of names) parameters.set(name, value);
     const previous = acting[index - 1];
+    // Derived from the PARAMETERISED args, so a needle and the step it checks
+    // carry the same placeholders and are filled with the same capture at
+    // replay. Built from the raw args, `{p1}` in the step would have been
+    // matched against a literal in the check.
+    //
+    // The last arm is `null`, not `{ kind: "element-present" }`. A tool this
+    // file has no rule for is a tool it cannot write an honest check for, and
+    // the old fallback wrote one that passed on any screen at all. Silence is
+    // the honest answer; the step's own receipt still has to come back ok.
     const verify = call.verify
       ?? (isSend(call, previous) ? sendVerify(call, previous, values, names) : null)
-      ?? (Object.hasOwn(DEFAULT_VERIFY, call.tool) ? DEFAULT_VERIFY[call.tool] : { kind: "element-present" });
+      ?? (Object.hasOwn(DEFAULT_VERIFY, call.tool) ? DEFAULT_VERIFY[call.tool](args) : null);
     return {
       tool: call.tool,
       args,
