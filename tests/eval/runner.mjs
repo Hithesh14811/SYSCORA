@@ -5,6 +5,7 @@
 // of what it did. Writes a JSON record per run and regenerates the scoreboard.
 //
 //   node tests/eval/runner.mjs [--only id] [--category files] [--repeat 3] [--mock]
+//                             [--manual] [--write-budgets] [--slack 1.4]
 //
 // See README.md in this directory for the rules a task has to follow.
 
@@ -35,7 +36,20 @@ const options = {
   category: flag("category"),
   repeat: Number(flag("repeat") ?? 1),
   mock: argv.includes("--mock"),
-  manual: argv.includes("--manual")
+  manual: argv.includes("--manual"),
+  // Record what this run measured as the budget every later run is held to.
+  // Deliberately a separate, explicit act: a budget that silently redefines
+  // itself on every run cannot detect a regression, it can only ratify one.
+  writeBudgets: argv.includes("--write-budgets"),
+  // HOW MUCH WORSE THAN THE BASELINE IS STILL NOISE.
+  //
+  // "read last 2 messages" measured 29,759 and 122,000 fresh tokens on the same
+  // code the same day — a 4x spread, decided by which chat WhatsApp happened to
+  // open on. A budget set tight against a single run would fail on that alone
+  // and teach everyone to ignore the eval. So budgets are set from the median of
+  // a repeated baseline, checked against the median of a repeated run, with
+  // headroom on top. Override per run when a change is expected to cost more.
+  slack: Number(flag("slack") ?? 1.4)
 };
 
 // ---- Running PowerShell for setup, verification and teardown -----------------
@@ -109,7 +123,7 @@ async function runSecondTime(task, first, { port, workspace }) {
   const second = { ...task, id: `${task.id}-replay` };
   if (!first.offeredSkill) {
     return {
-      ...first, id: second.id, pass: false, tokensIn: 0, tokensOut: 0, steps: 0, elapsedMs: 0,
+      ...first, id: second.id, pass: false, tokensIn: 0, tokensOut: 0, tokensCached: 0, tokensFresh: 0, steps: 0, elapsedMs: 0,
       reason: "the first run offered no route to save, so there is nothing to replay"
     };
   }
@@ -120,7 +134,7 @@ async function runSecondTime(task, first, { port, workspace }) {
   }).then((response) => response.json()).catch((error) => ({ saved: false, problems: [String(error)] }));
   if (!saved.saved) {
     return {
-      ...first, id: second.id, pass: false, tokensIn: 0, tokensOut: 0, steps: 0, elapsedMs: 0,
+      ...first, id: second.id, pass: false, tokensIn: 0, tokensOut: 0, tokensCached: 0, tokensFresh: 0, steps: 0, elapsedMs: 0,
       reason: `the offered route was refused: ${(saved.problems ?? []).join("; ")}`
     };
   }
@@ -160,7 +174,13 @@ async function loadTasks() {
 // ---- One task ----------------------------------------------------------------
 
 async function runTask(task, { port, workspace }) {
-  const expand = (text) => String(text ?? "").replaceAll("{workspace}", workspace);
+  // `{fixtures}` expands with FORWARD slashes on purpose. PowerShell takes them
+  // happily, and it keeps the token from ever introducing the backslash that
+  // `assertNoControlCharacters` exists to catch — a verify script path is exactly
+  // the kind of long string where `\t` would be pasted in and not noticed.
+  const expand = (text) => String(text ?? "")
+    .replaceAll("{workspace}", workspace)
+    .replaceAll("{fixtures}", path.join(here, "fixtures").replaceAll("\\", "/"));
   const record = {
     id: task.id,
     category: task.category ?? "uncategorised",
@@ -172,6 +192,17 @@ async function runTask(task, { port, workspace }) {
     elapsedMs: 0,
     tokensIn: 0,
     tokensOut: 0,
+    // WHAT WAS SENT IS NOT WHAT WAS BILLED, AND ONLY ONE OF THEM IS MONEY.
+    //
+    // The endpoint serves the longest identical prefix of a request from cache
+    // at roughly a tenth of the price — measured, 8,320 of the 8,222-token fixed
+    // prefix on every step after the first (scripts/probe-prompt-cache.mjs). The
+    // scoreboard quoted `tokensIn + tokensOut`, which counts a cached token and
+    // a fresh one the same, and so overstated a long GUI run by close to an
+    // order of magnitude and pointed the optimisation work at the wrong thing.
+    // `tokensFresh` is the number a budget is set on.
+    tokensCached: 0,
+    tokensFresh: 0,
     finalMessage: "",
     // WHICH TOOLS, IN WHAT ORDER.
     //
@@ -258,6 +289,10 @@ async function runTask(task, { port, workspace }) {
       record.toolCalls = metrics.toolCalls ?? 0;
       record.tokensIn = metrics.tokensIn ?? 0;
       record.tokensOut = metrics.tokensOut ?? 0;
+      record.tokensCached = metrics.tokensCached ?? 0;
+      // Derived rather than trusted, for the case where a provider reports no
+      // cache detail at all: with nothing cached, every input token was fresh.
+      record.tokensFresh = metrics.tokensFresh ?? Math.max(0, record.tokensIn - record.tokensCached);
       record.finalMessage = String(
         session.finalResponse?.summary?.summary
         ?? session.finalResponse?.message
@@ -316,7 +351,17 @@ async function runTask(task, { port, workspace }) {
   return record;
 }
 
-// ---- Scoreboard ---------------------------------------------------------------
+// ---- Aggregating repeats ------------------------------------------------------
+//
+// A SINGLE RUN OF A GUI TASK IS NOT A MEASUREMENT.
+//
+// Every number this project has quoted was an n=1 hand-run, and "read the last
+// two messages" measured 29,759 and 122,000 fresh tokens on the same code the
+// same day — decided by which chat WhatsApp happened to be showing. At that
+// spread a single run cannot distinguish a 30% improvement from luck, which is
+// how a regression gets merged with a graph attached. So every task is run N
+// times and reported as a median AND a spread; a median with no spread beside it
+// hides exactly the variance that makes the median unreliable.
 
 const median = (numbers) => {
   if (numbers.length === 0) return 0;
@@ -328,47 +373,186 @@ const median = (numbers) => {
 const costOf = (record) =>
   (record.tokensIn / 1e6) * COST_PER_MTOK_IN + (record.tokensOut / 1e6) * COST_PER_MTOK_OUT;
 
-function scoreboard(records, meta) {
-  const passed = records.filter((record) => record.pass);
-  const rate = records.length ? Math.round((passed.length / records.length) * 100) : 0;
+const spread = (numbers, format = (value) => value.toLocaleString()) => {
+  if (numbers.length <= 1) return "";
+  const low = Math.min(...numbers);
+  const high = Math.max(...numbers);
+  return low === high ? "" : `${format(low)}–${format(high)}`;
+};
+
+// One row per task, whatever the repeat count. Runs stay in the JSON record for
+// anyone who wants to look at an individual one.
+function summarise(records) {
+  const byTask = new Map();
+  for (const record of records) {
+    if (!byTask.has(record.id)) byTask.set(record.id, []);
+    byTask.get(record.id).push(record);
+  }
+  return [...byTask.entries()].map(([id, runs]) => {
+    const fresh = runs.map((run) => run.tokensFresh);
+    const times = runs.map((run) => run.elapsedMs);
+    const steps = runs.map((run) => run.steps);
+    const passes = runs.filter((run) => run.pass).length;
+    return {
+      id,
+      category: runs[0].category,
+      runs: runs.length,
+      passes,
+      // A task that passes twice out of three is not a passing task. Anything
+      // less than every run is a flake, and a flake is a defect that has not
+      // been diagnosed yet — grading it as a pass is how it stays undiagnosed.
+      pass: passes === runs.length,
+      medianFresh: median(fresh),
+      medianElapsedMs: median(times),
+      medianSteps: median(steps),
+      medianTokensSent: median(runs.map((run) => run.tokensIn + run.tokensOut)),
+      freshSpread: spread(fresh),
+      timeSpread: spread(times, (value) => `${(value / 1000).toFixed(1)}s`),
+      stepSpread: spread(steps),
+      cost: runs.reduce((sum, run) => sum + costOf(run), 0) / runs.length,
+      tools: runs.find((run) => run.tools.length)?.tools ?? [],
+      reason: runs.find((run) => !run.pass)?.reason ?? null
+    };
+  });
+}
+
+// ---- Budgets ------------------------------------------------------------------
+//
+// WHAT THE EVAL IS FOR. Without this it is a report; with it, it is a gate.
+//
+// A change that makes a task pass while doubling what it costs is a regression,
+// and the scoreboard as it stood would have shown that as two green ticks. The
+// budgets are recorded from a measured baseline (`--write-budgets`), never
+// hand-guessed, and they are checked against the MEDIAN of a repeated run so
+// that one unlucky run cannot fail the build on its own.
+
+const BUDGETS_FILE = path.join(here, "budgets.json");
+
+async function loadBudgets() {
+  try {
+    return JSON.parse(await fs.readFile(BUDGETS_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function budgetsFrom(summaries, meta) {
+  return {
+    recordedAt: meta.at,
+    model: meta.model,
+    repeat: meta.repeat,
+    slack: meta.slack,
+    note:
+      "Recorded from a measured baseline with --write-budgets, not chosen by hand. " +
+      "Each ceiling is that task's baseline MEDIAN times the slack above. A later run " +
+      "breaches a budget when ITS median exceeds the ceiling — one unlucky run cannot " +
+      "fail the gate, and a task that got quietly twice as expensive cannot pass it.",
+    tasks: Object.fromEntries(summaries.map((summary) => [summary.id, {
+      // Floors, because a task that costs almost nothing has a median near zero
+      // and multiplying that gives a ceiling nothing can stay under. They are the
+      // measured noise, not a target: 2,000 fresh tokens is well under a single
+      // step's fixed prompt, and 3s is under one model round trip.
+      freshTokens: Math.max(2000, Math.round(summary.medianFresh * meta.slack)),
+      elapsedMs: Math.max(3000, Math.round(summary.medianElapsedMs * meta.slack)),
+      steps: Math.max(2, Math.ceil(summary.medianSteps * meta.slack)),
+      baseline: {
+        pass: summary.pass,
+        passes: `${summary.passes}/${summary.runs}`,
+        medianFresh: summary.medianFresh,
+        medianElapsedMs: summary.medianElapsedMs,
+        medianSteps: summary.medianSteps
+      }
+    }]))
+  };
+}
+
+function checkBudgets(summaries, budgets) {
+  if (!budgets) return [];
+  const breaches = [];
+  for (const summary of summaries) {
+    const budget = budgets.tasks?.[summary.id];
+    if (!budget) continue;
+    // A TASK THAT USED TO PASS AND NOW DOES NOT IS THE WORST REGRESSION THERE IS,
+    // and it is not a token budget — so it is checked here rather than left to
+    // the pass column, where a task that was already failing at baseline would
+    // have made the whole gate red forever and got the gate switched off.
+    if (budget.baseline?.pass && !summary.pass) {
+      breaches.push(`${summary.id}: passed ${budget.baseline.passes} at baseline, now ${summary.passes}/${summary.runs}` +
+        (summary.reason ? ` — ${summary.reason}` : ""));
+    }
+    if (summary.medianFresh > budget.freshTokens) {
+      breaches.push(`${summary.id}: ${summary.medianFresh.toLocaleString()} fresh tokens against a ceiling of ` +
+        `${budget.freshTokens.toLocaleString()} (baseline median ${budget.baseline?.medianFresh?.toLocaleString() ?? "?"})`);
+    }
+    if (summary.medianElapsedMs > budget.elapsedMs) {
+      breaches.push(`${summary.id}: ${(summary.medianElapsedMs / 1000).toFixed(1)}s against a ceiling of ` +
+        `${(budget.elapsedMs / 1000).toFixed(1)}s (baseline median ${((budget.baseline?.medianElapsedMs ?? 0) / 1000).toFixed(1)}s)`);
+    }
+    if (summary.medianSteps > budget.steps) {
+      breaches.push(`${summary.id}: ${summary.medianSteps} steps against a ceiling of ${budget.steps} ` +
+        `(baseline median ${budget.baseline?.medianSteps ?? "?"})`);
+    }
+  }
+  return breaches;
+}
+
+// ---- Scoreboard ---------------------------------------------------------------
+
+function scoreboard(records, summaries, meta) {
+  const passed = summaries.filter((summary) => summary.pass);
+  const rate = summaries.length ? Math.round((passed.length / summaries.length) * 100) : 0;
   const lines = [];
   lines.push("# SYSCORA scoreboard");
   lines.push("");
-  lines.push(`Generated ${meta.at} · ${meta.model} · ${records.length} runs`);
+  lines.push(`Generated ${meta.at} · ${meta.model} · ${summaries.length} tasks × ${meta.repeat} = ${records.length} runs`);
+  if (meta.label) lines.push(`\n**${meta.label}**`);
+  lines.push("");
+  lines.push("Costs are quoted as **fresh** input tokens — what is billed at full rate. The");
+  lines.push("endpoint serves ~96.6% of the fixed prompt prefix from its cache at roughly a");
+  lines.push("tenth of the price, so `tokensIn` is bandwidth, not money.");
   lines.push("");
   lines.push("| | |");
   lines.push("|---|---|");
-  lines.push(`| **Pass rate** | **${rate}%** (${passed.length}/${records.length}) |`);
-  lines.push(`| Median tokens | ${median(records.map((r) => r.tokensIn + r.tokensOut)).toLocaleString()} |`);
-  lines.push(`| Median time | ${(median(records.map((r) => r.elapsedMs)) / 1000).toFixed(1)}s |`);
-  lines.push(`| Median steps | ${median(records.map((r) => r.steps))} |`);
-  lines.push(`| Median cost | $${median(records.map((r) => Math.round(costOf(r) * 1e6))) / 1e6} |`);
-  lines.push(`| Total cost | $${records.reduce((sum, r) => sum + costOf(r), 0).toFixed(3)} |`);
+  lines.push(`| **Pass rate** | **${rate}%** (${passed.length}/${summaries.length} tasks passing every run) |`);
+  lines.push(`| Median fresh tokens | ${median(summaries.map((s) => s.medianFresh)).toLocaleString()} |`);
+  lines.push(`| Median time | ${(median(summaries.map((s) => s.medianElapsedMs)) / 1000).toFixed(1)}s |`);
+  lines.push(`| Median steps | ${median(summaries.map((s) => s.medianSteps))} |`);
+  lines.push(`| Total cost of this run | $${records.reduce((sum, r) => sum + costOf(r), 0).toFixed(3)} |`);
   lines.push("");
+  if (meta.breaches?.length) {
+    lines.push("## Budget breaches");
+    lines.push("");
+    for (const breach of meta.breaches) lines.push(`- ${breach}`);
+    lines.push("");
+  }
   lines.push("## By task");
   lines.push("");
-  lines.push("| task | category | pass | steps | tokens | time | why it failed |");
-  lines.push("|---|---|---|---|---|---|---|");
-  for (const record of records) {
+  lines.push("Median of the repeats, with the full spread beside it where the runs disagreed.");
+  lines.push("");
+  lines.push("| task | category | pass | steps | fresh tokens | spread | time | spread | why it failed |");
+  lines.push("|---|---|---|---|---|---|---|---|---|");
+  for (const summary of summaries) {
     lines.push([
-      record.id,
-      record.category,
-      record.pass ? "✅" : "❌",
-      record.steps,
-      (record.tokensIn + record.tokensOut).toLocaleString(),
-      `${(record.elapsedMs / 1000).toFixed(1)}s`,
-      record.pass ? "" : (record.reason ?? "").slice(0, 80)
+      summary.id,
+      summary.category,
+      `${summary.pass ? "✅" : "❌"} ${summary.passes}/${summary.runs}`,
+      summary.medianSteps + (summary.stepSpread ? ` (${summary.stepSpread})` : ""),
+      summary.medianFresh.toLocaleString(),
+      summary.freshSpread,
+      `${(summary.medianElapsedMs / 1000).toFixed(1)}s`,
+      summary.timeSpread,
+      summary.pass ? "" : (summary.reason ?? "").slice(0, 80)
     ].join(" | ").replace(/^/, "| ").concat(" |"));
   }
   lines.push("");
-  lines.push("## The most expensive runs");
+  lines.push("## The most expensive tasks");
   lines.push("");
-  const dearest = [...records].sort((a, b) => (b.tokensIn + b.tokensOut) - (a.tokensIn + a.tokensOut)).slice(0, 5);
-  for (const record of dearest) {
+  const dearest = [...summaries].sort((a, b) => b.medianFresh - a.medianFresh).slice(0, 5);
+  for (const summary of dearest) {
     lines.push(
-      `- **${record.id}** — ${(record.tokensIn + record.tokensOut).toLocaleString()} tokens over ` +
-      `${record.steps} steps. ${record.pass ? "Passed, which is why nobody noticed." : "Failed."}` +
-      (record.tools.length ? `\n  \`${record.tools.join(" → ")}\`` : "")
+      `- **${summary.id}** — ${summary.medianFresh.toLocaleString()} fresh tokens over ` +
+      `${summary.medianSteps} steps. ${summary.pass ? "Passed, which is why nobody noticed." : "Failed."}` +
+      (summary.tools.length ? `\n  \`${summary.tools.join(" → ")}\`` : "")
     );
   }
   lines.push("");
@@ -403,9 +587,9 @@ async function main() {
       process.stdout.write(`  ${task.id}${options.repeat > 1 ? ` (${round})` : ""} … `);
       const record = await runTask(task, { port, workspace });
       records.push(record);
-      const tokens = (record.tokensIn + record.tokensOut).toLocaleString();
       console.log(
-        `${record.pass ? "PASS" : "FAIL"}  ${record.steps} steps · ${tokens} tokens · ` +
+        `${record.pass ? "PASS" : "FAIL"}  ${record.steps} steps · ` +
+        `${record.tokensFresh.toLocaleString()} fresh (${(record.tokensIn + record.tokensOut).toLocaleString()} sent) · ` +
         `${(record.elapsedMs / 1000).toFixed(1)}s${record.pass ? "" : `  — ${record.reason}`}`
       );
       if (record.tools.length) console.log(`        ${record.tools.join(" → ")}`);
@@ -433,19 +617,57 @@ async function main() {
   await new Promise((resolve) => server.close(resolve));
 
   const at = new Date().toISOString();
+  const summaries = summarise(records);
+  const meta = {
+    at,
+    model,
+    repeat: options.repeat,
+    slack: options.slack,
+    label: options.only || options.category
+      ? `Partial run — ${options.only ? `only ${options.only}` : `category ${options.category}`}. ` +
+        "Not a baseline; the budgets file is only written by a full run."
+      : (options.manual ? null : "Automatic tasks only. Run with --manual to include the four that touch " +
+        "the volume, WhatsApp and the webview.")
+  };
+
+  // A PARTIAL RUN MUST NOT BE ABLE TO REWRITE THE BUDGETS.
+  //
+  // `--only one-task --write-budgets` would otherwise drop every other task's
+  // ceiling from the file, and the next full run would sail through with nothing
+  // held to anything. Recording a baseline is a whole-suite act.
+  const budgets = await loadBudgets();
+  const partial = Boolean(options.only || options.category);
+  if (options.writeBudgets && partial) {
+    console.log("\nRefusing --write-budgets on a partial run: a baseline is the whole suite or it is not a baseline.");
+  } else if (options.writeBudgets) {
+    await fs.writeFile(BUDGETS_FILE, `${JSON.stringify(budgetsFrom(summaries, meta), null, 2)}\n`);
+    console.log(`\nRecorded ${summaries.length} budgets from this run into tests/eval/budgets.json`);
+  }
+  meta.breaches = options.writeBudgets ? [] : checkBudgets(summaries, budgets);
+
   const resultsDir = path.join(here, "results");
   await fs.mkdir(resultsDir, { recursive: true });
   await fs.writeFile(
     path.join(resultsDir, `${at.replace(/[:.]/g, "-")}.json`),
-    JSON.stringify({ at, model, records }, null, 2)
+    JSON.stringify({ at, model, repeat: options.repeat, summaries, records }, null, 2)
   );
-  const board = scoreboard(records, { at, model });
+  const board = scoreboard(records, summaries, meta);
   await fs.writeFile(path.join(here, "scoreboard.md"), board);
 
   console.log(`\n${board.split("## By task")[0].trim()}`);
+  if (meta.breaches.length) {
+    console.log(`\nBUDGET BREACHES (${meta.breaches.length}):`);
+    for (const breach of meta.breaches) console.log(`  - ${breach}`);
+  } else if (budgets && !options.writeBudgets) {
+    console.log(`\nNo budget breached against the baseline recorded ${budgets.recordedAt}.`);
+  } else if (!budgets) {
+    console.log("\nNo budgets recorded yet — run once with --write-budgets to make this a gate.");
+  }
   console.log(`\nFull scoreboard: tests/eval/scoreboard.md`);
-  // A non-zero exit when anything failed, so this can gate a commit later.
-  process.exitCode = records.every((record) => record.pass) ? 0 : 1;
+  // A non-zero exit when anything failed OR got quietly more expensive. The
+  // second half is the point: a change that keeps every task passing while
+  // doubling what it costs used to show up here as a page of green ticks.
+  process.exitCode = summaries.every((summary) => summary.pass) && meta.breaches.length === 0 ? 0 : 1;
 }
 
 main().catch((error) => {

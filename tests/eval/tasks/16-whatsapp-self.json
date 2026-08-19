@@ -2,10 +2,13 @@
   "id": "messaging-send-to-self",
   "category": "messaging",
   "prompt": "Send a WhatsApp message to my own chat (the one called 'Message yourself') saying eval-ping",
-  "why": "The highest-stakes action in the product, and the one that reported success while the text sat unsent in a search box. Aimed at the user's OWN chat so no other human is ever messaged by the harness. Manual: it needs WhatsApp signed in.",
+  "why": "The highest-stakes action in the product, and the one that reported success while the text sat unsent in a search box. Aimed at the user's OWN chat so no other human is ever messaged by the harness. Manual: it needs WhatsApp signed in. The verify was 'Write-Output checked-by-human' until 19 Aug 2026 — it passed unconditionally, so the single most important row on the scoreboard was a green tick with nothing behind it. It now counts occurrences of the text in the conversation before and after, over the RAW UIA view of WhatsApp's content window, in its own process: an INCREASE is the proof, because merely finding the words was already true from the previous run.",
   "timeoutMs": 240000,
+  "setup": [
+    { "run": "& '{fixtures}/whatsapp-message-count.ps1' -Text 'eval-ping' | Set-Content -Path '{workspace}/whatsapp-before.txt'" }
+  ],
   "verify": [
-    { "run": "Write-Output 'checked-by-human'", "expect": "checked" }
+    { "run": "$before = [int](Get-Content -Path '{workspace}/whatsapp-before.txt'); $now = [int](& '{fixtures}/whatsapp-message-count.ps1' -Text 'eval-ping'); if ($now -lt 0) { 'WHATSAPP-NOT-RUNNING' } elseif ($now -gt $before) { 'NEW-MESSAGE-IN-CONVERSATION' } else { \"NO-NEW-MESSAGE before=$before now=$now\" }", "expect": "NEW-MESSAGE-IN-CONVERSATION" }
   ],
   "manual": true
 }

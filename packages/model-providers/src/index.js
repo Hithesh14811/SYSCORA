@@ -1807,6 +1807,24 @@ export function createModelProvider(settings = {}) {
 // array or a comma-separated list; the resulting chain is still one provider
 // as far as the reasoning boundary is concerned.
 export function createModelProviderChain(settings = {}) {
+  // ASKING FOR MOCK MEANS ASKING FOR NO NETWORK, AND A FALLBACK DEFEATS THAT
+  // SILENTLY.
+  //
+  // Observed live, 19 Aug 2026, the first time a real fallback was configured:
+  // `npm run eval -- --mock` — documented as "no model, no machine, no cost" —
+  // built the chain [mock, deepseek]. MockModelProvider does not support `chat`,
+  // so FailoverModelProvider skipped straight past it to the paid endpoint, and
+  // thirty-odd eval tasks ran for real against the real machine and a real bill,
+  // including one that drives WhatsApp. Nothing warned; it looked like a mock run
+  // that happened to be slow.
+  //
+  // Keyed on the provider having been NAMED as mock, not on the primary instance
+  // turning out to be a Mock — `createModelProvider` also returns one when the
+  // requested provider has no credentials, and falling over to a working second
+  // account is exactly the right answer to that.
+  const askedForMock = String(settings.provider ?? "").toLowerCase() === "mock";
+  if (askedForMock) return new FailoverModelProvider([new MockModelProvider()]);
+
   const configuredKeys = Array.isArray(settings.apiKeys)
     ? settings.apiKeys.map((key) => String(key).trim()).filter(Boolean)
     : [];
