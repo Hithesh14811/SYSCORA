@@ -45,6 +45,26 @@ export { buildToolset };
 // a loop that has stopped making progress, and six minutes bounds that already.
 const DEFAULT_MAX_STEPS = 80;
 const DEFAULT_MAX_ELAPSED_MS = 6 * 60 * 1000;
+// AND A CEILING ON WHAT A SINGLE REQUEST MAY COST.
+//
+// There was none. `maxSteps` bounds decisions and `maxElapsedMs` bounds the wall
+// clock, and neither bounds money: a step that reads a window is worth twenty
+// steps that run a command, so eighty cheap steps and eighty expensive ones are
+// the same number and a different bill. Measured live: one drawing task spent
+// 894,000 tokens over 54 steps, and one hunt for an unlabelled emoji button
+// spent 692,000 over 48. Both finished inside six minutes. Nothing stopped
+// either, and nobody knew until the run was over.
+//
+// Counted in FRESH tokens, not sent ones, because fresh tokens are what is
+// billed at full rate — the endpoint serves ~96.6% of the fixed prefix from its
+// cache at roughly a tenth of the price, so a ceiling on `tokensIn` would fire
+// on runs that cost almost nothing. See the cache note in the loop.
+//
+// 150,000 is deliberately well above every task that currently works — the most
+// expensive passing eval task is ~35,000 — so this stops runaways and never a
+// working request. It is a backstop, not a target: if it starts firing on real
+// work, the fix is the loop, not a bigger number.
+const DEFAULT_MAX_FRESH_TOKENS = 150000;
 // Beyond this the conversation is trimmed from the oldest tool output forward.
 // Generous — a long task is a long conversation — but not unbounded, because an
 // unbounded prompt is how this codebase previously reached four million
@@ -121,13 +141,28 @@ const SUPERSEDED = "… [an earlier reading of this window, now out of date — 
 // that point on, so everything after it becomes a fresh, full-price token on
 // every subsequent step. The saving is real and so is the new cost, and which
 // one wins is an empirical question about a particular task — so it is settled
-// with a measurement rather than an argument. `SYSCORA_KEEP_HISTORY=1` turns the
-// collapse off; scripts/probe-history-cost.mjs runs the same task both ways and
-// compares what was actually billed.
-const KEEPS_HISTORY_INTACT = process.env.SYSCORA_KEEP_HISTORY === "1";
+// with a measurement rather than an argument. scripts/probe-history-cost.mjs
+// runs the same task both ways and compares what was actually billed.
+//
+// AND THE MEASUREMENT CAME BACK AGAINST IT, SO THE DEFAULT IS NOW OFF.
+//
+// Three paired live runs, comparing only runs that took the same number of
+// steps — the only fair comparison available:
+//
+//     6 steps, collapse on      24,725 fresh
+//     6 steps, collapse off     16,623 fresh
+//     6 steps, collapse off     16,196 fresh
+//
+// The collapse saves tokens and spends cache, and on this endpoint the cache is
+// worth more. It is kept, behind `SYSCORA_COLLAPSE_HISTORY=1`, because the
+// comparison is n=1 on the expensive side and because the eval now measures both
+// settings across the whole task set — a default should be reversible by a
+// number, not by an argument. P4 (delta perception, append-only history) replaces
+// both paths with something strictly better and this seam goes away.
+const COLLAPSES_HISTORY = process.env.SYSCORA_COLLAPSE_HISTORY === "1";
 
 function supersedeEarlierReading(messages, toolName, windowId) {
-  if (KEEPS_HISTORY_INTACT) return;
+  if (!COLLAPSES_HISTORY) return;
   if (toolName !== "screen" || !windowId) return;
   const tag = `(windowId ${windowId})`;
   for (let index = messages.length - 2; index >= 0; index -= 1) {
@@ -426,7 +461,13 @@ function pruneConversation(messages) {
   // comment above already knew that trimming a little on every step destroyed
   // prefix reuse — this makes the whole behaviour measurable rather than only
   // the frequency of it.
-  if (KEEPS_HISTORY_INTACT) return;
+  //
+  // OFF BY DEFAULT WITH THE COLLAPSE, and this half is the safer of the two to
+  // disable: MAX_CONVERSATION_CHARS is 60,000 and almost no run reaches it, so
+  // for ordinary work this changes nothing at all. What it does change is the
+  // long run — the one that was already expensive — where it stops turning every
+  // remaining step into a full-price re-read.
+  if (!COLLAPSES_HISTORY) return;
   if (messageChars(messages) <= MAX_CONVERSATION_CHARS) return;
   const target = Math.floor(MAX_CONVERSATION_CHARS * PRUNE_TARGET_FRACTION);
   // The tail that stays whatever happens.
@@ -451,6 +492,7 @@ export class FastAgent {
     onEvent = () => {},
     maxSteps = DEFAULT_MAX_STEPS,
     maxElapsedMs = DEFAULT_MAX_ELAPSED_MS,
+    maxFreshTokens = DEFAULT_MAX_FRESH_TOKENS,
     signal = null,
     systemPrompt = SYSTEM_PROMPT,
     // The saved routes, or nothing. DEFAULTS TO NOTHING ON PURPOSE: with no
@@ -464,6 +506,7 @@ export class FastAgent {
     this.onEvent = onEvent;
     this.maxSteps = maxSteps;
     this.maxElapsedMs = maxElapsedMs;
+    this.maxFreshTokens = maxFreshTokens;
     this.signal = signal;
     this.systemPrompt = systemPrompt;
     this.skills = skills;
@@ -733,6 +776,30 @@ export class FastAgent {
         return this._settle(
           "PARTIALLY_COMPLETED",
           `${lastText ? `${lastText}\n\n` : ""}I ran out of time on this one. Anything already done is still in place.`,
+          { steps, toolCalls, startedAt }
+        );
+      }
+      // THE COST CEILING, CHECKED BEFORE SPENDING THE NEXT ROUND TRIP.
+      //
+      // Here rather than where the tokens are counted, so it reads with the other
+      // two budgets and so it stops the run from spending MORE rather than
+      // punishing it for what it has already spent. A step that overshoots on its
+      // own — a very large screen reading — is already paid for by the time
+      // anyone can see it; what this prevents is the fifty steps after it.
+      //
+      // PARTIALLY_COMPLETED, not FAILED, and the number is in the sentence:
+      // hitting a budget is not the same as being unable to do the work, and a
+      // user told "I stopped" without being told what it cost cannot decide
+      // whether to raise the ceiling or rephrase the request.
+      const freshSoFar = Math.max(0, (this._tokens?.in ?? 0) - (this._tokens?.cached ?? 0));
+      if (freshSoFar >= this.maxFreshTokens) {
+        return this._settle(
+          "PARTIALLY_COMPLETED",
+          `${lastText ? `${lastText}\n\n` : ""}I stopped here: this request has cost ` +
+          `${freshSoFar.toLocaleString()} billed tokens, which is the ceiling I run under ` +
+          `(${this.maxFreshTokens.toLocaleString()}). Anything already done is still in place. ` +
+          "That usually means I was going round in circles rather than that the task is large — " +
+          "tell me what you can see and I will go straight there.",
           { steps, toolCalls, startedAt }
         );
       }
