@@ -196,12 +196,34 @@ async function loadTasks() {
     assertNoControlCharacters(task, name);
     tasks.push(task);
   }
-  return tasks.filter((task) => {
+  const selected = tasks.filter((task) => {
     if (options.only && task.id !== options.only) return false;
     if (options.category && task.category !== options.category) return false;
     if (task.manual && !options.manual && !options.only) return false;
     return true;
   });
+  // THE HEADLINE NUMBER GETS QUOTED TO PEOPLE WHO CANNOT CHECK IT, SO ITS
+  // DENOMINATOR HAS TO BE UNAMBIGUOUS.
+  //
+  // The header used to read "19 tasks × 3 = 60 runs", which is not arithmetic —
+  // 19 × 3 is 57 — and the pass rate underneath it was out of 20. Three
+  // different populations were being called "tasks": the 19 files on disk, the
+  // 15 that run without --manual, and the 20 ROWS that appear on the scoreboard,
+  // because `skill-replay-file-write` runs twice and reports the derive and the
+  // replay separately. Nothing was wrong with the measurement; the label was
+  // wrong, which is worse, because a wrong label is quoted with confidence.
+  return {
+    tasks: selected,
+    census: {
+      files: tasks.length,
+      selected: selected.length,
+      manualTotal: tasks.filter((task) => task.manual).length,
+      manualIncluded: selected.filter((task) => task.manual).length,
+      // Each of these contributes a SECOND row: the same request again with the
+      // route it just derived, which is the whole claim of skills.
+      extraRows: selected.filter((task) => task.replayTwice).length
+    }
+  };
 }
 
 // ---- One task ----------------------------------------------------------------
@@ -610,18 +632,40 @@ function scoreboard(records, summaries, meta) {
   lines.push("");
   // WHICH CODE THIS MEASURED. A scoreboard with no commit on it cannot be
   // compared to anything later, and this file is the thing a merge is gated on.
-  lines.push(`Generated ${meta.at} · ${meta.model} · ${summaries.length} tasks × ${meta.repeat} = ${records.length} runs`);
+  lines.push(`Generated ${meta.at} · ${meta.model}`);
   lines.push("");
   lines.push(`Code under test: \`${meta.commit}\``);
-  if (meta.label) lines.push(`\n**${meta.label}**`);
   lines.push("");
+  // Spelled out rather than multiplied, because three different numbers here can
+  // all honestly be called "tasks" and only one of them is the denominator.
+  const census = meta.census;
+  if (census) {
+    lines.push("**What was measured**");
+    lines.push("");
+    lines.push(`- **${census.files} task files** on disk, of which **${census.selected} ran**` +
+      (census.manualTotal
+        ? ` — including ${census.manualIncluded} of the ${census.manualTotal} opt-in \`manual\` tasks, ` +
+          "which touch the volume, WhatsApp and the webview and are skipped unless `--manual` is passed"
+        : ""));
+    const s = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+    lines.push(`- **${s(summaries.length, "scoreboard row")}**` +
+      (census.extraRows
+        ? `, because ${s(census.extraRows, "task")} runs twice: once to derive a route and once to replay ` +
+          "it, and those are reported separately"
+        : ""));
+    lines.push(`- **${s(meta.repeat, "repeat")}** of each row = **${s(records.length, "run")}**`);
+    lines.push(`- The pass rate below is out of the **${s(summaries.length, "row")}**, and a row counts as ` +
+      "passing only when EVERY repeat passed");
+    lines.push("");
+  }
+  if (meta.label) lines.push(`**${meta.label}**\n`);
   lines.push("Costs are quoted as **fresh** input tokens — what is billed at full rate. The");
   lines.push("endpoint serves ~96.6% of the fixed prompt prefix from its cache at roughly a");
   lines.push("tenth of the price, so `tokensIn` is bandwidth, not money.");
   lines.push("");
   lines.push("| | |");
   lines.push("|---|---|");
-  lines.push(`| **Pass rate** | **${rate}%** (${passed.length}/${summaries.length} tasks passing every run) |`);
+  lines.push(`| **Pass rate** | **${rate}%** (${passed.length} of ${summaries.length} rows passing every repeat) |`);
   lines.push(`| Median fresh tokens | ${median(summaries.map((s) => s.medianFresh)).toLocaleString()} |`);
   lines.push(`| Median time | ${(median(summaries.map((s) => s.medianElapsedMs)) / 1000).toFixed(1)}s |`);
   lines.push(`| Median steps | ${median(summaries.map((s) => s.medianSteps))} |`);
@@ -676,13 +720,14 @@ async function main() {
       at: saved.at,
       model: saved.model,
       repeat: saved.repeat ?? 1,
+      census: saved.census ?? null,
       commit: `${saved.commit ?? "unknown"} (re-aggregated from ${path.basename(options.from)})`,
       label: null
     }, { write: false });
     return;
   }
 
-  const tasks = await loadTasks();
+  const { tasks, census } = await loadTasks();
   if (tasks.length === 0) {
     console.log("No tasks matched.");
     return;
@@ -700,7 +745,11 @@ async function main() {
   const port = server.address().port;
   const model = options.mock ? "mock" : (process.env.SYSCORA_MODEL_NAME ?? "configured provider");
 
-  console.log(`Running ${tasks.length} task(s) × ${options.repeat} against ${model}\n`);
+  console.log(
+    `Running ${tasks.length} of ${census.files} task files × ${options.repeat} repeats against ${model}\n` +
+    `  ${census.manualIncluded} of ${census.manualTotal} opt-in tasks included` +
+    `${census.extraRows ? ` · ${census.extraRows} task reports a second row for its replay` : ""}\n`
+  );
   const records = [];
   for (let round = 1; round <= options.repeat; round += 1) {
     for (const task of tasks) {
@@ -756,6 +805,7 @@ async function main() {
     model,
     commit: `${head}${dirty ? " + uncommitted changes" : ""}`,
     repeat: options.repeat,
+    census,
     label: options.only || options.category
       ? `Partial run — ${options.only ? `only ${options.only}` : `category ${options.category}`}. ` +
         "Not a baseline; the budgets file is only written by a full run."
@@ -793,7 +843,7 @@ async function report(records, meta, { write = true } = {}) {
     await fs.mkdir(resultsDir, { recursive: true });
     await fs.writeFile(
       path.join(resultsDir, `${meta.at.replace(/[:.]/g, "-")}.json`),
-      JSON.stringify({ at: meta.at, model: meta.model, commit: meta.commit, repeat: meta.repeat, summaries, records }, null, 2)
+      JSON.stringify({ at: meta.at, model: meta.model, commit: meta.commit, repeat: meta.repeat, census: meta.census, summaries, records }, null, 2)
     );
     await fs.writeFile(path.join(here, "scoreboard.md"), board);
   }
