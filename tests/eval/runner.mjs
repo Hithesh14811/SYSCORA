@@ -146,7 +146,7 @@ async function stopSession(port, sessionId, { graceMs = 45000 } = {}) {
  * because "it felt faster" is exactly the claim this harness exists to replace.
  */
 async function runSecondTime(task, first, { port, workspace }) {
-  const second = { ...task, id: `${task.id}-replay` };
+  const second = { ...task, id: `${task.id}-replay`, isReplay: true };
   if (!first.offeredSkill) {
     return {
       ...first, id: second.id, pass: false, tokensIn: 0, tokensOut: 0, tokensCached: 0, tokensFresh: 0, steps: 0, elapsedMs: 0,
@@ -240,7 +240,18 @@ async function runTask(task, { port, workspace }) {
     verifications: []
   };
 
-  for (const step of task.setup ?? []) await powershell(expand(step.run));
+  // A SETUP STEP THAT UNDOES WHAT THE REPLAY IS ABOUT TO TEST.
+  //
+  // `runSecondTime` re-enters here with the same task, so the same setup runs
+  // again — and the skills task's setup deletes the saved route. It was deleting
+  // the very route that had just been accepted, so the replay found nothing to
+  // replay, went to the model, and was recorded as "the replay cost 39,823
+  // tokens", which reads as the skills feature being broken. `onlyOnFirstRun`
+  // marks a step that prepares the FIRST run and would sabotage the second.
+  for (const step of task.setup ?? []) {
+    if (step.onlyOnFirstRun && task.isReplay) continue;
+    await powershell(expand(step.run));
+  }
 
   const startedAt = Date.now();
   try {

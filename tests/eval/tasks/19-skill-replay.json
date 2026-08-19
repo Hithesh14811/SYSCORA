@@ -8,7 +8,7 @@
   "replayTokenBudget": 1000,
   "setup": [
     { "run": "Remove-Item '{workspace}\\routine.txt' -ErrorAction SilentlyContinue" },
-    { "run": "Get-ChildItem '{workspace}/../skills' -Filter *.json -ErrorAction SilentlyContinue | Where-Object { (Get-Content $_.FullName -Raw) -match 'routine' } | Remove-Item -Force -ErrorAction SilentlyContinue" }
+    { "onlyOnFirstRun": true, "run": "Get-ChildItem '{workspace}/../skills' -Filter *.json -ErrorAction SilentlyContinue | Where-Object { (Get-Content $_.FullName -Raw) -match 'routine' } | Remove-Item -Force -ErrorAction SilentlyContinue" }
   ],
   "verify": [
     { "run": "if (Test-Path '{workspace}\\routine.txt') { Get-Content '{workspace}\\routine.txt' -Raw } else { 'missing' }", "expect": "rehearsed" }
