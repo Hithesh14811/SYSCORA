@@ -2,12 +2,13 @@
   "id": "skill-replay-file-write",
   "category": "skills",
   "prompt": "Create a file called routine.txt in {workspace} containing the word rehearsed",
-  "why": "docs/skills.md §12, and the whole commercial argument: the hundredth run of a request must not cost what the first one did. The runner sends this twice - once to derive and be offered a route, then again with that route saved - and the second run has to pass the SAME independent check, be answered by the route rather than the model, and come in under the token budget. A filesystem task on purpose: the verification is Test-Path, which cannot be fooled by anything the agent believes about itself.",
+  "why": "docs/skills.md §12, and the whole commercial argument: the hundredth run of a request must not cost what the first one did. The runner sends this twice - once to derive and be offered a route, then again with that route saved - and the second run has to pass the SAME independent check, be answered by the route rather than the model, and come in under the token budget. A filesystem task on purpose: the verification is Test-Path, which cannot be fooled by anything the agent believes about itself. THE SETUP MUST DELETE THE SAVED ROUTE. The skills store is not part of the eval workspace and survives between runs, so from the second run onwards the FIRST half was itself a replay - 0 tokens, 0.8s, and no new route offered, which then failed the second half with 'nothing to replay'. The row read as a broken feature and was actually the feature working twice. It removes only routes that mention this task's own file, never the whole store: those are the user's.",
   "timeoutMs": 180000,
   "replayTwice": true,
   "replayTokenBudget": 1000,
   "setup": [
-    { "run": "Remove-Item '{workspace}\\routine.txt' -ErrorAction SilentlyContinue" }
+    { "run": "Remove-Item '{workspace}\\routine.txt' -ErrorAction SilentlyContinue" },
+    { "run": "Get-ChildItem '{workspace}/../skills' -Filter *.json -ErrorAction SilentlyContinue | Where-Object { (Get-Content $_.FullName -Raw) -match 'routine' } | Remove-Item -Force -ErrorAction SilentlyContinue" }
   ],
   "verify": [
     { "run": "if (Test-Path '{workspace}\\routine.txt') { Get-Content '{workspace}\\routine.txt' -Raw } else { 'missing' }", "expect": "rehearsed" }

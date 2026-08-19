@@ -112,6 +112,32 @@ function assertNoControlCharacters(task, fileName) {
 }
 
 /**
+ * Press stop on a running request and wait for it to actually settle.
+ *
+ * Returns the settled session if it got there, otherwise null. Best-effort
+ * throughout: this runs on the failure path, and a runner that throws while
+ * cleaning up after a failure loses the whole suite rather than one task.
+ */
+async function stopSession(port, sessionId, { graceMs = 45000 } = {}) {
+  const headers = { "x-syscora-token": TOKEN };
+  await fetch(`http://127.0.0.1:${port}/api/intents/${encodeURIComponent(sessionId)}/stop`, {
+    method: "POST", headers
+  }).catch(() => {});
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const status = await fetch(
+      `http://127.0.0.1:${port}/api/intents/${encodeURIComponent(sessionId)}/status`,
+      { headers }
+    ).catch(() => null);
+    if (!status?.ok) continue;
+    const body = await status.json().catch(() => null);
+    if (body?.settled || body?.session?.finalResponse) return body.session ?? body;
+  }
+  return null;
+}
+
+/**
  * Run the same request again, this time with the route saved.
  *
  * `docs/skills.md` §12: the second run must pass the SAME independent check,
@@ -218,11 +244,33 @@ async function runTask(task, { port, workspace }) {
 
   const startedAt = Date.now();
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/api/intents`, {
+    // ONE TASK MUST NOT BE ABLE TO KILL THE REST OF THE SUITE.
+    //
+    // Observed 19 Aug 2026 on the first full baseline: the WhatsApp task hit its
+    // 240s timeout, the runner moved on — and the agent was still working. The
+    // daemon enforces one request at a time (there is one pointer and one
+    // screen), so it answered 409 to every task after it. Rounds 2 and 3, all
+    // thirty-odd runs, recorded `0 fresh · 0.0s · daemon returned 409`. A
+    // scoreboard of zeros that looks like a catastrophic regression and is
+    // actually one unstopped session.
+    //
+    // Two halves, because either alone leaves a hole: below, a timeout STOPS the
+    // session it started; here, a 409 is treated as somebody else's leftover,
+    // stopped, and the request retried once. The second half is what makes the
+    // suite recoverable rather than merely well-behaved.
+    const submit = () => fetch(`http://127.0.0.1:${port}/api/intents`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-syscora-token": TOKEN },
       body: JSON.stringify({ text: expand(task.prompt), history: [], autoApprove: true })
     });
+    let response = await submit();
+    if (response.status === 409) {
+      const conflict = await response.json().catch(() => ({}));
+      if (conflict.sessionId) {
+        await stopSession(port, conflict.sessionId);
+        response = await submit();
+      }
+    }
     if (!response.ok) throw new Error(`daemon returned ${response.status}`);
     const { sessionId } = await response.json();
 
@@ -283,7 +331,19 @@ async function runTask(task, { port, workspace }) {
     record.elapsedMs = Date.now() - startedAt;
     if (!session) {
       record.reason = "timed out waiting for the agent to settle";
-    } else {
+      // The other half of the fix above: give up on the ANSWER, never on the
+      // SESSION. Press stop the way the user would and wait for it to actually
+      // settle — an abort is a request to a loop that is mid-tool-call, not an
+      // instant. Whatever it did on the machine stays done; that is what the
+      // task's own teardown is for.
+      //
+      // Its metrics are still read below when it settles. A run that timed out
+      // having spent 400,000 tokens and a run that timed out on step one are
+      // different diagnoses, and recording both as zero throws that away — which
+      // is exactly what the WhatsApp row said before this.
+      session = await stopSession(port, sessionId);
+    }
+    if (session) {
       const metrics = session.finalResponse?.metrics ?? {};
       record.steps = metrics.steps ?? 0;
       record.toolCalls = metrics.toolCalls ?? 0;
@@ -504,7 +564,11 @@ function scoreboard(records, summaries, meta) {
   const lines = [];
   lines.push("# SYSCORA scoreboard");
   lines.push("");
+  // WHICH CODE THIS MEASURED. A scoreboard with no commit on it cannot be
+  // compared to anything later, and this file is the thing a merge is gated on.
   lines.push(`Generated ${meta.at} · ${meta.model} · ${summaries.length} tasks × ${meta.repeat} = ${records.length} runs`);
+  lines.push("");
+  lines.push(`Code under test: \`${meta.commit}\``);
   if (meta.label) lines.push(`\n**${meta.label}**`);
   lines.push("");
   lines.push("Costs are quoted as **fresh** input tokens — what is billed at full rate. The");
@@ -618,9 +682,24 @@ async function main() {
 
   const at = new Date().toISOString();
   const summaries = summarise(records);
+  const head = await new Promise((resolve) => {
+    const child = spawn("git", ["rev-parse", "--short", "HEAD"], { cwd: repoRoot, windowsHide: true });
+    let out = "";
+    child.stdout.on("data", (chunk) => { out += chunk; });
+    child.on("close", () => resolve(out.trim() || "unknown"));
+    child.on("error", () => resolve("unknown"));
+  });
+  const dirty = await new Promise((resolve) => {
+    const child = spawn("git", ["status", "--porcelain", "--untracked-files=no"], { cwd: repoRoot, windowsHide: true });
+    let out = "";
+    child.stdout.on("data", (chunk) => { out += chunk; });
+    child.on("close", () => resolve(out.trim().length > 0));
+    child.on("error", () => resolve(false));
+  });
   const meta = {
     at,
     model,
+    commit: `${head}${dirty ? " + uncommitted changes" : ""}`,
     repeat: options.repeat,
     slack: options.slack,
     label: options.only || options.category
@@ -658,9 +737,13 @@ async function main() {
   if (meta.breaches.length) {
     console.log(`\nBUDGET BREACHES (${meta.breaches.length}):`);
     for (const breach of meta.breaches) console.log(`  - ${breach}`);
-  } else if (budgets && !options.writeBudgets) {
+  } else if (options.writeBudgets) {
+    // Nothing to say: this run just BECAME the baseline, so there was nothing to
+    // hold it to. Saying "no budgets recorded yet" here, as it did, reads as the
+    // gate having silently failed to write.
+  } else if (budgets) {
     console.log(`\nNo budget breached against the baseline recorded ${budgets.recordedAt}.`);
-  } else if (!budgets) {
+  } else {
     console.log("\nNo budgets recorded yet — run once with --write-budgets to make this a gate.");
   }
   console.log(`\nFull scoreboard: tests/eval/scoreboard.md`);
