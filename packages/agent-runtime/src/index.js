@@ -495,12 +495,40 @@ export class AgentRuntime {
     // So the question is asked where it costs nothing to not ask: one regex over
     // the command line, and a card in the transcript only for the handful of
     // shapes that are irreversible. No model call, no plan, no scheduler.
+    //
+    // A CALLER THAT SAID "YES" IN ADVANCE HAS TO BE HEARD, OR NOTHING
+    // IRREVERSIBLE CAN EVER RUN UNATTENDED.
+    //
+    // `autoApprove` was honoured by the staged pipeline and NEVER read here, on
+    // the route every real request takes — not a regression, it has been absent
+    // since d91fd43 first put an approval gate on this path. Nothing surfaced it
+    // because the only task that exercises it verified with
+    // `Write-Output 'checked-by-human'` and passed unconditionally.
+    //
+    // What it looked like, measured 19 Aug 2026: the eval sends
+    // `autoApprove: true`, the daemon forwards it, the card is emitted to nobody,
+    // and 120,000ms later the timeout below reads the silence as a refusal. The
+    // agent then behaved perfectly — reported the draft unsent, refused to retry
+    // by another route — so the product's flagship demonstration failed 0/3 with
+    // an honest explanation, and the honesty made it look like a click bug.
+    // Three runs at 136.7s, 137.0s and 149.9s: about twenty seconds of work and
+    // two minutes of waiting.
+    //
+    // The card is STILL emitted when auto-approving. A standing authorization is
+    // a reason not to ask, never a reason not to record — the audit has to be
+    // able to say what was authorized, and `autoApproved` on the resolution is
+    // what tells a human click apart from a caller's blanket yes.
+    //
+    // This answers CONFIRM cards only. The DENY floor is checked where the
+    // process is actually spawned (see the gate in tools.js), so nothing here
+    // can talk it round.
+    const autoApprove = options.autoApprove === true;
     const askUser = (request) => new Promise((resolve) => {
       const approvalId = createId("approval");
-      const settle = (approved) => {
+      const settle = (approved, automatic = false) => {
         if (!this._approvals.delete(approvalId)) return;
         clearTimeout(timer);
-        emit({ type: "APPROVAL_RESOLVED", details: { approvalId, approved } });
+        emit({ type: "APPROVAL_RESOLVED", details: { approvalId, approved, autoApproved: automatic } });
         resolve(approved);
       };
       // Nobody answered. Not approving is the only safe reading of silence, and
@@ -517,9 +545,11 @@ export class AgentRuntime {
           reason: request.reason,
           rule: request.rule,
           detail: request.detail,
-          timeoutMs: APPROVAL_TIMEOUT_MS
+          timeoutMs: APPROVAL_TIMEOUT_MS,
+          autoApproved: autoApprove
         }
       });
+      if (autoApprove) settle(true, true);
     });
     // A stop press is an answer too: refuse anything still waiting rather than
     // leaving the run stuck behind a card nobody is going to click.
