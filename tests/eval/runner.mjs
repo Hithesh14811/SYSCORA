@@ -49,7 +49,14 @@ const options = {
   // and teach everyone to ignore the eval. So budgets are set from the median of
   // a repeated baseline, checked against the median of a repeated run, with
   // headroom on top. Override per run when a change is expected to cost more.
-  slack: Number(flag("slack") ?? 1.4)
+  slack: Number(flag("slack") ?? 1.4),
+  // Re-aggregate a run that already happened, from its saved results file, and
+  // touch nothing on the machine. Every run's raw records are kept under
+  // tests/eval/results/, so changing how a budget is DERIVED need not mean
+  // driving Notepad and WhatsApp around for another half hour to find out what
+  // the change would have said. It also makes the derivation auditable: same
+  // input, different formula, comparable output.
+  from: flag("from")
 };
 
 // ---- Running PowerShell for setup, verification and teardown -----------------
@@ -477,6 +484,11 @@ function summarise(records) {
       medianElapsedMs: median(times),
       medianSteps: median(steps),
       medianTokensSent: median(runs.map((run) => run.tokensIn + run.tokensOut)),
+      minFresh: Math.min(...fresh),
+      maxFresh: Math.max(...fresh),
+      minElapsedMs: Math.min(...times),
+      maxElapsedMs: Math.max(...times),
+      maxSteps: Math.max(...steps),
       freshSpread: spread(fresh),
       timeSpread: spread(times, (value) => `${(value / 1000).toFixed(1)}s`),
       stepSpread: spread(steps),
@@ -519,19 +531,40 @@ function budgetsFrom(summaries, meta) {
       "breaches a budget when ITS median exceeds the ceiling — one unlucky run cannot " +
       "fail the gate, and a task that got quietly twice as expensive cannot pass it.",
     tasks: Object.fromEntries(summaries.map((summary) => [summary.id, {
-      // Floors, because a task that costs almost nothing has a median near zero
-      // and multiplying that gives a ceiling nothing can stay under. They are the
-      // measured noise, not a target: 2,000 fresh tokens is well under a single
-      // step's fixed prompt, and 3s is under one model round trip.
-      freshTokens: Math.max(2000, Math.round(summary.medianFresh * meta.slack)),
-      elapsedMs: Math.max(3000, Math.round(summary.medianElapsedMs * meta.slack)),
-      steps: Math.max(2, Math.ceil(summary.medianSteps * meta.slack)),
+      // A CEILING BELOW THE BASELINE'S OWN WORST RUN IS NOT A GATE, IT IS AN
+      // ALARM CLOCK.
+      //
+      // First version was median × slack. On the first change it was used to
+      // judge, it reported six breaches, and every one of them was the task's
+      // own variance: `chat-arithmetic` — one model call, twenty tokens, no
+      // machine — ranged 1.5s to 21.5s across three consecutive runs of
+      // identical code, and `app-type-into-notepad-and-save` ranged 32s to 157s.
+      // A ceiling at 1.4× the median sits inside that, so the baseline itself
+      // would have breached, and a gate that cries wolf gets switched off.
+      //
+      // So the ceiling is whichever is larger: the median times the slack, or a
+      // little above the worst run actually observed. On a task whose spread is
+      // already 3× that means a 1.4× regression is NOT detectable at n=3 — which
+      // is true, and better said out loud than hidden behind a red row. The
+      // observed spread is recorded below so a reader can see which rows are
+      // sharp instruments and which are not.
+      //
+      // Floors on top, because a task that costs almost nothing has a median
+      // near zero and multiplying that gives a ceiling nothing can stay under.
+      freshTokens: Math.max(2000, Math.round(summary.medianFresh * meta.slack), Math.round(summary.maxFresh * 1.1)),
+      elapsedMs: Math.max(3000, Math.round(summary.medianElapsedMs * meta.slack), Math.round(summary.maxElapsedMs * 1.1)),
+      steps: Math.max(2, Math.ceil(summary.medianSteps * meta.slack), Math.ceil(summary.maxSteps * 1.1)),
       baseline: {
         pass: summary.pass,
         passes: `${summary.passes}/${summary.runs}`,
         medianFresh: summary.medianFresh,
         medianElapsedMs: summary.medianElapsedMs,
-        medianSteps: summary.medianSteps
+        medianSteps: summary.medianSteps,
+        // How wide this row is. A task whose worst run is three times its median
+        // cannot detect a small regression, and knowing that is the difference
+        // between reading the scoreboard and believing it.
+        spread: `${summary.minFresh}–${summary.maxFresh} fresh · ` +
+          `${(summary.minElapsedMs / 1000).toFixed(1)}–${(summary.maxElapsedMs / 1000).toFixed(1)}s`
       }
     }]))
   };
@@ -637,6 +670,18 @@ function scoreboard(records, summaries, meta) {
 // ---- Go -----------------------------------------------------------------------
 
 async function main() {
+  if (options.from) {
+    const saved = JSON.parse(await fs.readFile(path.resolve(options.from), "utf8"));
+    await report(saved.records, {
+      at: saved.at,
+      model: saved.model,
+      repeat: saved.repeat ?? 1,
+      commit: `${saved.commit ?? "unknown"} (re-aggregated from ${path.basename(options.from)})`,
+      label: null
+    }, { write: false });
+    return;
+  }
+
   const tasks = await loadTasks();
   if (tasks.length === 0) {
     console.log("No tasks matched.");
@@ -692,7 +737,6 @@ async function main() {
   await new Promise((resolve) => server.close(resolve));
 
   const at = new Date().toISOString();
-  const summaries = summarise(records);
   const head = await new Promise((resolve) => {
     const child = spawn("git", ["rev-parse", "--short", "HEAD"], { cwd: repoRoot, windowsHide: true });
     let out = "";
@@ -707,18 +751,26 @@ async function main() {
     child.on("close", () => resolve(out.trim().length > 0));
     child.on("error", () => resolve(false));
   });
-  const meta = {
+  await report(records, {
     at,
     model,
     commit: `${head}${dirty ? " + uncommitted changes" : ""}`,
     repeat: options.repeat,
-    slack: options.slack,
     label: options.only || options.category
       ? `Partial run — ${options.only ? `only ${options.only}` : `category ${options.category}`}. ` +
         "Not a baseline; the budgets file is only written by a full run."
       : (options.manual ? null : "Automatic tasks only. Run with --manual to include the four that touch " +
         "the volume, WhatsApp and the webview.")
-  };
+  }, { write: true, records });
+}
+
+/**
+ * Aggregate, gate and publish. Split out from the running so that `--from` can
+ * re-derive a past run's verdict without touching the machine.
+ */
+async function report(records, meta, { write = true } = {}) {
+  const summaries = summarise(records);
+  meta.slack = options.slack;
 
   // A PARTIAL RUN MUST NOT BE ABLE TO REWRITE THE BUDGETS.
   //
@@ -735,14 +787,16 @@ async function main() {
   }
   meta.breaches = options.writeBudgets ? [] : checkBudgets(summaries, budgets);
 
-  const resultsDir = path.join(here, "results");
-  await fs.mkdir(resultsDir, { recursive: true });
-  await fs.writeFile(
-    path.join(resultsDir, `${at.replace(/[:.]/g, "-")}.json`),
-    JSON.stringify({ at, model, repeat: options.repeat, summaries, records }, null, 2)
-  );
   const board = scoreboard(records, summaries, meta);
-  await fs.writeFile(path.join(here, "scoreboard.md"), board);
+  if (write) {
+    const resultsDir = path.join(here, "results");
+    await fs.mkdir(resultsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(resultsDir, `${meta.at.replace(/[:.]/g, "-")}.json`),
+      JSON.stringify({ at: meta.at, model: meta.model, commit: meta.commit, repeat: meta.repeat, summaries, records }, null, 2)
+    );
+    await fs.writeFile(path.join(here, "scoreboard.md"), board);
+  }
 
   console.log(`\n${board.split("## By task")[0].trim()}`);
   if (meta.breaches.length) {
@@ -757,7 +811,7 @@ async function main() {
   } else {
     console.log("\nNo budgets recorded yet — run once with --write-budgets to make this a gate.");
   }
-  console.log(`\nFull scoreboard: tests/eval/scoreboard.md`);
+  console.log(write ? "\nFull scoreboard: tests/eval/scoreboard.md" : "\n(re-aggregated only — nothing was written)");
   // A non-zero exit when anything failed OR got quietly more expensive. The
   // second half is the point: a change that keeps every task passing while
   // doubling what it costs used to show up here as a page of green ticks.

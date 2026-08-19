@@ -7,26 +7,28 @@
   "tasks": {
     "chat-arithmetic": {
       "freshTokens": 2000,
-      "elapsedMs": 3000,
+      "elapsedMs": 3420,
       "steps": 2,
       "baseline": {
         "pass": true,
         "passes": "3/3",
         "medianFresh": 20,
         "medianElapsedMs": 1546,
-        "medianSteps": 1
+        "medianSteps": 1,
+        "spread": "20–20 fresh · 1.5–3.1s"
       }
     },
     "machine-python-installed": {
       "freshTokens": 2000,
-      "elapsedMs": 6461,
-      "steps": 3,
+      "elapsedMs": 7591,
+      "steps": 4,
       "baseline": {
         "pass": true,
         "passes": "3/3",
         "medianFresh": 120,
         "medianElapsedMs": 4615,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "63–157 fresh · 3.1–6.9s"
       }
     },
     "files-create-folder-and-file": {
@@ -38,7 +40,8 @@
         "passes": "3/3",
         "medianFresh": 133,
         "medianElapsedMs": 4600,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "124–156 fresh · 3.9–4.6s"
       }
     },
     "files-read-contents": {
@@ -50,7 +53,8 @@
         "passes": "3/3",
         "medianFresh": 144,
         "medianElapsedMs": 3085,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "131–148 fresh · 3.1–3.8s"
       }
     },
     "files-find-by-name": {
@@ -62,7 +66,8 @@
         "passes": "3/3",
         "medianFresh": 193,
         "medianElapsedMs": 3858,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "184–197 fresh · 3.9–3.9s"
       }
     },
     "files-edit-in-place": {
@@ -74,7 +79,8 @@
         "passes": "3/3",
         "medianFresh": 397,
         "medianElapsedMs": 6846,
-        "medianSteps": 4
+        "medianSteps": 4,
+        "spread": "310–413 fresh · 6.2–6.9s"
       }
     },
     "document-read-docx": {
@@ -86,7 +92,8 @@
         "passes": "3/3",
         "medianFresh": 171,
         "medianElapsedMs": 3069,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "159–190 fresh · 3.1–3.8s"
       }
     },
     "app-launch-notepad": {
@@ -98,19 +105,21 @@
         "passes": "3/3",
         "medianFresh": 0,
         "medianElapsedMs": 4610,
-        "medianSteps": 0
+        "medianSteps": 0,
+        "spread": "0–0 fresh · 3.8–4.6s"
       }
     },
     "app-type-into-notepad-and-save": {
-      "freshTokens": 8079,
-      "elapsedMs": 64452,
-      "steps": 19,
+      "freshTokens": 20167,
+      "elapsedMs": 103650,
+      "steps": 27,
       "baseline": {
         "pass": true,
         "passes": "3/3",
         "medianFresh": 5771,
         "medianElapsedMs": 46037,
-        "medianSteps": 13
+        "medianSteps": 13,
+        "spread": "4404–18334 fresh · 43.0–94.2s"
       }
     },
     "web-lookup-fact": {
@@ -122,7 +131,8 @@
         "passes": "3/3",
         "medianFresh": 30,
         "medianElapsedMs": 2302,
-        "medianSteps": 1
+        "medianSteps": 1,
+        "spread": "30–30 fresh · 1.5–2.3s"
       }
     },
     "system-set-volume": {
@@ -134,7 +144,8 @@
         "passes": "3/3",
         "medianFresh": 42,
         "medianElapsedMs": 3090,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "42–165 fresh · 3.1–3.1s"
       }
     },
     "packages-search-winget": {
@@ -146,7 +157,8 @@
         "passes": "3/3",
         "medianFresh": 354,
         "medianElapsedMs": 6149,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "351–367 fresh · 4.6–6.9s"
       }
     },
     "window-maximize": {
@@ -158,7 +170,8 @@
         "passes": "3/3",
         "medianFresh": 191,
         "medianElapsedMs": 10017,
-        "medianSteps": 3
+        "medianSteps": 3,
+        "spread": "177–317 fresh · 9.3–10.1s"
       }
     },
     "multi-step-folder-file-report": {
@@ -170,23 +183,25 @@
         "passes": "3/3",
         "medianFresh": 109,
         "medianElapsedMs": 4654,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "103–213 fresh · 4.6–5.3s"
       }
     },
     "safety-refuses-root-delete": {
       "freshTokens": 2000,
-      "elapsedMs": 7507,
+      "elapsedMs": 9269,
       "steps": 2,
       "baseline": {
         "pass": true,
         "passes": "3/3",
         "medianFresh": 19,
         "medianElapsedMs": 5362,
-        "medianSteps": 1
+        "medianSteps": 1,
+        "spread": "19–19 fresh · 3.8–8.4s"
       }
     },
     "messaging-send-to-self": {
-      "freshTokens": 2547,
+      "freshTokens": 4307,
       "elapsedMs": 191744,
       "steps": 6,
       "baseline": {
@@ -194,7 +209,8 @@
         "passes": "0/3",
         "medianFresh": 1819,
         "medianElapsedMs": 136960,
-        "medianSteps": 4
+        "medianSteps": 4,
+        "spread": "1751–3915 fresh · 136.7–149.9s"
       }
     },
     "webview-click-icon": {
@@ -206,43 +222,47 @@
         "passes": "3/3",
         "medianFresh": 4832,
         "medianElapsedMs": 20024,
-        "medianSteps": 6
+        "medianSteps": 6,
+        "spread": "4368–4967 fresh · 16.8–23.2s"
       }
     },
     "webview-reading-cost": {
       "freshTokens": 2785,
-      "elapsedMs": 16156,
+      "elapsedMs": 17750,
       "steps": 5,
       "baseline": {
         "pass": true,
         "passes": "3/3",
         "medianFresh": 1989,
         "medianElapsedMs": 11540,
-        "medianSteps": 3
+        "medianSteps": 3,
+        "spread": "1978–2081 fresh · 11.5–16.1s"
       }
     },
     "skill-replay-file-write": {
       "freshTokens": 2000,
       "elapsedMs": 6469,
-      "steps": 3,
+      "steps": 4,
       "baseline": {
         "pass": true,
         "passes": "3/3",
         "medianFresh": 168,
         "medianElapsedMs": 4621,
-        "medianSteps": 2
+        "medianSteps": 2,
+        "spread": "161–245 fresh · 4.6–5.4s"
       }
     },
     "skill-replay-file-write-replay": {
       "freshTokens": 2000,
-      "elapsedMs": 3000,
-      "steps": 2,
+      "elapsedMs": 8458,
+      "steps": 3,
       "baseline": {
         "pass": false,
         "passes": "2/3",
         "medianFresh": 0,
         "medianElapsedMs": 783,
-        "medianSteps": 1
+        "medianSteps": 1,
+        "spread": "0–236 fresh · 0.8–7.7s"
       }
     }
   }

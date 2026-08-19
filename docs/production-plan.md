@@ -141,8 +141,11 @@ so **this is not settled and the default has not been changed.** It is exactly
 what W7's fixed-task eval is for: run both settings over the eval suite and let
 the scoreboard decide.
 
-**Done when:** the eval reports median `tokensFresh` for both settings across the
-full task set, and the loser is deleted.
+**DECIDED, 19 Aug 2026: the collapse is OFF by default**, behind
+`SYSCORA_COLLAPSE_HISTORY=1` (the flag inverted; `SYSCORA_KEEP_HISTORY` is gone).
+The three paired runs above are what moved it, and they are enough to move a
+default. Both code paths stay until P4 replaces them, because n=3 is not enough
+to delete one, and `tests/unit/fast-agent-history-default.test.js` holds both.
 
 ---
 
@@ -206,8 +209,20 @@ round trip, host spawn, or PowerShell start — with a per-phase timing probe.
 
 ## W4 — Resilience
 
-1. **A second model provider with automatic failover**, and retry with backoff on
-   transient network errors before failing the run.
+1. ~~**A second model provider with automatic failover**~~ — **CONFIGURED, 19 Aug
+   2026.** The code was never the gap: `FailoverModelProvider` and
+   `createModelProviderChain` have been wired through `runtime-factory.js` all
+   along and `.syscora/config.json` named one endpoint. Two are now configured via
+   `model.fallbackProviderConfigs`, and `node scripts/probe-failover.mjs` proves
+   it end to end by pointing the primary at a dead port. **The remaining gap is
+   vendor diversity, not plumbing:** both endpoints serve the same model family,
+   so a bad model release takes out both. A second VENDOR is the thing still
+   worth buying.
+   The 402 that surfaced this is worth recording: the primary account ran out of
+   credit *mid-baseline*, and because failover retries the primary first on every
+   call and only advances `activeProviderIndex` on success, the run limped on at
+   +860ms per step rather than failing. Right behaviour, invisible symptom —
+   `probe-failover.mjs` is how you see it.
 2. **Delete or quarantine the staged pipeline.** It exists to answer with the
    network down; in practice it fires on brief blips and answers the wrong
    question with raw Win32 status codes and internal GUIDs. Either give it a
@@ -305,15 +320,38 @@ records what changed; the user can see, edit and delete skills.
 
 ---
 
-## W7 — The eval must gate merges
+## W7 — The eval must gate merges — **DONE, 19 Aug 2026**
 
-`tests/eval/scoreboard.md` currently shows two tasks. It needs the full set —
-including the flagship send, a Spotify play, a file task and a drawing — with
-**budget assertions**: pass rate, median tokens, median time. A change that makes
-a task pass while doubling its cost should fail CI.
+`tests/eval/scoreboard.md` showed two tasks and gated nothing. It now shows all
+nineteen, run three times each, on the real machine, with the commit stamped on
+it; `tests/eval/budgets.json` holds a ceiling per task recorded from that
+baseline; and any breach exits non-zero.
 
-**Done:** `npm run eval` fails on a token or latency regression, and the
-scoreboard is the number quoted in any investor conversation.
+```
+Baseline, commit f075fde, 19 tasks × 3 = 60 runs
+pass 90% (18/20 rows passing EVERY repeat) · median 156 fresh · 4.6s · 2 steps
+```
+
+Three decisions that make it usable rather than merely present:
+
+- **Medians with the spread beside them.** `app-type-into-notepad-and-save`
+  ranged 4,404–18,334 fresh tokens and 43–94 seconds across three consecutive
+  runs of identical code. A single run cannot tell a 30% improvement from luck.
+- **A task passes only when EVERY repeat passed.** A flake is a defect nobody has
+  diagnosed yet.
+- **Budgets are recorded, never hand-written**, and checked against the new run's
+  MEDIAN — so one unlucky run cannot fail the build and a task that got quietly
+  twice as expensive cannot pass it. A partial run refuses to rewrite them.
+
+**What it caught immediately** is the argument for having done it: the flagship
+WhatsApp task's verify was `Write-Output 'checked-by-human'` and had been passing
+unconditionally for months; the volume task's verify called a cmdlet that is not
+installed and could never pass; and `--mock` had silently started running against
+a paid endpoint and the real machine. See `docs/state-of-the-world.md`.
+
+**Still open:** the eval is not in CI, and the four `manual` tasks need
+`--manual` — so the default gate covers 15 of 19. They stay opt-in on purpose:
+one of them messages the user and one changes something they can hear.
 
 ---
 

@@ -1,6 +1,74 @@
-# SYSCORA — state of the world, 17 Aug 2026
+# SYSCORA — state of the world, 19 Aug 2026
 
 Written for a session starting cold. Read this, then `docs/production-plan.md`.
+
+## THE NUMBER IS NOW IN `tests/eval/scoreboard.md`, AND IT IS MEASURED
+
+Every figure below this section dated 17 Aug is an n=1 hand-run. From 19 Aug the
+project has a repeated, commit-stamped baseline over the whole task set, and it
+is the only number that should be quoted:
+
+```bash
+npm run eval -- --repeat 3 --manual                  # hold a change to the baseline
+npm run eval -- --repeat 3 --manual --write-budgets  # record a new one
+```
+
+**Baseline, 19 Aug 2026, commit `f075fde`, 19 tasks × 3 = 60 runs on this
+machine:** pass rate **90%** (18/20 rows passing every repeat), median **156**
+fresh tokens, median **4.6s**, median **2** steps, $0.594 for the whole suite.
+
+A task counts as passing only when EVERY repeat passed. The spread is printed
+beside every median, because the spread is the thing that made single runs
+useless: `app-type-into-notepad-and-save` ranges 4,404–18,334 fresh tokens and
+43–94 seconds across three consecutive runs of identical code.
+
+`tests/eval/budgets.json` holds each task's ceiling, recorded from that baseline
+and never hand-written. A later run breaches when ITS median exceeds the ceiling,
+so one unlucky run cannot fail the build and a task that got quietly twice as
+expensive cannot pass it. Any breach exits non-zero.
+
+### What the eval found the first time it was run properly
+
+Three of the numbers this project had been quoting were measuring nothing.
+
+- **The flagship task's verify could not fail.** `messaging-send-to-self` — send
+  a WhatsApp message — verified with `Write-Output 'checked-by-human'`. Every
+  scoreboard had shown a green tick for the highest-stakes action in the product
+  with nothing at all behind it, on the one task whose reason for existing is the
+  bug where a message was reported sent while the text sat unsent in a search
+  box. Replaced with a count of the text in the CONVERSATION, before and after,
+  over the raw UIA view of WhatsApp's content window in its own process.
+  **It now fails 0/3: the send does not happen.**
+- **The volume task's verify could not pass.** It called `Get-AudioDevice`, from
+  a module that is not installed here, so it printed `unreadable` however well
+  the agent did. And the machine was already sitting at 42%, the value the task
+  asks for, so even a working check would have passed with the agent doing
+  nothing. It now reads the endpoint through its own `IAudioEndpointVolume`
+  binding and the setup moves the volume away first. It passes 3/3, honestly.
+- **`--mock` stopped meaning mock** the moment a real fallback provider was
+  configured. `MockModelProvider` does not support `chat`, so failover skipped
+  past it and `npm run eval -- --mock` — documented as "no model, no machine, no
+  cost" — ran thirty-odd tasks against a paid endpoint and the real machine,
+  including one that drives WhatsApp. Asking for mock now yields mock alone.
+
+And one harness defect that made a bad row look like a catastrophe: a task that
+hit its timeout did not stop its session, so the daemon's one-request-at-a-time
+rule answered 409 to everything after it and two whole rounds recorded as zeros.
+
+### Still open, found by measuring, NOT yet fixed
+
+- **The WhatsApp send does not work.** 0/3, ~137s, 4 steps, `launch → screen →
+  click✗`. It settles honestly rather than lying, which is the invariant holding,
+  but the task fails.
+- **A saved route replays cleanly only 2 times in 3.** The recorder writes a
+  first step whose `verify` is `{kind: "element-present"}` with no needle — "a
+  check with an empty needle is not a check", from this file's own rules — and
+  when it does not hold the replay hands over to the model at step 1 in 62ms.
+- **The Baseten account is out of credit** (`HTTP 402: please check your current
+  payment status`), which is what made the first baseline attempt unusable. The
+  primary is now the DeepSeek endpoint directly, with Baseten kept as the
+  fallback entry so the chain is real.
+- **The leaked `primaryApiKey` still needs rotating by the user.**
 
 ## What this is
 
@@ -222,20 +290,28 @@ Two live bugs fell out of the pass:
 ## What is still wrong — with evidence
 
 - ~~**Cost.** 8,222 tokens/step fixed, no caching.~~ The caching was there all
-  along and unmeasured; see the cache section above. What remains is **W2.4**:
-  `supersedeEarlierReading` and `pruneConversation` rewrite messages in the
-  MIDDLE of the conversation, which moves the prefix and turns everything after
-  the edit back into full-price tokens. Three paired live runs
-  (`scripts/probe-history-cost.mjs`, `SYSCORA_KEEP_HISTORY=1`) point at the
-  collapse now being NET NEGATIVE — at 6 steps, 24,725 fresh with it on against
-  16,196–16,623 with it off. **Not settled**: n=1 on the expensive side, and a
-  live GUI task varies by more than that. It is what W7's fixed-task eval is for.
+  along and unmeasured; see the cache section above. **W2.4 is decided:** the
+  history collapse is OFF by default from 19 Aug, behind
+  `SYSCORA_COLLAPSE_HISTORY=1`. Three paired live runs at six steps: 24,725 fresh
+  with it on against 16,623 and 16,196 with it off. It saves tokens and spends
+  cache, and on this endpoint the cache is worth more. Both code paths stay until
+  P4 replaces them — n=3 moves a default, it does not delete a code path — and
+  the eval measures both settings across the whole task set.
+- ~~**No cost budget anywhere.**~~ `maxFreshTokens`, default 150,000, sits beside
+  `maxSteps` and `maxElapsedMs` from 19 Aug. Counted in FRESH tokens, because a
+  ceiling on `tokensIn` would fire on runs that cost almost nothing. On breach it
+  settles PARTIALLY_COMPLETED with both numbers in the sentence.
 - **Latency.** `screen` on WhatsApp is ~2–4s, dominated by a full-tree `FindAll`
   (W3.2, untouched). A shell command is now ~6s end to end, not 41s. Requests
   that need no model at all now take 115–461ms and no tokens (W3.1, done).
-- **One provider, no failover.** Four consecutive turns died on `fetch failed`.
-  The transport retries a 429 and a 5xx with backoff and the loop retries once
-  more, but there is still only one endpoint configured. **W4.1 is not done.**
+- ~~**One provider, no failover.**~~ Two endpoints are configured from 19 Aug —
+  `model.fallbackProviderConfigs` in `.syscora/config.json`. The code was always
+  there; the gap was ten lines of JSON. `node scripts/probe-failover.mjs` proves
+  it by pointing the primary at a dead port and checking a real request finishes
+  anyway, naming the endpoint that served it from `FailoverModelProvider`'s own
+  receipt rather than inferring it from success.
+  **Caveat: both endpoints serve the same model family and one of them has no
+  credit left.** That is resilience against an endpoint, not against a vendor.
 - **Drawing is a demo, not a capability.** 54 steps, 894k tokens, incomplete.
 - **No undo.** It cannot un-send a message. `docs/trust-and-triggers.md` unbuilt.
   **This and the next item are what an enterprise buyer asks about first, and
