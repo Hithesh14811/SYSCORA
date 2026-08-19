@@ -154,3 +154,21 @@ test("a check with nothing to look for is refused, and no check at all is fine",
       "only the honest route survived");
   });
 });
+
+// A DAEMON STARTED ON ONE DIRECTORY MUST NOT WRITE TO ANOTHER.
+//
+// `_basePath` was set lazily by the first submitIntent, so until a request had
+// been made, every skill read and write fell back to `process.cwd()`. The
+// daemon's `basePath` was honoured for config, audit and sessions and silently
+// ignored for skills — so the test above, running against a temp workspace,
+// saved a route into the REAL .syscora/skills of the repo and broke three other
+// tests that expected an empty store. In the product it means a daemon pointed
+// at one project keeps its routes in whichever directory it was launched from.
+test("a saved route lands in the workspace the daemon was started on", async () => {
+  await withServer(async ({ call, workspace }) => {
+    assert.equal((await (await call("POST", "/api/skills", { skill: goodSkill })).json()).saved, true);
+    const inWorkspace = await fs.readdir(path.join(workspace, ".syscora", "skills"));
+    assert.deepEqual(inWorkspace, ["open-chintu.json"],
+      "the route must be written under the workspace the server was given");
+  });
+});

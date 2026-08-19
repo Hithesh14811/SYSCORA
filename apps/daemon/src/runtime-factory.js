@@ -154,6 +154,9 @@ export function createRuntime(basePath = process.cwd()) {
   });
 
   const runtime = new AgentRuntime({
+    // So the skills store lands beside the audit log and the sessions, rather
+    // than wherever node was started from. See the constructor.
+    basePath,
     sessionStore,
     auditRepository,
     capabilityRegistry,

@@ -135,8 +135,23 @@ export class AgentRuntime {
     intentEngine,
     contextEngine,
     semanticState,
-    memory
+    memory,
+    // WHERE THIS RUNTIME'S STATE LIVES, KNOWN BEFORE THE FIRST REQUEST.
+    //
+    // `_basePath` was set lazily, by the first `submitIntent`, from that call's
+    // `workspacePath`. Everything that reads or writes a skill falls back to
+    // `process.cwd()` until then — so `startServer({ basePath: someTempDir })`
+    // was honoured for config, audit and sessions, and silently ignored for
+    // skills. A test that started a daemon on a temp workspace and saved a route
+    // wrote it into the REAL `.syscora/skills` of whatever directory node
+    // happened to be started from, and then three other tests failed because the
+    // store they expected to be empty was not.
+    //
+    // The daemon knows this path at construction. Passing it means the lazy
+    // default is only reached by a caller that genuinely never said.
+    basePath = null
   }) {
+    this._basePath = basePath;
     this.sessionStore = sessionStore;
     this.auditRepository = auditRepository;
     this.capabilityRegistry = capabilityRegistry;
@@ -287,7 +302,9 @@ export class AgentRuntime {
 
   _ensureToolset(workspacePath = null) {
     if (!this._toolset) {
-      this._basePath = workspacePath ?? process.cwd();
+      // A request that names a workspace still wins — that is the caller being
+      // specific — but the runtime's own base path is the default now, not cwd.
+      this._basePath = workspacePath ?? this._basePath ?? process.cwd();
       this._toolset = buildToolset({
         registry: this.capabilityRegistry,
         adapter: this.adapter,
