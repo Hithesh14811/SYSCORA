@@ -12,5 +12,8 @@
   ],
   "verify": [
     { "run": "if (Test-Path '{workspace}\\routine.txt') { Get-Content '{workspace}\\routine.txt' -Raw } else { 'missing' }", "expect": "rehearsed" }
+  ],
+  "teardown": [
+    { "run": "Get-ChildItem '{workspace}/../skills' -Filter *.json -ErrorAction SilentlyContinue | Where-Object { (Get-Content $_.FullName -Raw) -match 'routine' } | Remove-Item -Force -ErrorAction SilentlyContinue" }
   ]
 }

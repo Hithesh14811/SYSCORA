@@ -31,6 +31,7 @@ const REQUEST = process.argv.slice(2).join(" ") || "what is 17 times 23";
 
 const config = loadModelConfig(process.cwd());
 const chain = createModelProviderChain(config);
+let machineryWorks = false;
 
 console.log("=== 1. the chain, in the order it will be tried ===\n");
 if (chain.providers.length === 1) {
@@ -67,14 +68,37 @@ const healthy = liveness.filter((entry) => entry.ok).length;
 console.log(`\n  ${healthy} of ${liveness.length} endpoints answered.`);
 
 console.log("\n=== 3. with a dead endpoint in front, WHICH one answers ===\n");
-// The receipt, not an inference. `lastRequestProvider` is set by
-// FailoverModelProvider on the provider that actually returned, so this says
-// which endpoint served the request rather than concluding it from success.
+// TWO DIFFERENT CLAIMS, AND CONFLATING THEM WASTES A DAY.
+//
+//   "the failover MACHINERY works"  — a dead provider is skipped and the next
+//                                     one serves the request
+//   "this MACHINE is resilient"     — there is actually a healthy second
+//                                     endpoint to be skipped to
+//
+// The first is about the code and the second is about somebody's billing. On
+// 19 Aug 2026 the configured fallback was an account that had run out of credit,
+// so a probe that only tested the second claim reported "failover does not work"
+// when the truth was "the spare tyre is flat".
+//
+// So this part puts EVERY endpoint that answered in part 2 behind the dead one,
+// which isolates the machinery. Part 4 then tests the real configuration.
+//
+// The receipt is `lastRequestProvider` — set by FailoverModelProvider on the one
+// that actually returned — rather than an inference from the call not throwing.
+const asFallback = (provider) => ({
+  provider: config.provider,
+  baseUrl: provider.baseUrl,
+  apiKey: provider.apiKey,
+  model: provider.model
+});
 const withDeadPrimary = createModelProviderChain({
   ...config,
   baseUrl: DEAD_ENDPOINT,
-  fallbackProviderConfigs: config.fallbackProviderConfigs
+  fallbackProviderConfigs: liveness.filter((entry) => entry.ok).map((entry) => asFallback(entry.provider))
 });
+if (liveness.every((entry) => !entry.ok)) {
+  console.log("  Skipped: no endpoint answered in part 2, so there is nothing to fail over TO.");
+}
 try {
   const startedAt = Date.now();
   await withDeadPrimary.chat({
@@ -85,12 +109,12 @@ try {
   });
   const served = withDeadPrimary.lastRequestProvider;
   console.log(`  answered by ${served?.baseUrl} (${served?.model}) in ${Date.now() - startedAt}ms`);
-  console.log(served?.baseUrl === DEAD_ENDPOINT
-    ? "  FAIL — the dead endpoint cannot have answered; the probe is wrong."
-    : "  PASS — a different endpoint served it, which is what failover means.");
+  machineryWorks = served?.baseUrl !== DEAD_ENDPOINT;
+  console.log(machineryWorks
+    ? "  PASS — the machinery works: a dead endpoint was skipped and the next one served it."
+    : "  FAIL — the dead endpoint cannot have answered; the probe is wrong.");
 } catch (error) {
   console.log(`  FAIL — nothing answered: ${String(error?.message ?? error).slice(0, 200)}`);
-  console.log("  With only one configured provider this is the expected result, and it is the problem.");
 }
 
 console.log("\n=== 4. a real request, end to end, with the primary killed ===\n");
@@ -116,4 +140,22 @@ console.log("");
 console.log(settled === "COMPLETED"
   ? "  PASS — the primary endpoint was unreachable and the request finished anyway."
   : `  FAIL — the run settled ${settled ?? "not at all"} with the primary dead.`);
+
+console.log("\n=== verdict ===\n");
+if (settled === "COMPLETED") {
+  console.log("  This machine survives losing its primary model endpoint.");
+} else if (machineryWorks) {
+  // The distinction that matters, spelled out, because the two look identical in
+  // a transcript and lead to completely different work.
+  console.log("  The failover MACHINERY works — part 3 proves a dead endpoint is skipped.");
+  console.log("  What is missing is a HEALTHY second endpoint. Of the ones configured:");
+  for (const entry of liveness) {
+    console.log(`    ${entry.ok ? "healthy" : "UNUSABLE"}  ${entry.provider.baseUrl}`);
+  }
+  console.log("  Fix it in .syscora/config.json (`model.fallbackProviderConfigs`), not in the code.");
+  console.log("  And prefer a different VENDOR: two endpoints serving the same model family");
+  console.log("  survive an endpoint outage and not a bad model release.");
+} else {
+  console.log("  Neither the machinery nor the configuration could be shown to work here.");
+}
 process.exit(0);
