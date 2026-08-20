@@ -1,0 +1,17 @@
+{
+  "id": "draw-shape-in-paint",
+  "category": "drawing",
+  "prompt": "Open Paint, start a new document, draw a large circle in the middle of the canvas, and save it as {workspace}\\circle.bmp",
+  "why": "THE ONLY THING THIS PRODUCT HAS EVER DONE CATASTROPHICALLY BADLY WAS MEASURED BY NOTHING. A request to draw a train once took 54 steps and 894,000 tokens, and that number was the main argument for building a planner — while no eval row exercised drawing at all, so nobody could tell whether it was still true. Drawing is also the one kind of work where the agent's usual proof is worthless: reading the screen returns the same nothing for a circle as for a blank canvas, and a live run dragged across Paint with no tool selected and reported 'the shape is now visible on the canvas'. So the check is on the saved FILE, in pixels, through code the agent never touches: tests/eval/fixtures/ink-check.mjs walks a raw bitmap and reports the share of pixels that differ from the most common one. It is deliberately NOT screen-signature.js, which is what the agent's own draw tool verifies with — a verification sharing a code path with the thing it verifies can be fooled by the same fault. The format question is handed to Windows first (fixtures/ink-of-image.ps1) and only the pixel question stays in JavaScript, because the first version of this row read raw bitmap headers and FAILED A RUN THAT HAD DONE THE WORK: asked to save as circle.bmp, Paint wrote a PNG under that name — its Save-As dialog keeps its own idea of the format and the extension does not decide it — and the file it produced measures INK 0.699%. Watch the steps and tokens columns; the pass only says something visible landed on the canvas and reached the disk. RESIDUAL RISK, stated rather than hidden: if a Paint window is already open with earlier artwork and the agent saves that instead of starting a new document, the ink check would pass on someone else's drawing. Setup deletes the target file so a previous repeat cannot satisfy it, and the prompt asks for a new document, but the harness does not close a Paint the user may have open.",
+  "timeoutMs": 420000,
+  "setup": [
+    { "run": "Remove-Item -Path '{workspace}\\circle.bmp' -Force -ErrorAction SilentlyContinue" },
+    { "run": "Get-Process mspaint -ErrorAction SilentlyContinue | ForEach-Object { $_.Id } | Set-Content -Path \"$env:TEMP\\syscora-eval-paint-before.txt\" -Encoding ascii" }
+  ],
+  "verify": [
+    { "run": "& '{fixtures}/ink-of-image.ps1' -Path '{workspace}\\circle.bmp'", "expect": "INK" }
+  ],
+  "teardown": [
+    { "run": "$before = @(); $f = \"$env:TEMP\\syscora-eval-paint-before.txt\"; if (Test-Path $f) { $before = @(Get-Content $f | Where-Object { $_ } | ForEach-Object { [int]$_ }) }; Get-Process mspaint -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id } | Stop-Process -Force -ErrorAction SilentlyContinue; Remove-Item $f -ErrorAction SilentlyContinue" }
+  ]
+}

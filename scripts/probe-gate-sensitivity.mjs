@@ -19,7 +19,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { budgetsFrom, checkBudgets, DETECTS, MATTERS_ABOVE_FRESH } from "../tests/eval/budgets.mjs";
+import { summarise, budgetsFrom, checkBudgets, DETECTS, MATTERS_ABOVE_SENT } from "../tests/eval/budgets.mjs";
 
 const [baselinePath, laterPath] = process.argv.slice(2);
 if (!baselinePath || !laterPath) {
@@ -31,7 +31,13 @@ const read = async (file) => JSON.parse(await fs.readFile(path.resolve(file), "u
 const baseline = await read(baselinePath);
 const later = await read(laterPath);
 
-const summariesOf = (saved) => saved.summaries;
+// RE-SUMMARISED FROM THE RAW RECORDS, never from the `summaries` block saved
+// alongside them. That block was written by whichever version of the runner
+// produced the file, so a results file recorded before a metric existed has no
+// field for it — and the first run of this probe against two real files quietly
+// reported "0 rows over the threshold" for exactly that reason, which reads as
+// a clean bill of health and is the absence of one.
+const summariesOf = (saved) => summarise(saved.records);
 const meta = { at: baseline.at, model: baseline.model, repeat: baseline.repeat ?? 3 };
 const budgets = budgetsFrom(summariesOf(baseline), meta);
 
@@ -49,14 +55,14 @@ if (!falseAlarms.length) console.log("  none — unchanged code stayed inside ev
 
 const worse = (summary, factor) => ({
   ...summary,
-  medianFresh: Math.round(summary.medianFresh * factor),
-  minFresh: Math.round(summary.minFresh * factor),
-  maxFresh: Math.round(summary.maxFresh * factor)
+  medianTokensIn: Math.round(summary.medianTokensIn * factor),
+  minTokensIn: Math.round(summary.minTokensIn * factor),
+  maxTokensIn: Math.round(summary.maxTokensIn * factor)
 });
 
-const costly = summariesOf(later).filter((summary) => summary.medianFresh >= MATTERS_ABOVE_FRESH);
-console.log(`\nA ${Math.round((DETECTS - 1) * 100)}% COST REGRESSION, INJECTED INTO ONE ROW AT A TIME`);
-console.log(`(only the ${costly.length} rows over ${MATTERS_ABOVE_FRESH.toLocaleString()} fresh tokens — below that, 20% is a handful of tokens)\n`);
+const costly = summariesOf(later).filter((summary) => summary.medianTokensIn >= MATTERS_ABOVE_SENT);
+console.log(`\nA ${Math.round((DETECTS - 1) * 100)}% REGRESSION IN WORK DONE, INJECTED INTO ONE ROW AT A TIME`);
+console.log(`(only the ${costly.length} rows sending over ${MATTERS_ABOVE_SENT.toLocaleString()} tokens — below that, 20% is a handful)\n`);
 
 let caught = 0;
 for (const summary of costly) {
@@ -64,11 +70,11 @@ for (const summary of costly) {
   const breaches = checkBudgets([...others, worse(summary, DETECTS)], budgets);
   const mine = breaches.filter((breach) => breach.startsWith(`${summary.id}:`));
   if (mine.length) caught += 1;
-  const ceiling = budgets.tasks[summary.id]?.freshTokens ?? 0;
+  const ceiling = budgets.tasks[summary.id]?.tokensIn ?? 0;
   console.log(
     `  ${mine.length ? "CAUGHT " : "missed "} ${summary.id.padEnd(32)} ` +
-    `${String(summary.medianFresh).padStart(6)} → ${String(Math.round(summary.medianFresh * DETECTS)).padStart(6)} ` +
-    `against a ceiling of ${String(ceiling).padStart(6)}`
+    `${String(summary.medianTokensIn).padStart(8)} → ${String(Math.round(summary.medianTokensIn * DETECTS)).padStart(8)} ` +
+    `against a ceiling of ${String(ceiling).padStart(8)}`
   );
 }
 

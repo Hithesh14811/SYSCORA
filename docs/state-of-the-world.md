@@ -146,6 +146,64 @@ windows → focus → screen`, ten of its twenty-one tool calls being `screen`.
 `webview-click-icon`, previously the widest-spread row in the suite at
 27.1–51.1s, now runs 17.1–19.4s.
 
+### Measured 21 Aug 2026: the drawing hole, and why W2 (the planner) is cancelled
+
+There was **no drawing task in the eval**, so the single worst result this
+project ever recorded — a train, 54 steps, "894,000 tokens" — was measured by
+nothing, and it was the main argument for building a planner. `20-draw-shape`
+now covers it. Seven runs on current code:
+
+```
+  steps      15, 15, 23, 23, 39, 40, 48        median 23
+  sent      178k … 1,001k                      median 354k
+  fresh     7,912 … 103,455                    decided by the cache, see below
+  time      70s … 301s                         median 99s   (one run timed out)
+```
+
+**Against the stated threshold for building a planner — 500k+ tokens or 40+
+steps — drawing does not meet it. W2 IS CANCELLED, on the evidence.**
+
+The tool sequence says why, and it is the same in every run:
+
+```
+  launch → new_document → screen → click → screen → draw → …
+```
+
+**The circle is on the canvas by step 6, in a single `draw` call.** Every
+remaining step is Paint's Save-As dialog — the 48-step run spent eighteen shell
+calls flailing at it. That is not a decomposition problem and a planner emitting
+milestones would not remove one click of it. If this row's cost ever matters, the
+fix is a `save_as` verb of the same shape as `new_document`, which was added for
+exactly this reason and is the first thing the agent reaches for.
+
+The old headline was also never what it was used to argue. "894,000 tokens" was
+tokens SENT; the same task today sends 178k–1,001k and is billed 7,912.
+
+### Measured 21 Aug 2026: fresh tokens are hostage to someone else's cache
+
+The drawing row, six times, identical code, inside twenty minutes:
+
+```
+  cache hit 97.8–98.7%    fresh    7,912 –  12,809
+  cache hit 66.6–73.1%    fresh   48,753 – 103,455
+```
+
+At the **same 23 steps** that is 7,912 against 103,455 — thirteen times — while
+`tokensIn` across that pair moved 8%. Nothing in the code changed; the endpoint's
+prefix cache went cold.
+
+So **the eval gate is now on tokens SENT, not fresh tokens**. Fresh tokens are
+the money and are still reported, beside the cache hit rate that explains them —
+the scoreboard prints that rate and says to read any cost difference against it
+before hunting for a bug. Tokens sent are what the agent actually did.
+
+The gate is held to both halves of its claim by
+`node scripts/probe-gate-sensitivity.mjs <baseline.json> <later.json>`, against
+two real runs of the same code: **0 false alarms**, and a 20% regression injected
+one row at a time is caught on 2 of the 7 rows big enough for 20% to mean
+anything. The scoreboard names which rows those are, because a gate whose
+sensitivity is unstated is one nobody can trust.
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current

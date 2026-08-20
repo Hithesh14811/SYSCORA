@@ -17,7 +17,8 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { startServer } from "../../apps/daemon/src/server.js";
 import {
-  median, budgetsFrom, checkBudgets, noiseBand, detectability, DETECTS, MATTERS_ABOVE_FRESH
+  median, spread, summarise, budgetsFrom, checkBudgets, noiseBand, detectability,
+  DETECTS, MATTERS_ABOVE_SENT
 } from "./budgets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -470,59 +471,7 @@ async function runTask(task, { port, workspace }) {
 const costOf = (record) =>
   (record.tokensIn / 1e6) * COST_PER_MTOK_IN + (record.tokensOut / 1e6) * COST_PER_MTOK_OUT;
 
-const spread = (numbers, format = (value) => value.toLocaleString()) => {
-  if (numbers.length <= 1) return "";
-  const low = Math.min(...numbers);
-  const high = Math.max(...numbers);
-  return low === high ? "" : `${format(low)}–${format(high)}`;
-};
 
-// One row per task, whatever the repeat count. Runs stay in the JSON record for
-// anyone who wants to look at an individual one.
-function summarise(records) {
-  const byTask = new Map();
-  for (const record of records) {
-    if (!byTask.has(record.id)) byTask.set(record.id, []);
-    byTask.get(record.id).push(record);
-  }
-  return [...byTask.entries()].map(([id, runs]) => {
-    const fresh = runs.map((run) => run.tokensFresh);
-    const times = runs.map((run) => run.elapsedMs);
-    const steps = runs.map((run) => run.steps);
-    const passes = runs.filter((run) => run.pass).length;
-    return {
-      id,
-      category: runs[0].category,
-      runs: runs.length,
-      passes,
-      // A task that passes twice out of three is not a passing task. Anything
-      // less than every run is a flake, and a flake is a defect that has not
-      // been diagnosed yet — grading it as a pass is how it stays undiagnosed.
-      pass: passes === runs.length,
-      medianFresh: median(fresh),
-      medianElapsedMs: median(times),
-      medianSteps: median(steps),
-      medianTokensSent: median(runs.map((run) => run.tokensIn + run.tokensOut)),
-      // IN REPEAT ORDER, not sorted. Every repeat is a complete sweep of the
-      // suite, so lining the rows up by repeat index is what lets the scoreboard
-      // measure how much its own headline moves between identical passes. Sorting
-      // these would destroy exactly that.
-      freshRuns: fresh,
-      elapsedRuns: times,
-      minFresh: Math.min(...fresh),
-      maxFresh: Math.max(...fresh),
-      minElapsedMs: Math.min(...times),
-      maxElapsedMs: Math.max(...times),
-      maxSteps: Math.max(...steps),
-      freshSpread: spread(fresh),
-      timeSpread: spread(times, (value) => `${(value / 1000).toFixed(1)}s`),
-      stepSpread: spread(steps),
-      cost: runs.reduce((sum, run) => sum + costOf(run), 0) / runs.length,
-      tools: runs.find((run) => run.tools.length)?.tools ?? [],
-      reason: runs.find((run) => !run.pass)?.reason ?? null
-    };
-  });
-}
 
 // ---- Budgets ------------------------------------------------------------------
 //
@@ -621,12 +570,13 @@ function scoreboard(records, summaries, meta) {
   // 4, the recorded budgets caught 1.
   const inForce = meta.budgets?.tasks ?? budgetsFrom(summaries, meta).tasks;
   const recorded = Boolean(meta.budgets?.tasks);
-  const costly = summaries.filter((summary) => summary.medianFresh >= MATTERS_ABOVE_FRESH);
+  const costly = summaries.filter((summary) => summary.medianTokensIn >= MATTERS_ABOVE_SENT);
   const canSeeFresh = costly.filter((summary) => {
-    const ceiling = inForce[summary.id]?.freshTokens;
-    return ceiling !== undefined && summary.medianFresh * DETECTS > ceiling;
+    const ceiling = inForce[summary.id]?.tokensIn;
+    return ceiling !== undefined && summary.medianTokensIn * DETECTS > ceiling;
   });
-  const ungated = costly.filter((summary) => inForce[summary.id]?.freshTokens === undefined);
+  const ungated = costly.filter((summary) => inForce[summary.id]?.tokensIn === undefined);
+  const cacheRate = median(summaries.map((summary) => summary.medianCacheRate ?? 0));
   lines.push("**How much of this is signal**");
   lines.push("");
   if (freshBand) {
@@ -634,10 +584,16 @@ function scoreboard(records, summaries, meta) {
       `${freshBand.high.toLocaleString()}) across this run's own ${freshBand.sweeps} identical sweeps. ` +
       `**It is not the gate**, and a change smaller than that band cannot be read off it.`);
   }
-  lines.push(`- **The gate is the per-row budgets** in \`budgets.json\`, checked against each row's median` +
+  lines.push(`- **The endpoint served ${cacheRate}% of the input from its cache on this run.** ` +
+    "Fresh tokens are the money and that share decides them: the drawing row measured 7,912 fresh at " +
+    "98% and 103,455 fresh at 68% on identical code twenty minutes apart, while tokens SENT moved 8%. " +
+    "**Read any cost difference against this number before looking for a bug**, and compare fresh " +
+    "tokens only between runs whose cache rates are close.");
+  lines.push(`- **The gate is the per-row budgets** in \`budgets.json\`, on tokens SENT rather than fresh, ` +
+    `checked against each row's median` +
     (recorded ? `, as recorded ${meta.budgets.recordedAt}` : " — none recorded yet, so the figures below are what this run WOULD record") + ".");
-  lines.push(`- Of the **${costly.length} rows costing over ${MATTERS_ABOVE_FRESH.toLocaleString()} fresh tokens** — ` +
-    "the ones where a 20% regression is real money — " +
+  lines.push(`- Of the **${costly.length} rows sending over ${MATTERS_ABOVE_SENT.toLocaleString()} tokens** — ` +
+    "the ones doing enough work for 20% to mean something — " +
     `**${canSeeFresh.length} would catch one**` +
     (canSeeFresh.length ? `: ${canSeeFresh.map((s) => `\`${s.id}\``).join(", ")}` : "") + ". " +
     (canSeeFresh.length < costly.length - ungated.length
@@ -814,7 +770,7 @@ async function main() {
  * re-derive a past run's verdict without touching the machine.
  */
 async function report(records, meta, { write = true } = {}) {
-  const summaries = summarise(records);
+  const summaries = summarise(records, costOf);
   meta.slack = options.slack;
 
   // A PARTIAL RUN MUST NOT BE ABLE TO REWRITE THE BUDGETS.
