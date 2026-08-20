@@ -1,268 +1,407 @@
 {
-  "recordedAt": "2026-08-19T10:42:37.384Z",
+  "recordedAt": "2026-08-20T20:03:44.384Z",
   "model": "configured provider",
   "repeat": 3,
-  "slack": 1.4,
-  "note": "Recorded from a measured baseline with --write-budgets, not chosen by hand. Each ceiling is that task's baseline MEDIAN times the slack above. A later run breaches a budget when ITS median exceeds the ceiling — one unlucky run cannot fail the gate, and a task that got quietly twice as expensive cannot pass it.",
+  "detects": 1.2,
+  "note": "Recorded from a measured baseline with --write-budgets, not chosen by hand. Each ceiling is that row's baseline MEDIAN plus headroom proportional to that row's OWN measured spread, with a floor. A later run breaches when ITS median exceeds the ceiling, so one unlucky run cannot fail the gate and a row that got quietly more expensive cannot pass it. COST IS GATED ON tokensIn, NOT tokensFresh: fresh tokens are the money but they are decided by the provider's cache, which moved the drawing row between 7,912 and 103,455 on identical code in twenty minutes. tokensIn moved 8% across the same pair. `detects20` says whether the row is steady enough to see a 20% regression at this repeat count; where it is false the row is reported, not gated on, and raising --repeat is what fixes it.",
   "tasks": {
     "chat-arithmetic": {
-      "freshTokens": 2000,
-      "elapsedMs": 3420,
-      "steps": 2,
+      "tokensIn": 12074,
+      "elapsedMs": 5126,
+      "steps": 3,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 20,
-        "medianElapsedMs": 1546,
+        "medianTokensIn": 9441,
+        "medianFresh": 97,
+        "cacheHitRate": 99,
+        "medianElapsedMs": 1565,
         "medianSteps": 1,
-        "spread": "20–20 fresh · 1.5–3.1s"
+        "spread": "9,364–9,441 sent · 1.6–3.9s"
       }
     },
     "machine-python-installed": {
-      "freshTokens": 2000,
-      "elapsedMs": 7591,
+      "tokensIn": 22846,
+      "elapsedMs": 6646,
       "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 120,
-        "medianElapsedMs": 4615,
+        "medianTokensIn": 19059,
+        "medianFresh": 273,
+        "cacheHitRate": 98.6,
+        "medianElapsedMs": 4666,
         "medianSteps": 2,
-        "spread": "63–157 fresh · 3.1–6.9s"
+        "spread": "18,944–19,089 sent · 3.9–4.7s"
       }
     },
     "files-create-folder-and-file": {
-      "freshTokens": 2000,
-      "elapsedMs": 6440,
-      "steps": 3,
+      "tokensIn": 23054,
+      "elapsedMs": 6692,
+      "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 133,
-        "medianElapsedMs": 4600,
+        "medianTokensIn": 19245,
+        "medianFresh": 46,
+        "cacheHitRate": 99.8,
+        "medianElapsedMs": 4715,
         "medianSteps": 2,
-        "spread": "124–156 fresh · 3.9–4.6s"
+        "spread": "19,037–19,246 sent · 4.6–5.4s"
       }
     },
     "files-read-contents": {
-      "freshTokens": 2000,
-      "elapsedMs": 4319,
-      "steps": 3,
+      "tokensIn": 22911,
+      "elapsedMs": 5120,
+      "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 144,
-        "medianElapsedMs": 3085,
+        "medianTokensIn": 19117,
+        "medianFresh": 46,
+        "cacheHitRate": 99.8,
+        "medianElapsedMs": 3140,
         "medianSteps": 2,
-        "spread": "131–148 fresh · 3.1–3.8s"
+        "spread": "18,942–19,118 sent · 3.1–3.9s"
       }
     },
     "files-find-by-name": {
-      "freshTokens": 2000,
-      "elapsedMs": 5401,
-      "steps": 3,
+      "tokensIn": 22991,
+      "elapsedMs": 6744,
+      "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 193,
-        "medianElapsedMs": 3858,
+        "medianTokensIn": 19188,
+        "medianFresh": 259,
+        "cacheHitRate": 98.7,
+        "medianElapsedMs": 4666,
         "medianSteps": 2,
-        "spread": "184–197 fresh · 3.9–3.9s"
+        "spread": "18,989–19,203 sent · 4.6–5.5s"
       }
     },
     "files-edit-in-place": {
-      "freshTokens": 2000,
-      "elapsedMs": 9584,
+      "tokensIn": 45312,
+      "elapsedMs": 10570,
       "steps": 6,
+      "detects20": {
+        "sent": true,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 397,
-        "medianElapsedMs": 6846,
+        "medianTokensIn": 39118,
+        "medianFresh": 240,
+        "cacheHitRate": 99.4,
+        "medianElapsedMs": 7763,
         "medianSteps": 4,
-        "spread": "310–413 fresh · 6.2–6.9s"
+        "spread": "38,668–39,152 sent · 6.2–7.8s"
       }
     },
     "document-read-docx": {
-      "freshTokens": 2000,
-      "elapsedMs": 4297,
-      "steps": 3,
+      "tokensIn": 22929,
+      "elapsedMs": 5089,
+      "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 171,
-        "medianElapsedMs": 3069,
+        "medianTokensIn": 19133,
+        "medianFresh": 190,
+        "cacheHitRate": 99,
+        "medianElapsedMs": 3127,
         "medianSteps": 2,
-        "spread": "159–190 fresh · 3.1–3.8s"
+        "spread": "18,971–19,134 sent · 3.1–3.9s"
       }
     },
     "app-launch-notepad": {
-      "freshTokens": 2000,
-      "elapsedMs": 6454,
-      "steps": 2,
+      "tokensIn": 1500,
+      "elapsedMs": 6647,
+      "steps": 1,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
+        "medianTokensIn": 0,
         "medianFresh": 0,
-        "medianElapsedMs": 4610,
+        "cacheHitRate": 0,
+        "medianElapsedMs": 4669,
         "medianSteps": 0,
-        "spread": "0–0 fresh · 3.8–4.6s"
+        "spread": "0–0 sent · 4.7–5.4s"
       }
     },
     "app-type-into-notepad-and-save": {
-      "freshTokens": 20167,
-      "elapsedMs": 103650,
-      "steps": 27,
+      "tokensIn": 215745,
+      "elapsedMs": 61635,
+      "steps": 12,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 5771,
-        "medianElapsedMs": 46037,
-        "medianSteps": 13,
-        "spread": "4404–18334 fresh · 43.0–94.2s"
+        "medianTokensIn": 97886,
+        "medianFresh": 4541,
+        "cacheHitRate": 97.7,
+        "medianElapsedMs": 41849,
+        "medianSteps": 9,
+        "spread": "81,846–1,98,205 sent · 31.8–50.4s"
       }
     },
     "web-lookup-fact": {
-      "freshTokens": 2000,
-      "elapsedMs": 3223,
-      "steps": 2,
+      "tokensIn": 12085,
+      "elapsedMs": 5816,
+      "steps": 3,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 30,
-        "medianElapsedMs": 2302,
+        "medianTokensIn": 9451,
+        "medianFresh": 107,
+        "cacheHitRate": 98.9,
+        "medianElapsedMs": 2332,
         "medianSteps": 1,
-        "spread": "30–30 fresh · 1.5–2.3s"
+        "spread": "9,374–9,451 sent · 1.6–3.9s"
       }
     },
     "system-set-volume": {
-      "freshTokens": 2000,
-      "elapsedMs": 4326,
-      "steps": 3,
+      "tokensIn": 22786,
+      "elapsedMs": 4680,
+      "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 42,
-        "medianElapsedMs": 3090,
+        "medianTokensIn": 19005,
+        "medianFresh": 194,
+        "cacheHitRate": 99,
+        "medianElapsedMs": 3107,
         "medianSteps": 2,
-        "spread": "42–165 fresh · 3.1–3.1s"
+        "spread": "18,841–19,010 sent · 3.1–3.1s"
       }
     },
     "packages-search-winget": {
-      "freshTokens": 2000,
-      "elapsedMs": 8609,
-      "steps": 3,
+      "tokensIn": 23122,
+      "elapsedMs": 9756,
+      "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 354,
-        "medianElapsedMs": 6149,
+        "medianTokensIn": 19305,
+        "medianFresh": 503,
+        "cacheHitRate": 97.4,
+        "medianElapsedMs": 5426,
         "medianSteps": 2,
-        "spread": "351–367 fresh · 4.6–6.9s"
+        "spread": "19,143–19,319 sent · 4.6–7.8s"
       }
     },
     "window-maximize": {
-      "freshTokens": 2000,
-      "elapsedMs": 14024,
+      "tokensIn": 33799,
+      "elapsedMs": 13597,
       "steps": 5,
+      "detects20": {
+        "sent": true,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 191,
-        "medianElapsedMs": 10017,
+        "medianTokensIn": 28838,
+        "medianFresh": 294,
+        "cacheHitRate": 99,
+        "medianElapsedMs": 10083,
         "medianSteps": 3,
-        "spread": "177–317 fresh · 9.3–10.1s"
+        "spread": "28,563–28,957 sent · 9.3–11.6s"
       }
     },
     "multi-step-folder-file-report": {
-      "freshTokens": 2000,
-      "elapsedMs": 6516,
-      "steps": 3,
+      "tokensIn": 22838,
+      "elapsedMs": 73383,
+      "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 109,
-        "medianElapsedMs": 4654,
+        "medianTokensIn": 19052,
+        "medianFresh": 2540,
+        "cacheHitRate": 86.7,
+        "medianElapsedMs": 6219,
         "medianSteps": 2,
-        "spread": "103–213 fresh · 4.6–5.3s"
+        "spread": "19,052–19,469 sent · 4.7–70.6s"
       }
     },
     "safety-refuses-root-delete": {
-      "freshTokens": 2000,
-      "elapsedMs": 9269,
-      "steps": 2,
+      "tokensIn": 29972,
+      "elapsedMs": 14324,
+      "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 19,
-        "medianElapsedMs": 5362,
-        "medianSteps": 1,
-        "spread": "19–19 fresh · 3.8–8.4s"
+        "medianTokensIn": 18930,
+        "medianFresh": 2546,
+        "cacheHitRate": 86.6,
+        "medianElapsedMs": 8530,
+        "medianSteps": 2,
+        "spread": "9,440–18,982 sent · 6.2–10.8s"
       }
     },
     "messaging-send-to-self": {
-      "freshTokens": 4307,
-      "elapsedMs": 191744,
-      "steps": 6,
+      "tokensIn": 77871,
+      "elapsedMs": 29190,
+      "steps": 8,
+      "detects20": {
+        "sent": true,
+        "time": false
+      },
       "baseline": {
-        "pass": false,
-        "passes": "0/3",
-        "medianFresh": 1819,
-        "medianElapsedMs": 136960,
-        "medianSteps": 4,
-        "spread": "1751–3915 fresh · 136.7–149.9s"
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 65954,
+        "medianFresh": 16674,
+        "cacheHitRate": 74.7,
+        "medianElapsedMs": 22468,
+        "medianSteps": 6,
+        "spread": "55,622–66,039 sent · 20.9–26.4s"
       }
     },
     "webview-click-icon": {
-      "freshTokens": 6765,
-      "elapsedMs": 28034,
-      "steps": 9,
+      "tokensIn": 108119,
+      "elapsedMs": 37811,
+      "steps": 10,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 4832,
-        "medianElapsedMs": 20024,
-        "medianSteps": 6,
-        "spread": "4368–4967 fresh · 16.8–23.2s"
+        "medianTokensIn": 85881,
+        "medianFresh": 20345,
+        "cacheHitRate": 76.3,
+        "medianElapsedMs": 24869,
+        "medianSteps": 8,
+        "spread": "66,587–87,325 sent · 17.0–28.8s"
       }
     },
     "webview-reading-cost": {
-      "freshTokens": 2785,
-      "elapsedMs": 17750,
+      "tokensIn": 35186,
+      "elapsedMs": 16706,
       "steps": 5,
+      "detects20": {
+        "sent": true,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 1989,
-        "medianElapsedMs": 11540,
+        "medianTokensIn": 30077,
+        "medianFresh": 5345,
+        "cacheHitRate": 82.2,
+        "medianElapsedMs": 10104,
         "medianSteps": 3,
-        "spread": "1978–2081 fresh · 11.5–16.1s"
+        "spread": "30,049–30,388 sent · 7.8–13.2s"
       }
     },
     "skill-replay-file-write": {
-      "freshTokens": 2000,
-      "elapsedMs": 6469,
+      "tokensIn": 22808,
+      "elapsedMs": 6639,
       "steps": 4,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianFresh": 168,
-        "medianElapsedMs": 4621,
+        "medianTokensIn": 19025,
+        "medianFresh": 2460,
+        "cacheHitRate": 87,
+        "medianElapsedMs": 3893,
         "medianSteps": 2,
-        "spread": "161–245 fresh · 4.6–5.4s"
+        "spread": "18,972–19,286 sent · 3.1–4.7s"
       }
     },
     "skill-replay-file-write-replay": {
-      "freshTokens": 2000,
-      "elapsedMs": 8458,
+      "tokensIn": 1500,
+      "elapsedMs": 2074,
       "steps": 3,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
+      "baseline": {
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 0,
+        "medianFresh": 0,
+        "cacheHitRate": 0,
+        "medianElapsedMs": 780,
+        "medianSteps": 1,
+        "spread": "0–0 sent · 0.8–0.8s"
+      }
+    },
+    "draw-shape-in-paint": {
+      "tokensIn": 477882,
+      "elapsedMs": 128969,
+      "steps": 28,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
       "baseline": {
         "pass": false,
         "passes": "2/3",
-        "medianFresh": 0,
-        "medianElapsedMs": 783,
-        "medianSteps": 1,
-        "spread": "0–236 fresh · 0.8–7.7s"
+        "medianTokensIn": 350070,
+        "medianFresh": 103286,
+        "cacheHitRate": 70.5,
+        "medianElapsedMs": 94905,
+        "medianSteps": 24,
+        "spread": "2,89,360–4,15,672 sent · 78.2–111.1s"
       }
     }
   }
