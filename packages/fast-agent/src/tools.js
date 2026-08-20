@@ -71,10 +71,33 @@ const MAX_SCREEN_TEXT_CHARS = 2500;
 // alone exceeds it, and the rows that fell off were the tools.
 const MAX_ELEMENTS = 110;
 
+// NEVER CUT AN EMOJI IN HALF.
+//
+// A JS string is UTF-16 code units and an emoji is a surrogate PAIR of them, so
+// `slice(0, max)` can land between the two halves and leave a lone high
+// surrogate at the end. That is not a cosmetic problem: measured 20 Aug 2026,
+// every WhatsApp perception task in the eval died on
+//
+//   HTTP 400: Failed to parse the request body as JSON:
+//   messages[5].content: unexpected end of hex escape
+//
+// because the provider's JSON parser rejects the `\ud83d` that `JSON.stringify`
+// faithfully produced. The whole request is refused, so one clipped emoji in a
+// screen reading loses the entire run — and Node's own parser accepts the same
+// bytes, so nothing local catches it.
+//
+// A screen reading of a chat application is mostly emoji at the edges, which is
+// why the cut moved onto one when the visible messages changed.
+//
+// The transport well-forms message content too (see the model providers): this
+// stops one being created, that stops any reaching the wire whatever made them.
 function clip(value, max = MAX_OUTPUT_CHARS) {
   const text = String(value ?? "");
   if (text.length <= max) return text;
-  return `${text.slice(0, max)}\n… [${text.length - max} more characters]`;
+  // Step back one unit when the cut would land inside a pair. Dropping half a
+  // character the user cannot see is free; sending it is not.
+  const end = /[\uD800-\uDBFF]/.test(text[max - 1]) ? max - 1 : max;
+  return `${text.slice(0, end)}\n… [${text.length - end} more characters]`;
 }
 
 function normalizeLabel(value) {
@@ -164,6 +187,11 @@ function elementRank(element, text, { region = null, center = null } = {}) {
 // a reading LOOKS like to the model is worth pinning down, and it has been wrong
 // in expensive ways twice now.
 export { renderElements as renderElementsForTest };
+// Exported for the surrogate test, which has to exercise THIS function: a test
+// that reimplements the algorithm it is checking still passes when the real one
+// is reverted, which is the same shape of hollow check this codebase keeps
+// finding. Nothing else imports it.
+export { clip as clipForTest };
 
 function renderElements(elements, table) {
   const lines = [];

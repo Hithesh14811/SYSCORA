@@ -130,7 +130,37 @@ export async function openAiCompatibleChat({
   // calls — and an OpenAI-compatible gateway is entitled to reject a tool_call
   // object with a field it has never heard of. Whatever is added for one
   // provider must be dropped for the others rather than hoped over.
-  const wireMessages = (messages ?? []).map((message) => (Array.isArray(message.tool_calls)
+  // HALF AN EMOJI IS NOT SENDABLE, AND THE WHOLE RUN DIES ON IT.
+  //
+  // Measured 20 Aug 2026, on every WhatsApp perception task in the eval:
+  //
+  //   HTTP 400: Failed to parse the request body as JSON:
+  //   messages[5].content: unexpected end of hex escape
+  //
+  // A JS string is UTF-16 code units and an emoji is a surrogate PAIR of them.
+  // Anything that truncates by length — `clip()` on a screen reading, a prompt
+  // trim, a log excerpt — can cut between the two halves and leave a lone high
+  // surrogate. `JSON.stringify` faithfully encodes it as `\ud83d`, Node's own
+  // parser accepts that, and the provider's stricter parser rejects the whole
+  // body. So the failure cannot be caught by round-tripping locally, and it
+  // takes out the entire request rather than mangling one character.
+  //
+  // WhatsApp readings are full of emoji, which is why the perception tasks went
+  // from passing to failing when the visible chat content changed and moved the
+  // cut by a few characters.
+  //
+  // Repaired HERE, at the boundary, as well as at the place that does the
+  // cutting: a lone surrogate can be introduced by any caller, and the wire is
+  // the one place every message must pass through. `toWellFormed` replaces each
+  // one with U+FFFD, which costs a character nobody can read anyway and keeps
+  // the request sendable.
+  const wellFormed = (value) => (typeof value === "string" && typeof value.toWellFormed === "function"
+    ? value.toWellFormed()
+    : value);
+  const wireMessages = (messages ?? []).map((message) => ({
+    ...message,
+    ...(typeof message.content === "string" ? { content: wellFormed(message.content) } : {})
+  })).map((message) => (Array.isArray(message.tool_calls)
     ? {
         ...message,
         tool_calls: message.tool_calls.map((call) => ({
