@@ -219,9 +219,29 @@ scripts/probe-evidence.mjs                 every tool's receipt and its cost
 scripts/measure-prompt-cost.mjs            per-step fixed prompt cost
 ```
 
-Quote costs as **`tokensFresh`** (billed at full rate), never `tokensIn`. The
-endpoint serves ~96.6% of the fixed 8,222-token prefix from cache on every step
-after the first, at roughly a tenth of the price. `tokensIn` is bandwidth.
+**FRESH IS WHAT YOU ARE BILLED. SENT IS WHAT THE AGENT DID. Report the first,
+gate on the second.**
+
+This used to read "quote `tokensFresh`, never `tokensIn`", full stop. That is
+right for reporting COST and wrong for detecting a REGRESSION, and the
+distinction was never drawn.
+
+`tokensFresh` is what the endpoint bills at full rate — the money, and the right
+number to put in front of a human. It is also **decided by the provider's prefix
+cache, which is not in this codebase and does not change when the code does.**
+Measured 21 Aug 2026 across three identical sweeps of one suite: cache hit 97.1%,
+75.2%, 75.6%, and the headline median moved 206 → 2,598, which is 876%. The
+drawing row billed 7,912 and 103,455 at the **same 23 steps**. `files-read-contents`
+— reading one file — ranged 45 to 2,558. Nothing in the code differed.
+
+`tokensIn` moved 8% across that same pair. It is steps × how much conversation
+each one carried: it moves when the AGENT changes and holds still when only the
+endpoint does. So the eval gate is on tokens sent, and the scoreboard prints the
+cache hit rate beside the fresh figure so any cost difference can be read against
+it before anyone goes hunting for a bug.
+
+Do not re-derive the old rule from the old sentence: gating on fresh tokens fires
+when someone else's cache went cold, and a gate that cries wolf gets switched off.
 
 ---
 

@@ -246,7 +246,7 @@ production plan refers to it, not because it should be quoted.
 | `is python installed?` | 2 | 41s | 19,257 | correct, slow |
 | disk space / top RAM | 2 | ~6s | ~18,300 | correct |
 | play a song on Spotify | 5–7 | 27–47s | 54k–77k | correct, needs a click fallback |
-| draw a train in Paint | 37–54 | 227–365s | 514k–894k | **poor; one run ran out of time** |
+| draw a train in Paint | 37–54 | 227–365s | 514k–894k SENT | **the units are tokens SENT — see the 21 Aug correction; billed was a fiftieth of this** |
 
 #### The flagship row was wrong, and the way it was wrong is the lesson
 
@@ -503,7 +503,10 @@ Two live bugs fell out of the pass:
   receipt rather than inferring it from success.
   **Caveat: both endpoints serve the same model family and one of them has no
   credit left.** That is resilience against an endpoint, not against a vendor.
-- **Drawing is a demo, not a capability.** 54 steps, 894k tokens, incomplete.
+- ~~**Drawing is a demo, not a capability.** 54 steps, 894k tokens, incomplete.~~
+  **Wrong, corrected 21 Aug 2026: 894k was tokens SENT.** The eval row measures
+  23 steps median and 7,912 fresh tokens billed, and the circle is on the canvas
+  by step 6 in one `draw` call. What costs is Paint's Save-As dialog after it.
 - **No undo.** It cannot un-send a message. `docs/trust-and-triggers.md` unbuilt.
   **This and the next item are what an enterprise buyer asks about first, and
   neither has been started.**

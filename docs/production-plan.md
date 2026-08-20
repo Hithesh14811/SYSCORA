@@ -13,6 +13,12 @@ machine with a script in `scripts/`, it is not done.
 Quoted as **fresh input tokens** — what is actually billed at full rate. The
 older figures in this table counted cached tokens at full price; see W2.1.
 
+**Quoted, not gated on.** Fresh tokens are decided by the provider's prefix
+cache, which is not in this codebase: three identical sweeps of the eval measured
+97.1%, 75.2% and 75.6% cache hit rates, and the headline median moved 876% across
+them. Regressions are gated on tokens SENT — what the agent did — with the cache
+hit rate printed beside the money so the two are never confused again.
+
 | | today | target | |
 |---|---|---|---|
 | trivial request (`mute`, `volume 40`) | 0 tokens · 92ms | **0 tokens · < 400ms** | **MET** |
@@ -407,11 +413,33 @@ one of them messages the user and one changes something they can hear.
 
 ## Descope, explicitly
 
-**Drawing.** 54 steps and 894k tokens for a crude train. It is a demo, not a
-capability, and every step of it is a model round trip guessing at coordinates.
-Either cut it from the product story, or rebuild it as a single planned
-composition executed in one batch — not as forty individually reasoned drags.
-Do not sink more time into incremental fixes there.
+~~**Drawing.** 54 steps and 894k tokens for a crude train. It is a demo, not a
+capability…~~ — **REVERSED 21 Aug 2026. THE NUMBER WAS MISREAD.**
+
+**894,000 was tokens SENT, not tokens billed.** Nobody checked the units, and a
+working capability was written out of the product story on the strength of it.
+Measured on the eval's `draw-shape-in-paint` row, ten runs:
+
+```
+  steps   15, 15, 19, 23, 23, 28, 39, 40, 48     median 23
+  billed  7,912 fresh                            at a 98% cache hit rate
+  time    70s … 301s                             median ~95s
+```
+
+And the tool sequence is the same in every single run:
+
+```
+  launch → new_document → screen → click → screen → draw → …
+```
+
+**The drawing is finished by step 6, in ONE `draw` call.** It is not "forty
+individually reasoned drags" — it never was. Everything after step 6 is Paint's
+Save-As dialog; one run spent eighteen shell commands there. So the expensive
+part was never the drawing and the planner rebuild proposed above would not have
+removed a single click of it. W2 was cancelled for the same reason.
+
+If this row's cost ever matters, the fix is a `save_as` verb of the same shape as
+`new_document`. Do not re-derive the old conclusion from the old number.
 
 ---
 
