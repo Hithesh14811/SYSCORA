@@ -16,6 +16,9 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { startServer } from "../../apps/daemon/src/server.js";
+import {
+  median, budgetsFrom, checkBudgets, noiseBand, detectability, DETECTS, MATTERS_ABOVE_FRESH
+} from "./budgets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -463,12 +466,6 @@ async function runTask(task, { port, workspace }) {
 // times and reported as a median AND a spread; a median with no spread beside it
 // hides exactly the variance that makes the median unreliable.
 
-const median = (numbers) => {
-  if (numbers.length === 0) return 0;
-  const sorted = [...numbers].sort((left, right) => left - right);
-  const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[middle] : Math.round((sorted[middle - 1] + sorted[middle]) / 2);
-};
 
 const costOf = (record) =>
   (record.tokensIn / 1e6) * COST_PER_MTOK_IN + (record.tokensOut / 1e6) * COST_PER_MTOK_OUT;
@@ -506,6 +503,12 @@ function summarise(records) {
       medianElapsedMs: median(times),
       medianSteps: median(steps),
       medianTokensSent: median(runs.map((run) => run.tokensIn + run.tokensOut)),
+      // IN REPEAT ORDER, not sorted. Every repeat is a complete sweep of the
+      // suite, so lining the rows up by repeat index is what lets the scoreboard
+      // measure how much its own headline moves between identical passes. Sorting
+      // these would destroy exactly that.
+      freshRuns: fresh,
+      elapsedRuns: times,
       minFresh: Math.min(...fresh),
       maxFresh: Math.max(...fresh),
       minElapsedMs: Math.min(...times),
@@ -541,86 +544,6 @@ async function loadBudgets() {
   }
 }
 
-function budgetsFrom(summaries, meta) {
-  return {
-    recordedAt: meta.at,
-    model: meta.model,
-    repeat: meta.repeat,
-    slack: meta.slack,
-    note:
-      "Recorded from a measured baseline with --write-budgets, not chosen by hand. " +
-      "Each ceiling is that task's baseline MEDIAN times the slack above. A later run " +
-      "breaches a budget when ITS median exceeds the ceiling — one unlucky run cannot " +
-      "fail the gate, and a task that got quietly twice as expensive cannot pass it.",
-    tasks: Object.fromEntries(summaries.map((summary) => [summary.id, {
-      // A CEILING BELOW THE BASELINE'S OWN WORST RUN IS NOT A GATE, IT IS AN
-      // ALARM CLOCK.
-      //
-      // First version was median × slack. On the first change it was used to
-      // judge, it reported six breaches, and every one of them was the task's
-      // own variance: `chat-arithmetic` — one model call, twenty tokens, no
-      // machine — ranged 1.5s to 21.5s across three consecutive runs of
-      // identical code, and `app-type-into-notepad-and-save` ranged 32s to 157s.
-      // A ceiling at 1.4× the median sits inside that, so the baseline itself
-      // would have breached, and a gate that cries wolf gets switched off.
-      //
-      // So the ceiling is whichever is larger: the median times the slack, or a
-      // little above the worst run actually observed. On a task whose spread is
-      // already 3× that means a 1.4× regression is NOT detectable at n=3 — which
-      // is true, and better said out loud than hidden behind a red row. The
-      // observed spread is recorded below so a reader can see which rows are
-      // sharp instruments and which are not.
-      //
-      // Floors on top, because a task that costs almost nothing has a median
-      // near zero and multiplying that gives a ceiling nothing can stay under.
-      freshTokens: Math.max(2000, Math.round(summary.medianFresh * meta.slack), Math.round(summary.maxFresh * 1.1)),
-      elapsedMs: Math.max(3000, Math.round(summary.medianElapsedMs * meta.slack), Math.round(summary.maxElapsedMs * 1.1)),
-      steps: Math.max(2, Math.ceil(summary.medianSteps * meta.slack), Math.ceil(summary.maxSteps * 1.1)),
-      baseline: {
-        pass: summary.pass,
-        passes: `${summary.passes}/${summary.runs}`,
-        medianFresh: summary.medianFresh,
-        medianElapsedMs: summary.medianElapsedMs,
-        medianSteps: summary.medianSteps,
-        // How wide this row is. A task whose worst run is three times its median
-        // cannot detect a small regression, and knowing that is the difference
-        // between reading the scoreboard and believing it.
-        spread: `${summary.minFresh}–${summary.maxFresh} fresh · ` +
-          `${(summary.minElapsedMs / 1000).toFixed(1)}–${(summary.maxElapsedMs / 1000).toFixed(1)}s`
-      }
-    }]))
-  };
-}
-
-function checkBudgets(summaries, budgets) {
-  if (!budgets) return [];
-  const breaches = [];
-  for (const summary of summaries) {
-    const budget = budgets.tasks?.[summary.id];
-    if (!budget) continue;
-    // A TASK THAT USED TO PASS AND NOW DOES NOT IS THE WORST REGRESSION THERE IS,
-    // and it is not a token budget — so it is checked here rather than left to
-    // the pass column, where a task that was already failing at baseline would
-    // have made the whole gate red forever and got the gate switched off.
-    if (budget.baseline?.pass && !summary.pass) {
-      breaches.push(`${summary.id}: passed ${budget.baseline.passes} at baseline, now ${summary.passes}/${summary.runs}` +
-        (summary.reason ? ` — ${summary.reason}` : ""));
-    }
-    if (summary.medianFresh > budget.freshTokens) {
-      breaches.push(`${summary.id}: ${summary.medianFresh.toLocaleString()} fresh tokens against a ceiling of ` +
-        `${budget.freshTokens.toLocaleString()} (baseline median ${budget.baseline?.medianFresh?.toLocaleString() ?? "?"})`);
-    }
-    if (summary.medianElapsedMs > budget.elapsedMs) {
-      breaches.push(`${summary.id}: ${(summary.medianElapsedMs / 1000).toFixed(1)}s against a ceiling of ` +
-        `${(budget.elapsedMs / 1000).toFixed(1)}s (baseline median ${((budget.baseline?.medianElapsedMs ?? 0) / 1000).toFixed(1)}s)`);
-    }
-    if (summary.medianSteps > budget.steps) {
-      breaches.push(`${summary.id}: ${summary.medianSteps} steps against a ceiling of ${budget.steps} ` +
-        `(baseline median ${budget.baseline?.medianSteps ?? "?"})`);
-    }
-  }
-  return breaches;
-}
 
 // ---- Scoreboard ---------------------------------------------------------------
 
@@ -663,11 +586,15 @@ function scoreboard(records, summaries, meta) {
   lines.push("endpoint serves ~96.6% of the fixed prompt prefix from its cache at roughly a");
   lines.push("tenth of the price, so `tokensIn` is bandwidth, not money.");
   lines.push("");
+  const freshBand = noiseBand(summaries, (summary) => summary.freshRuns ?? []);
+  const timeBand = noiseBand(summaries, (summary) => summary.elapsedRuns ?? []);
+  const band = (value, measured, format = (v) => v.toLocaleString()) =>
+    (measured ? `${format(value)} · moved ${format(measured.low)}–${format(measured.high)} (${measured.swingPercent}%) across this run's own ${measured.sweeps} sweeps` : format(value));
   lines.push("| | |");
   lines.push("|---|---|");
   lines.push(`| **Pass rate** | **${rate}%** (${passed.length} of ${summaries.length} rows passing every repeat) |`);
-  lines.push(`| Median fresh tokens | ${median(summaries.map((s) => s.medianFresh)).toLocaleString()} |`);
-  lines.push(`| Median time | ${(median(summaries.map((s) => s.medianElapsedMs)) / 1000).toFixed(1)}s |`);
+  lines.push(`| Median fresh tokens | ${band(median(summaries.map((s) => s.medianFresh)), freshBand)} |`);
+  lines.push(`| Median time | ${band(median(summaries.map((s) => s.medianElapsedMs)), timeBand, (v) => `${(v / 1000).toFixed(1)}s`)} |`);
   lines.push(`| Median steps | ${median(summaries.map((s) => s.medianSteps))} |`);
   lines.push(`| Total cost of this run | $${records.reduce((sum, r) => sum + costOf(r), 0).toFixed(3)} |`);
   if (meta.stagedPipelineReaches !== null && meta.stagedPipelineReaches !== undefined) {
@@ -677,6 +604,53 @@ function scoreboard(records, summaries, meta) {
     lines.push(`| Offline pipeline reached | ${meta.stagedPipelineReaches} times |`);
   }
   lines.push("");
+
+  // WHAT THIS SCOREBOARD CAN AND CANNOT SEE.
+  //
+  // The headline median used to be quoted as though a merge could be gated on
+  // it. It cannot: it is a median-of-medians over a suite where most rows cost
+  // a few hundred tokens, so the middle of the list drifts for free, and the
+  // same commit scored 212 and 186 on consecutive runs. The per-row budgets are
+  // the instrument. This says so on the page rather than in a document nobody
+  // reads next to the number they are about to trust.
+  // AGAINST THE CEILINGS ACTUALLY IN FORCE, not the ones this run would record
+  // for itself. Those are different numbers and only one of them is the gate:
+  // budgets recorded on a noisier day are looser, and a scoreboard that quoted
+  // its own freshly-derived sensitivity would claim the gate could see things
+  // the gate cannot. Measured 21 Aug 2026 — derived-from-this-run said 2 rows of
+  // 4, the recorded budgets caught 1.
+  const inForce = meta.budgets?.tasks ?? budgetsFrom(summaries, meta).tasks;
+  const recorded = Boolean(meta.budgets?.tasks);
+  const costly = summaries.filter((summary) => summary.medianFresh >= MATTERS_ABOVE_FRESH);
+  const canSeeFresh = costly.filter((summary) => {
+    const ceiling = inForce[summary.id]?.freshTokens;
+    return ceiling !== undefined && summary.medianFresh * DETECTS > ceiling;
+  });
+  const ungated = costly.filter((summary) => inForce[summary.id]?.freshTokens === undefined);
+  lines.push("**How much of this is signal**");
+  lines.push("");
+  if (freshBand) {
+    lines.push(`- The headline median moved **${freshBand.swingPercent}%** (${freshBand.low.toLocaleString()}–` +
+      `${freshBand.high.toLocaleString()}) across this run's own ${freshBand.sweeps} identical sweeps. ` +
+      `**It is not the gate**, and a change smaller than that band cannot be read off it.`);
+  }
+  lines.push(`- **The gate is the per-row budgets** in \`budgets.json\`, checked against each row's median` +
+    (recorded ? `, as recorded ${meta.budgets.recordedAt}` : " — none recorded yet, so the figures below are what this run WOULD record") + ".");
+  lines.push(`- Of the **${costly.length} rows costing over ${MATTERS_ABOVE_FRESH.toLocaleString()} fresh tokens** — ` +
+    "the ones where a 20% regression is real money — " +
+    `**${canSeeFresh.length} would catch one**` +
+    (canSeeFresh.length ? `: ${canSeeFresh.map((s) => `\`${s.id}\``).join(", ")}` : "") + ". " +
+    (canSeeFresh.length < costly.length - ungated.length
+      ? `The others vary by more than 20% run to run, so raising \`--repeat\` is what would sharpen them — not a tighter ceiling, which would only produce false breaches.`
+      : ""));
+  if (ungated.length) {
+    lines.push(`- **${ungated.length} of those rows is not gated at all** — ` +
+      `${ungated.map((s) => `\`${s.id}\``).join(", ")} has no recorded budget. ` +
+      "A row nobody has recorded a baseline for cannot regress, which is the most comfortable kind of green there is. " +
+      "Re-record with `--write-budgets`.");
+  }
+  lines.push("");
+
   if (meta.breaches?.length) {
     lines.push("## Budget breaches");
     lines.push("");
@@ -857,6 +831,9 @@ async function report(records, meta, { write = true } = {}) {
     console.log(`\nRecorded ${summaries.length} budgets from this run into tests/eval/budgets.json`);
   }
   meta.breaches = options.writeBudgets ? [] : checkBudgets(summaries, budgets);
+  // The ceilings actually in force, so the scoreboard reports the sensitivity of
+  // the gate rather than of a gate it could hypothetically record for itself.
+  meta.budgets = options.writeBudgets ? null : budgets;
 
   const board = scoreboard(records, summaries, meta);
   if (write) {

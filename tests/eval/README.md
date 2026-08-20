@@ -45,11 +45,41 @@ npm run eval -- --repeat 3 --manual --write-budgets   # record a baseline
 npm run eval -- --repeat 3 --manual                   # hold a change to it
 ```
 
-`--write-budgets` records each task's measured median × `--slack` (default 1.4)
-into `tests/eval/budgets.json`, along with the baseline it came from. Later runs
-breach a budget when **their median** exceeds that ceiling, so one unlucky run
-cannot fail the build. A task that passed at baseline and no longer does is a
-breach too. Any breach exits non-zero.
+`--write-budgets` records each task's ceiling into `tests/eval/budgets.json`,
+along with the baseline it came from. Later runs breach a budget when **their
+median** exceeds that ceiling, so one unlucky run cannot fail the build. A task
+that passed at baseline and no longer does is a breach too. Any breach exits
+non-zero.
+
+Each ceiling is that row's median plus headroom **proportional to that row's own
+measured spread**, with a floor. It used to be one flat 1.4× for every row, which
+was sized against the spread of a single run while the thing it compares is the
+median of three — so it was loose everywhere. `messaging-send-to-self` varies by
+9% run to run and was being given 40% of headroom, which means a change making
+the flagship WhatsApp send a third more expensive would have passed as green.
+
+### What the gate can and cannot see
+
+**Do not gate on the headline "median fresh tokens".** It is a median-of-medians
+over a suite where most rows cost a few hundred tokens, so the middle of the list
+drifts for free: the *same commit* scored 212 and 186 on consecutive runs. The
+scoreboard now prints that band next to the number — measured from the run's own
+repeats, since every repeat is a complete independent sweep — precisely so nobody
+reads a 10% move as a result.
+
+The per-row budgets are the instrument. Each row records `detects20`: whether it
+is steady enough to catch a 20% regression at this repeat count. Where that is
+false the row is **reported, not gated** on small changes, and the fix is more
+repeats — not a tighter ceiling, which only buys false breaches, and a gate that
+cries wolf gets switched off.
+
+```bash
+node scripts/probe-gate-sensitivity.mjs <baseline.json> <later.json>
+```
+
+holds the gate to both halves of its claim against two real runs: how many
+breaches unchanged code produces (must be zero) and how many rows catch a 20%
+regression injected one at a time.
 
 Budgets are **recorded, never hand-written** — a hand-picked ceiling is an
 opinion, and the point of this file is to hold opinions to a measurement. A
