@@ -1283,7 +1283,33 @@ function New-UiCacheRequest {
   # that still reaches for .Current finds a working element rather than an
   # exception. None is faster and has bitten every codebase that tried it.
   $cache.AutomationElementMode = [System.Windows.Automation.AutomationElementMode]::Full
-  $cache.TreeScope = [System.Windows.Automation.TreeScope]::Element -bor [System.Windows.Automation.TreeScope]::Descendants
+  # ELEMENT, NOT ELEMENT|DESCENDANTS. THE SLOWNESS AND THE WRONG WINDOW WERE THE
+  # SAME LINE.
+  #
+  # A CacheRequest's TreeScope is not "how much tree to search" — FindAll already
+  # says that. It is how much to PREFETCH AROUND EVERY ELEMENT THE SEARCH
+  # RETURNS. With Descendants set, a FindAll(Descendants) that finds 530 controls
+  # asks UIA to cache each of those 530 controls' entire subtrees as well, which
+  # is the same tree over and over.
+  #
+  # Measured 20 Aug 2026 on WhatsApp's content window, same properties, same
+  # patterns, same 530 elements found and same 97 usable out the other end:
+  #
+  #   Element|Descendants   FindAll  2299ms
+  #   Element                FindAll   281ms      *** 8x, for identical output ***
+  #
+  # And on the WebView2 FRAME window it is not merely slow, it is wrong. The
+  # prefetch walks across the frame's child-HWND boundary into the Chromium
+  # provider and UIA throws IndexOutOfRangeException from inside FindAll — so the
+  # host returned 0 elements on one call and 240 on the next, and the 240 were
+  # other applications' controls. That is what reached a live transcript on 20
+  # Aug 2026 as a reading headed "WhatsApp" containing Visual Studio Code's menus
+  # and Opera's toolbar, and cost the run two extra steps and twelve seconds to
+  # notice and recover from. `screen` on that frame took 25.7 SECONDS to return
+  # nothing at all; the same window under Element takes 30ms.
+  #
+  # Element is the documented pairing for a FindAll that walks the tree itself.
+  $cache.TreeScope = [System.Windows.Automation.TreeScope]::Element
   return $cache
 }
 

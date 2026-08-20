@@ -75,6 +75,54 @@ rule answered 409 to everything after it and two whole rounds recorded as zeros.
   symptom but strange answers. It still starts — refusing to boot over one comma
   is worse — but it warns on stderr saying exactly that.
 
+### Fixed 20 Aug 2026: perception was slow AND wrong, and it was one line
+
+`New-UiCacheRequest` set the UIA cache request's `TreeScope` to
+`Element -bor Descendants`. That property is not how much tree to SEARCH — the
+`FindAll` right after it says that — it is how much to PREFETCH around every
+element the search returns. So a `FindAll(Descendants)` that found 530 controls
+asked UIA to cache 530 subtrees, which is the same tree over and over.
+
+Measured on the real machine, same properties, same patterns, same 530 elements
+found and the same 97 usable out the other end:
+
+```
+  Element|Descendants   FindAll  2299ms
+  Element               FindAll   281ms      8x, for identical output
+```
+
+**And on a WebView2 frame it was not merely slow, it was wrong.** The prefetch
+walks across the frame's child-HWND boundary into the Chromium provider and UIA
+throws `IndexOutOfRangeException` from inside `FindAll`. The host therefore
+returned 0 elements on one call and 240 on the next, and the 240 were *other
+applications' controls*. A live transcript on 20 Aug 2026 contains a reading
+headed `Window: WhatsApp.Root — WhatsApp` holding Visual Studio Code's menus,
+Opera's toolbar and Spotify's transport; the agent said it "looks scrambled",
+forced focus, read again and recovered — two extra steps and about twelve
+seconds, on a request that otherwise worked. Reading that frame took **25.7
+seconds to return nothing at all**. It now takes 30ms and returns the six
+caption buttons that are really there, which is what makes the redirect to the
+content window fire correctly.
+
+`node scripts/probe-screen-p50.mjs`, the `screen` TOOL end to end:
+
+| p50 | before | after |
+|---|---|---|
+| WhatsApp | 3,134ms | **1,233ms** |
+| Spotify | 3,432ms | **1,466ms** |
+| Chrome | 3,835ms | **1,408ms** |
+| all warm reads | 3,432ms | **1,408ms** |
+
+**The W8 target of 1.2s is NOT met — 1,408ms, over by 17%.** What remains is not
+the tree walk: raw UIA `FindAll` on WhatsApp's content window is 281ms, and the
+rest is the host serialising elements and the second raw-view pass that Chromium
+windows need for text the control view hides. The brief's assumption that
+`screen` was "dominated by a whole-tree FindAll" was wrong, and measuring it
+first is what found the real cause.
+
+`tests/unit/live-run-regressions.test.js` pins the one line; it fails with the
+offending assignment quoted if anyone puts `Descendants` back.
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current

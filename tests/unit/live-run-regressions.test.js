@@ -9,6 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   buildToolset, findActiveTool, findCanvas, hasUnreadableScript, wrongUrlNotice
 } from "../../packages/fast-agent/src/tools.js";
@@ -860,4 +861,32 @@ test("progress is only attached to the commands that report it", () => {
   assert.ok(!isWingetInstall("winget uninstall --id Canva.Canva"));
   assert.ok(reportsProgress("pip install numpy"));
   assert.ok(!reportsProgress("Get-Process | Select-Object Name"));
+});
+
+// ---- A reading of WhatsApp that contained Visual Studio Code ----------------
+
+// The cache request's TreeScope is how much to prefetch AROUND each element the
+// search returns, not how much tree to search. Set to Descendants, a FindAll
+// that finds 530 controls asks UIA to cache 530 subtrees, and on a WebView2
+// frame the prefetch crosses the child-HWND boundary and UIA throws from inside
+// FindAll. Measured 20 Aug 2026: 2299ms against 281ms for identical output on
+// the content window, and 25.7 SECONDS returning nothing on the frame — which
+// reached a live transcript as a reading headed "WhatsApp" full of other
+// applications' menus.
+//
+// This FAILS if anyone puts Descendants or Subtree back into that assignment.
+// It cannot check the timing — that is `node scripts/probe-screen-p50.mjs` —
+// but the one line is what the timing depends on.
+test("the UIA cache request prefetches one element, not every element's subtree", () => {
+  const host = readFileSync(new URL("../../os-adapters/windows-host/restore-host.ps1", import.meta.url), "utf8");
+  const start = host.indexOf("function New-UiCacheRequest");
+  assert.ok(start >= 0, "New-UiCacheRequest is where every screen reading gets its properties");
+  const body = host.slice(start, host.indexOf("\nfunction ", start + 1));
+  const assignment = /\$cache\.TreeScope\s*=\s*(.+)/.exec(body)?.[1] ?? "";
+  assert.ok(assignment, "the cache request must set a TreeScope rather than inherit one");
+  assert.ok(
+    !/Descendants|Subtree/.test(assignment),
+    `the cache request must prefetch the element only; found: ${assignment.trim()}`
+  );
+  assert.match(assignment, /TreeScope\]::Element/);
 });

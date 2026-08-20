@@ -39,6 +39,13 @@ await adapter.automationHost?.warm?.();
 const heading = (text) => (String(text).match(/^Window: .*$/m)?.[0] ?? "(no window heading)");
 const elementCount = (text) => (String(text).match(/^\s*\d+\|/gm) ?? []).length;
 
+// A SECOND LOOK AT AN UNCHANGED WINDOW HAS NO ELEMENT LIST, AND THAT IS THE TOOL
+// WORKING. It answers "IDENTICAL to your last reading" and spends no tokens on
+// the same 150 rows. Counting element lines alone reports that as "0 elements",
+// which reads as a broken reading and is the opposite of the truth — this probe
+// exists to find misleading readings, so it had better not produce one.
+const isUnchangedReading = (text) => /^IDENTICAL to your last reading/m.test(String(text));
+
 // Labels that belong to applications this reading was NOT asked about. A single
 // window cannot contain another program's menu bar, so one hit here means the
 // reading is not of a window at all.
@@ -48,8 +55,11 @@ const foreign = (text) => FOREIGN.filter((label) => String(text).includes(label)
 const report = (label, ms, result) => {
   const text = String(result?.text ?? "");
   const strangers = foreign(text);
+  const what = isUnchangedReading(text)
+    ? "unchanged since the last look (no list re-sent)"
+    : `${elementCount(text)} elements`;
   console.log(`${label}`);
-  console.log(`  ${ms}ms · ok=${result?.ok} · ${elementCount(text)} elements`);
+  console.log(`  ${ms}ms · ok=${result?.ok} · ${what}`);
   console.log(`  ${heading(text)}`);
   console.log(`  other applications visible in it: ${strangers.length ? strangers.join(", ") : "none"}`);
   console.log("");
@@ -93,7 +103,7 @@ if (workingReading.strangers > 0) {
 } else {
   console.log("The working-window read contained no other application's controls.");
 }
-console.log(`By name: ${namedReading.elements} elements, ${namedReading.strangers} strangers, ${byName.ms}ms.`);
+console.log(`By name: ${namedReading.strangers} strangers, ${byName.ms}ms.`);
 
 adapter.close?.();
 process.exit(0);
