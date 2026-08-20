@@ -17,7 +17,7 @@ older figures in this table counted cached tokens at full price; see W2.1.
 |---|---|---|---|
 | trivial request (`mute`, `volume 40`) | 0 tokens · 92ms | **0 tokens · < 400ms** | **MET** |
 | simple question (`is python installed?`) | 227 fresh · 3.9s | **< 6,000 fresh · < 3s** | cost MET 26x over · **time missed by 0.9s** |
-| GUI task (read a WhatsApp chat) | 1,833 fresh · 14.7s | **< 20,000 fresh · < 12s** | cost MET 11x over · **time missed by 2.7s** |
+| GUI task (read a WhatsApp chat) | 1,900 fresh · 11.3s | **< 20,000 fresh · < 12s** | **MET** |
 | repeat of a known task | 0 tokens · 0.8s | **0 tokens · < 2s** (skills) | **MET** |
 
 Re-measured 20 Aug 2026 on `f2377b7`. Medians, with the spread and the source of
@@ -31,23 +31,31 @@ price and predated the fast path, the webview routing and skills.
 - **simple question** — eval row `machine-python-installed`, 3 repeats: 227 fresh
   (221–259), 3.9s (3.9–4.7s). The cost target is met with a factor of 26 to
   spare. The 0.9s is one model round trip; nothing local is slow here.
-- **GUI task** — eval row `webview-reading-cost`, 3 repeats: 1,833 fresh
-  (1,773–2,233), 14.7s (10.1–17.8s). Cost met elevenfold; the whole miss is
-  perception. A single `screen` on WhatsApp is 6.5s on the good path and 13.0s
-  on the bad one (`node scripts/probe-stale-window.mjs`).
+- **GUI task** — eval row `webview-reading-cost`, **6 runs across two suites
+  after the W8 cache-scope fix**: 1,900 fresh (1,866–4,304), **11.3s
+  (7.8–22.3s)**. It was 1,833 fresh · 14.7s before the fix. The median is now
+  inside the target; the tail is not, and two of the six runs sat above 20s.
 - **repeat** — eval row `skill-replay-file-write-replay`, 3 repeats: 0 tokens,
   0.8s, no model call at all.
 
-**COST IS NO LONGER THE PROBLEM. LATENCY IS, AND IT IS ALL PERCEPTION.** That is
-what selects W8 (perception speed) ahead of the planner: every remaining miss is
-seconds spent reading a window, and no amount of planning makes a `screen` call
-faster.
+**COST IS NO LONGER THE PROBLEM — it is met on every row with an order of
+magnitude to spare. LATENCY IS, AND IT IS PERCEPTION, NOT PLANNING.** That is
+what selected W8 ahead of the lazy planner: every remaining miss was seconds
+spent reading a window, and no amount of planning makes a `screen` call faster.
+Three of the four numbers are now met. The one that is not — the simple
+question, 0.9s over — is a single model round trip, and there is nothing local
+left to remove from it.
+
+The flagship send, `messaging-send-to-self`, over the same 6 runs: **5 steps
+every single time, median 18.3s (17.0–21.7s)**, against 21.7s and a 22-step,
+152.6s worst case before. W8's own ceiling of 15s is still not met.
 
 The one number that does not fit: a REAL WhatsApp send, on a five-turn
 conversation, to a contact found by name — 79,638 fresh over 14 steps, live on 20
-Aug 2026. Ten of its 21 tool calls were `screen`, and two of the steps existed
-only to recover from a reading of the wrong window. It is the same defect, priced
-at a full request rather than a single call.
+Aug 2026, BEFORE the fix. Ten of its 21 tool calls were `screen`, and two of the
+steps existed only to recover from a reading of the wrong window. That recovery
+is what the cache-scope fix removes; the run has not been repeated since, because
+repeating it means messaging a real person.
 
 Plus: **zero false claims** across the eval suite, and no regression in pass rate.
 

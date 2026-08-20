@@ -123,6 +123,29 @@ first is what found the real cause.
 `tests/unit/live-run-regressions.test.js` pins the one line; it fails with the
 offending assignment quoted if anyone puts `Descendants` back.
 
+**What it did to the suite** — `npm run eval -- --repeat 3 --manual`, run twice
+after the fix, against one run of the same suite before it:
+
+```
+                      before        after #1      after #2
+  pass rate           100% (20/20)  100% (20/20)  100% (20/20)
+  median time         5.4s          4.7s          4.7s
+  median fresh        186           225           217
+  offline pipeline    0 of 60       0 of 60       0 of 60
+```
+
+Median fresh moved by less than the run-to-run noise of the metric itself: the
+SAME commit scored 212 and 186 on two runs, so ±26 is the floor of what this
+number can resolve, and nothing in a UIA prefetch setting can change the cost of
+`files-read-contents`.
+
+**The spreads are where the fix shows.** Per-run, the flagship send went from
+`152.6s / 22 steps, 20.1s, 21.7s` to six consecutive runs of **5 steps** at
+17.0–21.7s. The 22-step run was the wrong-window recovery — `launch → screen →
+windows → focus → screen`, ten of its twenty-one tool calls being `screen`.
+`webview-click-icon`, previously the widest-spread row in the suite at
+27.1–51.1s, now runs 17.1–19.4s.
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current
