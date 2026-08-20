@@ -199,6 +199,46 @@ function coarse(args) {
 // legitimate reason to stop and never a false claim about the machine.
 const ASKS_THE_USER = /\?\s*$|\?["')\]]*\s*$/;
 
+// WHY A RUN ENDED, AS A FACT THE LOOP RECORDS RATHER THAN A GUESS SOMEBODY MAKES
+// LATER FROM ITS PROSE.
+//
+// The runtime decided whether to fall back to the staged pipeline with
+// `status === "FAILED" && toolCalls === 0 && !/\b(429|401|403)\b|rate.?limit|…/`
+// — a heuristic about tool counts plus a regex over the user-facing sentence. It
+// is wrong in the obvious direction: a run that failed for ANY reason without
+// calling a tool was read as "the model is unreachable", so the request was
+// handed to ~20,000 lines of offline pipeline that plans from typed
+// capabilities.
+//
+// Measured 20 Aug 2026 on the safety task, live: the model refused correctly at
+// 11.4s, the loop settled FAILED at 14.4s, and the staged pipeline then ran
+// until 107.7s before reporting it could not help either. Ninety-three seconds
+// spent re-deriving an answer that was already correct and already on screen.
+//
+// The loop ALREADY knows why it stopped — it distinguishes rate limits from
+// dropped connections a few hundred lines below and writes a different sentence
+// for each. It just threw the distinction away and left the runtime to infer it
+// from the words. Now it says so.
+export const FailureReason = {
+  // The endpoint could not be reached at all. THE ONLY ONE that justifies the
+  // offline pipeline, because it is the only one where re-planning without a
+  // model is better than what the loop already has.
+  MODEL_UNREACHABLE: "MODEL_UNREACHABLE",
+  // The account is being throttled or rejected. Not an offline machine: trying
+  // again later works, and re-planning locally answers the wrong question.
+  MODEL_RATE_LIMITED: "MODEL_RATE_LIMITED",
+  // The provider emitted tool-call markup as prose, or cut a turn off at the
+  // token ceiling, twice. The model is reachable and misbehaving.
+  MODEL_MALFORMED: "MODEL_MALFORMED",
+  // The model answered without calling anything and the answer claimed
+  // something about this machine. See claimsWithoutEvidence.
+  NO_EVIDENCE: "NO_EVIDENCE",
+  // A ceiling was hit: steps, wall clock or billed tokens.
+  BUDGET: "BUDGET",
+  // The user, or a caller acting for them, said no to something irreversible.
+  DECLINED: "DECLINED"
+};
+
 // THE LIE WORE BOLD, AND EVERY GUARD IN THIS FILE LOOKED STRAIGHT PAST IT.
 //
 // Measured live, 17 Aug 2026, in the user's own transcript:
@@ -766,6 +806,10 @@ export class FastAgent {
     // See looksUnfinished: the loop settling COMPLETED on a turn that was
     // describing the NEXT step, four steps into the flagship task.
     let nudgedForUnfinished = false;
+    // How many irreversible actions the user refused. A run that had one is
+    // DECLINED, not COMPLETED — see the settle at the end of the no-tool-call
+    // branch.
+    let declinedActions = 0;
 
     while (steps < this.maxSteps) {
       if (this.signal?.aborted) {
@@ -776,7 +820,7 @@ export class FastAgent {
         return this._settle(
           "PARTIALLY_COMPLETED",
           `${lastText ? `${lastText}\n\n` : ""}I ran out of time on this one. Anything already done is still in place.`,
-          { steps, toolCalls, startedAt }
+          { steps, toolCalls, startedAt, failureReason: FailureReason.BUDGET }
         );
       }
       // THE COST CEILING, CHECKED BEFORE SPENDING THE NEXT ROUND TRIP.
@@ -800,7 +844,7 @@ export class FastAgent {
           `(${this.maxFreshTokens.toLocaleString()}). Anything already done is still in place. ` +
           "That usually means I was going round in circles rather than that the task is large — " +
           "tell me what you can see and I will go straight there.",
-          { steps, toolCalls, startedAt }
+          { steps, toolCalls, startedAt, failureReason: FailureReason.BUDGET }
         );
       }
       steps += 1;
@@ -846,7 +890,19 @@ export class FastAgent {
             ? `${lastText ? `${lastText}\n\n` : ""}I had to stop partway through: ${cause}. ` +
               "What I already did is still in place, so it is safe to ask again."
             : `I could not start: ${cause}. Nothing was changed.`,
-          { steps, toolCalls, startedAt }
+          {
+            steps,
+            toolCalls,
+            startedAt,
+            // The same three-way distinction the sentence above already makes,
+            // recorded as a fact instead of left for a regex to rediscover.
+            // Only UNREACHABLE justifies the offline pipeline.
+            failureReason: rateLimited
+              ? FailureReason.MODEL_RATE_LIMITED
+              : offline
+                ? FailureReason.MODEL_UNREACHABLE
+                : FailureReason.MODEL_MALFORMED
+          }
         );
       }
 
@@ -904,7 +960,9 @@ export class FastAgent {
           "I cannot run, twice in a row. Nothing further was done — what I had already done is still in " +
           "place. This is the model endpoint misbehaving, not the machine or the request; trying again " +
           "usually clears it.",
-          { steps, toolCalls, startedAt }
+          // Reachable and misbehaving. Re-planning offline answers a different
+          // question; the honest thing is to say the endpoint is broken.
+          { steps, toolCalls, startedAt, failureReason: FailureReason.MODEL_MALFORMED }
         );
       }
 
@@ -1000,7 +1058,11 @@ export class FastAgent {
             "FAILED",
             "I did not do that, and I cannot tell you the state of anything — I ran no tool at all, so I " +
             "have nothing to go on. Ask me again and I will actually check.",
-            { steps, toolCalls, startedAt }
+            // THE ONE THAT COST NINETY SECONDS. A run stopped here has a working
+            // model — it answered twice — so handing it to the offline pipeline
+            // was never right. Measured on the safety task: the refusal was
+            // correct at 11.4s and the pipeline ran until 107.7s.
+            { steps, toolCalls, startedAt, failureReason: FailureReason.NO_EVIDENCE }
           );
         }
         // A STOP WITHOUT A REASON IS INDISTINGUISHABLE FROM A CRASH.
@@ -1032,6 +1094,32 @@ export class FastAgent {
             `${lastText ? `${lastText}\n\n` : ""}I stopped before finishing that. What I already did is ` +
             "still in place, so it is safe to ask again.",
             { steps, toolCalls, startedAt }
+          );
+        }
+        // SAYING NO IS NOT A COMPLETION, AND IT IS NOT A FAILURE EITHER.
+        //
+        // A send the user declined settled COMPLETED. The sentence underneath it
+        // was honest — "it was not sent, the draft is still in the box" — and
+        // the green tick beside that sentence was not. The two together are
+        // worse than either: a surface showing COMPLETED over "I did not do it"
+        // teaches people to stop reading the sentence.
+        //
+        // This is the three-verdict rule the tool layer has followed since W1,
+        // applied to RUN STATUS, where it never was. CONFIRMED / REFUTED /
+        // UNCONFIRMED for a receipt; COMPLETED / DECLINED / FAILED for a run.
+        //
+        // Keyed on the RECEIPT, not on the words: `refusedByUser` is set by the
+        // tool that asked, so this is the system reading back something it did,
+        // not the loop recognising English in the model's summary.
+        //
+        // No skill is offered from a declined run. §9 records only completed
+        // routes, and a route whose irreversible step the user refused is
+        // exactly the one that must not be replayed for free.
+        if (declinedActions > 0) {
+          return this._settle(
+            "DECLINED",
+            lastText || "I stopped: you declined that, so I did not do it and nothing was changed.",
+            { steps, toolCalls, startedAt, failureReason: FailureReason.DECLINED }
           );
         }
         await this._offerSkill(userText, performed, malformedTurns);
@@ -1209,6 +1297,11 @@ export class FastAgent {
         // nothing in between. So a successful call — anything that moved the
         // machine or re-read it — clears the record: the world may no longer be
         // the one those calls failed in. Consecutive repeats are still refused.
+        // The system's own record that somebody said no. Counted here, off the
+        // receipt the gate wrote, so the settle below never has to read English
+        // to know a run was refused rather than finished. See the DECLINED
+        // settle.
+        if (result.raw?.refusedByUser === true) declinedActions += 1;
         if (result.ok) failedCalls.clear();
         else failedCalls.set(signature, result.text);
         performed.push({ tool: call.name, args: shown, ok: result.ok === true, verified: null });
@@ -1299,7 +1392,7 @@ export class FastAgent {
     return this._settle(
       "PARTIALLY_COMPLETED",
       `${lastText ? `${lastText}\n\n` : ""}I stopped after ${this.maxSteps} steps without finishing. Anything already done is still in place.`,
-      { steps, toolCalls, startedAt }
+      { steps, toolCalls, startedAt, failureReason: FailureReason.BUDGET }
     );
   }
 
@@ -1366,10 +1459,16 @@ export class FastAgent {
     throw lastError;
   }
 
-  _settle(status, message, { steps, toolCalls, startedAt }) {
+  _settle(status, message, { steps, toolCalls, startedAt, failureReason = null }) {
     const settled = {
       status,
       message,
+      // WHY, not inferred from the message. See FailureReason: the runtime used
+      // to decide whether the model was reachable by running a regex over this
+      // sentence, and spent ninety seconds in the offline pipeline when it
+      // guessed wrong. Null on the paths that succeeded — there is no reason to
+      // give for a run that worked.
+      failureReason,
       steps,
       toolCalls,
       elapsedMs: Date.now() - startedAt,

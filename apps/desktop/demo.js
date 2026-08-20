@@ -734,7 +734,14 @@ function renderFinal(turn, session) {
 
   // Stopping is the user getting what they asked for, not a failure. Labelling
   // it "Didn't work" in red tells them something went wrong when nothing did.
-  if (fr.status === "CANCELLED") {
+  //
+  // DECLINED is the same argument for the same reason: the user was asked
+  // whether to send something irreversible and said no. That is the safety
+  // feature working exactly as designed. It used to arrive here as COMPLETED —
+  // a green tick over the sentence "it was not sent" — and it must not land in
+  // the red branch now either, or refusing turns into something that looks like
+  // a fault the user caused.
+  if (fr.status === "CANCELLED" || fr.status === "DECLINED") {
     turn.append(el("div", "agent-answer", message));
   } else if (GOOD_STATUS.has(fr.status)) {
     turn.append(el("div", "agent-answer", message));

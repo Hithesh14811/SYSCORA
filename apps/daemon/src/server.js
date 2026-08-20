@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRuntime, loadCapabilityPlugins } from "./runtime-factory.js";
 import { ValidationError } from "../../../packages/shared-types/src/domain.js";
+import { AgentRuntime } from "../../../packages/agent-runtime/src/index.js";
 import { buildEnvelope, parseRequestBodyWithEnvelope } from "../../../packages/protocol/src/envelope.js";
 import { buildSessionResponse } from "../../../packages/protocol/src/session-protocol.js";
 import { projectSessionLifecycle } from "../../../packages/shared-types/src/session-lifecycle.js";
@@ -181,7 +182,20 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
       const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
 
       if (request.method === "GET" && requestUrl.pathname === "/api/health") {
-        sendJson(response, 200, { status: "ok", product: "SYSCORA" });
+        sendJson(response, 200, {
+          status: "ok",
+          product: "SYSCORA",
+          // HOW OFTEN THE OFFLINE PIPELINE WAS ACTUALLY NEEDED, this process.
+          //
+          // `docs/production-plan.md` W4.2 wants those ~20,000 lines deleted or
+          // quarantined. They are quarantined now — reachable only on a typed
+          // MODEL_UNREACHABLE, never on a guess about tool counts — and this is
+          // the number that should decide whether they are deleted. Deleting
+          // them on the strength of an argument is not a "don't break anything"
+          // move; deleting them because they fired zero times across sixty eval
+          // runs is.
+          stagedPipelineReaches: AgentRuntime.stagedPipelineReaches
+        });
         return;
       }
 

@@ -774,9 +774,24 @@ export class WindowsAdapter {
       const error = new Error(
         `Unable to update the Windows user PATH: ${String(ps.stderr || `PowerShell exited with code ${ps.exitCode}`).trim()}`
       );
-      error.code = /registry access is not allowed|access.*denied|securityexception/i.test(String(ps.stderr ?? ""))
-        ? "USER_PATH_PERMISSION_DENIED"
-        : "USER_PATH_UPDATE_FAILED";
+      // A KILLED PROCESS IS NOT A REFUSED WRITE, AND THE CALLER NEEDS TO KNOW
+      // WHICH.
+      //
+      // A timeout arrives here as exit code -1 with an empty stderr, which is
+      // indistinguishable from a genuine failure once it has been flattened into
+      // USER_PATH_UPDATE_FAILED — and the two call for opposite responses: retry
+      // the first, never silently retry the second. Observed 20 Aug 2026 in the
+      // full test suite, where spawning powershell.exe under load took longer
+      // than the default timeout and the PATH test failed as though the registry
+      // write had been rejected.
+      //
+      // Importantly this says nothing about whether the write LANDED. A timeout
+      // means unknown, which is why it is still an error and not a shrug.
+      error.code = ps.timedOut === true
+        ? "USER_PATH_UPDATE_TIMED_OUT"
+        : /registry access is not allowed|access.*denied|securityexception/i.test(String(ps.stderr ?? ""))
+          ? "USER_PATH_PERMISSION_DENIED"
+          : "USER_PATH_UPDATE_FAILED";
       error.commandResult = ps;
       throw error;
     }

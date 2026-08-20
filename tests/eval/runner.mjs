@@ -670,6 +670,12 @@ function scoreboard(records, summaries, meta) {
   lines.push(`| Median time | ${(median(summaries.map((s) => s.medianElapsedMs)) / 1000).toFixed(1)}s |`);
   lines.push(`| Median steps | ${median(summaries.map((s) => s.medianSteps))} |`);
   lines.push(`| Total cost of this run | $${records.reduce((sum, r) => sum + costOf(r), 0).toFixed(3)} |`);
+  if (meta.stagedPipelineReaches !== null && meta.stagedPipelineReaches !== undefined) {
+    // The number that decides whether ~20,000 lines of offline pipeline get
+    // deleted. Zero across a full suite is the evidence for deleting them;
+    // anything else is the list of cases that still need it.
+    lines.push(`| Offline pipeline reached | ${meta.stagedPipelineReaches} times |`);
+  }
   lines.push("");
   if (meta.breaches?.length) {
     lines.push("## Budget breaches");
@@ -721,6 +727,7 @@ async function main() {
       model: saved.model,
       repeat: saved.repeat ?? 1,
       census: saved.census ?? null,
+      stagedPipelineReaches: saved.stagedPipelineReaches ?? null,
       commit: `${saved.commit ?? "unknown"} (re-aggregated from ${path.basename(options.from)})`,
       label: null
     }, { write: false });
@@ -783,6 +790,19 @@ async function main() {
     }
   }
 
+  // HOW OFTEN THE OFFLINE PIPELINE WAS REACHED ACROSS THE WHOLE SUITE.
+  //
+  // Read before the server closes, because the counter lives in the daemon's
+  // process. `docs/production-plan.md` W4.2 wants ~20,000 lines of staged
+  // pipeline deleted or quarantined; it is quarantined now, behind a typed
+  // MODEL_UNREACHABLE, and this is the number that decides whether it is
+  // deleted. On 20 Aug 2026 it was being reached by any FAILED run with no tool
+  // calls — including a correct safety refusal — and cost ~90 seconds each time.
+  const stagedPipelineReaches = await fetch(`http://127.0.0.1:${port}/api/health`)
+    .then((response) => response.json())
+    .then((body) => Number(body?.stagedPipelineReaches ?? 0))
+    .catch(() => null);
+
   await new Promise((resolve) => server.close(resolve));
 
   const at = new Date().toISOString();
@@ -804,6 +824,7 @@ async function main() {
     at,
     model,
     commit: `${head}${dirty ? " + uncommitted changes" : ""}`,
+    stagedPipelineReaches,
     repeat: options.repeat,
     census,
     label: options.only || options.category
@@ -843,7 +864,7 @@ async function report(records, meta, { write = true } = {}) {
     await fs.mkdir(resultsDir, { recursive: true });
     await fs.writeFile(
       path.join(resultsDir, `${meta.at.replace(/[:.]/g, "-")}.json`),
-      JSON.stringify({ at: meta.at, model: meta.model, commit: meta.commit, repeat: meta.repeat, census: meta.census, summaries, records }, null, 2)
+      JSON.stringify({ at: meta.at, model: meta.model, commit: meta.commit, repeat: meta.repeat, census: meta.census, stagedPipelineReaches: meta.stagedPipelineReaches, summaries, records }, null, 2)
     );
     await fs.writeFile(path.join(here, "scoreboard.md"), board);
   }

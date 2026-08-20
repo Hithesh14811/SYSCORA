@@ -50,7 +50,7 @@ import {
 import { summarizeReadOnlyResults } from "./read-result-summary.js";
 import { PrerequisiteResolver } from "./prerequisite-resolver.js";
 import { EnvironmentModel } from "../../context-engine/src/environment-model.js";
-import { FastAgent, buildToolset } from "../../fast-agent/src/index.js";
+import { FailureReason, FastAgent, buildToolset } from "../../fast-agent/src/index.js";
 import { deleteSkill, readSkills, recordSkillRun, writeSkill } from "../../fast-agent/src/skills.js";
 
 export {
@@ -119,6 +119,14 @@ function verificationIsIndependent(capability, executionResult, observation, ver
 }
 
 export class AgentRuntime {
+  // HOW OFTEN THE OFFLINE PIPELINE IS ACTUALLY REACHED, counted for the whole
+  // process rather than per session, because the question it answers is about
+  // the product and not about one request: `docs/production-plan.md` W4.2 wants
+  // those ~20,000 lines deleted or quarantined, and that should be settled by a
+  // number. Quarantined behind a typed reason first (see _submitFastIntent);
+  // deleting it is a later session's job, with this count as the evidence.
+  static stagedPipelineReaches = 0;
+
   constructor({
     sessionStore,
     auditRepository,
@@ -634,10 +642,37 @@ export class AgentRuntime {
     // anything it cannot map it produces confident nonsense rather than nothing
     // — and the loop had already written the truthful message, which was thrown
     // away to make room for it.
-    const accountProblem = /\b(429|401|403)\b|rate.?limit|quota|exceeded|unauthorized|invalid.*api.?key/i
-      .test(String(outcome.message ?? ""));
-    if (outcome.status === "FAILED" && outcome.toolCalls === 0 && options.fast !== true && !accountProblem) {
-      emit({ type: "FAST_AGENT_UNAVAILABLE", details: { reason: outcome.message } });
+    // ASK THE LOOP WHY, DO NOT GUESS FROM WHAT IT SAID.
+    //
+    // Both paragraphs above were written after the guess went wrong, and both
+    // fixes were regexes over the user-facing sentence — first for 429s, then
+    // for dropped connections. The third case arrived on 20 Aug 2026 and no
+    // regex would have caught it, because the run had not failed for any
+    // model-related reason at all: the model refused a dangerous request
+    // correctly, the lie detector read the refusal's mention of `C:\Windows` as
+    // an unevidenced machine fact, and the loop settled FAILED with zero tool
+    // calls. `FAILED && toolCalls === 0` said "unreachable". It was not.
+    //
+    // Measured, live, on the safety task: refusal correct at 11.4s, FAILED at
+    // 14.4s, the offline pipeline then running until 107.7s before reporting it
+    // could not help either. Ninety-three seconds re-deriving an answer that was
+    // already right and already on screen.
+    //
+    // The loop now records WHY it stopped. Only MODEL_UNREACHABLE takes this
+    // branch, because it is the only reason for which planning without a model
+    // beats what the loop already has. Everything else — throttled, malformed,
+    // out of budget, no evidence — keeps the loop's own honest sentence.
+    const unreachable = outcome.failureReason === FailureReason.MODEL_UNREACHABLE;
+    if (unreachable && options.fast !== true) {
+      // HOW OFTEN IS THIS ACTUALLY REACHED? production-plan.md W4.2 wants ~20,000
+      // lines of staged pipeline deleted or quarantined, and that decision should
+      // be made on a count rather than an argument. Counted per process and
+      // surfaced through the daemon so the eval can record it.
+      AgentRuntime.stagedPipelineReaches += 1;
+      emit({
+        type: "FAST_AGENT_UNAVAILABLE",
+        details: { reason: outcome.message, failureReason: outcome.failureReason }
+      });
       const staged = await this._submitIntent(rawText, { ...options, fast: false, existingSession: session });
       // AND IF THE FALLBACK CANNOT ANSWER EITHER, SAY THE TRUE THING.
       //
@@ -671,7 +706,14 @@ export class AgentRuntime {
     // claims it whenever the loop finished — the model's own words say what was
     // and was not achieved. A stopped-early run is recorded as FAILED so the
     // daemon treats it as terminal, with the real status on finalResponse.
-    session.currentState = outcome.status === "COMPLETED"
+    //
+    // DECLINED sits with COMPLETED rather than with FAILED, and the distinction
+    // is the point: a user saying no is a run that ENDED PROPERLY. Nothing went
+    // wrong, nothing needs retrying, and nothing should be coloured red. The
+    // status string is not new — `unsupportedAction` below has settled DECLINED
+    // against a COMPLETED runtime state since long before this, for the same
+    // reason. What is new is that the agent loop can reach it.
+    session.currentState = outcome.status === "COMPLETED" || outcome.status === "DECLINED"
       ? RuntimeState.COMPLETED
       : outcome.status === "CANCELLED"
         ? RuntimeState.CANCELLED
