@@ -161,6 +161,10 @@ const SUPERSEDED = "… [an earlier reading of this window, now out of date — 
 // both paths with something strictly better and this seam goes away.
 const COLLAPSES_HISTORY = process.env.SYSCORA_COLLAPSE_HISTORY === "1";
 
+// `SYSCORA_TRACE_USAGE=1` prints what each step sent and how much of it the
+// endpoint served from cache. See the call site for what the two shapes mean.
+const TRACES_USAGE = process.env.SYSCORA_TRACE_USAGE === "1";
+
 function supersedeEarlierReading(messages, toolName, windowId) {
   if (!COLLAPSES_HISTORY) return;
   if (toolName !== "screen" || !windowId) return;
@@ -921,12 +925,35 @@ export class FastAgent {
       // done — overstates a long GUI run by something close to an order of
       // magnitude, and points optimisation work at the wrong thing. The number
       // to reduce is `in - cached`, not `in`.
-      this._tokens.cached += Number(
+      const cachedThisStep = Number(
         turn.usage?.prompt_tokens_details?.cached_tokens
           ?? turn.usage?.prompt_cache_hit_tokens
           ?? turn.usage?.cachedContentTokenCount
           ?? 0
       ) || 0;
+      this._tokens.cached += cachedThisStep;
+      // WHICH STEPS MISSED THE CACHE, WHEN THE BILL LOOKS WRONG.
+      //
+      // A total cannot tell the two failure shapes apart. A run whose cache holds
+      // serves the whole GROWING conversation from it, so cached-per-step climbs
+      // with the transcript; a run whose prefix breaks reports the fixed prefix
+      // and nothing more, step after step, and re-buys the conversation every
+      // time. They differ by roughly 10x in money and not at all in `tokensIn`.
+      //
+      // Observed 20 Aug 2026: a live 14-step WhatsApp send averaged 8,082 cached
+      // per step against an 8,222-token fixed prefix — i.e. the conversation
+      // itself never hit — while the 15-step eval task on the same code averaged
+      // 13,682 and clearly did. The aggregates could not say which steps missed,
+      // so the question was unanswerable without this line.
+      //
+      // Off unless asked for. One stderr line per step, nothing when unset.
+      if (TRACES_USAGE) {
+        const sentThisStep = Number(turn.usage?.prompt_tokens ?? turn.usage?.promptTokenCount ?? 0) || 0;
+        process.stderr.write(
+          `[usage] step ${String(steps).padStart(2)} sent ${String(sentThisStep).padStart(7)} ` +
+          `cached ${String(cachedThisStep).padStart(7)} fresh ${String(sentThisStep - cachedThisStep).padStart(7)}\n`
+        );
+      }
 
       // Checked BEFORE the text becomes `lastText`: a settle takes whatever
       // `lastText` holds, so letting the markup through here is how it reaches

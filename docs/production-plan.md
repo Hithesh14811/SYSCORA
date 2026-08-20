@@ -13,12 +13,41 @@ machine with a script in `scripts/`, it is not done.
 Quoted as **fresh input tokens** — what is actually billed at full rate. The
 older figures in this table counted cached tokens at full price; see W2.1.
 
-| | today | target |
-|---|---|---|
-| trivial request (`mute`, `volume 40`) | 18,400 sent · 5.5s | **0 tokens · < 400ms** |
-| simple question (`is python installed?`) | 9,835 fresh · 5.8s | **< 6,000 fresh · < 3s** |
-| GUI task (read a WhatsApp chat) | 26,766 fresh · 35s | **< 20,000 fresh · < 12s** |
-| repeat of a known task | as above | **0 tokens · < 2s** (skills) |
+| | today | target | |
+|---|---|---|---|
+| trivial request (`mute`, `volume 40`) | 0 tokens · 92ms | **0 tokens · < 400ms** | **MET** |
+| simple question (`is python installed?`) | 227 fresh · 3.9s | **< 6,000 fresh · < 3s** | cost MET 26x over · **time missed by 0.9s** |
+| GUI task (read a WhatsApp chat) | 1,833 fresh · 14.7s | **< 20,000 fresh · < 12s** | cost MET 11x over · **time missed by 2.7s** |
+| repeat of a known task | 0 tokens · 0.8s | **0 tokens · < 2s** (skills) | **MET** |
+
+Re-measured 20 Aug 2026 on `f2377b7`. Medians, with the spread and the source of
+each number below. The previous column was wrong in BOTH directions and by more
+than an order of magnitude in places, because it counted cached tokens at full
+price and predated the fast path, the webview routing and skills.
+
+- **trivial** — `node scripts/probe-fast-path.mjs`, warm: `volume 40` 92ms,
+  `what's my volume` 68ms, `mute` 470ms, all 0 tokens. The one over 400ms is
+  `mute`, and the extra is the audio endpoint, not a decision.
+- **simple question** — eval row `machine-python-installed`, 3 repeats: 227 fresh
+  (221–259), 3.9s (3.9–4.7s). The cost target is met with a factor of 26 to
+  spare. The 0.9s is one model round trip; nothing local is slow here.
+- **GUI task** — eval row `webview-reading-cost`, 3 repeats: 1,833 fresh
+  (1,773–2,233), 14.7s (10.1–17.8s). Cost met elevenfold; the whole miss is
+  perception. A single `screen` on WhatsApp is 6.5s on the good path and 13.0s
+  on the bad one (`node scripts/probe-stale-window.mjs`).
+- **repeat** — eval row `skill-replay-file-write-replay`, 3 repeats: 0 tokens,
+  0.8s, no model call at all.
+
+**COST IS NO LONGER THE PROBLEM. LATENCY IS, AND IT IS ALL PERCEPTION.** That is
+what selects W8 (perception speed) ahead of the planner: every remaining miss is
+seconds spent reading a window, and no amount of planning makes a `screen` call
+faster.
+
+The one number that does not fit: a REAL WhatsApp send, on a five-turn
+conversation, to a contact found by name — 79,638 fresh over 14 steps, live on 20
+Aug 2026. Ten of its 21 tool calls were `screen`, and two of the steps existed
+only to recover from a reading of the wrong window. It is the same defect, priced
+at a full request rather than a single call.
 
 Plus: **zero false claims** across the eval suite, and no regression in pass rate.
 
@@ -223,11 +252,24 @@ round trip, host spawn, or PowerShell start — with a per-phase timing probe.
    call and only advances `activeProviderIndex` on success, the run limped on at
    +860ms per step rather than failing. Right behaviour, invisible symptom —
    `probe-failover.mjs` is how you see it.
-2. **Delete or quarantine the staged pipeline.** It exists to answer with the
-   network down; in practice it fires on brief blips and answers the wrong
-   question with raw Win32 status codes and internal GUIDs. Either give it a
-   whitelist of requests it genuinely handles well and refuse everything else, or
-   remove it. Do not leave it as a general fallback.
+2. **Delete or quarantine the staged pipeline.** — **QUARANTINED, AND THE
+   EVIDENCE TO DELETE IT NOW EXISTS.** It is reachable only on a typed
+   `MODEL_UNREACHABLE`, never on a guess about tool counts, and the daemon counts
+   every time it is reached and reports the count at `/api/health`
+   (`stagedPipelineReaches`).
+
+   **Reached 0 times in 60 eval runs on 19 Aug 2026, 0 times in 60 more on 20
+   Aug, and 0 times across a live five-turn desktop session on 20 Aug** that
+   launched WhatsApp and Spotify and sent a message. 120 measured runs plus real
+   use, zero reaches.
+
+   That is what W4.2 asked for, and it justifies deleting roughly 20,000 lines —
+   `capability-registry`, most of `agent-runtime`, `interactive-agent-controller`,
+   `reasoning-engine`, `intent-engine`, `task-graph-scheduler`, `risk-engine` and
+   `packages/planner`. **It has not been done, deliberately.** A diff that size
+   against a standing "I don't want anything to break" deserves its own session
+   and its own eval run, not a side-quest at the end of another one. The number
+   is recorded here so that session can act on evidence instead of argument.
 3. **Never render provider markup.** `<｜DSML｜invoke …>` reached the user as
    visible text. Malformed turns are already detected and retried — ensure the
    text of a malformed turn can never become `lastText`.
