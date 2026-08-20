@@ -1,0 +1,18 @@
+{
+  "id": "undo-volume-change",
+  "category": "trust",
+  "prompt": "Set the system volume to 65 percent. Then undo that change.",
+  "why": "THE FEATURE'S ABSENCE COST THIS USER SOMETHING REAL: a session set the system volume to 42% and could not put it back, because nothing had recorded the previous value. This row is that defect, turned into a check. Setup puts the volume at a known 30% so the target is not whatever the machine happened to be at, and the verify reads the level straight out of the Windows audio endpoint with PowerShell — a different route from the one the agent used, so a reversal the agent merely believes in does not pass. It would FAIL if `undo` restored nothing, restored the wrong level, or reported success without the endpoint agreeing. It deliberately does NOT assert what the agent said: the sentence is not the evidence, the endpoint is. Manual, because it changes something the user can hear.",
+  "timeoutMs": 120000,
+  "setup": [
+    { "run": "& '{fixtures}/read-volume.ps1' | Set-Content -Path '{workspace}/volume-before-undo.txt'" },
+    { "run": "& '{fixtures}/set-volume.ps1' -Percent 30" }
+  ],
+  "verify": [
+    { "run": "& '{fixtures}/read-volume.ps1'", "expect": "30" }
+  ],
+  "teardown": [
+    { "run": "$v = Get-Content -Path '{workspace}/volume-before-undo.txt' -ErrorAction SilentlyContinue; if ($v) { & '{fixtures}/set-volume.ps1' -Percent ([int]$v) }" }
+  ],
+  "manual": true
+}

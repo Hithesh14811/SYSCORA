@@ -822,7 +822,27 @@ async function report(records, meta, { write = true } = {}) {
   process.exitCode = summaries.every((summary) => summary.pass) && meta.breaches.length === 0 ? 0 : 1;
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+// THE RUNNER NEVER EXITED, AND IT HAS BEEN LEAKING A PROCESS PER RUN SINCE
+// 19 AUG 2026.
+//
+// `server.close()` above stops the listener, but the daemon behind it holds a
+// long-lived PowerShell automation host whose open pipes keep this process's
+// event loop alive forever. Nothing said so: the scoreboard printed, the shell
+// prompt came back, and the runner sat there.
+//
+// Found 21 Aug 2026 by listing node processes while diagnosing a slow test
+// suite: TWENTY-FIVE of them, one for every eval run over three days, each
+// holding a daemon and a warm PowerShell host. The user had asked this very
+// product why their machine felt slow, and it had answered OneDrive — which was
+// true, and was not the whole truth, because the answer was partly us.
+//
+// Flush before exiting: on Windows stdout to a pipe is asynchronous, and calling
+// process.exit() with output still buffered truncates the summary — which is the
+// one thing anyone runs this for.
+main()
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  })
+  .finally(() => new Promise((resolve) => process.stdout.write("", resolve))
+    .then(() => process.exit(process.exitCode ?? 0)));

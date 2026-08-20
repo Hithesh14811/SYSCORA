@@ -39,7 +39,42 @@ it does not depend on skills, and getting it wrong once is the whole company.
 
 ---
 
-## 2. Undo
+## 2. Undo — **BUILT 21 Aug 2026, for settings. Not yet for files or messages.**
+
+`packages/fast-agent/src/undo-journal.js` and the `undo` tool in `tools.js`.
+
+**Not built on `rollback-manager.js`, and deliberately so.** The plan below
+proposed bridging to it. That file lives in `packages/agent-runtime`, which is
+part of the offline pipeline that has now been reached ZERO times across 180+
+measured runs and is queued for deletion. Building the first trust feature on
+twenty thousand lines that are about to be removed would have made both jobs
+harder. The journal is standalone and has no dependency on the pipeline.
+
+**The entry is written BEFORE the action.** An action that succeeded and then
+failed to journal has still happened, so `record()` returns a handle, the tool
+acts, and `settle()` says what happened — keyed on the tool's own typed receipt,
+never on parsing English. A REFUTED verdict abandons the entry; UNCONFIRMED
+leaves it undoable, because an action nobody could verify is the one most worth
+being able to reverse.
+
+**Three outcomes, three sentences.** `REVERSED` / `COULD_NOT` / `NEVER_REVERSIBLE`,
+plus "the window closed" as a distinct case from "never possible". `record()`
+THROWS if a caller supplies neither a reversal nor a reason — an entry that is
+silent about being irreversible implies a coverage the journal does not have,
+and that is worse than no journal at all.
+
+**Proven end to end on the real machine.** Eval row `undo-volume-change`: set the
+volume to 65%, undo, and PowerShell reads the endpoint back at the original 30%
+through a different route than the agent used. 3 steps, 6s. That row exists
+because a session left this user's volume at 42% and could not put it back.
+
+**What is NOT covered yet, stated so nobody assumes otherwise:** file writes and
+edits, and sent messages. A WhatsApp send is still irreversible in practice —
+the journal supports a windowed reversal (`windowMs`, tested) and nothing wires
+"delete for everyone" to it yet. Until that is done, `undo` after a send will
+correctly say it cannot help rather than pretending.
+
+### The original plan, kept because it is what the tests were written against
 
 **What already exists** (`packages/agent-runtime/src/rollback-manager.js`):
 `capture(task)` takes a checkpoint before an action, `rollback(records)` restores
