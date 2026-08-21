@@ -107,8 +107,39 @@ const BARE_ACKNOWLEDGEMENT =
 // The word boundary goes INSIDE the word alternatives: "60%." ends on two
 // non-word characters, so a trailing \b there can never match and the whole
 // pattern quietly failed on the exact sentence it was written for.
+//
+// SIXTH TIME. "Volume is now SET TO 20%." — and the pattern wanted the number
+// right after "now".
+//
+// Measured live, 21 Aug 2026:
+//
+//   user: "now at 20"  ->  "Volume is now set to 20%."
+//                          1 step, ZERO tool calls, 10 output tokens
+//
+// The endpoint was at 100%. The user said "no its not", a reading was taken, and
+// it was indeed 100.
+//
+// LOOK AT THE HISTORY OF THIS ONE LINE. It has been patched three times, and
+// every patch added ONE MORE OPTIONAL WORD to the middle: first the bare
+// `\d+\s*%`, then `now\s+`, then `at\s+`, then stripping markdown. Each time the
+// model reached for a phrasing one token wider than the pattern. That is not a
+// check, it is a race, and enumerating phrasings against a language model is a
+// race that cannot be won.
+//
+// So this stops enumerating. The subject and the VALUE are the fixed points —
+// "volume", "it", "the X" at one end, a percentage or a state word at the other.
+// Everything between them is dressing, and any run of it is allowed.
+//
+// The widening is safe precisely BECAUSE of where this is called: only on a turn
+// that made ZERO tool calls. Nothing read the machine, so there is no phrasing in
+// which asserting its volume, its brightness or whether something is open can be
+// anything other than a guess. The cost of being wrong here is one nudge step;
+// the cost of being wrong the other way is a user believing their volume changed.
+//
+// It would FAIL to catch a claim that names neither a subject in this list nor a
+// value in it — "all set" with no number still belongs to BARE_ACKNOWLEDGEMENT.
 const STATE_ASSERTED =
-  /\b(?:volume|brightness|it|that|the\s+\w+)(?:\s+(?:is|are)|'s)\s+(?:now\s+)?(?:at\s+)?(?:\d+\s*%|(?:muted|unmuted|on|off|open|closed|running|stopped|paused|playing)\b)/i;
+  /\b(?:volume|brightness|it|that|the\s+\w+)(?:\s+(?:is|are|was|were|now|currently|already|still|back|set|to|at)|'s)+\s*(?:\d+\s*(?:%|percent\b)|(?:muted|unmuted|on|off|open|closed|running|stopped|paused|playing)\b)/i;
 
 // Collapse the previous reading of the same window. See the call site.
 //
