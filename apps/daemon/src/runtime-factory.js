@@ -30,7 +30,7 @@ import { ElevatedHostClient } from "../../../os-adapters/windows-host/src/elevat
 import fsSync from "node:fs";
 import { InstallationKeyStore } from "../../../packages/permission-broker/src/installation-key.js";
 import { loadModelConfig } from "./model-config.js";
-import { resolveStateDir, cloudSyncedRoot } from "../../../packages/shared-types/src/state-path.js";
+import { resolveStateDir, cloudSyncedRoot, assertNotContainerRedirected } from "../../../packages/shared-types/src/state-path.js";
 
 /**
  * Elevation configuration, from .syscora/config.json (`elevation` block) with
@@ -78,6 +78,12 @@ export function createRuntime(basePath = process.cwd()) {
   // "OneDrive is syncing" both times and never asked what OneDrive was syncing.
   // Warn rather than relocate: moving someone's state uninvited is the same
   // shape as losing it. `scripts/migrate-state-dir.mjs` does the move on request.
+  // A state directory that is secretly a link into another application's
+  // container looks healthy from inside it and is unreachable from outside —
+  // which is how 735 MB of the user's conversations ended up somewhere Notepad
+  // could not write and an app reset would erase. Checked here, at the one
+  // place the state directory is decided for the whole product.
+  assertNotContainerRedirected(stateDirectory);
   const syncedRoot = cloudSyncedRoot(stateDirectory);
   if (syncedRoot) {
     process.emitWarning(

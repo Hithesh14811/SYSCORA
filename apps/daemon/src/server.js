@@ -9,6 +9,7 @@ import { AgentRuntime } from "../../../packages/agent-runtime/src/index.js";
 import { buildEnvelope, parseRequestBodyWithEnvelope } from "../../../packages/protocol/src/envelope.js";
 import { buildSessionResponse } from "../../../packages/protocol/src/session-protocol.js";
 import { projectSessionLifecycle } from "../../../packages/shared-types/src/session-lifecycle.js";
+import { closeWindowsAutomationHost } from "../../../os-adapters/windows-host/src/client.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -847,5 +848,65 @@ if (process.argv[1] === __filename) {
   // nothing external depends on 4317, so there is no callback or CORS origin to
   // keep stable. 4317 remains the standalone default.
   const port = Number(process.env.SYSCORA_PORT ?? process.env.PORT ?? "4317");
-  startServer({ port });
+  const server = startServer({ port });
+
+  // THE DAEMON HAD NO SHUTDOWN PATH AT ALL, AND THAT IS WHERE THE ORPHANS CAME
+  // FROM.
+  //
+  // `closeWindowsAutomationHost()` was written, correct, and called by exactly
+  // one thing: the eval runner. Nothing on a real path called it. So every time
+  // the Electron shell quit — which does `daemonProcess.kill()` — the daemon
+  // died without ever telling its long-lived PowerShell host to stop, and the
+  // host survived its parent. 15 orphans, 801 MB, the oldest seven days old, on
+  // the machine whose owner had just asked why it felt slow.
+  //
+  // Found by `scripts/audit-reachability.mjs`, which exists because this is the
+  // eighth defect of exactly this shape: machinery that is correct and that
+  // nothing reaches.
+  //
+  // Killing something is only half an action. A handler that stops the host and
+  // then leaves the process running is the same defect wearing a hat, so this
+  // closes the host, closes the server, and exits.
+  let closing = false;
+  const shutdown = (signal) => {
+    if (closing) return; // a second Ctrl-C must not re-enter this
+    closing = true;
+    try {
+      const stopped = closeWindowsAutomationHost();
+      console.log(`SYSCORA daemon shutting down on ${signal}; automation host ${stopped ? "stopped" : "was not running"}`);
+    } catch (error) {
+      console.error(`SYSCORA daemon: automation host did not stop cleanly: ${error?.message ?? error}`);
+    }
+    server.close(() => process.exit(0));
+    // A client holding a keep-alive socket can stall server.close() forever,
+    // and a shutdown that hangs is indistinguishable from one that never ran.
+    setTimeout(() => process.exit(0), 2_000).unref();
+  };
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"]) {
+    process.on(signal, () => shutdown(signal));
+  }
+
+  // AND ON WINDOWS THE SIGNAL HANDLERS ABOVE DO NOT RUN WHEN THE SHELL QUITS.
+  //
+  // Node's `child.kill("SIGTERM")` is TerminateProcess on Windows — the child
+  // gets no catchable signal and no chance to clean up. Measured with
+  // `scripts/probe-daemon-shutdown.mjs`: the daemon exits with code `null` and
+  // never prints its shutdown line. The handlers still earn their place for a
+  // console Ctrl-C, but the path that actually matters, the Electron shell
+  // quitting, would have sailed straight past them. A fix that is unreachable
+  // on the platform it was written for is this project's most expensive
+  // recurring defect, and this one nearly shipped as another.
+  //
+  // So the shell closes the daemon's stdin instead, which Windows delivers
+  // reliably and which needs no HTTP endpoint and no new attack surface.
+  if (!process.stdin.isTTY) {
+    process.stdin.on("end", () => shutdown("stdin closed"));
+    process.stdin.on("close", () => shutdown("stdin closed"));
+    process.stdin.resume();
+  }
+  // `beforeExit` covers the ordinary case where the event loop drains on its
+  // own — no signal is delivered then, and the host would keep it alive anyway.
+  process.on("beforeExit", () => {
+    try { closeWindowsAutomationHost(); } catch { /* exiting regardless */ }
+  });
 }

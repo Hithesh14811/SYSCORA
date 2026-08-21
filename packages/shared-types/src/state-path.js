@@ -37,19 +37,89 @@ export const STATE_POINTER_FILENAME = ".syscora-path";
 export const LEGACY_STATE_DIRNAME = ".syscora";
 
 /**
- * The default location for a fresh install: %LOCALAPPDATA%\SYSCORA on Windows,
- * ~/.local/state/syscora elsewhere. Not used unless something asks for it —
- * resolveStateDir never silently relocates an existing installation, because
- * moving a user's state without being asked is indistinguishable from losing it.
+ * The default location for a fresh install: %USERPROFILE%\SYSCORA on Windows.
+ *
+ * NOT %LOCALAPPDATA%, AND THAT IS THE WHOLE POINT OF THIS COMMENT.
+ *
+ * The first version of this used `%LOCALAPPDATA%\SYSCORA`, which is the ordinary
+ * Windows answer and was wrong here in a way that took a day to see. When an
+ * agent running inside a packaged (MSIX) application creates a directory under
+ * AppData\Local, the container captures it: `C:\Users\hithe\AppData\Local\SYSCORA`
+ * became a link to
+ * `C:\Users\hithe\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\SYSCORA`.
+ *
+ * Two consequences, both measured on the real machine:
+ *
+ *   - 735 MB of the user's own conversations ended up inside another
+ *     application's private storage, to be erased whenever that application is
+ *     reset or uninstalled;
+ *   - processes OUTSIDE the container resolve the same path differently, so
+ *     Notepad's and Paint's Save dialogs could not write there. SYSCORA worked
+ *     this out on its own and wrote it into its notes — which are injected into
+ *     every prompt, so the eval's file rows then spent an extra turn verifying
+ *     every write, and `skill-replay-file-write` went 19,025 -> 30,175 tokens.
+ *     A migration nobody could see broke a benchmark row two layers away.
+ *
+ * The migration's SHA-256 check passed 37/37 and proved nothing, because it ran
+ * inside the same container and so compared the redirected path with itself.
+ * That is the house rule about verification not sharing a code path with the
+ * thing it verifies, broken by the person who enforces it.
+ *
+ * %USERPROFILE% is not redirected. `assertNotContainerRedirected` below is the
+ * check that stops this returning silently.
  */
 export function defaultStateDir() {
   if (process.platform === "win32") {
-    const local = process.env.LOCALAPPDATA
-      ?? path.join(os.homedir(), "AppData", "Local");
-    return path.join(local, "SYSCORA");
+    const home = process.env.USERPROFILE ?? os.homedir();
+    return path.join(home, "SYSCORA");
   }
   const base = process.env.XDG_STATE_HOME ?? path.join(os.homedir(), ".local", "state");
   return path.join(base, "syscora");
+}
+
+/**
+ * Is this directory a reparse point (junction/symlink) pointing somewhere else?
+ *
+ * A state directory that is secretly a link into an application container reads
+ * as perfectly healthy from inside that container and is invisible from outside
+ * it. Returns the real target, or null when the path is what it says it is.
+ *
+ * Uses lstat + readlink rather than asking any SYSCORA code, deliberately: this
+ * is the check that catches the case where our own reads all agree with each
+ * other because they share the redirection.
+ */
+export function redirectedTarget(target) {
+  try {
+    // realpath, NOT lstat/readlink. The first version of this used
+    // `lstatSync().isSymbolicLink()` and returned null for the very directory
+    // it was written to catch: a package container redirects at the API layer
+    // rather than with a junction, so from inside it `lstat` reports an
+    // ordinary directory and `readlink` reports nothing. A CHECK THAT CANNOT
+    // FIRE ON THE CASE IT EXISTS FOR IS NOT A CHECK. `realpathSync.native`
+    // asks Windows to resolve the path and returns the container location.
+    const real = fs.realpathSync.native(target);
+    return path.resolve(real) === path.resolve(target) ? null : real;
+  } catch {
+    return null; // absent, or unreadable
+  }
+}
+
+/**
+ * Refuse a state directory that is a link into somebody else's container.
+ * Warns rather than throws: a running product must not be bricked by this, but
+ * it must never be silent about it either.
+ */
+export function assertNotContainerRedirected(stateDir) {
+  const real = redirectedTarget(stateDir);
+  if (!real) return null;
+  if (!/[\\/]Packages[\\/][^\\/]+[\\/]LocalCache/i.test(real)) return real;
+  process.emitWarning(
+    `SYSCORA state at ${stateDir} is a link into an application container (${real}). `
+    + "Anything outside that container - Notepad's and Paint's Save dialogs among them - "
+    + "resolves that path differently, and the contents are erased if that application is reset. "
+    + "Move it with `node scripts/migrate-state-dir.mjs --target %USERPROFILE%\\SYSCORA`."
+  );
+  return real;
 }
 
 /**

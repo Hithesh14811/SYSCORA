@@ -30,7 +30,13 @@ import {
 const apply = process.argv.includes("--apply");
 const targetArg = process.argv[process.argv.indexOf("--target") + 1];
 const repoRoot = path.resolve(process.argv[2]?.startsWith("--") ? "." : (process.argv[2] ?? "."));
-const source = path.join(repoRoot, LEGACY_STATE_DIRNAME);
+// --source, because after the first migration the state is no longer in the
+// repo and the second one has to move it OUT of %LOCALAPPDATA%, which a
+// packaged application had quietly captured.
+const sourceArg = process.argv[process.argv.indexOf("--source") + 1];
+const source = process.argv.includes("--source")
+  ? path.resolve(sourceArg)
+  : path.join(repoRoot, LEGACY_STATE_DIRNAME);
 const target = process.argv.includes("--target") ? path.resolve(targetArg) : defaultStateDir();
 const pointerFile = path.join(repoRoot, STATE_POINTER_FILENAME);
 

@@ -42,7 +42,11 @@ function startDaemon() {
   daemonProcess = spawn(process.execPath, ["--use-system-ca", daemonEntry], {
     cwd: repoRoot,
     env,
-    stdio: "ignore",
+    // stdin is a PIPE, not "ignore", and that is the shutdown channel.
+    // Windows gives a killed child no catchable signal, so closing this pipe is
+    // how the daemon learns to stop its long-lived PowerShell host instead of
+    // orphaning it. stdout/stderr stay ignored as before.
+    stdio: ["pipe", "ignore", "ignore"],
     windowsHide: true
   });
 
@@ -80,10 +84,37 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
+  // `daemonProcess.kill()` alone is what orphaned a PowerShell host every time
+  // the user closed this window. The default signal is SIGKILL-like on Windows
+  // — the daemon dies without running any shutdown, so it never tells its
+  // long-lived automation host to stop, and the host outlives its own parent.
+  // 15 of them accumulated, 801 MB, oldest seven days.
+  //
+  // So: ask first, wait briefly, and only then insist. The daemon's SIGTERM
+  // handler closes the automation host and exits.
   if (daemonProcess) {
+    const child = daemonProcess;
+    daemonProcess = null;
+    let exited = false;
+    child.once("exit", () => { exited = true; });
     try {
-      daemonProcess.kill();
-    } catch {}
+      // Close stdin FIRST. That is the one that actually reaches the daemon on
+      // Windows; SIGTERM here is TerminateProcess and runs no cleanup at all,
+      // which is why the host used to survive. Kept as the fallback below.
+      child.stdin?.end();
+    } catch { /* already gone */ }
+    try {
+      child.kill("SIGTERM");
+    } catch { /* already gone */ }
+    // A daemon that will not go quietly must still not keep the app open, but
+    // it gets long enough to stop its host first.
+    setTimeout(() => {
+      if (!exited) {
+        try { child.kill(); } catch { /* already gone */ }
+      }
+      app.quit();
+    }, 2_500);
+    return;
   }
   app.quit();
 });

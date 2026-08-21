@@ -258,3 +258,64 @@ test("the default store deletes NOTHING — retention is the user's call", async
   }
   assert.equal((await store.stats()).sessions, 40);
 });
+
+// THE DEFECT THE FIRST VERSION OF THIS FILE COULD NOT HAVE CAUGHT.
+//
+// W0 moved working state to %LOCALAPPDATA%\SYSCORA. Run from inside a packaged
+// (MSIX) application, that directory is captured by the container: the bytes
+// land in ...\Packages\<app>\LocalCache\..., every read from inside agrees with
+// every write, and the migration's own SHA-256 check passed 37/37 while proving
+// nothing, because it compared the redirected path with itself.
+//
+// From OUTSIDE, the same path resolves elsewhere. Notepad's and Paint's Save
+// dialogs could not write there; SYSCORA learned that and wrote it into its
+// notes, which are injected into every prompt, and the eval's file rows then
+// spent an extra turn verifying every write. 19,025 -> 30,175 tokens sent on
+// skill-replay-file-write, from a migration two layers away.
+//
+// These fail if the default lands back under AppData, or if the redirect check
+// goes back to a signal that cannot see container redirection.
+test("the default state directory is not under AppData, where a container can capture it", () => {
+  const fallback = defaultStateDir();
+  assert.ok(path.isAbsolute(fallback));
+  if (process.platform === "win32") {
+    assert.ok(!/[\/]AppData[\/]/i.test(fallback),
+      `${fallback} is under AppData; an agent inside a packaged app gets that redirected into the package`);
+    assert.ok(!/onedrive/i.test(fallback), "and it must still not land back inside OneDrive");
+  }
+});
+
+test("the redirect check uses a signal that can actually fire", async () => {
+  const { redirectedTarget } = await import("../../packages/shared-types/src/state-path.js");
+  const root = await tempRoot();
+
+  // An ordinary directory is not redirected.
+  const plain = path.join(root, "plain");
+  await fs.mkdir(plain, { recursive: true });
+  assert.equal(redirectedTarget(plain), null);
+
+  // THE FIXTURE HAS TO HAVE THE SHAPE OF THE REAL DEFECT, and the first version
+  // of this test did not. It pointed `redirectedTarget` at a junction — and
+  // node's lstat DOES report a junction as a symbolic link, so the old, broken
+  // implementation passed too. The test was vacuous, which was found only by
+  // putting the old signal back and watching 16/16 still pass.
+  //
+  // The container case is not a link. It is a path that is an ordinary
+  // directory by every local stat and still resolves somewhere else. A CHILD of
+  // a junction has exactly that shape: `link/sub` is not itself a link, so
+  // lstat-based detection returns null, while realpath resolves it to `plain/sub`.
+  await fs.mkdir(path.join(plain, "sub"), { recursive: true });
+  const link = path.join(root, "link");
+  try {
+    await fs.symlink(plain, link, "junction");
+  } catch {
+    return; // no permission to make links on this machine; nothing to assert
+  }
+  const child = path.join(link, "sub");
+  assert.equal(fsSync.lstatSync(child).isSymbolicLink(), false,
+    "fixture is wrong: the child must NOT be a link, or it does not reproduce the defect");
+
+  const seen = redirectedTarget(child);
+  assert.ok(seen, "a path that is not a link and still resolves elsewhere must be reported, not passed as clean");
+  assert.equal(fsSync.realpathSync.native(seen), fsSync.realpathSync.native(path.join(plain, "sub")));
+});
