@@ -20,6 +20,7 @@
 // result as text sized to what the next decision needs.
 
 import fs from "node:fs/promises";
+import path from "node:path";
 import {
   classifyShellCommand,
   requiresClickConfirmation,
@@ -45,6 +46,9 @@ import { describeMachine, readMachineProfile } from "./machine-profile.js";
 import { describeNotes, forgetNote, readNotes, rememberNote } from "./notes.js";
 import { extractDocumentText, isDocumentPath } from "./documents.js";
 import { createProgressReader, reportsProgress } from "./command-progress.js";
+import { Reversal, createUndoJournal, timeLeft } from "./undo-journal.js";
+import { prepareFileUndo, restoreFile, describeFileChange } from "./undo-files.js";
+import { resolveStateDir } from "../../shared-types/src/state-path.js";
 import { createWingetWatcher, isWingetInstall } from "./winget-progress.js";
 import { isWebviewHostProcess, normalizeWindow, pickWebviewWindow } from "../../../os-adapters/windows/src/webview-windows.js";
 // THE RECEIPT EVERY RESULT CARRIES. See evidence.js: a success sentence is only
@@ -827,7 +831,24 @@ export function buildToolset({
   const state = {
     elements: [],
     cwd: basePath,
+    // Where undo backups go. Kept beside the other working state rather than
+    // next to the user's file: a `.bak` appearing in their folder is litter they
+    // did not ask for, and one in their repository is litter git will notice.
+    // Through resolveStateDir, NOT `basePath + ".syscora"`. Those were the same
+    // directory when the undo backups were written and are not any more: W0
+    // moved working state out of the user's OneDrive folder, and a hardcoded
+    // join here would quietly put every backup copy of every file the agent
+    // overwrites back inside the synced tree — re-creating, one .bak at a time,
+    // the exact defect that took two and a half cores for five sessions.
+    stateDir: resolveStateDir(basePath),
     lastWindow: null,
+    // WHAT WAS DONE AND HOW TO PUT IT BACK. See undo-journal.js.
+    //
+    // A previous session left the user's volume at 42% and could not restore it
+    // because nothing had recorded the previous value. The entry is written
+    // BEFORE the action, because an action that succeeded and then failed to
+    // journal has still happened.
+    journal: createUndoJournal(),
     // Surfaces SEEN to be empty — not surfaces we happen to have opened.
     //
     // Those were the same set until a live run showed they are not: launching
@@ -3103,6 +3124,36 @@ export function buildToolset({
             };
           }
         }
+        // A SEND JOURNALLED NOTHING, SO `undo` SAID "there is nothing on this
+        // session's record to put back" — ABOUT A MESSAGE THAT HAD JUST GONE TO
+        // ANOTHER PERSON.
+        //
+        // That sentence is true of the journal and false about the world, and it
+        // is the exact failure `docs/trust-and-triggers.md` names: a journal that
+        // quietly omits the irreversible entries is worse than none, because it
+        // implies a coverage it does not have. Silence reads as "nothing
+        // happened". So the send is recorded, with no reversal and a reason.
+        //
+        // NOT a windowed "delete for everyone" reversal, and deliberately not.
+        // The journal supports one (`windowMs`, tested), but nothing here can
+        // yet drive WhatsApp's delete-for-everyone and prove the message is GONE
+        // FROM THE CONVERSATION over a separate raw-UIA pass. Recording a
+        // reversal this code cannot perform would make `undo` promise an unsend
+        // it would then fail — which is the same lie in the other direction.
+        // W2.2 in the brief is what closes this; until then the honest answer is
+        // the one below.
+        const sendEntryId = gate.confirm
+          ? state.journal.record({
+              tool: "key",
+              summary: state.lastTyped
+                ? `sent ${JSON.stringify(clip(state.lastTyped, 60))} in ${application ?? "a messaging window"}`
+                : `pressed Enter to send in ${application ?? "a messaging window"}`,
+              reversal: null,
+              why: "a sent message cannot be unsent from here. WhatsApp's \"delete for everyone\" is not wired "
+                + "up yet, and it only works for a limited time after sending — so if you want it gone, do it "
+                + "in the app now rather than later."
+            })
+          : null;
         const pressed = await runCapability("keyboard.press", {
           keys: args.keys,
           application,
@@ -3142,15 +3193,7 @@ export function buildToolset({
             ? (stillInBox !== null && stillInBox.includes(wanted) ? false : null)
             : !stillInBox.includes(wanted);
           if (sent === true) state.lastTyped = null;
-          return {
-            ...pressed,
-            keys: args.keys,
-            sendChecked: true,
-            sent,
-            landed,
-            stillInBox,
-            typed: state.lastTyped,
-            evidence: evidence({
+          const sendEvidence = evidence({
               observed: sent === true
                 ? `the box held ${JSON.stringify(clip(wanted, 60))} before Enter and no longer does`
                 : sent === false
@@ -3161,7 +3204,21 @@ export function buildToolset({
               method: "uia.focusedElement",
               actedVia: "keyboard.press",
               verdict: sent === true ? CONFIRMED : sent === false ? REFUTED : UNCONFIRMED
-            })
+            });
+          // Keyed on the receipt, never on the sentence. A REFUTED send did not
+          // happen and abandons the entry — there is nothing to warn about.
+          // UNCONFIRMED keeps it, because a message that MIGHT have gone is
+          // exactly the one the user needs told about.
+          state.journal.settle(sendEntryId, sendEvidence);
+          return {
+            ...pressed,
+            keys: args.keys,
+            sendChecked: true,
+            sent,
+            landed,
+            stillInBox,
+            typed: state.lastTyped,
+            evidence: sendEvidence
           };
         }
         // A BARE KEYSTROKE HAS NOTHING BEHIND IT, AND USED TO SAY "Sent."
@@ -4377,6 +4434,22 @@ export function buildToolset({
         const content = intent === "append" && current
           ? `${current}${current.endsWith("\n") ? "" : "\n"}${String(args.contents ?? "")}`
           : String(args.contents ?? "");
+        // THE COPY IS TAKEN BEFORE THE WRITE, AND THE ENTRY BEFORE THE ACTION.
+        //
+        // Both orderings matter and neither is fussiness. A backup taken after
+        // the write copies the new contents; an entry written after the action
+        // is missing exactly when the action succeeded and the journalling did
+        // not. `prepareFileUndo` never throws — a failure to prepare an undo
+        // must not stop the user's work — it returns `{reversal: null, why}`,
+        // which is how "this one cannot be put back" gets said AT THE TIME
+        // instead of being discovered when someone asks.
+        const undo = await prepareFileUndo(state.stateDir, filePath);
+        const entryId = state.journal.record({
+          tool: "write_file",
+          summary: describeFileChange(filePath, undo.reversal),
+          reversal: undo.reversal,
+          why: undo.why
+        });
         // The capability's input is `content`, singular. Getting this wrong writes
         // an empty file and reports success.
         const result = await runCapability("filesystem.write", { filePath, content });
@@ -4389,11 +4462,11 @@ export function buildToolset({
         // was printed over an empty file. Reading it again is one call down a
         // different capability and it settles the only question there is.
         const onDisk = await fileNow(filePath);
-        return {
-          ...result,
-          filePath,
-          appended: intent === "append" && Boolean(current),
-          evidence: onDisk == null
+        // Settled on the tool's OWN typed receipt, never on a sentence. A
+        // REFUTED verdict abandons the entry — the write did not happen, so
+        // there is nothing to put back; UNCONFIRMED leaves it undoable, because
+        // an action nobody could verify is the one most worth reversing.
+        const writeEvidence = onDisk == null
             ? evidence({
                 observed: `${filePath} could not be read back after writing`,
                 method: NOTHING_READ_IT_BACK, actedVia: "filesystem.write", verdict: UNCONFIRMED
@@ -4405,7 +4478,13 @@ export function buildToolset({
                 method: "filesystem.read",
                 actedVia: "filesystem.write",
                 verdict: onDisk === content ? CONFIRMED : REFUTED
-              })
+              });
+        state.journal.settle(entryId, writeEvidence);
+        return {
+          ...result,
+          filePath,
+          appended: intent === "append" && Boolean(current),
+          evidence: writeEvidence
         };
       },
       failed: (result) => verdictOf(result) === REFUTED,
@@ -4503,6 +4582,16 @@ export function buildToolset({
         const next = args.all === true
           ? current.split(old).join(String(args.new ?? ""))
           : current.replace(old, String(args.new ?? ""));
+        // Same ordering as write_file, and for the same reason: the copy before
+        // the write, the entry before the action. An edit is the case where
+        // undo matters most — the file had contents somebody wanted.
+        const undo = await prepareFileUndo(state.stateDir, filePath);
+        const entryId = state.journal.record({
+          tool: "edit_file",
+          summary: describeFileChange(filePath, undo.reversal),
+          reversal: undo.reversal,
+          why: undo.why
+        });
         await runCapability("filesystem.write", { filePath, content: next });
         state.ownedPaths.add(filePath.toLowerCase());
         // Where the change landed, so the next step does not need to re-read the
@@ -4513,25 +4602,27 @@ export function buildToolset({
         // path that resolved somewhere else, an encoding round trip.
         const onDisk = await fileNow(filePath);
         const wanted = String(args.new ?? "");
+        const editEvidence = onDisk == null
+          ? evidence({
+              observed: `${filePath} could not be read back after the edit`,
+              method: NOTHING_READ_IT_BACK, actedVia: "filesystem.write", verdict: UNCONFIRMED
+            })
+          : evidence({
+              observed: onDisk === next
+                ? `${filePath} now reads back as the edited ${next.length} characters`
+                : `${filePath} reads back as ${onDisk.length} characters, which is not the edit that was written` +
+                  `${wanted && !onDisk.includes(wanted) ? " — the new text is not in it" : ""}`,
+              method: "filesystem.read",
+              actedVia: "filesystem.write",
+              verdict: onDisk === next ? CONFIRMED : REFUTED
+            });
+        state.journal.settle(entryId, editEvidence);
         return {
           filePath,
           occurrences: args.all === true ? occurrences : 1,
           lineNumber,
           bytes: next.length,
-          evidence: onDisk == null
-            ? evidence({
-                observed: `${filePath} could not be read back after the edit`,
-                method: NOTHING_READ_IT_BACK, actedVia: "filesystem.write", verdict: UNCONFIRMED
-              })
-            : evidence({
-                observed: onDisk === next
-                  ? `${filePath} now reads back as the edited ${next.length} characters`
-                  : `${filePath} reads back as ${onDisk.length} characters, which is not the edit that was written` +
-                    `${wanted && !onDisk.includes(wanted) ? " — the new text is not in it" : ""}`,
-                method: "filesystem.read",
-                actedVia: "filesystem.write",
-                verdict: onDisk === next ? CONFIRMED : REFUTED
-              })
+          evidence: editEvidence
         };
       },
       failed: (result) => verdictOf(result) === REFUTED,
@@ -5011,6 +5102,163 @@ export function buildToolset({
         : refuted(result, "The page did not move — you are already at the end of it."))
     },
     {
+      name: "undo",
+      // THE PRODUCT COULD NOT PUT ANYTHING BACK.
+      //
+      // A session set this user's volume to 42% and could not restore it,
+      // because the previous value existed nowhere by the time anyone wanted it.
+      // See undo-journal.js: the entry is written BEFORE the action, and carries
+      // a typed reversal descriptor rather than a sentence to be re-interpreted.
+      description:
+        "Put back the last thing that was changed. Says so plainly when the last action cannot be undone.",
+      parameters: { type: "object", properties: {}, required: [] },
+      preview: () => "the last change",
+      acts: true,
+      execute: async () => {
+        const entry = state.journal.last();
+        if (!entry) {
+          return {
+            nothingToUndo: true,
+            evidence: evidence({
+              observed: "the journal for this session holds no action that could be put back",
+              method: "undo.journal",
+              verdict: UNCONFIRMED
+            })
+          };
+        }
+        // THE THREE ANSWERS ARE DIFFERENT SENTENCES AND MUST STAY THAT WAY.
+        //
+        // "This was never reversible, and the journal said so at the time" is
+        // not the same as "I tried and could not", and neither is "it ran out of
+        // time". Collapsing them is how a journal starts implying a coverage it
+        // does not have.
+        if (!entry.reversal) {
+          state.journal.close(entry.id, Reversal.NEVER_REVERSIBLE);
+          return {
+            outcome: Reversal.NEVER_REVERSIBLE,
+            entry,
+            evidence: evidence({
+              observed: `the journal recorded at the time that this could not be undone: ${entry.why}`,
+              method: "undo.journal",
+              verdict: UNCONFIRMED
+            })
+          };
+        }
+        if (entry.expired) {
+          state.journal.close(entry.id, Reversal.COULD_NOT);
+          return {
+            outcome: Reversal.COULD_NOT,
+            entry,
+            evidence: evidence({
+              observed: `the window for reversing this closed — ${entry.summary}`,
+              method: "undo.journal",
+              verdict: UNCONFIRMED
+            })
+          };
+        }
+
+        if (entry.reversal.kind === "volume") {
+          const target = entry.reversal;
+          await runCapability("system.volume.set", { percent: target.percent, mute: target.muted });
+          // READ BACK THROUGH SOMETHING THAT DID NOT DO THE SETTING. `.set`
+          // reporting on itself is what `applied` always was, and it is exactly
+          // the claim this codebase keeps catching. `.inspect` is the endpoint's
+          // getter, and it is what decides the verdict below.
+          const after = await runCapability("system.volume.inspect", {}).catch(() => null);
+          const restored = after?.available === true
+            && Math.abs(Number(after.percent) - target.percent) <= 1
+            && Boolean(after.muted) === Boolean(target.muted);
+          state.journal.close(entry.id, restored ? Reversal.REVERSED : Reversal.COULD_NOT);
+          return {
+            outcome: restored ? Reversal.REVERSED : Reversal.COULD_NOT,
+            entry,
+            percent: after?.percent ?? null,
+            muted: after?.muted ?? null,
+            evidence: evidence({
+              observed: after?.available
+                ? `the endpoint reports ${after.percent}%${after.muted ? ", muted" : ""}, and it was ` +
+                  `${target.percent}%${target.muted ? ", muted" : ""} before the change`
+                : "the audio endpoint could not be read back after the attempt",
+              method: "system.volume.inspect",
+              actedVia: "system.volume.set",
+              verdict: restored ? CONFIRMED : REFUTED
+            })
+          };
+        }
+
+        if (entry.reversal.kind === "file") {
+          // ACT THROUGH NODE, CHECK THROUGH THE CAPABILITY — the inverse of the
+          // pairing write_file uses, so a bug in either layer cannot hide in
+          // both directions. evidence() refuses a receipt whose method equals
+          // its actedVia, so this is enforced at construction, not remembered.
+          const outcome = await restoreFile(entry.reversal, { readBack: fileNow });
+          state.journal.close(entry.id, outcome.restored ? Reversal.REVERSED : Reversal.COULD_NOT);
+          return {
+            outcome: outcome.restored ? Reversal.REVERSED : Reversal.COULD_NOT,
+            entry,
+            filePath: entry.reversal.filePath,
+            evidence: evidence({
+              observed: outcome.observed,
+              method: outcome.method,
+              actedVia: outcome.actedVia,
+              verdict: outcome.verdict
+            })
+          };
+        }
+
+        // A descriptor nobody here knows how to execute. Not a crash and not a
+        // shrug: the entry exists, so say what it was and that this route cannot
+        // perform it, rather than reporting a reversal that never ran.
+        state.journal.close(entry.id, Reversal.COULD_NOT);
+        return {
+          outcome: Reversal.COULD_NOT,
+          entry,
+          evidence: evidence({
+            observed: `the journal holds a "${entry.reversal.kind}" reversal, which this version cannot carry out`,
+            method: "undo.journal",
+            verdict: UNCONFIRMED
+          })
+        };
+      },
+      failed: (result) => result.outcome === Reversal.COULD_NOT,
+      render: (result) => {
+        if (result.nothingToUndo) {
+          return reported(result, "There is nothing on this session's record to put back.");
+        }
+        const left = timeLeft(result.entry);
+        if (result.outcome === Reversal.NEVER_REVERSIBLE) {
+          return unconfirmed(result, `That one cannot be undone. ${result.entry.why}`);
+        }
+        if (result.outcome === Reversal.COULD_NOT) {
+          if (result.entry?.expired) {
+            return unconfirmed(result, `Too late — the window for reversing "${result.entry.summary}" has closed.`);
+          }
+          // THE HELPER HAS TO MATCH THE VERDICT, and the two COULD_NOT paths do
+          // not share one. A reversal that ran and was contradicted by the
+          // endpoint is REFUTED; one this version cannot carry out never ran, so
+          // nothing about the world was established and it is UNCONFIRMED.
+          // Rendering the first through unconfirmed() throws, which is the gate
+          // in evidence.js doing its job — it caught this exact mistake here.
+          const sentence = `I could not put that back: ${result.entry.summary}.`;
+          return verdictOf(result) === REFUTED ? refuted(result, sentence) : unconfirmed(result, sentence);
+        }
+        // The sentence names what was READ BACK, not what was asked for. Two
+        // reversals now reach here and they prove themselves differently — an
+        // audio endpoint reporting a level, a filesystem reporting contents —
+        // so the receipt's own `observed` is what speaks rather than a template
+        // that would have to guess.
+        if (result.filePath) {
+          return confirmed(result, `Put back — ${result.filePath} is as it was before. ` +
+            `${result.evidence?.observed}.${left ? ` (${left} left on the next one.)` : ""}`);
+        }
+        return confirmed(
+          result,
+          `Put back — ${result.entry.summary.split("→")[0].trim()}. The endpoint now reports ` +
+          `${result.percent}%${result.muted ? ", muted" : ""}.${left ? ` (${left} left on the next one.)` : ""}`
+        );
+      }
+    },
+    {
       name: "volume",
       // "Turn it down" had no verb. The capabilities have been there and
       // verified the whole time — read the level, set the level, mute — and the
@@ -5043,11 +5291,34 @@ export function buildToolset({
             })
           };
         }
-        // Muting alone must not move the level; read it back and set what is
-        // already there so the one call can carry either intent.
+        // WHAT IT WAS BEFORE — read once, and used for two different things.
+        //
+        // Muting alone must not move the level, so the level is read back and
+        // re-set so one call can carry either intent. The same reading is what
+        // makes this undoable: a session left this user's volume at 42% and
+        // could not put it back, because the previous value existed nowhere by
+        // the time anyone wanted it.
+        const before = await runCapability("system.volume.inspect", {}).catch(() => null);
         const percent = args.percent == null
-          ? Number((await runCapability("system.volume.inspect", {}).catch(() => null))?.percent ?? 50)
+          ? Number(before?.percent ?? 50)
           : Math.max(0, Math.min(100, Number(args.percent)));
+        // BEFORE the action, never after. If the set succeeds and this line has
+        // not run, the volume has moved and nothing knows where from.
+        const undoId = before?.available
+          ? state.journal.record({
+              tool: "volume",
+              summary: `system volume ${before.percent}%${before.muted ? " (muted)" : ""} → ` +
+                `${percent}%${args.mute == null ? "" : args.mute ? " (muted)" : " (unmuted)"}`,
+              reversal: { kind: "volume", percent: Number(before.percent), muted: Boolean(before.muted) }
+            })
+          : state.journal.record({
+              tool: "volume",
+              summary: `system volume → ${percent}%`,
+              // The endpoint would not say where it was. Saying so is the point:
+              // an entry that pretended it could restore an unknown value is the
+              // failure this journal exists to prevent.
+              why: "the audio endpoint could not be read before the change, so there is no previous level to go back to"
+            });
         const set = await runCapability("system.volume.set", { percent, ...(args.mute == null ? {} : { mute: args.mute }) });
         // A FLAG IS NOT SILENCE. The level comes back from
         // GetMasterVolumeLevelScalar and the peak from IAudioMeterInformation —
@@ -5058,10 +5329,8 @@ export function buildToolset({
         const AUDIBLE = 0.0001;
         const contradicted = set?.muted === true
           && Number.isFinite(set?.peak) && set.peak > AUDIBLE;
-        return {
-          ...set,
-          evidence: set?.applied === false
-            ? evidence({
+        const receipt = set?.applied === false
+          ? evidence({
                 observed: `asked for ${set.requestedPercent}% and the endpoint reports ${set.percent ?? "an unreadable level"}`,
                 method: "audio.endpoint:get",
                 actedVia: "audio.endpoint:set",
@@ -5083,8 +5352,14 @@ export function buildToolset({
                   method: "audio.endpoint:get+meter",
                   actedVia: "audio.endpoint:set",
                   verdict: CONFIRMED
-                })
-        };
+                });
+        // Keyed on the receipt, not on whether the code reached this line. A
+        // REFUTED verdict abandons the entry — the volume did not move, so there
+        // is nothing to put back — while UNCONFIRMED leaves it undoable, because
+        // an action nobody could verify is the one most worth being able to
+        // reverse.
+        state.journal.settle(undoId, receipt);
+        return { ...set, evidence: receipt };
       },
       failed: (result) => result.available === false || result.applied === false,
       render: (result) => {

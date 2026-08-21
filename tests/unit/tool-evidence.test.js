@@ -203,7 +203,16 @@ const SUCCESS_CALLS = [
   { tool: "close_app", args: { application: "app" } },
   { tool: "remember", args: { fact: "the project lives in C:\\work" }, needsNotes: true },
   { tool: "wait", args: { ms: 1 } },
-  { tool: "batch", args: { steps: [{ tool: "wait", args: { ms: 1 } }] } }
+  { tool: "batch", args: { steps: [{ tool: "wait", args: { ms: 1 } }] } },
+  // Undo needs something on the record to put back, so the volume moves first.
+  // Called with an empty journal it takes a different path and returns a
+  // different receipt, which is why both are here: a tool that only carries
+  // evidence on its happy path carries it nowhere that matters.
+  { tool: "undo", args: {}, needsUndoable: true },
+  // Nothing on the record means nothing was touched, so this call reports
+  // rather than acts — the same shape as `volume` and `clipboard` with no
+  // arguments.
+  { tool: "undo", args: {}, label: "undo (nothing on the record)", readOnly: true }
 ];
 
 // Where `remember` writes. A real directory, thrown away afterwards, because the
@@ -220,6 +229,7 @@ async function runOne(call) {
   const files = new Map(call.file ? [call.file] : []);
   const { toolset } = harness({ files, basePath: call.needsNotes ? notesRoot : undefined });
   if (call.needsReading) await toolset.execute("screen", { application: "app" });
+  if (call.needsUndoable) await toolset.execute("volume", { percent: 40 });
   const outcome = await toolset.execute(call.tool, call.args);
   return { outcome, raw: outcome.raw };
 }

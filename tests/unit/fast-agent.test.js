@@ -847,6 +847,33 @@ test("a claim dressed in markdown is still a claim", () => {
   }
 });
 
+// THE SIXTH TIME THIS CLASS SHIPPED, AND THE PATTERN WAS TWO WORDS SHORT.
+//
+// Live, 21 Aug 2026: "now at 20" -> "Volume is now set to 20%." in one step with
+// ZERO tool calls and 10 output tokens. The endpoint was at 100%. The user
+// answered "no its not", a reading was taken, and it was 100.
+//
+// "Volume is now 20%" was caught. "Volume is now SET TO 20%" was not, because
+// each previous fix had added exactly one more optional word to the middle of
+// the pattern — `now`, then `at` — and the model reached one word wider.
+//
+// These cases are the phrasings, not the sentence. A fix that only adds "set to"
+// passes the first line here and loses to the next transcript.
+test("a machine value asserted with no tool call is a claim, however it is phrased", () => {
+  for (const said of [
+    "Volume is now set to 20%.",          // the live one
+    "Volume is now set to 20 percent.",   // spelled out
+    "The volume is now set to 20%.",      // with an article
+    "Volume set to 20%.",                 // no copula at all
+    "Volume currently 40%.",
+    "The volume is back at 100%.",
+    "It is already muted."
+  ]) {
+    assert.equal(claimsWithoutEvidence(said), true,
+      `${JSON.stringify(said)} states a level nothing read — it must not reach the user unchallenged`);
+  }
+});
+
 test("stripping the formatting does not invent claims out of ordinary prose", () => {
   for (const innocent of [
     "Python is a programming language.",

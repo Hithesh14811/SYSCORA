@@ -623,3 +623,54 @@ body:not(.debug) .debug-only { display: none; }
   position: relative;
   top: 8px;
 }
+
+/* THE MODEL'S OWN REASONING, COLLAPSED AND GREY.
+ *
+ * Fed only from the endpoint's `reasoning_content` channel, which is separate
+ * from the answer all the way down the stack. If the model sends no reasoning,
+ * no block is created — a "thinking" panel with invented contents would be a
+ * worse lie than no panel, and this surface exists to be a transcript.
+ *
+ * Collapsed by default because it is scratch work. Grey and a size down because
+ * the answer underneath it is what the user came for. */
+.thinking-box {
+  margin: 2px 0 8px;
+  border-left: 2px solid var(--line, #2a2a2a);
+  padding-left: 10px;
+}
+.thinking-summary {
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+}
+.thinking-summary::-webkit-details-marker { display: none; }
+/* The disclosure arrow, drawn rather than borrowed, so it points the same way in
+ * every browser this ships in. */
+.thinking-summary::before {
+  content: "";
+  width: 0; height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 120ms ease;
+}
+.thinking-box[open] > .thinking-summary::before { transform: rotate(90deg); }
+.thinking-summary:hover { color: var(--fg, #ddd); }
+/* While it is still arriving, the label pulses in the same rhythm as the status
+ * dot above it, so "still going" and "finished" are distinguishable at a glance
+ * without reading the words. */
+.thinking-box:not(.done) > .thinking-summary { animation: pulse 1.6s ease-in-out infinite; }
+.thinking-body {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  margin-top: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}

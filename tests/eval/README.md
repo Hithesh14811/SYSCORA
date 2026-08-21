@@ -86,9 +86,13 @@ opinion, and the point of this file is to hold opinions to a measurement. A
 partial run (`--only`, `--category`) refuses to write them: a baseline is the
 whole suite or it is not a baseline.
 
-Costs are quoted as **fresh** tokens. The endpoint serves ~96.6% of the fixed
-prompt prefix from its cache at roughly a tenth of the price, so `tokensIn` is
-bandwidth and `tokensFresh` is money.
+**Fresh is what you are billed. Sent is what the agent did.** Costs are *quoted*
+as **fresh** tokens, because that is the money — the endpoint serves most of the
+fixed prompt prefix from its cache at roughly a tenth of the price. But the gate
+is on tokens **sent**, because fresh tokens are decided by that cache and the
+cache is not in this codebase: three identical sweeps of this suite measured
+97.1%, 75.2% and 75.6% cache hit rates, and `files-read-contents` — reading one
+file — ranged 45 to 2,558 fresh tokens across them.
 
 ## The one rule
 

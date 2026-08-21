@@ -230,6 +230,43 @@ test("every route to a delete asks, not just the readable one", () => {
   }
 });
 
+// KILLING A PROCESS WAS UNGATED WHILE STOPPING A SERVICE WAS NOT.
+//
+// Observed live 21 Aug 2026: asked why the machine felt slow, the agent found
+// OneDrive at 97% of a core and ran `Stop-Process -Name OneDrive -Force`, then a
+// restart against a path that does not exist on this machine. OneDrive stayed
+// dead — and the repository this product is built in lives inside that folder.
+// Nothing in the table stood between the agent and that command.
+test("forcing a running program to quit asks first, by every route", () => {
+  for (const command of [
+    "Stop-Process -Name OneDrive -Force",
+    "Stop-Process -Id 8100",
+    "Get-Process chrome | Stop-Process -Force",
+    "taskkill /IM OneDrive.exe /F",
+    "taskkill.exe /PID 8100"
+  ]) {
+    const asked = requiresConfirmation(command);
+    assert.equal(asked.confirm, true, `must ask before killing a process: ${command}`);
+    assert.equal(asked.rule, "kill-process");
+  }
+});
+
+// The narrowness is the point. Asking to close an application goes through the
+// `close_app` tool, not the shell, and ordinary process READS must stay free —
+// a gate that fires on `Get-Process` would fire on every diagnosis the agent
+// makes and would be switched off within a day.
+test("reading about processes, and ordinary work, still do not ask", () => {
+  for (const command of [
+    "Get-Process | Sort-Object WS -Descending",
+    "Get-Process OneDrive -ErrorAction SilentlyContinue",
+    "Get-CimInstance Win32_Process | Select-Object Name,ProcessId",
+    "Start-Process 'C:\\Program Files\\Microsoft OneDrive\\OneDrive.exe'",
+    "git commit -m 'kill the old build step'"
+  ]) {
+    assert.equal(requiresConfirmation(command).confirm, false, `must not ask: ${command}`);
+  }
+});
+
 // The gate was on the wrong things. It asked whether it could delete an empty
 // leftover folder, and did not ask before sending a message to the wrong person
 // twice or clicking "Delete for everyone" twice.

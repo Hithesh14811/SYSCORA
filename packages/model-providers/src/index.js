@@ -92,8 +92,15 @@ export function validateSchema(data, schema) {
 // name. Its first sentence reaches the screen in a few hundred milliseconds,
 // while the tools it asked for are already running.
 //
-// Returns { text, toolCalls: [{ id, name, arguments }], finishReason, usage }.
-// `onTextDelta` is invoked with each token of prose as it arrives.
+// Returns { text, reasoning, toolCalls: [{ id, name, arguments }], finishReason, usage }.
+// `onTextDelta` is invoked with each token of prose as it arrives, and
+// `onReasoningDelta` with each token of the model's own reasoning where the
+// endpoint sends one. Measured against deepseek-v4-flash, 21 Aug 2026: the delta
+// carries `role`, `content` AND `reasoning_content`, with the first reasoning
+// token at 1,430ms and the first answer token at 1,514ms. Before this the
+// reasoning was parsed off the wire and thrown away, and the chat surface said
+// "Thinking…" from the moment a request was sent — including the 631ms in which
+// nothing had come back at all.
 export async function openAiCompatibleChat({
   baseUrl,
   apiKey,
@@ -106,6 +113,7 @@ export async function openAiCompatibleChat({
   timeoutMs = 60000,
   signal = null,
   onTextDelta = null,
+  onReasoningDelta = null,
   stream = true,
   // BEING RATE-LIMITED IS A WAIT, NOT A FAILURE.
   //
@@ -173,7 +181,7 @@ export async function openAiCompatibleChat({
   const deadline = Date.now() + timeoutMs;
   const attemptOptions = {
     baseUrl, apiKey, model, headers, wireMessages, tools,
-    temperature, maxTokens, stream, onTextDelta, signal, deadline
+    temperature, maxTokens, stream, onTextDelta, onReasoningDelta, signal, deadline
   };
 
   let attempt = 0;
@@ -217,7 +225,7 @@ export async function openAiCompatibleChat({
  */
 async function sendChatOnce({
   baseUrl, apiKey, model, headers, wireMessages, tools,
-  temperature, maxTokens, stream, onTextDelta, signal, deadline
+  temperature, maxTokens, stream, onTextDelta, onReasoningDelta, signal, deadline
 }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.max(1000, deadline - Date.now()));
@@ -273,6 +281,8 @@ async function sendChatOnce({
     const decoder = new TextDecoder();
     let buffer = "";
     let text = "";
+    // Accumulated separately from `text` on purpose — see the delta handler.
+    let reasoning = "";
     let finishReason = null;
     let usage = null;
     const pending = new Map();
@@ -301,6 +311,14 @@ async function sendChatOnce({
         if (!choice) continue;
         if (choice.finish_reason) finishReason = choice.finish_reason;
         const delta = choice.delta ?? {};
+        // The model's own reasoning, where the endpoint sends one. Kept separate
+        // from `text` all the way out: it is not the answer, it must never be
+        // rendered as the answer, and a settle that mistook it for one would be
+        // publishing the model's scratch work as a result.
+        if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+          reasoning += delta.reasoning_content;
+          onReasoningDelta?.(delta.reasoning_content);
+        }
         if (typeof delta.content === "string" && delta.content) {
           text += delta.content;
           emitted = true;
@@ -347,7 +365,7 @@ async function sendChatOnce({
         arguments: call.arguments || "{}"
       }))
       .filter((call) => call.name);
-    return { text, toolCalls, finishReason, usage };
+    return { text, reasoning, toolCalls, finishReason, usage };
   } finally {
     clearTimeout(timeout);
     if (signal) signal.removeEventListener?.("abort", onOuterAbort);

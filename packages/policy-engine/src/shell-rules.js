@@ -463,6 +463,37 @@ const CONFIRM_RULES = Object.freeze([
     reason: "something on the machine depends on it, and a stopped service does not come back on its own"
   },
   {
+    id: "kill-process",
+    // THE TABLE GUARDED STOPPING A SERVICE AND NOT KILLING A PROCESS, WHICH IS
+    // THE SAME ACT WITH A WORSE BLAST RADIUS.
+    //
+    // Observed live, 21 Aug 2026. Asked why the machine felt slow, the agent
+    // correctly found OneDrive pegged at 97% of a core, and — with no gate in
+    // its way — ran `Stop-Process -Name OneDrive -Force` followed by a
+    // Start-Process against `$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe`,
+    // a path that does not exist on this machine. The real one was in a reading
+    // it had taken two steps earlier. The user's file sync stayed dead, and the
+    // repository this product is built in lives inside that OneDrive folder.
+    //
+    // A process is not a service: nothing restarts it, and whatever was unsaved
+    // in it is gone. `close_app` is the ordinary route for "shut Spotify" and is
+    // untouched by this — the pattern is deliberately anchored to the shell
+    // verbs, so asking to close an application stays exactly as fast as it was.
+    // ANCHORED TO COMMAND POSITION, because `kill` is an ordinary English word
+    // and PowerShell also happens to alias it to Stop-Process. The first draft
+    // of this rule was `\b(?:stop-process|kill)\b`, and the test below caught it
+    // asking permission for `git commit -m 'kill the old build step'`. A gate
+    // that fires on a commit message gets switched off, and then it is not
+    // guarding the thing it was written for either.
+    pattern: new RegExp([
+      String.raw`(?:^|[;|&(]\s*)(?:stop-process|kill)\b`,
+      String.raw`\|\s*stop-process\b`,
+      String.raw`(?:^|[;|&(]\s*)taskkill(?:\.exe)?\s+\S`
+    ].join("|"), "i"),
+    summary: "force a running program to quit",
+    reason: "anything unsaved in it is lost, and nothing starts it again on its own — a failed restart leaves it dead"
+  },
+  {
     id: "scheduled-task",
     pattern: /\b(?:register|unregister|set)-scheduledtask\b|\bschtasks(?:\.exe)?\s+\/(?:create|delete|change)\b/i,
     summary: "add or change something that runs automatically",
