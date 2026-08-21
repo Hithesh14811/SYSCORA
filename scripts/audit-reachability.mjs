@@ -563,9 +563,19 @@ async function runSelfTest() {
   );
 
   // 5. A cleanup path only scaffolding calls.
+  //
+  // Patches the DAEMON as well as the eval runner, and the reason is worth
+  // keeping: when this sweep's real finding was fixed by wiring the daemon's
+  // shutdown, the self-test silently fell to 4/5, because removing the call
+  // from the runner alone no longer made the function unreachable — server.js
+  // still called it. A self-test that only reproduces a defect in the one file
+  // it was first found in stops reproducing it the moment the fix lands
+  // somewhere else, and then reports all-clear forever.
+  const server = path.join(repoRoot, "apps/daemon/src/server.js");
+  const strip = (b) => b.replace(/closeWindowsAutomationHost\(\)/g, "(() => false)()");
   await check(
     "a teardown nothing real calls (closeWindowsAutomationHost)",
-    [[evalRunner, (b) => b.replace(/closeWindowsAutomationHost\(\);/g, "/* removed */")]],
+    [[evalRunner, strip], [server, strip]],
     async () => sweepCleanup(),
     (f) => f.sweep === "cleanup" && /close/i.test(f.subject)
   );
