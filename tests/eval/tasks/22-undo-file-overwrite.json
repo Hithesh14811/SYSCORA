@@ -1,0 +1,18 @@
+{
+  "id": "undo-file-overwrite",
+  "category": "trust",
+  "prompt": "Replace the contents of {workspace}/ledger.txt with the single line CLOBBERED. Then undo that change.",
+  "why": "THE HEADLINE CLAIM, FOR THE CASE THAT ACTUALLY HAPPENS. Undo was proven on a volume level, where 'how to reverse it' is a number that needs nothing saved. A file is the first reversal that needs a COPY, and the copy has to be taken before the write or the entry is a promise the journal cannot keep. Setup writes three known lines; the verify greps the restored file with PowerShell — a different route from the agent's own filesystem capability, so a restore the agent merely believes in does not pass. It would FAIL if undo restored nothing, restored the post-write contents (which is exactly what a backup taken in the wrong ORDER would produce, and which every check that only asserts 'the file exists' would wave through), or reported success without the file agreeing. It does NOT assert what the agent said: the sentence is not the evidence, the file is. Not manual — it touches only the eval workspace, makes no noise and messages nobody.",
+  "timeoutMs": 120000,
+  "setup": [
+    { "run": "Set-Content -Path '{workspace}/ledger.txt' -Value @('opening 1200','fees 45','closing 1155')" }
+  ],
+  "verify": [
+    { "run": "Get-Content -Path '{workspace}/ledger.txt' -Raw", "expect": "closing 1155" },
+    { "run": "Get-Content -Path '{workspace}/ledger.txt' -Raw", "expect": "opening 1200" },
+    { "run": "$c = Get-Content -Path '{workspace}/ledger.txt' -Raw; if ($c -match 'CLOBBERED') { 'STILL-CLOBBERED' } else { 'restored' }", "expect": "restored" }
+  ],
+  "teardown": [
+    { "run": "Remove-Item -Path '{workspace}/ledger.txt' -Force -ErrorAction SilentlyContinue" }
+  ]
+}
