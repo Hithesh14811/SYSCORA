@@ -204,6 +204,39 @@ one row at a time is caught on 2 of the 7 rows big enough for 20% to mean
 anything. The scoreboard names which rows those are, because a gate whose
 sensitivity is unstated is one nobody can trust.
 
+### Found 21 Aug 2026: the thing making the machine slow is US
+
+The user asked this product, twice, why their machine felt slow. Both times it
+answered "OneDrive is syncing" — measured, honest, and not the cause. It never
+asked what OneDrive was syncing.
+
+```
+  C:\…\SYSCORA\.syscora\sessions\sessions.sqlite     1,447 MB   modified seconds ago
+  C:\…\SYSCORA\.syscora\audit\audit.sqlite             283 MB   modified seconds ago
+  C:\…\SYSCORA\.syscora\semantic-state\…sqlite         333 MB
+```
+
+**`.syscora/` lives inside the user's OneDrive folder, and OneDrive does not read
+.gitignore.** Every agent turn rewrites a 1.4 GB database, so OneDrive re-uploads
+it, continuously. Measured while idle: `OneDrive.Sync.Service` at 178.9% CPU and
+`OneDrive` at 75% — about two and a half cores, indefinitely.
+
+The database is 1,830 sessions at roughly 800 KB each, because every session
+keeps its full event stream including screen readings, forever, and
+`SessionStore` has no DELETE in it at all — only INSERT and UPDATE.
+`SessionStore.list()` then parses every one of those rows into memory to build a
+list.
+
+**Nothing has been deleted.** That is 1,830 of the user's own conversations and
+pruning them is their decision, not a cleanup task to slip into a session. The
+two fixes worth doing, in order:
+
+1. Keep `.syscora/` out of the synced folder, or exclude it in OneDrive. It is
+   working state and secrets in plaintext; it has no business being uploaded.
+2. Bound the store. A session that keeps six 110-line screen readings forever is
+   the same unbounded-growth defect the history collapse was written for, one
+   layer down.
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current
