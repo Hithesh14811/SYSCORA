@@ -17,6 +17,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { resolveStateDir } from "../../shared-types/src/state-path.js";
 
 // A recorded route is a handful of steps. Something claiming ninety is a
 // transcript of the agent flailing, and replaying it would be worse than
@@ -49,7 +50,7 @@ const NEEDLE_REQUIRED = new Set([
 ]);
 
 export function skillsDirectory(basePath) {
-  return path.join(basePath, ".syscora", "skills");
+  return path.join(resolveStateDir(basePath), "skills");
 }
 
 export function skillPath(basePath, id) {

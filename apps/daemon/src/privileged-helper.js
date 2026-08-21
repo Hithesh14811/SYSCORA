@@ -4,6 +4,7 @@ import { ApprovalTokenStore } from "../../../packages/permission-broker/src/appr
 import { PermissionBroker } from "../../../packages/permission-broker/src/index.js";
 import { PrivilegedOperationHelper } from "../../../packages/privileged-helpers/src/index.js";
 import { WindowsAdapter } from "../../../os-adapters/windows/src/windows-adapter.js";
+import { resolveStateDir } from "../../../packages/shared-types/src/state-path.js";
 
 function parseArgs(argv) {
   const parsed = {};
@@ -27,7 +28,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const basePath = args.basePath ? path.resolve(args.basePath) : process.cwd();
   const sessionId = args.sessionId ?? "privileged";
-  const stateDirectory = path.join(basePath, ".syscora");
+  const stateDirectory = resolveStateDir(basePath);
   const auditRepository = new AuditRepository(path.join(stateDirectory, "audit"));
   const approvalTokenStore = new ApprovalTokenStore(path.join(stateDirectory, "permission-broker"));
   const permissionBroker = new PermissionBroker({

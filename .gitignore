@@ -1,5 +1,8 @@
 node_modules/
 .syscora/
+# Names where working state actually lives, per machine. See
+# packages/shared-types/src/state-path.js — it is a local fact, not a shared one.
+.syscora-path
 coverage/
 dist/
 *.log

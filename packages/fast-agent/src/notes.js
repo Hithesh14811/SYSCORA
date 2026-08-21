@@ -19,6 +19,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { resolveStateDir } from "../../shared-types/src/state-path.js";
 
 // Roughly 375 tokens at the ceiling. It sits in the prompt for the life of every
 // task, so this is a real budget rather than a formality.
@@ -28,7 +29,7 @@ export const MAX_NOTES = 40;
 export const MAX_NOTE_CHARS = 200;
 
 export function notesPath(basePath) {
-  return path.join(basePath, ".syscora", "notes.md");
+  return path.join(resolveStateDir(basePath), "notes.md");
 }
 
 function normalize(fact) {

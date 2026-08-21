@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { startServer } from "../../apps/daemon/src/server.js";
+import { resolveStateDir } from "../../packages/shared-types/src/state-path.js";
 import {
   median, spread, summarise, budgetsFrom, checkBudgets, noiseBand, detectability,
   DETECTS, MATTERS_ABOVE_SENT
@@ -670,7 +671,12 @@ async function main() {
     return;
   }
 
-  const workspace = path.join(repoRoot, ".syscora", "eval-workspace");
+  // Must resolve the same way the daemon does. A workspace still pinned to
+  // <repo>/.syscora after the state directory moved would put the eval's files
+  // in one place and the agent's config, notes and skills in another — and the
+  // rows that read a file back would fail for a reason that has nothing to do
+  // with the agent.
+  const workspace = path.join(resolveStateDir(repoRoot), "eval-workspace");
   await fs.rm(workspace, { recursive: true, force: true });
   await fs.mkdir(workspace, { recursive: true });
 

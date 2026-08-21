@@ -30,6 +30,7 @@ import { ElevatedHostClient } from "../../../os-adapters/windows-host/src/elevat
 import fsSync from "node:fs";
 import { InstallationKeyStore } from "../../../packages/permission-broker/src/installation-key.js";
 import { loadModelConfig } from "./model-config.js";
+import { resolveStateDir, cloudSyncedRoot } from "../../../packages/shared-types/src/state-path.js";
 
 /**
  * Elevation configuration, from .syscora/config.json (`elevation` block) with
@@ -46,7 +47,7 @@ import { loadModelConfig } from "./model-config.js";
 export function loadElevationConfig(basePath = process.cwd()) {
   let file = {};
   try {
-    const raw = fsSync.readFileSync(path.join(basePath, ".syscora", "config.json"), "utf8");
+    const raw = fsSync.readFileSync(path.join(resolveStateDir(basePath), "config.json"), "utf8");
     file = JSON.parse(raw)?.elevation ?? {};
   } catch { /* absent or unreadable config means defaults */ }
 
@@ -68,7 +69,23 @@ export function loadElevationConfig(basePath = process.cwd()) {
 }
 
 export function createRuntime(basePath = process.cwd()) {
-  const stateDirectory = path.join(basePath, ".syscora");
+  const stateDirectory = resolveStateDir(basePath);
+  // Working state inside a cloud-synced folder is not a style problem. Measured
+  // 21 Aug 2026: 2.07 GB of databases under a OneDrive-synced path, rewritten
+  // every turn, holding OneDrive at ~24% of a core on an IDLE machine and far
+  // more during turns — and the plaintext API keys were being uploaded with it.
+  // The user asked this product twice why their machine felt slow; it answered
+  // "OneDrive is syncing" both times and never asked what OneDrive was syncing.
+  // Warn rather than relocate: moving someone's state uninvited is the same
+  // shape as losing it. `scripts/migrate-state-dir.mjs` does the move on request.
+  const syncedRoot = cloudSyncedRoot(stateDirectory);
+  if (syncedRoot) {
+    process.emitWarning(
+      `SYSCORA state lives at ${stateDirectory}, inside the synced folder ${syncedRoot}. `
+      + "Every turn rewrites databases there and the sync client re-uploads them, continuously. "
+      + "It also holds API keys in plaintext. Run `node scripts/migrate-state-dir.mjs` to move it."
+    );
+  }
   const auditRepository = new AuditRepository(path.join(stateDirectory, "audit"));
   const sessionStore = new SessionStore(path.join(stateDirectory, "sessions"));
   const approvalTokenStore = new ApprovalTokenStore(path.join(stateDirectory, "permission-broker"));

@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { resolveStateDir } from "../../../packages/shared-types/src/state-path.js";
 
 // Model configuration loader. Resolves the model gateway settings from, in
 // priority order:
 //   1. Environment variables (SYSCORA_MODEL_PROVIDER / _API_KEY / _NAME / base).
-//   2. A local, GITIGNORED config file at <basePath>/.syscora/config.json.
+//   2. A local, GITIGNORED config file at <stateDir>/config.json.
 //   3. Built-in defaults (Mock provider — deterministic, no network).
 //
 // The API key is NEVER committed to source. It lives only in .syscora/ (already
@@ -14,7 +15,7 @@ import path from "node:path";
 export function loadModelConfig(basePath = process.cwd()) {
   let fileConfig = {};
   let consentConfig = {};
-  const configPath = path.join(basePath, ".syscora", "config.json");
+  const configPath = path.join(resolveStateDir(basePath), "config.json");
   try {
     if (fs.existsSync(configPath)) {
       const raw = fs.readFileSync(configPath, "utf8");
