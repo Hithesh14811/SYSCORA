@@ -263,8 +263,20 @@ class Turn {
   constructor() {
     this.root = el("div", "turn");
     chatLog.appendChild(this.root);
-    this.status = el("div", "turn-status", "Thinking…");
+    // "CONNECTING", NOT "THINKING", UNTIL SOMETHING IS ACTUALLY THINKING.
+    //
+    // This line used to read "Thinking…" from the instant the request left the
+    // box. Measured against the configured endpoint on 21 Aug 2026
+    // (`node scripts/probe-reasoning-stream.mjs`): the first byte comes back at
+    // 631ms and the first reasoning token at 1,430ms. So for the first second
+    // and a half the word "thinking" described a request sitting on a wire — and
+    // on a slow or dead connection it described nothing at all, which is exactly
+    // when the user most needs to be able to tell the difference between a model
+    // that is working and a network that is not.
+    this.status = el("div", "turn-status", "Connecting…");
     this.root.appendChild(this.status);
+    this.thinking = null;
+    this.reasoning = "";
     this.pendingSteps = [];
     this.sawNarration = false;
     // The adaptive loop executes each of its actions THROUGH the task graph, so
@@ -290,11 +302,51 @@ class Turn {
     this.status = null;
   }
 
+  // THE MODEL'S OWN REASONING, STREAMED, BEHIND A DISCLOSURE ARROW.
+  //
+  // Only ever fed from AGENT_REASONING — the endpoint's `reasoning_content`
+  // channel, which is separate from the answer all the way down. Nothing here
+  // paraphrases or invents: if the model sends no reasoning, no block appears,
+  // because a "thinking" panel with made-up contents is worse than none.
+  //
+  // Collapsed by default and grey, like every other chat surface, because this
+  // is scratch work and the answer is what the user came for.
+  streamReasoning(text) {
+    if (!text) return;
+    // The first reasoning token is the moment thinking genuinely starts. Before
+    // it, the status line says "Connecting…" and means it.
+    this.setStatus("Thinking…");
+    if (!this.thinking) {
+      const box = el("details", "thinking-box");
+      const summary = el("summary", "thinking-summary", "Thinking");
+      box.appendChild(summary);
+      this.thinkingBody = el("div", "thinking-body");
+      box.appendChild(this.thinkingBody);
+      this.root.appendChild(box);
+      this.thinking = box;
+    }
+    this.reasoning += text;
+    this.thinkingBody.textContent = this.reasoning;
+    // Follow the stream only while it is open; scrolling a collapsed block
+    // yanks the page around for something nobody is looking at.
+    if (this.thinking.open) scrollToEnd();
+  }
+
+  // Thinking is over the moment the answer starts. The block stays on screen —
+  // it is a transcript, not a spinner — but it stops claiming to be live.
+  sealReasoning() {
+    if (!this.thinking) return;
+    this.thinking.classList.add("done");
+    const summary = this.thinking.querySelector(".thinking-summary");
+    if (summary) summary.textContent = "Thought for a moment";
+  }
+
   // The model talking, one token at a time. This is the first thing on screen
   // and it arrives while the tools it is describing are already running — the
   // whole reason the loop streams at all.
   streamDelta(text) {
     this.clearStatus();
+    this.sealReasoning();
     this.sawNarration = true;
     if (!this.streamNode) {
       const block = el("div", "agent-says streaming");
@@ -545,7 +597,7 @@ async function respondToApproval(approvalId, approved) {
 // Phases the runtime passes through before the model has said anything. They
 // share the one transient status line; none of them is worth a permanent row.
 const PHASE_STATUS = {
-  INTENT_RECEIVED: "Thinking…",
+  INTENT_RECEIVED: "Connecting…",
   INTENT_CLASSIFIED: "Working out what you meant…",
   CAPABILITY_CATALOG_REFRESHED: "Checking what I can do…",
   CONTEXT_COLLECTED: "Looking at the current state…",
@@ -565,6 +617,11 @@ function handleEvent(turn, event) {
   // The model, in its own words. This is the event this whole surface exists for.
   if (type === "AGENT_DELTA") {
     if (d.text) turn.streamDelta(d.text);
+    return;
+  }
+  // The model's reasoning, on its own channel. Never merged into the answer.
+  if (type === "AGENT_REASONING") {
+    if (d.text) turn.streamReasoning(d.text);
     return;
   }
   if (type === "AGENT_SAYS") {

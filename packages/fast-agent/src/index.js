@@ -1506,6 +1506,21 @@ export class FastAgent {
           timeoutMs: Math.max(15000, Math.min(90000, remainingMs)),
           signal: this.signal,
           onTextDelta: (delta) => { this._emit({ type: "AGENT_DELTA", details: { text: delta } }); },
+          // THE MODEL'S SCRATCH WORK, ON ITS OWN CHANNEL AND UNDER ITS OWN NAME.
+          //
+          // Two things depended on this and both were guesses. The surface said
+          // "Thinking…" from the instant a request was sent — measured against
+          // this endpoint on 21 Aug 2026, the first byte arrives at 631ms and the
+          // first reasoning token at 1,430ms, so for the first second and a half
+          // "thinking" described a request sitting on a wire. And a dropdown
+          // showing what it is thinking could not exist at all, because the
+          // reasoning was parsed off the stream and discarded.
+          //
+          // It is emitted SEPARATELY from AGENT_DELTA and never joins `lastText`.
+          // Reasoning is not an answer: a settle that took it for one would
+          // publish "We need answer simple. 17*23=391." to the user as the
+          // result, and every honesty guard in this file reads `lastText`.
+          onReasoningDelta: (delta) => { this._emit({ type: "AGENT_REASONING", details: { text: delta } }); },
           onRetry: (info) => { this._emit({ type: "AGENT_THROTTLED", details: info }); }
         });
       } catch (error) {
