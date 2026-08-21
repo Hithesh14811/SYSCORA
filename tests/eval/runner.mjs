@@ -17,6 +17,7 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { startServer } from "../../apps/daemon/src/server.js";
 import { resolveStateDir } from "../../packages/shared-types/src/state-path.js";
+import { closeWindowsAutomationHost } from "../../os-adapters/windows-host/src/client.js";
 import {
   median, spread, summarise, budgetsFrom, checkBudgets, noiseBand, detectability,
   DETECTS, MATTERS_ABOVE_SENT
@@ -740,6 +741,15 @@ async function main() {
     .catch(() => null);
 
   await new Promise((resolve) => server.close(resolve));
+
+  // Closing the HTTP server is only half of stopping. The daemon also spawned
+  // the long-lived PowerShell automation host, and nothing stopped it: 15 of
+  // them were found alive on this machine on 21 Aug 2026, 801 MB resident, the
+  // oldest 170.9 hours old. Worse, the undead child's stdio pipe keeps Node's
+  // event loop referenced — so this runner set `process.exitCode` below, printed
+  // the whole scoreboard, and then never exited. A gate that never returns
+  // cannot gate anything, which is why `npm run eval` had never run in CI.
+  closeWindowsAutomationHost();
 
   const at = new Date().toISOString();
   const head = await new Promise((resolve) => {

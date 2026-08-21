@@ -108,3 +108,28 @@ export function getWindowsAutomationHost() {
   sharedHost ??= new WindowsAutomationHostClient();
   return sharedHost;
 }
+
+/**
+ * Shut the shared host down. THE MACHINERY ABOVE WAS ALWAYS CORRECT AND NOTHING
+ * ON A REAL PATH CALLED IT.
+ *
+ * `close()` kills the child, destroys the pipes and unrefs — exactly right. But
+ * measured 21 Aug 2026, the only callers were five probe scripts. Not the
+ * daemon, not the eval runner. So every eval and every unattended run left a
+ * `powershell.exe` behind: 15 of them on this machine, 801 MB resident, the
+ * oldest 170.9 hours old — on the machine whose owner had asked why it felt slow.
+ *
+ * The second consequence is worse than the memory. An undead child with a live
+ * stdio pipe holds a reference in Node's event loop, so `tests/eval/runner.mjs`
+ * — which sets `process.exitCode` rather than calling `process.exit()` — printed
+ * its entire scoreboard and then HUNG FOREVER. `npm run eval` never returns,
+ * which means it can never gate CI, which was the whole point of building it.
+ *
+ * Idempotent, and safe to call when no host was ever started.
+ */
+export function closeWindowsAutomationHost() {
+  if (!sharedHost) return false;
+  sharedHost.close();
+  sharedHost = null;
+  return true;
+}
