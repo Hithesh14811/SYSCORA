@@ -291,6 +291,71 @@ makes the worst case far smaller and `listSummaries()` now exists, but the
 endpoint still has no limit and was left alone rather than changing the daemon's
 API contract inside a different workstream.
 
+### Found 21 Aug 2026 (W1): `npm run eval` never returned, so the gate could never have gated
+
+The suite finished, wrote its results and its scoreboard at 13:09, and the
+process was still sitting there at 0% CPU ninety minutes later.
+
+`WindowsAutomationHostClient.close()` (`os-adapters/windows-host/src/client.js`)
+was always correct — kills the child, destroys the pipes, unrefs. **Nothing on a
+real path called it.** The only five callers in the tree are probe scripts; not
+the daemon, not the eval runner. Two consequences:
+
+```
+  15 leaked powershell.exe, 801 MB resident, 1,162.7 CPU-seconds burned,
+  the oldest 170.9 hours old — created 14 Aug.
+```
+
+And the worse one: an undead child with a live stdio pipe holds a reference in
+Node's event loop, and `runner.mjs` sets `process.exitCode` rather than calling
+`process.exit()`. So it printed the whole scoreboard and hung forever. **The P1
+done-criterion — "`npm run eval` fails CI on a token or latency regression" —
+was unreachable, and had been since the runner was written.**
+
+This is the shape this codebase keeps producing: the machinery exists, it is
+correct, and it is unreachable. Same as `autoApprove` never read on the hot path.
+
+Fixed: `closeWindowsAutomationHost()` exported and called in the runner's
+teardown beside `server.close()`. Measured — **with the fix it exits in 7.4s
+with a real exit code and the host count does not move; without it the work
+completes and the process hangs, killed at 75s (exit 124).**
+
+**Not fixed:** the daemon and the desktop shell leak the same way when they
+stop, which is where the 14–16 Aug hosts came from.
+
+### Measured 21 Aug 2026 (W1): the run itself, and why it does NOT clear W0 to merge
+
+`npm run eval -- --repeat 3 --manual` on `072789c`, 21 rows × 3 = 63 runs:
+**pass rate 95% (20 of 21)**, median 248 fresh, median 5.5s, cache hit 98.7%,
+$1.884, offline pipeline reached 0 times. Pass rate is unchanged against the
+recorded baseline.
+
+**But three rows breached, and all three moved the same way — roughly 2× on
+steps and on tokens SENT, which is the endpoint-independent number:**
+
+| row | baseline median sent | its own baseline spread | this run | steps |
+|---|---|---|---|---|
+| `app-type-into-notepad-and-save` | 97,886 | 81,846–198,205 | **368,071** | 9 → 24 |
+| `skill-replay-file-write` | 19,025 | 18,972–19,286 | **29,412** | 2 → 3 |
+| `draw-shape-in-paint` | 350,070 | 289,360–415,672 | **773,061** | 24 → 37 |
+
+Every one is outside its own measured spread, and `skill-replay-file-write`'s
+baseline spread is 1.7% wide. More tokens sent with more steps is the agent
+taking more attempts — behavioural, not a cache artefact.
+
+**THE MACHINE WAS NOT QUIET AND THE NUMBERS CANNOT BE ATTRIBUTED.** Measured
+during the run with `scripts/probe-total-load.ps1` and
+`scripts/probe-leaked-hosts.ps1`: seven browser/editor windows open (Brave on
+YouTube, Chrome and Edge with Colab, VS Code, Opera, Copilot), 15 leaked
+PowerShell hosts holding 801 MB, total CPU 17.1% of 16 cores. Foreground
+contention is this project's most expensive documented failure mode — a click
+delivered after another window takes the foreground is swallowed — and the
+failing row's trace is full of it: `click✗ → click → … → windows → focus`.
+
+So this run establishes that W0 did not break the suite, and **does not**
+establish that W0 is free. **A clean re-run on a quiet machine, against the same
+rows on master, is what would settle it, and it has not been done.**
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current
