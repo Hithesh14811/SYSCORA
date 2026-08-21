@@ -204,6 +204,93 @@ one row at a time is caught on 2 of the 7 rows big enough for 20% to mean
 anything. The scoreboard names which rows those are, because a gate whose
 sensitivity is unstated is one nobody can trust.
 
+### Fixed 21 Aug 2026 (W0): the machine was slow because of US, and the stated cause was wrong
+
+The user asked this product twice why their machine felt slow. Both times it
+answered "OneDrive is syncing" — measured, honest, and useless, because nobody
+asked what OneDrive was syncing. `.syscora/` sat inside
+`C:\Users\hithe\OneDrive\Documents\SYSCORA`: 2,068.6 MB of databases rewritten
+every agent turn, re-uploaded continuously, with the plaintext API keys.
+OneDrive does not read `.gitignore`.
+
+**The second half of the diagnosis was wrong, and it would have sent the fix the
+wrong way.** The standing explanation for the 1,443 MB session store was "1,830
+sessions at roughly 800 KB each, because every session keeps its full event
+stream including screen readings". That is an average, and the average names the
+wrong mechanism. `node scripts/probe-session-store.mjs`:
+
+```
+  newest 1,000 sessions        31.4 MB      the median session is ~2 KB
+  123 sessions from 8 Aug     843.6 MB      58% of the file, one day
+  ONE session                 396.4 MB      27% of the file, one row
+```
+
+194 of 1,834 sessions held 1,401.7 MB — **97% of the bytes in 11% of the rows.**
+Inside the biggest: `events` 140.7 MB over 35 entries, which is 4 MB per event,
+and `interactiveController` 123.1 MB — the offline pipeline's entire result
+object assigned onto the session at `agent-runtime/src/index.js:1810`.
+
+A retention policy, the obvious response to "1,830 sessions", would have deleted
+the user's conversations and left the actual defect — an unbounded ROW — in
+place to write another 400 MB the next time that path ran.
+
+What was built:
+
+- **`resolveStateDir`** (`packages/shared-types/src/state-path.js`) is now the
+  one place `.syscora` is resolved: `SYSCORA_STATE_DIR`, then a `.syscora-path`
+  pointer file, then the old behaviour. The third rule is what keeps ~40 tests
+  on temp roots isolated from each other and from the real installation; a
+  machine-global default would have collided every one of them.
+- **`scripts/migrate-state-dir.mjs`** copies, verifies every file by SHA-256,
+  and writes the pointer only if all of them match. It never moves and never
+  deletes. Run on the real machine: **37/37 files byte-identical**, 2,068.6 MB
+  to `%LOCALAPPDATA%\SYSCORA`. The original is still in OneDrive, untouched.
+- **A 256 KB per-row cap in `SessionStore`** — transcript protected, unprotected
+  fields shed largest-first, then long strings truncated, then a guaranteed
+  floor. The trim is recorded IN the row and warned about: a session that
+  quietly lost its evidence ledger is indistinguishable from one that never had
+  one. Plus the DELETE the store never had, a `prune` that refuses to guess a
+  number, `listSummaries` that does not deserialise 1,443 MB to build a menu,
+  and `stats`. **Retention by count is implemented and OFF** — which
+  conversations to delete is the user's call, and they chose to keep all 1,834.
+- **`scripts/compact-session-store.mjs`** applied the cap to rows written before
+  it existed: **1,447.0 MB → 64.8 MB**, 1,834 sessions before and after, largest
+  row **396.4 MB → 0.2 MB**, and all 194 rewritten rows verified to still carry
+  their id, their timestamp and the user's own question.
+
+**The measurement, with its confounder stated.** `scripts/probe-idle-load.ps1`,
+60-second samples:
+
+```
+                          before   after
+  OneDrive.Sync.Service    12.3%    1.1%
+  OneDrive                 11.3%    0.0%
+```
+
+Machine load, both samples: Brave playing YouTube, Chrome and Edge with Colab
+notebooks, VS Code, Opera, Copilot. **The SYSCORA desktop app was open for the
+"before" and closed for the "after", and neither sample can be re-taken — so
+that pair is suggestive, not proof.** The "178.9%" quoted elsewhere was a
+`Get-Counter` snapshot taken during activity; the honest idle figure was ~24%.
+
+**The mechanism has no confounder, and is proven separately.**
+`node scripts/probe-turn-writes.mjs` snapshots all 484 files under the synced
+tree, writes a session five times through `SessionStore` exactly as a turn does,
+and snapshots again: **0 files changed inside OneDrive.** Pointed at a scratch
+state directory inside OneDrive it reports 1 changed file and names it — so the
+check is not vacuous.
+
+`tests/unit/state-bounds.test.js` — 14 tests, held to three injected
+regressions: the cap never firing (3 fail), `prune` reporting removals it did
+not perform (2 fail), the pointer file being ignored (1 fail).
+
+**Found on the way, not fixed:** `GET /api/sessions` calls `SessionStore.list()`,
+which parses every row and returns every session in full. On the real
+installation that was 1,443 MB of JSON deserialised to build a menu. The cap
+makes the worst case far smaller and `listSummaries()` now exists, but the
+endpoint still has no limit and was left alone rather than changing the daemon's
+API contract inside a different workstream.
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current
