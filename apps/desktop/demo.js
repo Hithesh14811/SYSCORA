@@ -15,6 +15,17 @@
 // this file only renders what the pipeline reports.
 
 import { readIntentSession } from "./intent-client.js";
+// THE MODEL WRITES MARKDOWN AND THIS FILE WAS SHOWING THE ASTERISKS. Every
+// answer went on screen through `textContent`, so headings, numbered steps,
+// bold names and code blocks all arrived as one wall of characters. See
+// markdown.js — it escapes before it builds, because this text comes from a
+// model that reads other people's pages.
+import { setMarkdown } from "./markdown.js";
+// Which model answers, and what the user attached. Both are decided in the
+// composer and neither may be guessed at send time — see models.js for why
+// "Auto" is a router with a stated reason rather than a silent default.
+import { AUTO, MODELS, checkAttachments, selectableModels } from "./models.js";
+import { describeAttachments, prepareAttachment } from "./attachments.js";
 
 const TOKEN_STORAGE_KEY = "syscora_token";
 // A KNOWN TOKEN IS NOT A TOKEN.
@@ -139,6 +150,16 @@ function addBubble(role, node) {
 
 function textNode(text) {
   return el("div", null, text);
+}
+
+// The user's own words, with the attached file's contents taken back out.
+// describeAttachments appends a fenced, labelled block per document; this is
+// its inverse, used only for what is DISPLAYED. The model still receives the
+// whole thing.
+function stripAttachmentBlocks(text) {
+  return String(text ?? "")
+    .replace(/\n\n--- Attached file: [\s\S]*?--- end of .*? ---/g, "")
+    .trim();
 }
 
 // ---- Naming things the way a person would -----------------------------------
@@ -351,7 +372,10 @@ class Turn {
     if (!this.streamNode) {
       const block = el("div", "agent-says streaming");
       this.streamBlock = block;
-      this.streamNode = el("p", null, "");
+      // A div, not a p: half-finished markdown is shown as plain text WHILE it
+      // streams — re-parsing on every chunk makes headings and lists flicker in
+      // and out as their syntax completes — and is rendered once at the end.
+      this.streamNode = el("div", "md-stream", "");
       block.appendChild(this.streamNode);
       this.root.appendChild(block);
     }
@@ -366,6 +390,13 @@ class Turn {
     if (!this.streamNode) return false;
     const streamed = this.streamNode.textContent.trim();
     this.streamBlock?.classList.remove("streaming");
+    // The turn is over, so the text is complete and can be parsed. Until this
+    // point it was deliberately literal.
+    if (streamed) {
+      setMarkdown(this.streamNode, streamed);
+      this.streamNode.classList.remove("md-stream");
+      this.streamNode.classList.add("md");
+    }
     if (!streamed) this.streamBlock?.remove();
     this.streamNode = null;
     this.streamBlock = null;
@@ -385,7 +416,9 @@ class Turn {
     // should be able to disagree with the second line on the strength of the
     // first.
     if (observed) block.appendChild(el("p", "agent-observed", observed));
-    if (text) block.appendChild(el("p", null, text));
+    // The answer is the one place structure matters most, so it is the one
+    // place markdown is rendered rather than shown.
+    if (text) setMarkdown(block.appendChild(el("div", "md")), text);
     if (detail) block.appendChild(el("p", "agent-detail", detail));
     if (steps.length > 1) {
       const list = el("ol", "plan");
@@ -423,14 +456,36 @@ class Turn {
     this.clearStatus();
     this.throttleNode = null;
     this._closeStream(null);
-    const step = el("div", "step running");
-    const head = el("div", "step-head");
+    // A STEP IS A SUMMARY THAT CAN BE OPENED, NOT A WALL THAT IS ALWAYS OPEN.
+    //
+    // Every command's full output, every screen reading and every page dump was
+    // printed in the transcript at full height. Reading back a conversation
+    // meant scrolling past thousands of lines of PowerShell to find the two
+    // sentences that mattered. The evidence still has to be THERE — that is the
+    // whole argument of this product — but it does not have to be in the way.
+    //
+    // <details> rather than a click handler: the browser gives keyboard access,
+    // find-in-page that opens the section containing a hit, and correct
+    // semantics for a screen reader, none of which a div and an onclick do.
+    const step = el("details", "step running");
+    const head = document.createElement("summary");
+    head.className = "step-head";
     head.appendChild(el("span", "step-icon", "▸"));
     head.appendChild(el("span", "step-verb", subgoal || verbFor(capability)));
     head.appendChild(el("code", "step-tool", capability));
     const arg = explicitArg || argSummary(capability, inputs);
     if (arg) head.appendChild(el("code", "step-arg", arg));
+    // Drawn by CSS from the open/closed state, so it can never disagree with it.
+    head.appendChild(el("span", "step-chevron", ""));
     step.appendChild(head);
+    // OPEN WHILE IT RUNS, CLOSED ONCE IT WORKED.
+    //
+    // Closed-always would hide the progress bar of a `winget install` that runs
+    // for a minute, and "is this downloading or hung" is the one thing a person
+    // watching an install wants to know. So it is open while there is something
+    // to watch and collapses itself when it succeeds. A step that FAILED stays
+    // open — see finishStep — because that output is the reason to look.
+    step.open = true;
     this.root.appendChild(step);
     this.pendingSteps.push({ key, capability, node: step, head });
     scrollToEnd();
@@ -509,6 +564,9 @@ class Turn {
     } else if (!ok && message) {
       step.appendChild(el("div", "step-error", message));
     }
+    // Collapse what worked; leave open what did not. A failed step's output is
+    // the reason the reader is here.
+    if (step.tagName === "DETAILS") step.open = !ok;
     scrollToEnd();
   }
 
@@ -1201,10 +1259,26 @@ async function stopRunning() {
 }
 
 let reqId = 0;
-async function submit(text) {
+async function submit(text, { attachments = [], routing = null, display = null } = {}) {
   if (runningSessionId) return;
   document.querySelector(".welcome")?.remove();
-  addBubble("user", textNode(text));
+  // WHAT IS SENT AND WHAT IS SHOWN ARE NOT THE SAME THING.
+  //
+  // An attached document travels as its extracted text, which for a resume is
+  // forty thousand characters. Putting that in the user's own bubble would bury
+  // the question they actually asked under the file they attached. The bubble
+  // shows what they typed and NAMES the attachments; the model gets both.
+  const bubble = addBubble("user", textNode(display ?? stripAttachmentBlocks(text)));
+  if (attachments.length) {
+    const list = el("div", "bubble-attachments");
+    for (const file of attachments) {
+      list.appendChild(el("span", "bubble-attachment",
+        `${file.kind === "image" ? "🖼" : "📄"} ${file.name}`));
+    }
+    bubble?.appendChild?.(list);
+  }
+  // Which model was chosen and why, kept beside the request it applies to.
+  if (routing) bubble?.appendChild?.(el("div", "bubble-routing", routing));
   // Captured BEFORE this turn is appended: history means the turns before this
   // one, and including the current message would duplicate it in the prompt.
   const history = conversation.slice();
@@ -1313,14 +1387,177 @@ sendButton.addEventListener("click", (event) => {
   stopRunning();
 });
 
+
+/* ===========================================================================
+   THE COMPOSER: attachments and model choice
+   ===========================================================================*/
+
+const fileInput = document.getElementById("fileInput");
+const attachButton = document.getElementById("attachButton");
+const attachmentStrip = document.getElementById("attachmentStrip");
+const modelSelect = document.getElementById("modelSelect");
+const modelHint = document.getElementById("modelHint");
+
+let attachedFiles = [];
+
+// Auto first, because it is the right answer for almost every request and the
+// only one that can pick a model able to read what has been attached.
+function fillModelPicker() {
+  if (!modelSelect) return;
+  const auto = document.createElement("option");
+  auto.value = AUTO;
+  auto.textContent = "Auto";
+  modelSelect.appendChild(auto);
+  for (const model of selectableModels()) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.label;
+    modelSelect.appendChild(option);
+  }
+  // Remembered per machine. A model choice that resets every launch is one
+  // nobody bothers to make.
+  const remembered = localStorage.getItem("syscora_model");
+  modelSelect.value = remembered && [AUTO, ...MODELS.map((m) => m.id)].includes(remembered) ? remembered : AUTO;
+  describeModelChoice();
+}
+
+function describeModelChoice() {
+  if (!modelHint) return;
+  const chosen = modelSelect.value;
+  if (chosen === AUTO) {
+    modelHint.textContent = MODELS.length > 1
+      ? "picks the cheapest model that can do the job"
+      : "";
+    modelHint.classList.remove("error");
+    return;
+  }
+  const model = MODELS.find((entry) => entry.id === chosen);
+  modelHint.textContent = model?.blurb ?? "";
+  modelHint.classList.remove("error");
+}
+
+function showComposerError(message) {
+  if (!modelHint) return;
+  modelHint.textContent = message;
+  modelHint.classList.add("error");
+}
+
+function renderAttachments() {
+  if (!attachmentStrip) return;
+  attachmentStrip.textContent = "";
+  attachmentStrip.hidden = attachedFiles.length === 0;
+  for (const [index, file] of attachedFiles.entries()) {
+    const chip = el("div", `attachment-chip${file.kind === "rejected" ? " bad" : ""}`);
+    chip.appendChild(el("span", "attachment-icon", file.kind === "image" ? "🖼" : file.kind === "rejected" ? "⚠" : "📄"));
+    const meta = el("div", "attachment-meta");
+    meta.appendChild(el("span", "attachment-name", file.name));
+    // What actually happens to it, said plainly: a PDF becomes text before it
+    // travels, and the user should know that is what was sent.
+    meta.appendChild(el("span", "attachment-note",
+      file.kind === "rejected" ? file.error
+        : file.kind === "image" ? "sent as an image"
+        : `${file.extractedBy}, ${file.text.length.toLocaleString()} characters`));
+    chip.appendChild(meta);
+    const remove = el("button", "attachment-remove", "✕");
+    remove.type = "button";
+    remove.title = `Remove ${file.name}`;
+    remove.addEventListener("click", () => {
+      attachedFiles.splice(index, 1);
+      renderAttachments();
+      describeModelChoice();
+    });
+    chip.appendChild(remove);
+    attachmentStrip.appendChild(chip);
+  }
+}
+
+function clearAttachments() {
+  attachedFiles = [];
+  if (fileInput) fileInput.value = "";
+  renderAttachments();
+  describeModelChoice();
+}
+
+async function acceptFiles(files) {
+  for (const file of files) {
+    const chip = { name: file.name, kind: "pending", bytes: file.size };
+    attachedFiles.push(chip);
+    renderAttachments();
+    let prepared;
+    try {
+      prepared = await prepareAttachment(file);
+    } catch (error) {
+      prepared = { name: file.name, kind: "rejected", error: `${file.name} could not be read: ${error?.message ?? error}` };
+    }
+    const at = attachedFiles.indexOf(chip);
+    if (at >= 0) attachedFiles[at] = prepared;
+    renderAttachments();
+  }
+  // Say immediately whether the current model can take what was just attached,
+  // rather than waiting for the user to press send and be refused.
+  const usable = attachedFiles.filter((file) => file.kind !== "rejected");
+  const verdict = checkAttachments(modelSelect.value, usable);
+  if (!verdict.ok) showComposerError(verdict.reason);
+  else if (verdict.reason && modelSelect.value === AUTO && usable.length) {
+    modelHint.textContent = verdict.reason;
+    modelHint.classList.remove("error");
+  } else describeModelChoice();
+}
+
+if (attachButton) attachButton.addEventListener("click", () => fileInput.click());
+if (fileInput) fileInput.addEventListener("change", () => acceptFiles([...fileInput.files]));
+if (modelSelect) modelSelect.addEventListener("change", () => {
+  localStorage.setItem("syscora_model", modelSelect.value);
+  describeModelChoice();
+});
+
+// Drag and drop onto the whole conversation, because that is where people aim.
+for (const eventName of ["dragover", "drop"]) {
+  document.addEventListener(eventName, (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    document.body.classList.toggle("dragging", eventName === "dragover");
+    if (eventName === "drop") acceptFiles([...event.dataTransfer.files]);
+  });
+}
+document.addEventListener("dragleave", (event) => {
+  if (event.relatedTarget === null) document.body.classList.remove("dragging");
+});
+
+// Pasting a screenshot is how people share one.
+chatInput?.addEventListener("paste", (event) => {
+  const files = [...(event.clipboardData?.files ?? [])];
+  if (files.length) { event.preventDefault(); acceptFiles(files); }
+});
+
+fillModelPicker();
+
 chatForm.addEventListener("submit", (e) => {
   e.preventDefault();
   if (runningSessionId) return;
   const text = chatInput.value.trim();
-  if (!text) return;
+  const attachments = attachedFiles.filter((file) => file.kind !== "rejected");
+  if (!text && !attachments.length) return;
+
+  // REFUSE BEFORE SENDING, NOT AFTER.
+  //
+  // If the chosen model cannot read what is attached, the request must stop
+  // here with a sentence naming the way out. Sending it anyway means the model
+  // answers confidently about a file it never saw, which is the failure this
+  // whole product exists to make impossible.
+  const verdict = checkAttachments(modelSelect.value, attachments);
+  if (!verdict.ok) {
+    showComposerError(verdict.reason);
+    return;
+  }
+
+  // Documents travel as extracted TEXT, fenced and labelled, so the model can
+  // tell the user's words from the file's contents.
+  const body = `${text}${describeAttachments(attachments)}`;
   chatInput.value = "";
   chatInput.style.height = "auto";
-  submit(text);
+  submit(body, { attachments, model: verdict.model ?? null, routing: verdict.reason ?? null });
+  clearAttachments();
 });
 
 chatInput.addEventListener("keydown", (event) => {

@@ -664,7 +664,47 @@ body:not(.debug) .debug-only { display: none; }
 /* While it is still arriving, the label pulses in the same rhythm as the status
  * dot above it, so "still going" and "finished" are distinguishable at a glance
  * without reading the words. */
-.thinking-box:not(.done) > .thinking-summary { animation: pulse 1.6s ease-in-out infinite; }
+/* THE LABEL WAS PHYSICALLY GROWING AND SHRINKING.
+ *
+ * This reused `pulse`, which is `transform: scale(.8) -> scale(1.15)`. That
+ * keyframe was written for the small round step icon, where a throb reads as a
+ * heartbeat. Applied to a line of TEXT it moves the words back and forth about
+ * four pixels, twice a second, for as long as the model is thinking — which is
+ * exactly the part of a reply people stare at.
+ *
+ * A shimmer instead: nothing moves, the highlight travels across the letters.
+ * It says "still working" without anything changing size or position. */
+.thinking-box:not(.done) > .thinking-summary {
+  background: linear-gradient(
+    100deg,
+    var(--muted) 30%,
+    var(--text) 48%,
+    var(--muted) 66%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: think-shimmer 2.1s linear infinite;
+}
+@keyframes think-shimmer {
+  from { background-position: 180% 0; }
+  to { background-position: -80% 0; }
+}
+/* Once it has finished thinking the text is just text again — the gradient has
+ * to be undone or the label stays washed out under a stopped animation. */
+.thinking-box.done > .thinking-summary {
+  background: none;
+  -webkit-text-fill-color: currentColor;
+  animation: none;
+}
+/* Someone who has asked their operating system to stop animating things means
+ * it, and a shimmer under the cursor for a minute is exactly the kind of thing
+ * that rule exists for. */
+@media (prefers-reduced-motion: reduce) {
+  .thinking-box:not(.done) > .thinking-summary { animation: none; -webkit-text-fill-color: currentColor; background: none; }
+  .step.running .step-icon { animation: none; }
+}
 .thinking-body {
   color: var(--muted);
   font-size: 13px;
@@ -673,4 +713,239 @@ body:not(.debug) .debug-only { display: none; }
   margin-top: 6px;
   max-height: 260px;
   overflow-y: auto;
+}
+
+/* ============================================================================
+   RENDERED MARKDOWN
+   ----------------------------------------------------------------------------
+   The answer used to be one <p> of literal characters, asterisks included. It
+   is now real structure, so it needs real spacing — the rhythm here is what
+   makes a long reply skimmable rather than a wall.
+   ========================================================================== */
+
+.md { line-height: 1.6; }
+.md > *:first-child { margin-top: 0; }
+.md > *:last-child { margin-bottom: 0; }
+.md p { margin: 0 0 10px; }
+
+.md h2, .md h3, .md h4, .md h5, .md h6 {
+  margin: 18px 0 8px;
+  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.md h2 { font-size: 17px; }
+.md h3 { font-size: 15.5px; }
+.md h4, .md h5, .md h6 { font-size: 14px; color: var(--muted); text-transform: none; }
+
+.md ul, .md ol { margin: 0 0 10px; padding-left: 22px; }
+.md li { margin: 3px 0; }
+.md li > ul, .md li > ol { margin: 3px 0; }
+
+.md strong { font-weight: 650; color: #fff; }
+.md em { font-style: italic; }
+.md del { opacity: 0.6; }
+
+.md code {
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 0.88em;
+  background: rgba(110, 145, 200, 0.13);
+  border: 1px solid rgba(125, 155, 205, 0.16);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+
+.md pre.md-code {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  background: #0b0f16;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+/* The border and tint belong to the block, not to each token inside it. */
+.md pre.md-code code { background: none; border: 0; padding: 0; font-size: 12.5px; }
+
+.md blockquote {
+  margin: 0 0 12px;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+
+.md a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(76, 141, 255, 0.35); }
+.md a:hover { border-bottom-color: var(--accent); }
+
+.md hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
+
+.md table.md-table {
+  width: 100%;
+  margin: 0 0 12px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.md table.md-table th,
+.md table.md-table td {
+  border: 1px solid var(--border);
+  padding: 7px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.md table.md-table th { background: var(--panel-2); font-weight: 600; }
+
+/* Mid-stream the text is deliberately unparsed, so newlines still have to
+   survive or a streaming answer collapses into one line as it arrives. */
+.md-stream { white-space: pre-wrap; line-height: 1.6; }
+
+/* ============================================================================
+   COLLAPSIBLE STEPS
+   ========================================================================== */
+
+details.step > summary { list-style: none; cursor: pointer; }
+details.step > summary::-webkit-details-marker { display: none; }
+details.step > summary::marker { content: ""; }
+details.step > summary:hover { background: rgba(125, 155, 205, 0.06); }
+details.step > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+
+/* Drawn from the element's own open state, so the arrow cannot disagree with
+   whether the section is actually open. */
+.step-chevron {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--muted);
+  transition: transform .15s ease;
+  font-size: 10px;
+}
+.step-chevron::before { content: "▶"; }
+details.step[open] .step-chevron { transform: rotate(90deg); }
+
+/* ============================================================================
+   COMPOSER: attachments and model choice
+   ========================================================================== */
+
+.composer-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 2px 0;
+  min-width: 0;
+}
+
+.composer-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color .12s ease, border-color .12s ease, background .12s ease;
+}
+.composer-button:hover { color: var(--text); border-color: #3d4a5e; background: rgba(125, 155, 205, 0.06); }
+
+.model-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.model-picker:hover { border-color: #3d4a5e; }
+.model-picker-icon { color: var(--accent); font-size: 11px; }
+.model-picker select {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  padding-right: 14px;
+  cursor: pointer;
+  outline: none;
+  /* The chevron is drawn rather than native, so it matches the rest. */
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+                    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: right 4px top 52%, right 0px top 52%;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+.model-picker select option { background: var(--panel-2); color: var(--text); }
+
+.model-hint {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+/* A refusal has to look different from a description, or it is not read. */
+.model-hint.error { color: var(--danger); white-space: normal; }
+
+.attachment-strip { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 2px 8px; }
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 340px;
+  padding: 7px 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 12.5px;
+}
+.attachment-chip.bad { border-color: rgba(248, 81, 73, 0.5); background: rgba(248, 81, 73, 0.07); }
+.attachment-icon { flex-shrink: 0; font-size: 14px; }
+.attachment-meta { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.attachment-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The note says what actually happens to the file — a PDF becomes text before
+   it travels, and the user should be told that is what was sent. */
+.attachment-note { color: var(--muted); font-size: 11.5px; }
+.attachment-chip.bad .attachment-note { color: var(--danger); white-space: normal; }
+.attachment-remove {
+  margin-left: auto;
+  flex-shrink: 0;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  border-radius: 5px;
+}
+.attachment-remove:hover { color: var(--text); background: rgba(125, 155, 205, 0.12); }
+
+/* Attachments and routing, shown under the user's own message. */
+.bubble-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.bubble-attachment {
+  font-size: 11.5px;
+  color: var(--muted);
+  background: rgba(125, 155, 205, 0.1);
+  border-radius: 6px;
+  padding: 2px 7px;
+}
+.bubble-routing { margin-top: 6px; font-size: 11.5px; color: var(--muted); font-style: italic; }
+
+/* Whole-window drop target: people aim at the conversation, not at a button. */
+body.dragging::after {
+  content: "Drop files to attach";
+  position: fixed;
+  inset: 12px;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  color: var(--accent);
+  background: rgba(76, 141, 255, 0.06);
+  border: 2px dashed var(--accent);
+  border-radius: 16px;
+  pointer-events: none;
 }

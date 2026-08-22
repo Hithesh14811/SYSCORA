@@ -88,7 +88,25 @@
       </section>
 
       <form id="chatForm" class="chat-bar">
+        <!-- Attachments sit ABOVE the input, where they read as part of the
+             message being composed rather than as a toolbar. -->
+        <div id="attachmentStrip" class="attachment-strip" hidden></div>
         <textarea id="chatInput" rows="1" placeholder="Ask SYSCORA to do something..." required></textarea>
+        <div class="composer-controls">
+          <input id="fileInput" type="file" multiple hidden
+                 accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.js,.ts,.py,.java,.html,.css,.yml,.yaml,.xml,.sql" />
+          <button id="attachButton" class="composer-button" type="button" title="Attach files">
+            <span aria-hidden="true">📎</span><span class="composer-button-text">Attach</span>
+          </button>
+          <!-- Auto is a ROUTER, not a default: it picks the cheapest model that
+               can actually do what the request needs, and says which and why.
+               See models.js. -->
+          <label class="model-picker" title="Which model answers">
+            <span class="model-picker-icon" aria-hidden="true">◇</span>
+            <select id="modelSelect" aria-label="Model"></select>
+          </label>
+          <span id="modelHint" class="model-hint"></span>
+        </div>
 <!-- The "Auto-approve" checkbox that lived here is gone. The agent loop has no
          approval gate to skip, so on every request that reaches it the toggle did
          nothing at all; a control that does nothing is worse than no control,
