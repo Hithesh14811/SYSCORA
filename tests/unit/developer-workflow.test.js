@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createRuntime } from "../../apps/daemon/src/runtime-factory.js";
 import { createDefaultCapabilityRegistry } from "../../packages/capability-registry/src/index.js";
 import { PermissionBroker } from "../../packages/permission-broker/src/index.js";
@@ -175,7 +176,13 @@ test("privileged helper subprocess enforces the scoped single-use token and safe
 
     const result = await new Promise((resolve) => {
       const child = spawn(process.execPath, [
-        path.resolve("c:\\Users\\hithe\\OneDrive\\Documents\\SYSCORA\\apps\\daemon\\src\\privileged-helper.js"),
+        // Resolved from THIS FILE, not from an absolute path on one machine.
+        // It was hardcoded to `c:\Users\hithe\OneDrive\Documents\SYSCORA\...`,
+        // so this test could only ever pass on the author's laptop, in that
+        // exact folder — a fresh clone, a renamed directory or any other
+        // developer would spawn a path that does not exist and get a failure
+        // with nothing in it to explain why.
+        fileURLToPath(new URL("../../apps/daemon/src/privileged-helper.js", import.meta.url)),
         "--basePath", tempRoot,
         "--sessionId", "priv_sub",
         "--operation", "service.restart",
