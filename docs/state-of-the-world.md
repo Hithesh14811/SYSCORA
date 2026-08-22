@@ -491,6 +491,79 @@ WhatsApp sent it to the model endpoint. `sanitizeExternalContext` redacts
 agent READS off a window. This is the injection boundary's mirror image: not
 "what it reads must not command it", but "what it reads must not leak".
 
+### Done 22 Aug 2026 (W3): the four things that made this a prototype
+
+**W2 (deleting the ~14k-line offline pipeline) was SKIPPED on purpose.** It is
+cleanup with real breakage risk and nothing a user would notice, against four
+hardening items that are what stand between this and a product people trust
+with their machine. Order was the user's call and they asked for the next big
+thing without breaking anything.
+
+**1. A credential the agent READS no longer reaches the model.** The redaction
+enumerated vendor prefixes — `sk`, `gsk`, `ghp`, `github_pat`, `xox`, `AKIA` —
+and a Baseten key beginning `rn37EXgy.` matched none of them, nor would the next
+vendor's. The rule is now the SHAPE: an unbroken run of 28+ letters and digits
+carrying upper case AND lower case AND a digit. The threshold is set by what
+must SURVIVE, not by what must be caught, because over-redaction has cost this
+project more (`***REDACTED_EMAIL***` typed into a login form, `%USERPROFILE%`
+typed into PowerShell as a relative path). Separators end a run, so a file path
+is seven short runs; all three character classes are required, so a UUID and a
+git hash cannot match at any length. Known misses are stated in the comment.
+Two tables plus a reachability test that builds the object the loop is actually
+handed — `reasoningEngine.modelProvider` — rather than reading the source and
+concluding it is wired up.
+
+**2. The daemon has a crash path.** There were zero `uncaughtException` and zero
+`unhandledRejection` handlers in the repository, in a process that renames
+files, sends messages and changes system settings. A crash now writes down what
+had already been done, stops the automation host, and exits non-zero; the next
+start reports it in sentences and moves the record aside. **The trap:** from
+Node 15 an unhandled rejection already terminates the process, so a handler that
+logs and returns REMOVES the only protection there was. `a crash guard that does
+not exit is worse than none` is asserted directly, and 5 of 12 tests fail when
+the exit is commented out.
+
+**3. One machine, one task at a time — on every route.** The 409 guard existed
+and had two ways past it. `?sync=true` called `runtime.submitIntent` directly
+and never registered in `intentRuns`, so any number of synchronous requests ran
+at once against the one physical mouse; and on the async route the entry was
+created by a callback the runtime invokes when it gets round to it, so two
+requests arriving together could both read an empty map. Both are one bug: the
+lock was DERIVED from the runtime's bookkeeping instead of TAKEN by the thing
+accepting the request. Now claimed in the handler before any await, released by
+identity, released in a `finally`. Four HTTP-level tests, three of which fail
+against the previous code.
+
+**4. The model keys are encrypted at rest.** They sat in plaintext beside a
+DPAPI store that was already constructed and used for other things. The
+demonstrated cost was not theft — a session dumped that config into a transcript
+and the live key went with it. `config.json` now holds `dpapi:model-apikey.bin`
+references; `scripts/protect-model-key.mjs` migrates, verifies the round trip
+BEFORE deleting any plaintext, and has `--revert`. Plaintext still works, so an
+unmigrated config behaves exactly as it did. Synchronous by deliberate choice:
+`createRuntime` is sync in eight places including six test files, and making the
+key async would be a wide change to the start path the eval and the desktop
+shell depend on, to save a few hundred milliseconds once per process.
+
+**The migration's own check caught a real defect in the migration.** The first
+run reported "1 key IS STILL IN PLAINTEXT". The config held BOTH `apiKey` and
+`primaryApiKey`; the script protected whichever one `loadModelConfig` prefers
+and left the other in the file — and every fingerprint it printed afterwards was
+correct, because they were read back through the same preference order. **A
+migration that moves the value the loader happens to prefer has not moved the
+secret out of the file.**
+
+Verified after migration with `node scripts/probe-failover.mjs`: a real request
+completed end to end through the encrypted credentials.
+
+**Found while verifying, not caused by any of this: the primary model endpoint
+is out of credit.** `https://api.deepseek.com` now answers `HTTP 402
+Insufficient Balance` — it served the whole eval an hour earlier. The key is
+still valid (402 is a billing answer, not an auth one). The product keeps
+working because the Baseten fallback is healthy, which it had not been until
+today. This is the first time the failover chain has had somewhere real to fail
+over TO, and it is now load-bearing rather than theoretical.
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current

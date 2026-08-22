@@ -14,10 +14,17 @@
 // for the same reason probe-failover.mjs separates the machinery from the
 // billing: an endpoint listed in a config file is not an endpoint that answers.
 
-import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { resolveStateDir } from "../packages/shared-types/src/state-path.js";
+// THROUGH THE LOADER THE DAEMON USES, not by parsing config.json.
+//
+// Once the keys moved into DPAPI (scripts/protect-model-key.mjs) the file holds
+// references like "dpapi:model-primary.bin", and a probe that read the file
+// directly would report every endpoint DEAD while the product worked perfectly.
+// What is being tested here is whether the endpoints answer for the credentials
+// THE DAEMON WILL PRESENT, so it has to resolve them the same way.
+import { loadModelConfig } from "../apps/daemon/src/model-config.js";
 
 const configPath = path.join(resolveStateDir(process.cwd()), "config.json");
 const fingerprint = (key) => {
@@ -26,17 +33,16 @@ const fingerprint = (key) => {
   return `${String(key).length} chars, #${hash}`;
 };
 
-const raw = JSON.parse(fs.readFileSync(configPath, "utf8"));
-const model = raw.model ?? raw;
+const model = loadModelConfig(process.cwd());
 
 const entries = [
-  { label: "primary", provider: model.provider, model: model.model, baseUrl: model.baseUrl, apiKey: model.primaryApiKey || model.apiKey },
+  { label: "primary", provider: model.provider, model: model.model, baseUrl: model.baseUrl, apiKey: model.apiKey },
   ...(model.fallbackProviderConfigs ?? []).map((entry, index) => ({
     label: `fallback ${index + 1}`,
     provider: entry.provider,
     model: entry.model,
     baseUrl: entry.baseUrl,
-    apiKey: entry.apiKeyFromExistingConfig ? (model.primaryApiKey || model.apiKey) : entry.apiKey,
+    apiKey: entry.apiKey,
     inherits: entry.apiKeyFromExistingConfig === true
   }))
 ];
