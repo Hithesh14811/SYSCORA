@@ -356,6 +356,141 @@ So this run establishes that W0 did not break the suite, and **does not**
 establish that W0 is free. **A clean re-run on a quiet machine, against the same
 rows on master, is what would settle it, and it has not been done.**
 
+### Fixed 22 Aug 2026 (W1): a third of every look was one PowerShell idiom
+
+The brief for this session named three causes of slow perception, in order.
+**The first two do not happen on the hot path, and the third was understated.**
+Measured before touching anything, with `node scripts/probe-perception-breakdown.mjs`,
+which wraps `screen.read` and `adapter.listWindows` and counts what one `screen`
+tool call actually issues:
+
+- **"OCR runs by default and should not."** Not on the route the agent takes.
+  **0 of 18 real looks paid for capture+OCR.** The `screen` tool has asked for
+  `includeOcr: false` first and fallen back to pixels only on an unusable tree
+  since it was written — `tools.js:2370`. The audited 5,392ms-vs-1,195ms figure
+  is the `screen.read` CAPABILITY called directly, a layer nothing on the hot
+  path calls that way.
+- **"WebView2 apps read the screen twice."** Only the FIRST look at a window:
+  measured 2 reads on the first, 1 on all five warm ones. `state.webviewWindows`
+  already memoises which sibling window holds the interface.
+- **"`listWindows` costs 533ms and is called up to 3× per `screen` call."** The
+  count was wrong — once per look, not three — and the cost was the real thing,
+  because **96% of it was `Get-Process -Id` called once per window.**
+
+`Get-Process -Id` reads like a lookup and is an enumeration: it walks every
+process on the machine and then filters. `scripts/probe-window-list-cost.ps1`,
+28 visible windows:
+
+```
+  Get-Process -Id, once per window    290.9ms
+  Get-Process once, into a lookup      12.4ms
+  Screen.FromHandle, once per window    1.0ms
+  GetDpiForWindow, once per window      0.1ms
+  the native enumeration itself         0.3ms
+```
+
+It cost far more than `window.enumerate`, because `Resolve-Window` calls
+`Get-WindowList` and every host request that NAMES a window calls
+`Resolve-Window` — so the N+1 was paid again inside every inspect, click, type
+and focus. Four lines changed. Measured on the same desktop, 37 windows open:
+
+| | before | after |
+|---|---|---|
+| `adapter.listWindows` | 405ms | **30ms** |
+| one `screen` call, p50 over 18 warm looks | 1,418ms | **442ms** |
+| `probe-screen-p50.mjs`, WhatsApp | 1,233ms (20 Aug) | **634ms** |
+| `probe-screen-p50.mjs`, all warm reads | 1,408ms (20 Aug) | **418ms** |
+
+**The W8 target of 1.2s is met for the first time**, at 418ms.
+
+Fidelity is the half that matters and is checked separately by
+`node scripts/probe-window-list-fidelity.mjs`, which compares every window's
+process name against a `Get-Process` run in a SEPARATE powershell.exe — not the
+host, not the adapter: **0 mismatches, 0 windows missing a name, bounds or DPI.**
+`--break` corrupts one row and the check reports FAIL, so it is a check.
+`tests/unit/live-run-regressions.test.js` pins the shape; verified by putting
+the per-window call back, which fails it.
+
+**Two things were NOT changed, because measuring them said not to.** Filling the
+window's name from the UI inspection that already returned it would now save
+~25ms, not the ~300ms it was worth an hour earlier; and the WebView2 first-look
+double read is once per window per session, behind a working memo.
+
+### Corrected 22 Aug 2026: the perception-cost table quotes a failed read
+
+`audit.txt` and the session brief carry a pitch table reading "SYSCORA `screen`
+— Settings ~35 tokens" against "Anthropic computer use screenshot ~1,365". The
+screenshot figure is arithmetic and sound (1280×800 ÷ 750). **The 35 does not
+reproduce by any route.** `node scripts/probe-one-window.mjs settings` measures
+what the model is actually handed, in the same characters ÷ 4 the rest of the
+project uses:
+
+| one look | chars | ~tokens |
+|---|---|---|
+| Settings, read successfully | 1,066 | **267** |
+| Settings, asked for as `SystemSettings` — a FAILED read | 976 | 244 |
+| Notepad | 1,954 | 489 |
+| WhatsApp | 4,114 | 1,029 |
+
+So the honest claim is **~267–1,029 tokens against a screenshot's ~1,365** —
+between 1.3× and 5× cheaper per observation, not 39×. The advantage that does
+survive is the one that was never about the ratio: text does not accumulate in
+the conversation the way images do, and what comes back is already NAMED,
+clickable controls rather than pixels something still has to interpret.
+
+**Why the failed read is 244 tokens of nothing:** there is no window whose
+process is `SystemSettings`. Settings is a UWP application, so the desktop
+enumerates its frame under `ApplicationFrameHost`, and `_resolveWindow` matches
+on process name or title. Asked for `settings` it matches the TITLE and returns
+a full 37-element tree; asked for the process name a person would get from Task
+Manager it resolves nothing, pays two window enumerations and answers "the
+screen could not be captured". Every UWP application — Settings, Calculator,
+Photos, Store, Mail — has this shape. Not fixed: it costs a window-ownership
+lookup and belongs with the WebView2 frame/content work, not inside a
+speed change.
+
+### Measured 22 Aug 2026: the flagship eval row measures the user, not the code
+
+`npm run eval -- --repeat 3 --manual` on the change: **96% (22 of 23)**, median
+**4.6s** (was 5.6s), $1.137, offline pipeline reached 0 times. Three breaches,
+all `messaging-send-to-self`, and **all three runs PASSED** — the message was
+sent and verified every time. What breached was cost: 30, 18 and 5 steps.
+
+The row's cost is decided by which chat WhatsApp opens on, which is decided by
+what the user last did in WhatsApp. The runner's own comment says so about the
+sibling task. Held to a paired run from an IDENTICAL starting chat — the user's
+most recent conversation, confirmed by reading the window between runs:
+
+```
+  master   FAIL  10 steps  27.0s  121,405 sent   message not confirmed sent
+  changed  PASS  23 steps  56.9s  431,518 sent
+```
+
+**Master breaches the same ceiling from the same state and additionally fails
+the task.** So the breach is not attributable to the perception change, and on
+the one run that started where the recorded baseline started — the chat already
+open — the changed code ran the same 5-step shape in **10.0s against the
+baseline's 17.0–21.7s.**
+
+**The gate is what is broken here.** The 8-step ceiling was recorded from runs
+that all began with the target chat open, while this document already records
+the row at 3 steps/15.2s with the chat open and 10 steps/46s from a different
+one. **A ceiling below a row's own documented worst passing run is not a gate**
+— the fifth instance of that class. Either the task's `setup` must put WhatsApp
+in a known chat, or the ceiling must be re-derived from the real spread. Until
+one of those happens this row fires on any run where the user touched WhatsApp
+first, and cannot tell that from a regression.
+
+### Found 22 Aug 2026, not fixed: a secret on screen reaches the model
+
+The user moved a live model API key between devices through a WhatsApp chat. It
+therefore appears in the chat list PREVIEW, so it is in the `screen` reading of
+WhatsApp — 131 elements, one of which is the key — and every eval run that read
+WhatsApp sent it to the model endpoint. `sanitizeExternalContext` redacts
+`sk-`-shaped keys out of what the user types; nothing redacts a credential the
+agent READS off a window. This is the injection boundary's mirror image: not
+"what it reads must not command it", but "what it reads must not leak".
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current

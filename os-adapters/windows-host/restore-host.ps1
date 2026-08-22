@@ -1011,15 +1011,43 @@ function Read-OcrImage($path, $windowId=$null, $originX=0, $originY=0) {
   return @{ available=$true; text=$recognized.Text; targets=$targets; path=$path }
 }
 
+# ONE Get-Process, NOT ONE PER WINDOW.
+#
+# `Get-Process -Id` does not look a process up — it enumerates every process on
+# the machine and then filters. Called once per window that is 28 full process
+# enumerations to answer 28 questions, and it was the whole cost of this
+# function. Measured on this desktop, 22 Aug 2026, 28 visible windows
+# (`scripts/probe-window-list-cost.ps1`):
+#
+#   Get-Process -Id, once per window    290.9ms
+#   Get-Process once, into a lookup      12.4ms
+#   Screen.FromHandle, once per window    1.0ms
+#   GetDpiForWindow, once per window      0.1ms
+#   the native enumeration itself         0.3ms
+#
+# So 96% of a 405ms call was that one line, and the per-window work the comment
+# under Get-ForegroundWindow blames — FromHandle and DpiForWindow — costs 1.1ms
+# between them. That matters more than it looks: Resolve-Window calls this, and
+# every host request that names a window calls Resolve-Window, so the N+1 was
+# paid again inside every inspect, click, type and focus.
+#
+# Still enumerated fresh on every call. A cached process table would be a
+# staleness bug in `launch`, which polls this waiting for a new window.
 function Get-WindowList {
+  $processNameById = @{}
+  foreach ($process in (Get-Process -ErrorAction SilentlyContinue)) {
+    $processNameById[[int]$process.Id] = $process.ProcessName
+  }
   @([M4Native]::Windows() | ForEach-Object {
-    $process = Get-Process -Id $_.processId -ErrorAction SilentlyContinue
+    # A window whose process exited between the enumeration and here has no
+    # name, which is what Get-Process -Id -ErrorAction SilentlyContinue gave.
+    $processName = $processNameById[[int]$_.processId]
     $handle = [IntPtr][Int64]$_.windowId
     $display = [System.Windows.Forms.Screen]::FromHandle($handle)
     [pscustomobject]@{
       windowId = [string]$_.windowId
       processId = $_.processId
-      processName = if ($process) { $process.ProcessName } else { $null }
+      processName = if ($processName) { $processName } else { $null }
       title = $_.title
       className = $_.className
       bounds = @{ x=$_.x; y=$_.y; width=$_.width; height=$_.height }
@@ -1042,10 +1070,12 @@ function Get-ProcessParents {
 
 # Just the window the user is looking at.
 #
-# Get-WindowList calls Get-Process, Screen.FromHandle and DpiForWindow once per
-# window; on a normal desktop that is fifty-odd windows and a measured second of
-# wall clock. Every look at the screen paid it purely to find out which window
-# was in front, which the OS already knows. This asks that question directly.
+# Describing every window on the desktop to find out which one is in front is
+# work the OS has already done, so this asks it directly. It used to be worth
+# far more than it is now: this comment read "Get-WindowList costs a measured
+# second of wall clock", and the reason it did was the per-window Get-Process
+# above, which is gone. Get-WindowList is ~30ms today against this function's
+# ~17ms, so keep this for being the right question rather than for the saving.
 function Get-ForegroundWindow {
   $handle = [M4Native]::GetForegroundWindow()
   if ($handle -eq [IntPtr]::Zero) { return $null }

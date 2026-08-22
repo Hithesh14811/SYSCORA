@@ -45,10 +45,16 @@ That is a harness advantage, so it survives whatever model is plugged in.
 | perception, one observation | tokens |
 |---|---|
 | Anthropic computer use screenshot @1280×800 | ~1,365 |
-| SYSCORA `screen` — Settings | ~35 |
-| SYSCORA `screen` — WhatsApp (complex app) | ~925 |
+| SYSCORA `screen` — Settings | ~~~35~~ **267** |
+| SYSCORA `screen` — WhatsApp (complex app) | ~~~925~~ **1,029** |
 
-Text also does not accumulate in the conversation the way images do.
+**CORRECTED 22 Aug 2026 — do not quote the struck-through numbers.** The ~35
+was a read that FAILED and returned an error message; measured with
+`node scripts/probe-one-window.mjs settings`, a successful reading of Settings
+is 267 tokens. The honest claim is **1.3×–5× cheaper per observation, not 39×**.
+See `docs/state-of-the-world.md`. What survives unchanged is the part that was
+never a ratio: text does not accumulate in the conversation the way images do,
+and what comes back is already named, clickable controls rather than pixels.
 
 **The moat is verification.** `packages/fast-agent/src/evidence.js` makes a
 success sentence unreachable without a CONFIRMED verdict, and refuses at

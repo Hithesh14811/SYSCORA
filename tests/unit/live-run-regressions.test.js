@@ -890,3 +890,37 @@ test("the UIA cache request prefetches one element, not every element's subtree"
   );
   assert.match(assignment, /TreeScope\]::Element/);
 });
+
+// ---- A third of every look at the screen was one PowerShell idiom ------------
+
+// `Get-Process -Id` reads like a lookup and is an enumeration: it walks every
+// process on the machine and then filters. Get-WindowList called it once per
+// window, so describing 28 windows meant 28 full process enumerations, and that
+// single line was 96% of the call. Measured 22 Aug 2026 by
+// `scripts/probe-window-list-cost.ps1`, 28 visible windows:
+//
+//   Get-Process -Id, once per window   290.9ms      one Get-Process   12.4ms
+//
+// It mattered far past `window.enumerate`, because Resolve-Window calls
+// Get-WindowList and every host request that names a window calls
+// Resolve-Window — so the N+1 was paid again inside every inspect, click, type
+// and focus. End to end (`scripts/probe-perception-breakdown.mjs`):
+// listWindows 405ms -> 30ms, and the p50 of one `screen` call 1,418ms -> 442ms.
+//
+// This FAILS if the per-window call comes back. It cannot check the timing —
+// that is the probe — but the shape is what the timing depends on.
+test("the window list looks processes up once, not once per window", () => {
+  const host = readFileSync(new URL("../../os-adapters/windows-host/restore-host.ps1", import.meta.url), "utf8");
+  const start = host.indexOf("function Get-WindowList");
+  assert.ok(start >= 0, "Get-WindowList is what every window-naming host request resolves through");
+  const body = host.slice(start, host.indexOf("\nfunction ", start + 1));
+  // Comments are stripped first: the body carries a comment explaining what the
+  // removed call used to do, and a test that reads its own explanation as a
+  // violation would fail forever for the wrong reason.
+  const code = body.split("\n").filter((line) => !/^\s*#/.test(line)).join("\n");
+  assert.ok(
+    !/Get-Process\s+-Id/.test(code),
+    "Get-WindowList must not call Get-Process -Id — that is one full process enumeration per window"
+  );
+  assert.match(code, /Get-Process\b/, "it still needs process names, from one enumeration into a lookup");
+});
