@@ -12,6 +12,7 @@ import { projectSessionLifecycle } from "../../../packages/shared-types/src/sess
 import { closeWindowsAutomationHost } from "../../../os-adapters/windows-host/src/client.js";
 import { resolveStateDir } from "../../../packages/shared-types/src/state-path.js";
 import { installCrashGuards, reportInterruptedRun } from "./crash-guard.js";
+import { reportPreflight } from "./preflight.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -907,6 +908,11 @@ if (process.argv[1] === __filename) {
   // (the dev-preview harness) assigns a free port when 4317 is already taken —
   // nothing external depends on 4317, so there is no callback or CORS origin to
   // keep stable. 4317 remains the standalone default.
+  // Before anything is constructed: every store this is about to build sits on
+  // an experimental Node API, and "it broke because you upgraded Node" is not a
+  // conclusion anyone reaches from a stack trace about a database handle.
+  reportPreflight();
+
   const port = Number(process.env.SYSCORA_PORT ?? process.env.PORT ?? "4317");
   const server = startServer({ port });
 
