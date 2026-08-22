@@ -1,0 +1,25 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "syscora-ui",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "--use-system-ca",
+        "apps/daemon/src/server.js"
+      ],
+      "port": 4317,
+      "autoPort": true
+    },
+    {
+      "name": "syscora-ui-verify",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "--use-system-ca",
+        "apps/daemon/src/server.js"
+      ],
+      "port": 4318,
+      "autoPort": true
+    }
+  ]
+}

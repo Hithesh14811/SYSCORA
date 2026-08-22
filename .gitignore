@@ -10,3 +10,22 @@ dist/
 probe-*.json
 anaconda_projects/
 tests/eval/results/
+
+# A LITERAL "%USERPROFILE%" DIRECTORY IS A BUG'S FOOTPRINT, NOT A SOURCE TREE.
+#
+# The agent was once handed the placeholder `%USERPROFILE%` instead of a real
+# home directory (see packages/shared-types/src/external-context.js), typed it
+# back into PowerShell, and PowerShell — which does not expand %VAR% — resolved
+# it as a RELATIVE path. So a folder literally named `%USERPROFILE%` appeared
+# inside the repository, five temp files deep, and got committed. Removed from
+# tracking on 22 Aug 2026; ignored here so it cannot come back.
+%USERPROFILE%/
+*AppDataLocalTemp*
+
+# Session transcripts. Large, local, and the documented way a live API key
+# reached a file once already — never something to publish.
+transcript.txt
+
+# Claude Code's per-machine settings. launch.json IS shared (it says how to run
+# this project); settings.local.json is one developer's own choices.
+.claude/settings.local.json
