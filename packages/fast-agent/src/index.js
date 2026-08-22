@@ -74,6 +74,68 @@ const MAX_CONVERSATION_CHARS = 60000;
 // before starting without it. See _machineFacts.
 const MACHINE_FACTS_DEADLINE_MS = 2500;
 
+// THE OUTPUT CEILING IS SHARED WITH THE MODEL'S THINKING, AND THINKING GOES FIRST.
+//
+// This endpoint is a reasoning model: `reasoning_content` is billed as
+// completion tokens and reported under
+// `completion_tokens_details.reasoning_tokens`. `max_tokens` bounds the two
+// TOGETHER, so a turn that deliberates past the ceiling never reaches the tool
+// call it was deliberating towards — and `wasTruncated` then discards the whole
+// turn, correctly, because half a decision is not safe to run.
+//
+// Measured against this endpoint on 21 Aug 2026, replaying one real decision —
+// "draw a beautiful and detailed car", at the step after Paint had been opened
+// and the screen read (scripts/probe-reasoning-budget.mjs, n=8 per ceiling):
+//
+//   at the 4,096 ceiling       3 of 8 turns hit `length` with ZERO tool calls;
+//                              reasoning had eaten 4,096 of 4,096 output tokens
+//   with room (16,384)         0 of 8 truncated, every one produced a tool call
+//   reasoning, unconstrained   1,062 · 1,943 · 2,517 · 5,219 · 6,350 · 6,626 ·
+//                              6,983 · 11,891  — p50 6,350
+//
+// Live, that is what made "draw a car" open Paint, make a fresh document, read
+// the screen and then stop with "I hit the output length limit twice" — two
+// independent overruns, 8,192 output tokens spent, nothing drawn.
+//
+// A CEILING IS A BEHAVIOURAL DIAL, NOT A SAFETY LIMIT. DO NOT RAISE THIS ONE.
+//
+// The older note here said "a ceiling is not a cost" — true about the invoice,
+// since the provider bills what it generates, and it was read as licence to
+// raise the ceiling whenever a turn ran out of room. It is FALSE ABOUT
+// BEHAVIOUR, which is the part that matters and the part that was measured
+// wrong. Given more room a reasoning model does not think the same thoughts with
+// slack: it thinks longer and then ATTEMPTS MORE.
+//
+// THE FIRST FIX FOR THE TRUNCATION RAISED THIS FOR EVERY TURN, AND THE EVAL SAID
+// NO. Measured over a full 69-run eval at a 16,384 ceiling for every turn,
+// against the recorded baseline:
+//
+//   draw-shape-in-paint   3/3 passing → 1/3, 15 steps → 26, 48,753 → 157,690
+//                         fresh. It elaborated instead of drawing one circle,
+//                         and ran out of time before it saved the file.
+//   app-type-...-and-save 9 steps → 18, 41.8s → 80.8s, and breached three
+//                         budgets at once
+//   pass rate             100% → 91%
+//
+// So the ceiling stays where the baseline set it, and the extra room goes ONLY
+// to the turn that has demonstrated it needs it. 62% of turns never truncate and
+// pay nothing for this; the 38% that do get a retry that can actually finish.
+const MODEL_OUTPUT_CEILING = 4096;
+// The retry after a truncation gets MORE ROOM, not a politer request.
+//
+// The previous retry asked the model to "keep it SHORT … the smallest arguments
+// that do the job". Measured with that message appended, truncation continued
+// at 3 of 6 — indistinguishable from 3 of 8 without it. Of course it did: the
+// message asks for smaller ARGUMENTS and what overran was REASONING, so it
+// argues with the wrong half of the budget. Changing the shape rather than the
+// wording is the only thing that has ever worked on this class of defect.
+//
+// 16,384 is the value measured to truncate 0 of 8 on the decision that provoked
+// this, and it is reached only after a turn has already been cut off — so it
+// cannot slow down or embellish a task that was going fine. The endpoint was
+// measured to accept up to 65,536.
+const MODEL_OUTPUT_CEILING_RETRY = 16384;
+
 // Things that can only be true because a tool said so.
 //
 // Past-tense claims of having acted, and specific facts about THIS machine — a
@@ -886,7 +948,13 @@ export class FastAgent {
 
       let turn;
       try {
-        turn = await this._callModel(messages, this.maxElapsedMs - elapsed);
+        // After a turn was cut off, the next one gets more room rather than a
+        // request to be brief. See MODEL_OUTPUT_CEILING_RETRY.
+        turn = await this._callModel(
+          messages,
+          this.maxElapsedMs - elapsed,
+          retriedTruncatedTurn ? MODEL_OUTPUT_CEILING_RETRY : MODEL_OUTPUT_CEILING
+        );
       } catch (error) {
         // The user pressing stop aborts the in-flight request, which surfaces
         // here as a provider error. Reporting that as "all configured model
@@ -1049,12 +1117,21 @@ export class FastAgent {
             details: { toolCalls: turn.toolCalls.length, text: String(turn.text ?? "").slice(0, 200) }
           });
           messages.push({ role: "assistant", content: turn.text || "(cut off)" });
+          // WHAT OVERRAN WAS THINKING, SO THAT IS WHAT THIS NAMES.
+          //
+          // This message used to ask for "the smallest arguments that do the
+          // job". Measured, that changed nothing — truncation continued at 3 of
+          // 6 with it against 3 of 8 without — because the arguments were never
+          // the problem: in every truncated sample the turn carried ZERO tool
+          // calls and reasoning had consumed the entire ceiling. The retry now
+          // gets a bigger ceiling too; this says what to do with it.
           messages.push({
             role: "user",
-            content: "[SYSTEM] Your last turn hit the output token limit and was cut off partway, so " +
-              "nothing in it was used — no tool ran and the text was discarded. Do that step again and " +
-              "keep it SHORT: if you were answering, give the whole answer in a few sentences; if you were " +
-              "calling a tool, make the call with the smallest arguments that do the job."
+            content: "[SYSTEM] Your last turn was cut off at the output token limit before you finished, so " +
+              "nothing in it was used — no tool ran and the text was discarded. You had spent the whole " +
+              "budget THINKING, not writing. You have more room now, but do not plan the entire task again: " +
+              "decide only the very next action from what you can already see, and call the tool. You can " +
+              "work the rest out on the following steps."
           });
           continue;
         }
@@ -1484,7 +1561,7 @@ export class FastAgent {
     }
   }
 
-  async _callModel(messages, remainingMs) {
+  async _callModel(messages, remainingMs, maxTokens = MODEL_OUTPUT_CEILING) {
     // One retry, because the endpoint this runs against intermittently drops a
     // connection and losing a whole task to that is far more expensive than
     // sending the request again.
@@ -1495,15 +1572,20 @@ export class FastAgent {
           messages,
           tools: this.toolset.definitions,
           temperature: 0.2,
-          // A CEILING IS NOT A COST. Providers bill the tokens actually
-          // generated, so raising this is free for every turn that does not need
-          // it — and 2048 was demonstrably too low: a final answer listing a
-          // handful of WhatsApp messages hit it and was cut off mid-sentence
-          // (2,062 output tokens against the 2,048 ceiling). The truncation
-          // handling above is the real fix, because any ceiling can be reached;
-          // this just stops it being reached by ordinary answers.
-          maxTokens: 4096,
-          timeoutMs: Math.max(15000, Math.min(90000, remainingMs)),
+          // See MODEL_OUTPUT_CEILING. Raised twice now for the same reason and
+          // measured both times: 2,048 cut off a final answer mid-sentence, and
+          // 4,096 sat below the median of the reasoning distribution it had to
+          // contain. The truncation handling above is still the real backstop,
+          // because any ceiling can be reached.
+          maxTokens,
+          // THE HARD CAP USED TO BE 90 SECONDS, AND IT MADE THE RETRY ABOVE
+          // UNREACHABLE. At the rate this endpoint generates (~107 tokens/s,
+          // measured), the 16,384-token retry ceiling needs about 153 seconds —
+          // so a retry that used its budget was aborted before it could deliver,
+          // and the fix would have measured as no fix at all. The transport now
+          // distinguishes a silent socket from a slow one (STREAM_IDLE_TIMEOUT_MS),
+          // so the only honest total bound left is the run's own budget.
+          timeoutMs: Math.max(15000, remainingMs),
           signal: this.signal,
           onTextDelta: (delta) => { this._emit({ type: "AGENT_DELTA", details: { text: delta } }); },
           // THE MODEL'S SCRATCH WORK, ON ITS OWN CHANNEL AND UNDER ITS OWN NAME.

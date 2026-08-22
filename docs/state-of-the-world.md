@@ -556,7 +556,18 @@ Two live bugs fell out of the pass:
    tool calls — the arguments of a cut-off call are a JSON object the provider
    stopped writing, and this loop runs `type`, `run` and `click` straight onto
    the user's machine. Retried once, then PARTIALLY_COMPLETED with the fragment
-   and a warning. `maxTokens` 2,048 → 4,096; a ceiling is not a cost.
+   and a warning. `maxTokens` 2,048 → 4,096.
+
+   **"A ceiling is not a cost" used to be written here as a general licence, and
+   it is wrong.** It is true about the invoice — the provider bills what it
+   generates — and false about behaviour. Raising the per-turn ceiling to 16,384
+   for every turn, to fix a drawing request that was truncating, was measured
+   over a full 69-run eval on 21 Aug 2026: pass rate 100% → 91%, six budget
+   breaches, `draw-shape-in-paint` 3/3 → 1/3 at 3× the tokens and 2× the steps.
+   Given more room a reasoning model thinks longer and then ATTEMPTS MORE — it
+   elaborated instead of drawing one circle and ran out of time before saving.
+   The ceiling now stays at the baseline 4,096 and the extra room goes only to a
+   turn that has ALREADY been cut off (`MODEL_OUTPUT_CEILING_RETRY` 16,384).
 
 2. **An answer that simply stops.** A second run ended on a colon with
    `finish_reason: "stop"` and 1,359 of 4,096 tokens — the model announced a list

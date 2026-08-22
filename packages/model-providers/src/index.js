@@ -101,6 +101,15 @@ export function validateSchema(data, schema) {
 // reasoning was parsed off the wire and thrown away, and the chat surface said
 // "Thinking…" from the moment a request was sent — including the 631ms in which
 // nothing had come back at all.
+// How long a stream may say NOTHING before it is treated as dead.
+//
+// Not a total duration — see the timer in sendChatOnce for why that question is
+// the wrong one on a reasoning endpoint. Measured against this provider: first
+// byte at 631ms, first reasoning token at 1,430ms, and continuous deltas after
+// that. Forty-five seconds of complete silence is not a slow model, it is a
+// socket nobody is going to write to again.
+const STREAM_IDLE_TIMEOUT_MS = 45000;
+
 export async function openAiCompatibleChat({
   baseUrl,
   apiKey,
@@ -111,6 +120,9 @@ export async function openAiCompatibleChat({
   temperature = 0.2,
   maxTokens = 2048,
   timeoutMs = 60000,
+  // Injectable so a test can prove the silence rule without waiting 45 seconds
+  // for it. A rule nobody can afford to test is a rule nobody has tested.
+  idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS,
   signal = null,
   onTextDelta = null,
   onReasoningDelta = null,
@@ -181,7 +193,7 @@ export async function openAiCompatibleChat({
   const deadline = Date.now() + timeoutMs;
   const attemptOptions = {
     baseUrl, apiKey, model, headers, wireMessages, tools,
-    temperature, maxTokens, stream, onTextDelta, onReasoningDelta, signal, deadline
+    temperature, maxTokens, stream, onTextDelta, onReasoningDelta, signal, deadline, idleTimeoutMs
   };
 
   let attempt = 0;
@@ -225,10 +237,39 @@ export async function openAiCompatibleChat({
  */
 async function sendChatOnce({
   baseUrl, apiKey, model, headers, wireMessages, tools,
-  temperature, maxTokens, stream, onTextDelta, onReasoningDelta, signal, deadline
+  temperature, maxTokens, stream, onTextDelta, onReasoningDelta, signal, deadline, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS
 }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Math.max(1000, deadline - Date.now()));
+  // A TOTAL-DURATION TIMEOUT CANNOT TELL THINKING FROM A DEAD SOCKET.
+  //
+  // This was one timer, armed when the request went out and never rearmed. On a
+  // reasoning endpoint that is the wrong question: the model streams its whole
+  // deliberation before it writes a single tool call, so a turn that thinks for
+  // 110 seconds and a connection that died at the first byte look IDENTICAL to a
+  // clock that only knows how long the request has been open — and the healthy
+  // one was aborted mid-stream, with bytes still arriving.
+  //
+  // Measured 21 Aug 2026: one drawing decision streamed 11,891 reasoning tokens
+  // over 111.6s, against a ceiling the loop capped at 90s. The abort surfaces as
+  // `fetch failed`, `isRetryableProviderError` says AbortError is retryable, and
+  // the loop's own two-attempt retry then spends another 90s — which is the
+  // 144-180s "stall at 0 steps" the briefs have been attributing to the user's
+  // phone tethering. Tethering makes it fire more often. It does not cause it.
+  //
+  // What actually separates a dead connection from a slow one is SILENCE, so
+  // that is what this measures now: rearmed on every chunk, with the caller's
+  // deadline still there as an absolute backstop. A stream that is delivering is
+  // never killed for taking its time; one that has gone quiet still dies.
+  const hardTimer = setTimeout(() => controller.abort(), Math.max(1000, deadline - Date.now()));
+  let idleTimer = null;
+  const armIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  };
+  const clearTimers = () => {
+    clearTimeout(hardTimer);
+    clearTimeout(idleTimer);
+  };
   const onOuterAbort = () => controller.abort();
   if (signal) {
     if (signal.aborted) controller.abort();
@@ -277,6 +318,11 @@ async function sendChatOnce({
 
     // Server-sent events. Text deltas go straight out to the caller; tool-call
     // deltas arrive in fragments keyed by index and are reassembled here.
+    // Only from here on: before the body exists there is nothing to be idle
+    // BETWEEN, and a non-streaming response (handled above) delivers in one
+    // piece, so silence is not evidence about it either. Both of those stay on
+    // the hard deadline alone.
+    armIdle();
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -294,6 +340,8 @@ async function sendChatOnce({
     try {
     while (!done) {
       const { value, done: streamDone } = await reader.read();
+      // Bytes arrived, so the connection is alive whatever the clock says.
+      armIdle();
       if (streamDone) break;
       buffer += decoder.decode(value, { stream: true });
       let boundary = buffer.indexOf("\n");
@@ -367,7 +415,7 @@ async function sendChatOnce({
       .filter((call) => call.name);
     return { text, reasoning, toolCalls, finishReason, usage };
   } finally {
-    clearTimeout(timeout);
+    clearTimers();
     if (signal) signal.removeEventListener?.("abort", onOuterAbort);
   }
 }

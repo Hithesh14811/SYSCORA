@@ -723,7 +723,12 @@ test("a cut-off answer is asked for again rather than published as the result", 
   assert.doesNotMatch(outcome.message, /are:$/, "the fragment must not be the final word");
 });
 
-test("a truncated turn is asked to be shorter, and says nothing was used", async () => {
+// This used to assert the nudge said "keep it SHORT … the smallest arguments
+// that do the job". That instruction was measured against the live endpoint and
+// changed nothing — truncation continued at 3 of 6 with it against 3 of 8
+// without — because the arguments were never what overran. What the retry must
+// do now is name thinking as the cause and ask for the NEXT action only.
+test("a truncated turn is told what actually overran, and that nothing was used", async () => {
   const provider = scriptedProvider([
     { text: "The last two messages are:", finishReason: "length" },
     { text: "Done." }
@@ -732,9 +737,10 @@ test("a truncated turn is asked to be shorter, and says nothing was used", async
   await agent.run("read them");
 
   const nudge = provider.seen.at(-1).map((message) => String(message.content ?? "")).join("\n");
-  assert.match(nudge, /hit the output token limit/);
+  assert.match(nudge, /output token limit/);
   assert.match(nudge, /nothing in it was used/);
-  assert.match(nudge, /keep it SHORT/);
+  assert.match(nudge, /THINKING/, "the retry must name the half of the budget that actually overran");
+  assert.match(nudge, /do not plan the entire task again/i);
 });
 
 // HALF A DECISION IS NOT A DECISION. The arguments of a cut-off tool call are a
@@ -771,6 +777,118 @@ test("truncated twice is PARTIALLY_COMPLETED, with the fragment and a warning", 
   assert.equal(outcome.status, "PARTIALLY_COMPLETED");
   assert.match(outcome.message, /aa dekhen/, "what did arrive is still worth showing");
   assert.match(outcome.message, /CUT OFF/);
+});
+
+// ---- The output ceiling is shared with the model's thinking -----------------
+//
+// `max_tokens` bounds reasoning AND the tool call together, and reasoning is
+// emitted first, so a turn that deliberates past the ceiling never reaches the
+// call. Measured against the live endpoint on 21 Aug 2026 with one real drawing
+// decision (scripts/probe-reasoning-budget.mjs, n=8): at a 4,096 ceiling 3 of 8
+// turns came back `length` carrying ZERO tool calls, and the unconstrained
+// reasoning distribution was 1,062 · 1,943 · 2,517 · 5,219 · 6,350 · 6,626 ·
+// 6,983 · 11,891 — a median of 6,350, well above the ceiling meant to hold it.
+//
+// The retry that existed asked for "the smallest arguments that do the job",
+// which argued with the wrong half of the budget and measured as no
+// improvement. These two tests pin the mechanism instead of the wording.
+function ceilingRecordingProvider(turns) {
+  const ceilings = [];
+  const timeouts = [];
+  return {
+    ceilings,
+    timeouts,
+    supportsChat: () => true,
+    async chat({ maxTokens, tools, timeoutMs }) {
+      assert.ok(Array.isArray(tools), "the loop must send the tool definitions");
+      ceilings.push(maxTokens);
+      timeouts.push(timeoutMs);
+      const turn = turns.shift() ?? { text: "Done." };
+      return {
+        text: turn.text ?? "",
+        toolCalls: [],
+        finishReason: turn.finishReason ?? "stop"
+      };
+    }
+  };
+}
+
+// THE ORDINARY TURN KEEPS THE BASELINE CEILING. This assertion is the scar from
+// the first attempt at the fix, which raised the ceiling for EVERY turn: a
+// reasoning model given more room thinks longer and then attempts more, and a
+// full eval measured draw-shape-in-paint falling from 3/3 to 1/3 at 3x the
+// tokens, app-type doubling its steps, and the pass rate going 100% → 91%.
+// Raising this again without re-running the eval will reproduce that.
+test("an ordinary turn is not given more room than the baseline measured", async () => {
+  const provider = ceilingRecordingProvider([{ text: "Done." }]);
+  await new FastAgent({ provider, toolset: stubToolset(), maxSteps: 4 }).run("say hello");
+
+  assert.equal(
+    provider.ceilings[0], 4096,
+    "the eval baseline was recorded at 4,096; a turn that has not truncated must not be given more"
+  );
+});
+
+test("the retry ceiling clears the measured reasoning median", async () => {
+  const provider = ceilingRecordingProvider([
+    { text: "", finishReason: "length" },
+    { text: "Done." }
+  ]);
+  await new FastAgent({ provider, toolset: stubToolset(), maxSteps: 6 }).run("draw a detailed car");
+
+  // 6,350 is the measured p50 of reasoning alone for a real drawing decision. A
+  // retry at or under it re-truncates on most of the distribution it exists to
+  // hold, which is what made the retry useless before.
+  assert.ok(
+    provider.ceilings[1] > 6350,
+    `the retry must clear the measured reasoning median of 6,350, got ${provider.ceilings[1]}`
+  );
+});
+
+test("a truncated turn is retried with MORE room, not a request to be brief", async () => {
+  const provider = ceilingRecordingProvider([
+    // Truncated with no tool calls at all: reasoning ate the whole budget.
+    { text: "", finishReason: "length" },
+    { text: "Done." }
+  ]);
+  await new FastAgent({ provider, toolset: stubToolset(), maxSteps: 6 }).run("draw a detailed car");
+
+  // Not an assertion on the CALL COUNT: a turn that comes back with no tool
+  // calls also trips the no-evidence backstop, which asks again. What matters is
+  // the ceiling on the call that follows the truncation.
+  assert.ok(provider.ceilings.length >= 2, "the truncated turn must be retried");
+  assert.ok(
+    provider.ceilings[1] > provider.ceilings[0],
+    `the retry after a truncation must raise the ceiling — got ${provider.ceilings[0]} then ${provider.ceilings[1]}. ` +
+    "Asking the model to be shorter was measured to change nothing, because what overran was its reasoning."
+  );
+});
+
+// A FIX CAN ITSELF BE UNREACHABLE.
+//
+// The retry above is allowed 16,384 output tokens. This endpoint generates at
+// roughly 107 tokens/second (measured: 11,891 reasoning tokens in 111.6s), so
+// using that budget takes about 153 seconds — and the loop used to cap every
+// request at 90. The retry would have been aborted before it could deliver, and
+// the whole fix would have measured as no fix at all.
+test("the request deadline is not shorter than the retry ceiling needs", async () => {
+  const provider = ceilingRecordingProvider([
+    { text: "", finishReason: "length" },
+    { text: "Done." }
+  ]);
+  await new FastAgent({
+    provider, toolset: stubToolset(), maxSteps: 6, maxElapsedMs: 6 * 60 * 1000
+  }).run("draw a detailed car");
+
+  const retryCeiling = provider.ceilings[1];
+  // 90 tokens/s is a deliberately pessimistic floor against the 107 measured, so
+  // this stays true on a slower day rather than only on the day it was written.
+  const secondsNeeded = retryCeiling / 90;
+  assert.ok(
+    provider.timeouts[1] >= secondsNeeded * 1000,
+    `a ${retryCeiling}-token ceiling needs ~${Math.round(secondsNeeded)}s to generate, ` +
+    `but the request was given ${Math.round(provider.timeouts[1] / 1000)}s`
+  );
 });
 
 test("an ordinary finish reason is not mistaken for truncation", () => {
