@@ -62,6 +62,18 @@ function inferContentType(filePath) {
 export function startServer({ port = 4317, basePath = process.cwd(), runtime: injectedRuntime = null, warmHost = true } = {}) {
   const runtime = injectedRuntime ?? createRuntime(basePath);
   const intentRuns = new Map();
+  // THE ONE PHYSICAL MOUSE, CLAIMED.
+  //
+  // Not derived from `intentRuns`: that map is filled by a callback the runtime
+  // chooses when to invoke, and one whole route never filled it at all. See the
+  // claim taken in POST /api/intents. Null means nothing is running.
+  let activeIntent = null;
+  const releaseIntentClaim = (held) => {
+    // Identity, not truthiness. Releasing "whatever is active" would let a
+    // finishing run unlock a DIFFERENT run that had since taken the claim —
+    // which is the classic way a mutex stops being one.
+    if (activeIntent === held) activeIntent = null;
+  };
   // "ANSWERED" belongs here: a conversational reply is a settled result the
   // client should stop polling on, even though nothing was executed.
   const terminalStates = new Set(["COMPLETED", "COMPLETED_WITH_WARNINGS", "ANSWERED", "FAILED", "TIMED_OUT", "CANCELLED", "ROLLED_BACK", "DENIED", "PLAN_REJECTED"]);
@@ -325,17 +337,37 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         // describe half of what happened. The chat surface already turns its
         // send button into a stop button while a request runs; this is the same
         // rule at the API, where nothing else was enforcing it.
-        const active = [...intentRuns.values()].find((run) => !run.settled);
+        // THE CLAIM IS TAKEN HERE, NOT WHERE THE RUN ANNOUNCES ITSELF.
+        //
+        // This used to look for an unsettled entry in `intentRuns`, and there
+        // were two ways past it. `?sync=true` called `runtime.submitIntent`
+        // directly and never registered at all, so any number of synchronous
+        // requests ran at once, each driving the same physical mouse. And even
+        // on the asynchronous route the entry is created by `onSessionStarted`,
+        // a callback the runtime invokes when it gets round to it — so two
+        // requests arriving close together could both read an empty map before
+        // either had registered.
+        //
+        // Both are the same bug: the lock was derived from the runtime's own
+        // bookkeeping instead of being taken by the thing doing the accepting.
+        // `activeIntent` is set HERE, before any await, which is what makes it
+        // a lock rather than a description.
+        const active = activeIntent ?? [...intentRuns.values()].find((run) => !run.settled);
         if (active) {
           sendJson(response, 409, {
             error: "SYSCORA is already working on something.",
             message: "There is one screen and one pointer, so requests run one at a time. " +
               "Stop the running request first, or wait for it to finish.",
-            sessionId: active.sessionId,
-            statusUrl: `/api/intents/${active.sessionId}/status`
+            sessionId: active.sessionId ?? null,
+            // Only when there is one to point at: a run that has not announced
+            // its session yet has no status page, and "/api/intents/null/status"
+            // is a worse answer than none.
+            ...(active.sessionId ? { statusUrl: `/api/intents/${active.sessionId}/status` } : {})
           });
           return;
         }
+        const held = { at: Date.now(), sessionId: null };
+        activeIntent = held;
         const runOptions = {
           workspacePath: basePath,
           autoApprove: payload.autoApprove === true,
@@ -353,12 +385,25 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
             : []
         };
         if (requestUrl.searchParams.get("sync") === "true") {
-          const session = await runtime.submitIntent(payload.text, runOptions);
-          const legacy = buildSessionResponse(session);
-          sendJson(response, 200, {
-            envelope: buildEnvelope("intent_response", legacy, parsed.requestId),
-            ...legacy
-          });
+          // `finally`, not a release after the send: a run that throws must not
+          // leave the claim held, or one failed tool turns "one at a time" into
+          // "one ever" and every later request is answered 409 by a daemon that
+          // is doing nothing at all. That exact shape has already happened here
+          // once — an eval task that hit its timeout did not stop its session,
+          // and two whole rounds recorded as zeros behind a 409.
+          try {
+            const session = await runtime.submitIntent(payload.text, {
+              ...runOptions,
+              onSessionStarted: (sessionId) => { held.sessionId = sessionId; }
+            });
+            const legacy = buildSessionResponse(session);
+            sendJson(response, 200, {
+              envelope: buildEnvelope("intent_response", legacy, parsed.requestId),
+              ...legacy
+            });
+          } finally {
+            releaseIntentClaim(held);
+          }
           return;
         }
 
@@ -370,19 +415,26 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         // reach the agent loop mid-step; the loop checks it between steps and
         // the in-flight model request is aborted with it.
         const canceller = new AbortController();
-        const runPromise = Promise.resolve(runtime.submitIntent(payload.text, {
+        // An async wrapper rather than Promise.resolve: a runtime that throws
+        // SYNCHRONOUSLY would escape before `.finally` below was ever attached,
+        // and the claim taken above would be held by a run that never started.
+        const runPromise = (async () => runtime.submitIntent(payload.text, {
           ...runOptions,
           signal: canceller.signal,
           onSessionStarted: (sessionId) => {
             submittedSessionId = sessionId;
+            held.sessionId = sessionId;
             ensureRun(sessionId).canceller = canceller;
             resolveStarted(sessionId);
           }
-        }));
+        }))();
         runPromise.then((session) => settleRun(session.sessionId, session)).catch((error) => {
           if (submittedSessionId) settleRun(submittedSessionId, null, error);
           rejectStarted(error);
-        });
+        // Released when the RUN ends, not when this handler returns — the
+        // asynchronous route answers 202 immediately and the machine is still
+        // being driven long after that.
+        }).finally(() => releaseIntentClaim(held));
         const sessionId = await started;
         sendJson(response, 202, {
           status: "RUNNING",
