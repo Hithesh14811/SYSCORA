@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRuntime, loadCapabilityPlugins } from "./runtime-factory.js";
-import { ValidationError } from "../../../packages/shared-types/src/domain.js";
+import { PROTOCOL_VERSION, ValidationError } from "../../../packages/shared-types/src/domain.js";
 import { AgentRuntime } from "../../../packages/agent-runtime/src/index.js";
 import { buildEnvelope, parseRequestBodyWithEnvelope } from "../../../packages/protocol/src/envelope.js";
 import { buildSessionResponse } from "../../../packages/protocol/src/session-protocol.js";
@@ -453,12 +453,43 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
       // carries a `say`, which reaches the user about a second in, before the
       // tool it describes has finished. One request, not two.
 
+      // READING A LIST SHOULD NOT DESERIALISE EVERY SESSION.
+      //
+      // This called `sessionStore.list()`, which parses every stored session in
+      // full, and then `buildSessionResponse` VALIDATED every one of them.
+      // Measured on the real installation, 22 Aug 2026, 2,234 sessions:
+      // `list()` 1,238ms against `listSummaries()` 390ms, and a response body
+      // of **73.0 MB** — to draw a menu.
+      //
+      // `listSummaries` was written for exactly this, in the workstream that
+      // found the problem, and then nothing called it: the only callers in the
+      // tree were its own tests. That is the ninth time this codebase has
+      // produced correct machinery nothing reaches.
+      //
+      // The default is now the summary, bounded. `?full=true` still returns
+      // whole sessions because an API consumer may genuinely want them — but it
+      // is bounded too, because the unbounded version is what 73 MB looks like.
       if (request.method === "GET" && requestUrl.pathname === "/api/sessions") {
-        const sessions = await runtime.sessionStore.list();
-        const legacy = buildSessionResponse({ sessions });
+        const limit = Math.min(1000, Math.max(1, Number(requestUrl.searchParams.get("limit") ?? 200) || 200));
+        if (requestUrl.searchParams.get("full") === "true") {
+          const sessions = (await runtime.sessionStore.list()).slice(0, limit);
+          const legacy = buildSessionResponse({ sessions });
+          sendJson(response, 200, {
+            envelope: buildEnvelope("sessions_response", legacy),
+            ...legacy
+          });
+          return;
+        }
+        const sessions = await runtime.sessionStore.listSummaries({ limit });
         sendJson(response, 200, {
-          envelope: buildEnvelope("sessions_response", legacy),
-          ...legacy
+          envelope: buildEnvelope("sessions_response", { sessions }),
+          // Not through buildSessionResponse: that validates each entry as a
+          // full ExecutionSession, and a summary deliberately is not one.
+          // Saying so in the payload is cheaper than a consumer discovering it.
+          protocolVersion: PROTOCOL_VERSION,
+          summary: true,
+          limit,
+          sessions
         });
         return;
       }

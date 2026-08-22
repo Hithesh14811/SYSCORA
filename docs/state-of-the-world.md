@@ -564,6 +564,40 @@ working because the Baseten fallback is healthy, which it had not been until
 today. This is the first time the failover chain has had somewhere real to fail
 over TO, and it is now load-bearing rather than theoretical.
 
+### Fixed 22 Aug 2026: the session list was a 73 MB response to draw a menu
+
+`GET /api/sessions` called `sessionStore.list()`, which parses every stored
+session in full, and then `buildSessionResponse` VALIDATED each one. Measured on
+the real installation, **2,234 sessions**:
+
+```
+  listSummaries()   390ms
+  list()          1,238ms      response body 73.0 MB
+```
+
+**`listSummaries` had been written for exactly this problem, in the workstream
+that found it, and then nothing called it** — the only callers in the tree were
+its own unit tests. Ninth instance of correct machinery nothing reaches.
+
+The default is now the summary, bounded to 200 and clamped to 1,000; `?full=true`
+still returns whole sessions and is bounded too. Measured end to end against the
+real store, through the running daemon:
+
+| request | before | after |
+|---|---|---|
+| `GET /api/sessions` | 73.0 MB | **94,859 bytes, 163ms** |
+| `GET /api/sessions?limit=5` | — | 2,653 bytes |
+| `GET /api/sessions?full=true&limit=2` | — | 214,236 bytes, 892ms |
+
+Roughly **790× smaller**. `npm run mvp:status` took the same change, with
+`--full` for the old behaviour.
+
+**Found on the way, not fixed:** `audit.sqlite` is **367 MB** and
+`semantic-state.sqlite` is **370 MB** in the state directory. The 256 KB per-row
+cap added in W0 protects `sessions.sqlite` (78.8 MB for 2,234 sessions) and
+nothing else. `semantic-state` belongs to the offline pipeline the eval reports
+reached 0 times, so 370 MB of it is worth explaining before it is capped.
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current
@@ -574,11 +608,32 @@ over TO, and it is now load-bearing rather than theoretical.
 - **There is still no second VENDOR.** Two endpoints serving the same DeepSeek
   family survive an endpoint outage, not a bad model release.
 - **The leaked `primaryApiKey` still needs rotating by the user.**
-- **A declined irreversible action still settles COMPLETED.** The message is
-  honest — "it was not sent" — but the status beside it is not, and a surface
-  showing a green tick over that sentence is misleading. Not changed here:
-  settle semantics are deliberate (`agent-runtime` says the model's own words
-  carry what was and was not achieved) and changing them is not a one-line fix.
+- ~~**A declined irreversible action still settles COMPLETED.**~~ **Fixed, and
+  this entry was stale.** Checked end to end on 22 Aug 2026: the loop settles
+  `DECLINED` keyed on the `refusedByUser` RECEIPT rather than on the model's
+  words (`fast-agent/src/index.js`), `agent-runtime` maps it onto a COMPLETED
+  runtime state on purpose — a user saying no is a run that ended properly,
+  nothing went wrong and nothing should be coloured red — and `apps/desktop/demo.js`
+  renders it. No skill is offered from a declined run, which is right: a route
+  whose irreversible step was refused is exactly the one that must not be
+  replayed for free.
+
+- ~~**`keyboard.press` types the key's NAME and reports success.**~~ **Fixed 22
+  Aug 2026.** SendKeys types anything that is not its own notation literally, so
+  `keys: "enter"` with no `chord` typed e-n-t-e-r and returned
+  `performed: true` — a WhatsApp box left holding `syscora-undo-mt409iu6enter`
+  with nothing sent. `WindowsAdapter.keyboardAction` translates the name into a
+  chord, so this only ever bit a caller reaching the host directly; the host now
+  refuses anyway, because it must be honest about what it did whoever asked.
+  The guard is the shape — one character is a real keystroke, notation is a
+  brace group anywhere or a modifier AT THE START — and that last clause is the
+  whole subtlety: `+` is both SendKeys' shift modifier and how people spell a
+  combination, so a first version testing for a modifier anywhere let `ctrl+s`
+  through, which SendKeys delivers as `ctrlS`. **Caught by the probe, not by
+  reasoning.** `node scripts/probe-key-refusal.mjs` drives the real host against
+  its own scratch Notepad and reads the document back: 6 of 6 cases correct, and
+  the single-character case shows the document CHANGING, which is what proves
+  the check is not vacuous.
 
 ## What this is
 

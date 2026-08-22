@@ -891,6 +891,46 @@ test("the UIA cache request prefetches one element, not every element's subtree"
   assert.match(assignment, /TreeScope\]::Element/);
 });
 
+// ---- "enter" is not a key press, it is five letters -------------------------
+
+// SendKeys types anything that is not its own notation LITERALLY, so
+// `keyboard.press` with keys "enter" and no chord typed e-n-t-e-r into the
+// window and returned `performed: true`. Observed live: a WhatsApp message box
+// holding "syscora-undo-mt409iu6enter", nothing sent, and a receipt saying the
+// keystroke had been delivered. A false-success generator in the input path.
+//
+// The guard is the SHAPE — a single character is a real keystroke, and notation
+// is a brace group anywhere or a modifier symbol AT THE START. That last part is
+// the subtlety: `+` is both SendKeys' shift modifier and how people spell a
+// combination, so a first version testing for a modifier ANYWHERE let "ctrl+s"
+// through, which SendKeys delivers as "ctrlS". Caught by
+// `node scripts/probe-key-refusal.mjs`, which drives the real host against its
+// own scratch Notepad and reads the document back — all six cases pass, and the
+// single-character case shows the document CHANGING, which is what proves the
+// check is not vacuous.
+//
+// This pins the shape. It cannot press a key; the probe does that.
+test("the host refuses a keys value SendKeys would type instead of press", () => {
+  const host = readFileSync(new URL("../../os-adapters/windows-host/restore-host.ps1", import.meta.url), "utf8");
+  const start = host.indexOf('"keyboard.press"');
+  assert.ok(start >= 0, "keyboard.press is where a key press either happens or is faked");
+  const body = host.slice(start, host.indexOf("\n    \"clipboard.read\"", start));
+  const code = body.split("\n").filter((line) => !/^\s*#/.test(line)).join("\n");
+
+  assert.match(code, /keys-would-be-typed-literally/,
+    "the refusal must be reachable — without it SendKeys types the key's NAME and reports success");
+  const guard = /if\(\$keys\.Length -gt 1 -and (.+)\)\{/.exec(code)?.[1] ?? "";
+  assert.ok(guard, "the guard must test the length as well as the shape: one character IS a keystroke");
+  assert.ok(
+    /\^\[\\\^%~\\\+\]/.test(guard) || /'\^\[/.test(guard),
+    `a modifier only counts as notation when it LEADS, or "ctrl+s" is typed as six characters; found: ${guard}`
+  );
+  assert.ok(
+    !/\[\\\{\\\}\\\^%~\\\+\]/.test(guard),
+    "testing for a modifier ANYWHERE lets ctrl+s through — that was the first version of this guard"
+  );
+});
+
 // ---- A third of every look at the screen was one PowerShell idiom ------------
 
 // `Get-Process -Id` reads like a lookup and is an enumeration: it walks every

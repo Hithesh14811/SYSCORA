@@ -2246,6 +2246,47 @@ function Invoke-Operation($operation, $params) {
         try{ $chord=[M4Native]::Chord([string]$params.chord) }catch{ $chord=$null }
       }
       if($null -eq $chord){
+        # "enter" IS NOT A KEY PRESS, IT IS FIVE LETTERS.
+        #
+        # SendKeys types anything that is not its own notation LITERALLY. So a
+        # caller asking to press "enter" got e-n-t-e-r typed into the window and
+        # `performed = true` back. Observed live: a WhatsApp message box left
+        # holding "syscora-undo-mt409iu6enter", nothing sent, and a receipt
+        # saying the keystroke had been delivered. That is a false-success
+        # generator sitting in the input path, which is the one thing this
+        # codebase refuses to have.
+        #
+        # WindowsAdapter.keyboardAction translates "enter" to a chord before it
+        # gets here, so this only bites a caller that reaches the host directly —
+        # and the host must be honest about what it did no matter who asked.
+        #
+        # The test is the SHAPE, not a list of key names: a single character is a
+        # real keystroke, and SendKeys notation is a brace group anywhere or a
+        # modifier symbol AT THE START. Anything else multi-character is plain
+        # text, so the caller either meant a key (pass `chord`) or meant to type
+        # (use keyboard.type). Enumerating key names would be a race against the
+        # next synonym; this cannot be.
+        #
+        # "AT THE START" is the whole subtlety, and the first version of this
+        # guard got it wrong: `+` is both SendKeys' shift modifier and the way
+        # people spell a combination, so testing for a modifier ANYWHERE let
+        # "ctrl+s" through — which SendKeys reads as "type c, t, r, l, then
+        # shift+s" and delivers as "ctrlS". Measured by
+        # scripts/probe-key-refusal.mjs, which caught exactly that. This is the
+        # same test normalizeSendKeys and chordSpec already use to decide
+        # whether a caller wrote notation, and it must stay the same test.
+        if($keys.Length -gt 1 -and $keys -notmatch '[\{\}]' -and $keys -notmatch '^[\^%~\+]'){
+          return @{
+            performed=$false
+            reason="keys-would-be-typed-literally"
+            # The lesson goes in the RESULT, where it is read at the moment it
+            # matters and costs nothing the rest of the time.
+            message="SendKeys would type '$keys' as $($keys.Length) literal characters, not press a key. Pass `chord` (for example chord='enter' or chord='ctrl+s') to press a key, or use keyboard.type to type text."
+            keys=$keys
+            windowId=$inputWindowId
+            foreground=$focus
+          }
+        }
         [System.Windows.Forms.SendKeys]::SendWait($keys)
         return @{performed=$true;method="sendkeys";keys=$keys;windowId=$inputWindowId;foreground=$focus}
       }
