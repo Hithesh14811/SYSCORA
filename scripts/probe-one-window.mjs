@@ -30,6 +30,36 @@ const result = await toolset.execute("screen", target);
 const elapsed = Date.now() - started;
 
 const rendered = String(result?.text ?? JSON.stringify(result));
+
+// --sanitized: what would actually leave this machine.
+//
+// The reading above is the RAW one. What the model receives has been through
+// sanitizeExternalContext, and the only honest way to check that redaction
+// works is to run a real window's real contents through it — a synthetic test
+// string proves the regex, not the pipeline.
+//
+// It refuses to print when anything credential-shaped survives, by a rule
+// written HERE rather than imported from the sanitizer: a checker that shares
+// the sanitizer's own definition of "secret" would agree with it about a key
+// they both miss, and print it.
+if (process.argv.includes("--sanitized")) {
+  const { sanitizeExternalContext } = await import("../packages/shared-types/src/external-context.js");
+  const sent = sanitizeExternalContext(rendered);
+  const suspicious = (sent.match(/[A-Za-z0-9_.-]{24,}/g) ?? [])
+    .filter((run) => /[a-z]/.test(run) && /[A-Z]/.test(run) && /\d/.test(run));
+  console.log(`\n=== what would reach the model — ${sent.length} chars, ~${Math.round(sent.length / 4)} tokens ===`);
+  console.log(`    redactions: ${(sent.match(/\*\*\*REDACTED\*\*\*/g) ?? []).length}`);
+  console.log(`    credential-shaped runs still present: ${suspicious.length}`);
+  if (suspicious.length) {
+    console.log("\n    REFUSING TO PRINT — something key-shaped survived sanitization.");
+    console.log(`    lengths of what survived: ${suspicious.map((run) => run.length).join(", ")}\n`);
+  } else {
+    console.log("");
+    console.log(sent.slice(0, 3000));
+  }
+  adapter.close?.();
+  process.exit(suspicious.length ? 1 : 0);
+}
 // Characters ÷ 4, the same approximation measure-prompt-cost.mjs uses, so the
 // two numbers can be compared. It is a ratio, not a tokenizer.
 console.log(`\n=== what the model is handed for ${JSON.stringify(target)} — ` +

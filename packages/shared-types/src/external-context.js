@@ -1,5 +1,43 @@
 import { redactSensitiveData } from "./redaction.js";
 
+// WHAT THE AGENT READS OFF A WINDOW IS ALSO WHAT IT SENDS TO THE MODEL.
+//
+// Found live, 22 Aug 2026. The user moved a model API key between their devices
+// through a WhatsApp chat, so it sat in the chat list PREVIEW — one of the 131
+// elements in a `screen` reading of WhatsApp — and every run that looked at
+// WhatsApp posted it to the model endpoint. The vendor-prefix list below caught
+// none of it, because the key began `rn37EXgy.` and Baseten is not on the list.
+// Nor would the next vendor be: that list is a race against an industry that
+// invents a new prefix every month, and this project's own rule is that a guard
+// enumerating spellings loses to the next spelling.
+//
+// So this matches the SHAPE instead — the one property every API key has and no
+// English does: a long unbroken run of letters and digits carrying upper case
+// AND lower case AND a digit at once.
+//
+// THE THRESHOLD IS SET BY WHAT MUST SURVIVE, NOT BY WHAT MUST BE CAUGHT.
+// Over-redaction has cost this project far more than under-redaction: it typed
+// `***REDACTED_EMAIL***` into a login form, typed `%USERPROFILE%` into
+// PowerShell as a relative path and burned a whole task budget, and destroyed
+// the cost metrics of 1,673 sessions with `/token/i`. So:
+//
+//   separators END a run  — `C:\Users\hithe\Documents\Project2024\src` is seven
+//     short runs, not one long one, and file paths are the thing this must
+//     never touch. Base64 secrets containing `/` are missed as a result. That
+//     is the deliberate side of the trade: a missed secret is a risk, a
+//     mangled path is a broken product.
+//   all THREE character classes — a UUID and a git hash are single-case hex,
+//     so neither can ever match however long it is.
+//   28 characters — `ChatListItemGridViewItem2` is 25, and identifiers of that
+//     shape are what UI Automation names its controls with.
+//
+// Known limits, stated rather than discovered later: a 32-character
+// single-case hex key (Azure) is indistinguishable from an MD5 by shape alone
+// and is NOT caught, and neither is a secret shorter than 28 characters that
+// carries no known prefix. tests/unit/secret-shapes.test.js pins both tables.
+const SECRET_RUN = /[A-Za-z0-9_-]{28,}/g;
+const looksLikeCredential = (run) => /[a-z]/.test(run) && /[A-Z]/.test(run) && /\d/.test(run);
+
 function clipped(value, depth = 0, maxStringLength = 1200) {
   if (depth > 5) return "[DEPTH_LIMIT]";
   if (Array.isArray(value)) {
@@ -72,7 +110,10 @@ function scrub(item, parentKey = "") {
       .replace(/\b(?:sk|gsk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b/gi, "***REDACTED***")
       .replace(/\bAKIA[A-Z0-9]{12,}\b/g, "***REDACTED***")
       .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, "Bearer ***REDACTED***")
-      .replace(/\b(api[_ -]?key|password|access[_ -]?token|auth[_ -]?token)\s*[:=]\s*[^\s,;]+/gi, "$1=***REDACTED***");
+      .replace(/\b(api[_ -]?key|password|access[_ -]?token|auth[_ -]?token)\s*[:=]\s*[^\s,;]+/gi, "$1=***REDACTED***")
+      // Last, so a key the named rules above already recognised keeps their
+      // more specific replacement rather than being flattened by this one.
+      .replace(SECRET_RUN, (run) => (looksLikeCredential(run) ? "***REDACTED***" : run));
   }
   return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, scrub(child, key)]));
 }
