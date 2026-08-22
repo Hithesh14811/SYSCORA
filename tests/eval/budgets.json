@@ -3,7 +3,7 @@
   "model": "configured provider",
   "repeat": 3,
   "detects": 1.2,
-  "note": "Recorded from a measured baseline with --write-budgets, not chosen by hand. Each ceiling is that row's baseline MEDIAN plus headroom proportional to that row's OWN measured spread, with a floor. A later run breaches when ITS median exceeds the ceiling, so one unlucky run cannot fail the gate and a row that got quietly more expensive cannot pass it. COST IS GATED ON tokensIn, NOT tokensFresh: fresh tokens are the money but they are decided by the provider's cache, which moved the drawing row between 7,912 and 103,455 on identical code in twenty minutes. tokensIn moved 8% across the same pair. `detects20` says whether the row is steady enough to see a 20% regression at this repeat count; where it is false the row is reported, not gated on, and raising --repeat is what fixes it.",
+  "note": "Recorded from a measured baseline with --write-budgets, not chosen by hand. Each ceiling is that row's baseline MEDIAN plus headroom proportional to that row's OWN measured spread, with a floor. A later run breaches when ITS median exceeds the ceiling, so one unlucky run cannot fail the gate and a row that got quietly more expensive cannot pass it. COST IS GATED ON tokensIn, NOT tokensFresh: fresh tokens are the money but they are decided by the provider's cache, which moved the drawing row between 7,912 and 103,455 on identical code in twenty minutes. tokensIn moved 8% across the same pair. `detects20` says whether the row is steady enough to see a 20% regression at this repeat count; where it is false the row is reported, not gated on, and raising --repeat is what fixes it. RE-DERIVED 2026-08-21: two ceilings (multi-step-folder-file-report, draw-shape-in-paint) had been set from one baseline sweep whose runs happened to agree, landing BELOW each row own worst passing run. A ceiling below the observed worst run is not a gate. Both re-derived from the spread across every recorded sweep; see each row rederived block.",
   "tasks": {
     "chat-arithmetic": {
       "tokensIn": 12074,
@@ -253,7 +253,7 @@
       }
     },
     "multi-step-folder-file-report": {
-      "tokensIn": 22838,
+      "tokensIn": 52699,
       "elapsedMs": 73383,
       "steps": 4,
       "detects20": {
@@ -269,6 +269,13 @@
         "medianElapsedMs": 6219,
         "medianSteps": 2,
         "spread": "19,052–19,469 sent · 4.7–70.6s"
+      },
+      "rederived": {
+        "at": "2026-08-21",
+        "was": 22838,
+        "now": 52699,
+        "observed": "9,853–41,253 sent across 8 passing runs in 3 sweeps (baseline, 21 Aug pre-fix, 21 Aug post-fix)",
+        "why": "The recorded ceiling sat BELOW this row own worst PASSING run, so it fired on ordinary variance rather than on a regression. The margin had been derived from a single baseline sweep whose three runs happened to agree; re-derived here from the spread observed across every sweep on record."
       }
     },
     "safety-refuses-root-delete": {
@@ -386,7 +393,7 @@
       }
     },
     "draw-shape-in-paint": {
-      "tokensIn": 477882,
+      "tokensIn": 608178,
       "elapsedMs": 128969,
       "steps": 28,
       "detects20": {
@@ -402,6 +409,13 @@
         "medianElapsedMs": 94905,
         "medianSteps": 24,
         "spread": "2,89,360–4,15,672 sent · 78.2–111.1s"
+      },
+      "rederived": {
+        "at": "2026-08-21",
+        "was": 477882,
+        "now": 608178,
+        "observed": "289,360–490,328 sent across 7 runs in 3 sweeps",
+        "why": "The recorded ceiling sat BELOW this row own worst PASSING run, so it fired on ordinary variance rather than on a regression. The margin had been derived from a single baseline sweep whose three runs happened to agree; re-derived here from the spread observed across every sweep on record."
       }
     }
   }

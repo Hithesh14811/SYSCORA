@@ -28,6 +28,31 @@ test("redactSensitiveData masks sensitive fields recursively", () => {
   assert.equal(output.list[1].key, "visible-name");
 });
 
+// A COUNT IS NOT A CREDENTIAL.
+//
+// `/token/i` matched `tokensIn`, `tokensOut`, `tokensCached` and `tokensFresh`,
+// so every persisted session recorded its own cost as "***REDACTED***" — 1,673
+// of the 1,998 rows on this machine. The product's headline claims are about
+// cost per task, and the record of it was being destroyed on the way to disk.
+test("token COUNTS survive persistence while auth tokens do not", () => {
+  const output = redactSensitiveData({
+    metrics: { tokensIn: 3324, tokensOut: 8584, tokensCached: 49536, tokensFresh: 227 },
+    auth: { token: "sk-notarealkey0000", accessToken: "ya29.notarealtoken" },
+    // A number under an unambiguous name stays covered: a numeric PIN is still
+    // a credential, and this is the case the shape rule must not give away.
+    login: { password: 4821, secret: 99 }
+  });
+
+  assert.equal(output.metrics.tokensIn, 3324, "a token COUNT is a measurement");
+  assert.equal(output.metrics.tokensOut, 8584);
+  assert.equal(output.metrics.tokensCached, 49536);
+  assert.equal(output.metrics.tokensFresh, 227);
+  assert.equal(output.auth.token, REDACTED, "a token that is a string is still a credential");
+  assert.equal(output.auth.accessToken, REDACTED);
+  assert.equal(output.login.password, REDACTED, "an unambiguous name is redacted at any type");
+  assert.equal(output.login.secret, REDACTED);
+});
+
 test("risk engine evaluates from plan without context.intent", () => {
   const engine = new RiskEngine();
   const result = engine.assess(

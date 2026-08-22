@@ -187,6 +187,18 @@ export function checkBudgets(summaries, budgets) {
       breaches.push(`${summary.id}: passed ${budget.baseline.passes} at baseline, now ${summary.passes}/${summary.runs}` +
         (summary.reason ? ` — ${summary.reason}` : ""));
     }
+    // A NOISY ROW IS GATED BLUNTLY, NOT LEFT UNGATED. `detects20` is a REPORT on
+    // whether this row could see a 20% regression, and it is deliberately not a
+    // switch: suppressing the ceilings where it is false would leave the widest
+    // rows — the expensive ones — unguarded at any magnitude. The protection for
+    // a noisy row is that its ceiling is WIDE, sized from its own spread, so 20%
+    // fits under it and 250% does not. That was tried as a switch on 21 Aug 2026
+    // and "a row too noisy for 20% still catches a large regression" caught it
+    // immediately, which is the test doing exactly what it was written for.
+    //
+    // What actually went wrong on that run was upstream of here: see the
+    // `rederived` blocks in budgets.json. A ceiling is only wide when the sweep
+    // it was recorded from actually OBSERVED the row's spread.
     if (budget.tokensIn && summary.medianTokensIn > budget.tokensIn) {
       breaches.push(`${summary.id}: ${summary.medianTokensIn.toLocaleString()} tokens sent against a ceiling of ` +
         `${budget.tokensIn.toLocaleString()} (baseline median ${budget.baseline?.medianTokensIn?.toLocaleString() ?? "?"})`);

@@ -72,6 +72,32 @@ const STEADY = rowFrom("messaging-send-to-self", [55659, 56042, 56151], [17800, 
 // Save-As dialog decides the whole run.
 const THRASHES = rowFrom("draw-shape-in-paint", [177901, 180977, 326431], [70500, 72300, 89400]);
 
+// A CEILING BELOW THE ROW'S OWN WORST RUN IS NOT A GATE, IT IS A TRIPWIRE.
+//
+// This is the property that failed on 21 Aug 2026, and it failed upstream of the
+// formula rather than in it. `multi-step-folder-file-report` was recorded from
+// three sweeps that all happened to take the same route through the task — one
+// `run` doing the whole job — so its measured spread was 2.2%, the margin fell
+// to MIN_MARGIN, and the ceiling landed at 22,838. The model's other legitimate
+// route, `run → write_file ×3 → run` (one call per file the prompt names, the
+// same work and the same verified result), sends 41,253. The gate then reported
+// a regression that was not one, and a gate that cries wolf gets switched off.
+//
+// The formula itself is sound and this pins it: whatever spread it is shown, the
+// ceiling it produces must sit above it. A refactor to a fixed slack — median
+// times a constant — breaks this immediately on the wide rows, which are exactly
+// the expensive ones the gate claims to be worth anything on.
+test("a recorded ceiling always clears the spread it was recorded from", () => {
+  for (const row of [STEADY, THRASHES, rowFrom("lopsided", [9853, 19814, 41253])]) {
+    const budget = budgetsFrom([row], META).tasks[row.id];
+    assert.ok(
+      budget.tokensIn >= row.maxTokensIn,
+      `${row.id}: ceiling ${budget.tokensIn} is under its own worst observed run ${row.maxTokensIn}, ` +
+      "so the next ordinary run of it reports a regression that did not happen"
+    );
+  }
+});
+
 test("a 20% regression on a steady row breaches its budget", () => {
   const budgets = budgetsFrom([STEADY], META);
   const breaches = checkBudgets([worseBy(STEADY, DETECTS)], budgets);
