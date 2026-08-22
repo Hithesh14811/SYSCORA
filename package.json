@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "apps/daemon/src/server.js",
+  "main": "apps/desktop-shell/src/main.js",
   "os": [
     "win32"
   ],
@@ -19,6 +19,7 @@
     "mvp:status": "node apps/daemon/src/index.js sessions",
     "mvp:ui": "node --use-system-ca apps/daemon/src/server.js",
     "desktop:dev": "electron apps/desktop-shell/src/main.js",
+    "dist": "electron-builder --win",
     "doctor": "node scripts/doctor.mjs",
     "test": "node scripts/run-tests-bounded.js",
     "test:raw": "node --test --test-timeout=240000 --test-concurrency=1 --test-force-exit tests/**/*.test.js",
@@ -28,5 +29,37 @@
   },
   "devDependencies": {
     "electron": "^35.0.0"
+  },
+  "build": {
+    "appId": "com.syscora.desktop",
+    "productName": "SYSCORA",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "apps/**/*",
+      "packages/**/*",
+      "os-adapters/**/*",
+      "package.json",
+      "!**/*.md",
+      "!tests/**",
+      "!dist/**",
+      "!.syscora/**",
+      "!**/node_modules/**"
+    ],
+    "asarUnpack": [
+      "os-adapters/**/*",
+      "packages/privileged-helpers/schema/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
   }
 }
