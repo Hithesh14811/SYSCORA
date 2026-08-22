@@ -308,6 +308,22 @@ export class AgentRuntime {
     for (const settle of [...this._approvals.values()]) settle(approved === true);
   }
 
+  /**
+   * What this runtime did to the machine that nobody has been told about.
+   *
+   * For the crash handler in the daemon: if the process dies mid-action, the
+   * only record that a file was overwritten or a message sent is the in-memory
+   * journal, and it dies with it. This is what gets written down instead.
+   *
+   * Deliberately NOT through `_ensureToolset()`. A crash handler that
+   * CONSTRUCTS things — a toolset, a PowerShell host, a registry — can fail
+   * inside the failure and lose the original error. No toolset means nothing
+   * was done, which is both the honest answer and the cheap one.
+   */
+  interruptedWork() {
+    try { return this._toolset?.interruptedWork?.() ?? []; } catch { return []; }
+  }
+
   _ensureToolset(workspacePath = null) {
     if (!this._toolset) {
       // A request that names a workspace still wins — that is the caller being

@@ -5912,6 +5912,45 @@ export function buildToolset({
       try { return tool?.preview?.(args ?? {}) ?? ""; } catch { return ""; }
     },
 
+    // WHAT WAS DONE TO THIS MACHINE THAT NOBODY HAS BEEN TOLD ABOUT.
+    //
+    // The undo journal lives in memory for the life of the daemon, which is
+    // right for `undo` — the toolset outlives a request so "put that back" works
+    // in the next message. It is wrong for a CRASH: the process dies holding the
+    // only record that it renamed the user's file thirty milliseconds earlier,
+    // and the next start knows nothing, so the machine has been changed and the
+    // one thing that could say so is gone.
+    //
+    // This is what the crash handler writes down. Summaries only — the journal's
+    // `reversal` descriptors carry paths and backup locations, and a crash file
+    // sitting in the state directory is not the place for them. Reversibility is
+    // reported as a boolean so the report can say "3 of these could have been
+    // put back" without publishing how.
+    interruptedWork() {
+      try {
+        return state.journal.list()
+          // ABANDONED means the machine said the action did not happen, so it
+          // is not unfinished work. An entry already closed by `undo` has an
+          // outcome and has been dealt with. What is left is what happened and
+          // was never accounted for — plus PENDING, which is not "nothing
+          // happened", it is "we stopped knowing", and reads that way.
+          .filter((entry) => entry.state !== "ABANDONED" && entry.outcome === null)
+          .map((entry) => ({
+            at: entry.at,
+            tool: entry.tool,
+            summary: String(entry.summary ?? "").slice(0, 300),
+            reversible: entry.reversal !== null,
+            // Why it cannot be put back, when that is the case — this is the
+            // field the journal refuses to let a caller leave silent.
+            why: entry.reversal === null ? String(entry.why ?? "").slice(0, 200) : null,
+            finished: entry.state !== "PENDING"
+          }));
+      } catch {
+        // A crash handler that throws is a crash handler that hides the crash.
+        return [];
+      }
+    },
+
     /**
      * Run one tool call. Never throws: a failure is a result the model reads and
      * works around, exactly like a non-zero exit code.

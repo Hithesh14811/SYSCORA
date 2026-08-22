@@ -10,6 +10,8 @@ import { buildEnvelope, parseRequestBodyWithEnvelope } from "../../../packages/p
 import { buildSessionResponse } from "../../../packages/protocol/src/session-protocol.js";
 import { projectSessionLifecycle } from "../../../packages/shared-types/src/session-lifecycle.js";
 import { closeWindowsAutomationHost } from "../../../os-adapters/windows-host/src/client.js";
+import { resolveStateDir } from "../../../packages/shared-types/src/state-path.js";
+import { installCrashGuards, reportInterruptedRun } from "./crash-guard.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -838,6 +840,12 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
     console.log(`SYSCORA API token: ${apiToken}`);
   });
 
+  // The crash handler needs to ask the runtime what it had already done to the
+  // machine. Hung off the server rather than returned beside it, because the
+  // one caller treats the return value as an http.Server and calling
+  // `.close()` on a wrapper object would be a silent no-op — which is exactly
+  // the kind of shutdown that leaked fifteen PowerShell hosts.
+  server.syscoraRuntime = runtime;
   return server;
 }
 
@@ -849,6 +857,21 @@ if (process.argv[1] === __filename) {
   // keep stable. 4317 remains the standalone default.
   const port = Number(process.env.SYSCORA_PORT ?? process.env.PORT ?? "4317");
   const server = startServer({ port });
+
+  // A CRASH IS THE ONE EXIT THAT WAS NOT HANDLED AT ALL.
+  //
+  // Every path below covers a deliberate stop — a signal, the shell closing
+  // stdin, the event loop draining. None of them covers the daemon falling over
+  // mid-action, which is the only exit where the user's machine has been
+  // changed and nobody has been told. See crash-guard.js; the record it leaves
+  // is read and reported here on the next start.
+  const stateDirectory = resolveStateDir(process.cwd());
+  reportInterruptedRun({ stateDir: stateDirectory });
+  installCrashGuards({
+    runtime: server.syscoraRuntime ?? null,
+    stateDir: stateDirectory,
+    closeHost: closeWindowsAutomationHost
+  });
 
   // THE DAEMON HAD NO SHUTDOWN PATH AT ALL, AND THAT IS WHERE THE ORPHANS CAME
   // FROM.
