@@ -2284,9 +2284,9 @@ export function buildToolset({
       // foreground window belongs to whoever is at the keyboard. The user
       // watches SYSCORA work, so the window in front is usually SYSCORA's own
       // chat — and this agent, mid-way through drawing in Paint, clicked a
-      // toolbar, read "the screen", and got back a reading of the Claude window
-      // with the conversation about itself in it. Every conclusion after that
-      // was drawn from the wrong application.
+      // toolbar, read "the screen", and got back a reading of the chat window it
+      // was being driven from, with the conversation about itself in it. Every
+      // conclusion after that was drawn from the wrong application.
       //
       // The window it has been working in is the one it means. `desktop: true`
       // asks the old question, for the rare case where "what is in front of me

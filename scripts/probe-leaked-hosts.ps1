@@ -12,9 +12,9 @@
 # printed in the table, and never consulted — so every powershell.exe on the
 # machine older than two hours was counted as a leaked automation host. On
 # 22 Aug 2026 that reported "5 processes, 510 MB leaked" when the truth was FOUR
-# shells belonging to a live Claude session and ONE host belonging to the running
-# SYSCORA desktop app. Nothing had leaked at all, and the figure was repeated to
-# the user as fact.
+# shells belonging to a live developer tool session and ONE host belonging to the
+# running SYSCORA desktop app. Nothing had leaked at all, and the figure was
+# repeated to the user as fact.
 #
 # A LEAKED HOST IS ONE WHOSE OWNER IS GONE. That is two questions, and age
 # answers neither: a daemon that has been up all day legitimately owns a host

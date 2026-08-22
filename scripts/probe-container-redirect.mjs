@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 // Is a directory what it says it is, or is somebody redirecting it?
 //
-// `C:\Users\hithe\AppData\Local\SYSCORA` held the user's 1,904 conversations and
-// physically lived at
-// `...\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\SYSCORA`.
+// `%LOCALAPPDATA%\SYSCORA` held the user's 1,904 conversations and physically
+// lived at `%LOCALAPPDATA%\Packages\<host application package family>\LocalCache\Local\SYSCORA`.
 // From inside the container that redirection is invisible: lstat says "ordinary
 // directory", readlink says "not a link", and every read agrees with every
 // write. From outside - Notepad's Save dialog, for one - the same path resolves

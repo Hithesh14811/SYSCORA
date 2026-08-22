@@ -26,6 +26,14 @@ tests/eval/results/
 # reached a file once already — never something to publish.
 transcript.txt
 
-# Claude Code's per-machine settings. launch.json IS shared (it says how to run
-# this project); settings.local.json is one developer's own choices.
-.claude/settings.local.json
+# Local editor and assistant tooling configuration. Per-developer, per-machine,
+# and nothing about it belongs in a public repository.
+.claude/
+CLAUDE.md
+.cursor/
+.windsurf/
+.aider*
+.github/copilot-instructions.md
+
+# Internal engineering handoff notes. Working documents, not product docs.
+docs/next-session-brief.md

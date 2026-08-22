@@ -1405,7 +1405,7 @@ Return JSON: { "reply": string }`.trim();
   //
   // The runtime's own summariser is capability-centric by construction: asked
   // which process used the most memory it replied "processes.list: 25 items
-  // (first: Memory Compression, claude, OneDrive...)". Every fact the user
+  // (first: Memory Compression, chrome, OneDrive...)". Every fact the user
   // wanted is in there and none of it is an answer. This is the last step that
   // makes a verified read useful to a person.
   //

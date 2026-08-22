@@ -49,7 +49,10 @@ const isUnchangedReading = (text) => /^IDENTICAL to your last reading/m.test(Str
 // Labels that belong to applications this reading was NOT asked about. A single
 // window cannot contain another program's menu bar, so one hit here means the
 // reading is not of a window at all.
-const FOREIGN = ["Opera menu", "Toggle Panel", "Claude Code", "Search tabs", "Now playing bar", "Address bar"];
+// Machine-specific by nature: these are labels seen bleeding in from whatever
+// else happened to be open when the bug was reproduced. Add whatever your own
+// desktop contributes — a hit means the reading is not of one window.
+const FOREIGN = ["Opera menu", "Toggle Panel", "Search tabs", "Now playing bar", "Address bar"];
 const foreign = (text) => FOREIGN.filter((label) => String(text).includes(label));
 
 const report = (label, ms, result) => {

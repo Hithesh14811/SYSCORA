@@ -44,9 +44,8 @@ export const LEGACY_STATE_DIRNAME = ".syscora";
  * The first version of this used `%LOCALAPPDATA%\SYSCORA`, which is the ordinary
  * Windows answer and was wrong here in a way that took a day to see. When an
  * agent running inside a packaged (MSIX) application creates a directory under
- * AppData\Local, the container captures it: `C:\Users\hithe\AppData\Local\SYSCORA`
- * became a link to
- * `C:\Users\hithe\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\SYSCORA`.
+ * AppData\Local, the container captures it: `%LOCALAPPDATA%\SYSCORA` became a
+ * link to `%LOCALAPPDATA%\Packages\<the host application's package family>\LocalCache\Local\SYSCORA`.
  *
  * Two consequences, both measured on the real machine:
  *

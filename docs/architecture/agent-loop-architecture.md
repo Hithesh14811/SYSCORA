@@ -16,7 +16,7 @@
 
 The readiness report diagnoses SYSCORA's failures accurately — false successes, vocabulary drift, missing routes, fragmented environment awareness — and proposes fixes for each. This document argues that several of those symptoms share one structural cause that the report does not name, and that fixing the cause is cheaper than fixing the symptoms one at a time.
 
-The product goal is that SYSCORA should be to the operating system what Claude Code and Codex are to a codebase. Those systems have no intent classifier and no planner. Understanding why they don't is the whole argument here.
+The product goal is that SYSCORA should be to the operating system what an agentic coding assistant is to a codebase. Those systems have no intent classifier and no planner. Understanding why they don't is the whole argument here.
 
 ## 2. The structural difference
 

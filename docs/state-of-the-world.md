@@ -637,8 +637,8 @@ reached 0 times, so 370 MB of it is worth explaining before it is capped.
 
 ## What this is
 
-An agent that operates this Windows machine from natural language — Claude Code's
-shape, pointed at the whole OS. Chat in, real actions out, verified against the
+An agent that operates this Windows machine from natural language — the shape of
+an agentic coding assistant, pointed at the whole OS. Chat in, real actions out, verified against the
 machine. The goal is a product people trust with their computer: **fast, cheap,
 and incapable of claiming something it did not do.**
 

@@ -5,8 +5,8 @@ you want in ordinary words, and it does it: opens the applications, reads what i
 on screen, clicks, types, runs commands, checks its own work, and tells you what
 is now true.
 
-It is the shape of Claude Code or Cursor, pointed at the operating system instead
-of a repository. One conversation, held open for the whole task. The model talks
+It is the shape of an agentic coding assistant, pointed at the operating system
+instead of a repository. One conversation, held open for the whole task. The model talks
 while it works, calls tools by name, reads the results, and keeps going until the
 job is done.
 
