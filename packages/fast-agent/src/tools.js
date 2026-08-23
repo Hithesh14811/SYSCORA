@@ -46,6 +46,9 @@ import { describeMachine, readMachineProfile } from "./machine-profile.js";
 import { describeNotes, forgetNote, readNotes, rememberNote } from "./notes.js";
 import { extractDocumentText, isDocumentPath } from "./documents.js";
 import { createProgressReader, reportsProgress } from "./command-progress.js";
+// Searching the web without driving a browser. See web-search.js: a search is a
+// LIST, and a list is one HTTP round trip rather than six page loads.
+import { renderResults, searchWeb } from "./web-search.js";
 import { Reversal, createUndoJournal, timeLeft } from "./undo-journal.js";
 import { prepareFileUndo, restoreFile, describeFileChange } from "./undo-files.js";
 import { resolveStateDir } from "../../shared-types/src/state-path.js";
@@ -4827,6 +4830,77 @@ export function buildToolset({
     // rather than hidden, because the choice between it and the user's own
     // browser is a real one the model has to make — reading, searching and
     // research here; anything touching the user's accounts through the desktop.
+    // SEARCHING IS A LIST, NOT A BROWSING SESSION.
+    //
+    // Before this, every lookup drove the controlled Chromium. Measured live on
+    // 22 Aug 2026 on a request to find internships: Google answered with a
+    // CAPTCHA ("Our systems have detected unusual traffic"), then four more page
+    // loads got the signed-out LinkedIn marketing page. Six navigations and tens
+    // of thousands of tokens of page chrome, for ten links.
+    //
+    // The description names WHEN NOT TO USE IT, because the choice between this
+    // and the browser is real and the model has to make it every time.
+    {
+      name: "search",
+      description:
+        "Search the web and get back a list of titles, URLs and snippets in one step. Use this FIRST for " +
+        "any lookup, question of fact, or finding pages worth reading. Use web_open instead when you must " +
+        "be ON a page — signing in, clicking, filling a form, or reading one page in full.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "What to search for, as you would type it" },
+          limit: { type: "number", description: "How many results, 1-15. Default 8." }
+        },
+        required: ["query"]
+      },
+      preview: (args) => args.query,
+      acts: false,
+      execute: async (args) => {
+        const limit = Math.max(1, Math.min(15, Number(args.limit) || 8));
+        const found = await searchWeb(String(args.query ?? ""), { limit });
+        // Results are somebody else's words. An instruction inside a search
+        // snippet is content, not a command — same boundary as a page, a chat or
+        // a document. See content-boundary.js.
+        const injected = found.ok
+          ? screenObservedContent(
+              found.results.map((result) => `${result.title} ${result.snippet}`).join("\n"),
+              `web search for "${found.query}"`
+            )
+          : null;
+        return {
+          ...found,
+          injected,
+          evidence: evidence({
+            observed: found.ok
+              ? `${found.results.length} results for ${JSON.stringify(found.query)} from ${found.provider}`
+              : `no results for ${JSON.stringify(found.query)}: ${found.reason}`,
+            method: "web.search",
+            verdict: found.ok ? CONFIRMED : REFUTED
+          })
+        };
+      },
+      failed: (result) => result.ok === false,
+      render: (result) => {
+        if (!result.ok) {
+          // The recovery depends on WHY, so the two cases say different things.
+          // Being rate-limited and finding nothing lead opposite ways: one means
+          // stop searching and open a page, the other means search differently.
+          const rateLimited = /rate-limiting|declined the request/.test(result.reason ?? "");
+          return refuted(result, [
+            `The search for "${result.query}" returned nothing: ${result.reason}.`,
+            rateLimited
+              ? "The search engines are refusing requests from this machine right now, so searching again will " +
+                "not help. Use web_open on a site you already know, or the desktop browser."
+              : "Try different words, or use web_open on a site you already know."
+          ].join(" "));
+        }
+        return confirmed(result, [
+          renderResults(result),
+          result.injected ? `\n\n${result.injected}` : ""
+        ].join(""));
+      }
+    },
     {
       name: "web_open",
       description:

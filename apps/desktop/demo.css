@@ -1,15 +1,34 @@
 :root {
-  --bg: #0d1117;
-  --panel: #161b22;
-  --panel-2: #1c2330;
-  --border: #2d3646;
-  --text: #e6edf3;
-  --muted: #8b98a9;
-  --accent: #4c8dff;
-  --ok: #3fb950;
-  --warn: #d29922;
-  --danger: #f85149;
+  /* A CALIBRATED SURFACE, NOT A PILE OF HEX CODES.
+   *
+   * The old palette was six unrelated greys and a stock blue. These are one
+   * hue (222deg) at controlled lightness steps, so panels sit in a believable
+   * order instead of fighting each other, and the accent is the only saturated
+   * thing on screen — which is what makes it read as "this is the control" and
+   * not as decoration. */
+  --bg: #0a0d13;
+  --bg-raised: #0e131b;
+  --panel: #121821;
+  --panel-2: #182029;
+  --border: #212b38;
+  --border-soft: #1a222d;
+
+  --text: #e8eef6;
+  --text-dim: #a6b3c4;
+  --muted: #6f7f93;
+
+  --accent: #5b9dff;
+  --accent-dim: #2f5da8;
+  --ok: #46c46a;
+  --warn: #e0a63a;
+  --danger: #ff6b62;
+
   --radius: 12px;
+  --radius-sm: 8px;
+  /* Real elevation. A border alone makes everything look like a wireframe. */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .3);
+  --shadow-2: 0 8px 28px rgba(0, 0, 0, .45);
+  --ring: 0 0 0 3px rgba(91, 157, 255, .18);
 }
 
 * { box-sizing: border-box; }
@@ -949,3 +968,241 @@ body.dragging::after {
   border-radius: 16px;
   pointer-events: none;
 }
+
+/* Search results inside a step read as links, not as a wall of pre-formatted
+   text — the URL is the part a person acts on. */
+.step-output.search-results { white-space: normal; font-family: inherit; font-size: 13px; }
+.search-hit { padding: 7px 0; border-bottom: 1px solid rgba(125, 155, 205, 0.09); }
+.search-hit:last-child { border-bottom: 0; }
+.search-hit-title { color: var(--accent); display: block; text-decoration: none; }
+.search-hit-title:hover { text-decoration: underline; }
+.search-hit-url { color: var(--ok); font-size: 11.5px; display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-hit-snippet { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+
+/* ============================================================================
+   THE SHELL — a considered surface rather than boxes on a dark background
+   ----------------------------------------------------------------------------
+   Everything below overrides earlier rules deliberately: the earlier ones stay
+   so nothing that referenced them breaks, and this section is where the look is
+   decided. The changes are the ones that separate "a developer's tool window"
+   from "a product": type that has a scale, a top bar that recedes, one accent
+   used only for controls, and real elevation on things that float.
+   ========================================================================== */
+
+body {
+  font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  background:
+    /* A very slight wash behind the conversation so the surface has a top and
+       a bottom. Flat black reads as unfinished. */
+    radial-gradient(1200px 500px at 50% -10%, rgba(91, 157, 255, .07), transparent 70%),
+    var(--bg);
+}
+
+/* --- top bar ------------------------------------------------------------- */
+
+.demo-topbar {
+  padding: 10px 18px;
+  background: rgba(14, 19, 27, .82);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border-soft);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.brand { gap: 11px; }
+/* A mark, not an emoji floating in space. */
+.brand .logo {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  font-size: 14px;
+  color: #fff;
+  background: linear-gradient(145deg, var(--accent), #3a6fd8);
+  border-radius: 9px;
+  box-shadow: var(--shadow-1), inset 0 1px 0 rgba(255, 255, 255, .22);
+}
+.brand h1 { font-size: 14.5px; font-weight: 600; letter-spacing: .2px; }
+/* The tagline was competing with the product name for attention. */
+.brand p { font-size: 11.5px; color: var(--muted); }
+
+.topbar-actions { display: flex; align-items: center; gap: 8px; }
+
+.topbar-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background .13s ease, color .13s ease, border-color .13s ease;
+}
+.topbar-button:hover { color: var(--text); background: var(--panel-2); border-color: #2c3849; }
+.topbar-button:active { transform: translateY(1px); }
+
+/* Developer mode is a real switch — it shows the raw session JSON — but it is
+   a developer's switch, so it recedes until it is looked for. */
+.debug-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px 5px 9px;
+  font-size: 11.5px;
+  color: var(--muted);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+.debug-toggle:hover { color: var(--text-dim); }
+.debug-toggle input { accent-color: var(--accent); margin: 0 0 0 2px; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 3px rgba(111, 127, 147, .12); }
+body.online .status-dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(70, 196, 106, .14); }
+
+/* --- the conversation ---------------------------------------------------- */
+
+.feed { padding: 26px 0 8px; scroll-behavior: smooth; }
+
+.bubble.user {
+  background: linear-gradient(180deg, #1b2432, #161e2a);
+  border: 1px solid #26313f;
+  border-radius: 14px 14px 4px 14px;
+  padding: 11px 14px;
+  box-shadow: var(--shadow-1);
+}
+.agent-says { font-size: 14px; color: var(--text); }
+
+/* Steps read as one quiet stack rather than a row of competing cards. */
+.step {
+  background: var(--bg-raised);
+  border: 1px solid var(--border-soft);
+  border-left-width: 2px;
+  border-radius: 10px;
+  margin: 7px 0;
+  overflow: hidden;
+  transition: border-color .15s ease, background .15s ease;
+}
+.step:hover { border-color: var(--border); }
+.step-head { padding: 9px 12px; gap: 9px; font-size: 12.5px; align-items: center; }
+.step-verb { font-weight: 500; }
+.step-tool, .step-arg {
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: rgba(125, 155, 205, .07);
+  border-radius: 5px;
+  padding: 1px 6px;
+}
+.step-arg { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 44ch; }
+.step-output {
+  margin: 0;
+  padding: 11px 13px;
+  background: #070a0f;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 340px;
+  overflow: auto;
+}
+
+/* --- the composer -------------------------------------------------------- */
+
+.chat-bar {
+  margin: 0 auto 20px;
+  padding: 12px 12px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow-2);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+/* The whole composer responds to focus, not just the textarea inside it —
+   otherwise the ring appears around a box that has no visible edge. */
+.chat-bar:focus-within { border-color: var(--accent-dim); box-shadow: var(--shadow-2), var(--ring); }
+.chat-bar textarea {
+  background: transparent;
+  border: 0;
+  outline: none;
+  font-size: 14.5px;
+  line-height: 1.55;
+  color: var(--text);
+  resize: none;
+  padding: 2px 2px 0;
+  width: 100%;
+}
+.chat-bar textarea::placeholder { color: var(--muted); }
+
+#sendButton {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  border: 0;
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+  margin-left: auto;
+  flex-shrink: 0;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .18) inset;
+  transition: background .13s ease, transform .1s ease, opacity .13s ease;
+}
+#sendButton:hover { background: #6ea8ff; }
+#sendButton:active { transform: scale(.94); }
+
+/* --- the empty state ----------------------------------------------------- */
+
+.welcome { padding: 34px 0 10px; }
+.welcome h2 { font-size: 25px; font-weight: 600; letter-spacing: -.4px; margin-bottom: 6px; }
+.welcome .muted { font-size: 13.5px; max-width: 52ch; }
+.suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+.suggestion {
+  padding: 9px 13px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  transition: background .13s ease, border-color .13s ease, color .13s ease, transform .1s ease;
+}
+.suggestion:hover { color: var(--text); background: var(--panel-2); border-color: var(--border); transform: translateY(-1px); }
+
+/* --- focus, for anyone not using a mouse --------------------------------- */
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+/* --- a scrollbar that belongs to this window ----------------------------- */
+
+* { scrollbar-width: thin; scrollbar-color: #29323f transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: #252e3a; border: 2px solid transparent; background-clip: content-box; border-radius: 10px; }
+*::-webkit-scrollbar-thumb:hover { background: #33404f; background-clip: content-box; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* THE COMPOSER IS A COLUMN, AND IT LINES UP WITH THE CONVERSATION.
+ *
+ * It was `flex-direction: row` from when it held only a textarea and a button.
+ * With an attachment strip and a controls row added, row would have laid all
+ * three out side by side. And `margin: 0 auto` made it shrink to its content —
+ * 521px against the conversation's 888px — so the box you type in did not line
+ * up with the answers above it. Caught by measuring both, not by looking. */
+.chat-bar {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: 100%;
+  margin-left: 0;
+  margin-right: 0;
+  gap: 0;
+}
+.composer-controls { width: 100%; }
+/* The send button ends the controls row, so it sits with the other controls
+   rather than floating beside a textarea of a different height. */
+.composer-controls #sendButton { margin-left: auto; }

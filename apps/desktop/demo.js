@@ -162,6 +162,50 @@ function stripAttachmentBlocks(text) {
     .trim();
 }
 
+// Search results, parsed back out of the block the tool rendered and drawn as
+// links. The shape is fixed by renderResults() in web-search.js:
+//
+//   1. Title
+//      https://url
+//      snippet
+//
+// Anything that does not match that shape falls through to plain text, so a
+// change to the tool's rendering degrades to what it used to be rather than
+// showing nothing.
+function renderSearchResults(text) {
+  const wrap = el("div", "step-output search-results");
+  const lines = text.split("\n");
+  const header = lines[0]?.trim();
+  if (header) wrap.appendChild(el("div", "search-hit-snippet", header));
+  let current = null;
+  for (const line of lines.slice(1)) {
+    const title = /^\s*\d+\.\s+(.*)$/.exec(line);
+    const url = /^\s*(https?:\/\/\S+)\s*$/.exec(line);
+    if (title) {
+      current = el("div", "search-hit");
+      current.dataset.title = title[1];
+      wrap.appendChild(current);
+    } else if (url && current) {
+      // The title becomes the link once its URL is known — the anchor needs an
+      // href, and the href arrives on the line after the title.
+      const anchor = el("a", "search-hit-title", current.dataset.title ?? url[1]);
+      anchor.href = url[1];
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      current.prepend(anchor);
+      current.appendChild(el("span", "search-hit-url", url[1]));
+    } else if (line.trim() && current) {
+      current.appendChild(el("div", "search-hit-snippet", line.trim()));
+    }
+  }
+  // Nothing recognised: show what was actually returned rather than an empty box.
+  if (!wrap.querySelector(".search-hit")) {
+    const plain = el("pre", "step-output", text.trim());
+    return plain;
+  }
+  return wrap;
+}
+
 // ---- Naming things the way a person would -----------------------------------
 
 // A capability identifier is an internal name. `pointer.clickAt` is what the
@@ -223,6 +267,7 @@ const TOOL_VERB = {
   clipboard: "Used the clipboard",
   play_music: "Played",
   volume: "Set the volume",
+  search: "Searched the web",
   web_open: "Opened a page",
   web_read: "Read the page",
   web_click: "Clicked on the page",
@@ -558,7 +603,13 @@ class Turn {
     // The output. This is the part that makes a step believable, so it is shown
     // rather than summarized away — trimmed, and scrollable when it is long.
     const body = preview || (ok ? null : message);
-    if (body) {
+    if (body && capability === "search" && ok) {
+      // A SEARCH RESULT IS A LINK, AND A LINK IS FOR CLICKING.
+      //
+      // Rendered as a <pre> like a command's stdout, ten results are ten lines
+      // of unclickable text and the user has to retype a URL to follow one.
+      step.appendChild(renderSearchResults(String(body)));
+    } else if (body) {
       const out = el("pre", "step-output", String(body).trim());
       step.appendChild(out);
     } else if (!ok && message) {

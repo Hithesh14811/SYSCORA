@@ -193,6 +193,10 @@ const SUCCESS_CALLS = [
   { tool: "clipboard", args: {}, label: "clipboard (read)", readOnly: true },
   { tool: "clipboard", args: { text: "copied" }, label: "clipboard (write)" },
   { tool: "play_music", args: { query: "Señorita" } },
+  // Reaches the network in production, so this file gives it a query and
+  // asserts the receipt shape; whether DuckDuckGo answers is measured by
+  // tests/unit/web-search.test.js against a stubbed fetch.
+  { tool: "search", args: { query: "syscora evidence test" }, readOnly: true },
   { tool: "web_open", args: { url: "https://example.com/" } },
   { tool: "web_read", args: {} },
   { tool: "web_click", args: { text: "Next" } },
