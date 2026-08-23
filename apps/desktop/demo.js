@@ -25,7 +25,7 @@ import { setMarkdown } from "./markdown.js";
 // composer and neither may be guessed at send time — see models.js for why
 // "Auto" is a router with a stated reason rather than a silent default.
 import { AUTO, MODELS, checkAttachments, selectableModels } from "./models.js";
-import { describeAttachments, prepareAttachment } from "./attachments.js";
+import { describeAttachments, prepareAttachment, prepareFolder } from "./attachments.js";
 
 const TOKEN_STORAGE_KEY = "syscora_token";
 // A KNOWN TOKEN IS NOT A TOKEN.
@@ -172,11 +172,22 @@ function stripAttachmentBlocks(text) {
 // Anything that does not match that shape falls through to plain text, so a
 // change to the tool's rendering degrades to what it used to be rather than
 // showing nothing.
+
+// The site a result is on, which is most of how anyone decides whether to trust
+// it. A bare URL buries it in front of a query string nobody reads.
+function domainOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
 function renderSearchResults(text) {
   const wrap = el("div", "step-output search-results");
   const lines = text.split("\n");
   const header = lines[0]?.trim();
-  if (header) wrap.appendChild(el("div", "search-hit-snippet", header));
+  const hits = [];
   let current = null;
   for (const line of lines.slice(1)) {
     const title = /^\s*\d+\.\s+(.*)$/.exec(line);
@@ -184,7 +195,7 @@ function renderSearchResults(text) {
     if (title) {
       current = el("div", "search-hit");
       current.dataset.title = title[1];
-      wrap.appendChild(current);
+      hits.push(current);
     } else if (url && current) {
       // The title becomes the link once its URL is known — the anchor needs an
       // href, and the href arrives on the line after the title.
@@ -193,16 +204,28 @@ function renderSearchResults(text) {
       anchor.target = "_blank";
       anchor.rel = "noopener noreferrer";
       current.prepend(anchor);
-      current.appendChild(el("span", "search-hit-url", url[1]));
+      const domain = domainOf(url[1]);
+      const badge = el("span", "search-hit-domain");
+      // The site's initial in a tile, rather than its favicon. A favicon means a
+      // request per result to somebody else's server from a surface that has
+      // just told the user everything stays on this machine.
+      badge.appendChild(el("span", "search-hit-favicon", domain.slice(0, 1).toUpperCase()));
+      badge.appendChild(el("span", null, domain));
+      current.appendChild(badge);
     } else if (line.trim() && current) {
       current.appendChild(el("div", "search-hit-snippet", line.trim()));
     }
   }
   // Nothing recognised: show what was actually returned rather than an empty box.
-  if (!wrap.querySelector(".search-hit")) {
-    const plain = el("pre", "step-output", text.trim());
-    return plain;
-  }
+  if (hits.length === 0) return el("pre", "step-output", text.trim());
+
+  // "Sources", the way every assistant that searches labels them — the count is
+  // the useful part of the header line, the engine's name is not.
+  const count = el("div", "search-sources-head");
+  count.appendChild(el("span", null, `Sources · ${hits.length}`));
+  if (header) count.appendChild(el("span", "search-provider", header.replace(/^\d+\s+results?\s+for\s+/i, "")));
+  wrap.appendChild(count);
+  for (const hit of hits) wrap.appendChild(hit);
   return wrap;
 }
 
@@ -282,6 +305,43 @@ function verbFor(capability) {
   if (TOOL_VERB[name]) return TOOL_VERB[name];
   for (const [pattern, verb] of VERB) if (pattern.test(name)) return verb;
   return "Ran a step";
+}
+
+// WHAT IT IS DOING, IN THE PRESENT TENSE, WHILE IT IS DOING IT.
+//
+// Every row used to be written in the past tense the moment it opened — a search
+// that had not answered yet said "Searched the web", which is the same class of
+// claim as reporting a message sent while it sits in a box. The row is rewritten
+// to the past tense in finishStep, when it has actually finished.
+const TOOL_VERB_RUNNING = {
+  search: "Searching the web",
+  web_open: "Reading the page",
+  web_read: "Reading the page",
+  run: "Running",
+  screen: "Looking at the screen",
+  read_file: "Reading the file",
+  write_file: "Writing the file",
+  launch: "Opening"
+};
+
+// A row that carries a picture of what it is reads faster than one that carries
+// a tick. Only the handful that appear most; everything else keeps the tick.
+const TOOL_GLYPH = {
+  search: "🌐",
+  web_open: "🌐",
+  web_read: "🌐",
+  web_click: "🌐",
+  web_type: "🌐",
+  web_scroll: "🌐",
+  open_url: "🌐",
+  read_file: "📄",
+  write_file: "📄",
+  edit_file: "📄",
+  run: "▸"
+};
+
+function runningVerbFor(capability) {
+  return TOOL_VERB_RUNNING[String(capability ?? "")] ?? verbFor(capability);
 }
 
 // The one argument worth showing next to the tool name. A command line is the
@@ -512,11 +572,11 @@ class Turn {
     // <details> rather than a click handler: the browser gives keyboard access,
     // find-in-page that opens the section containing a hit, and correct
     // semantics for a screen reader, none of which a div and an onclick do.
-    const step = el("details", "step running");
+    const step = el("details", `step running tool-${String(capability ?? "").replace(/[^a-z_]/gi, "")}`);
     const head = document.createElement("summary");
     head.className = "step-head";
-    head.appendChild(el("span", "step-icon", "▸"));
-    head.appendChild(el("span", "step-verb", subgoal || verbFor(capability)));
+    head.appendChild(el("span", "step-icon", TOOL_GLYPH[capability] ?? "▸"));
+    head.appendChild(el("span", "step-verb", subgoal || runningVerbFor(capability)));
     head.appendChild(el("code", "step-tool", capability));
     const arg = explicitArg || argSummary(capability, inputs);
     if (arg) head.appendChild(el("code", "step-arg", arg));
@@ -597,6 +657,10 @@ class Turn {
     step.classList.add(ok ? "ok" : "bad");
     const icon = head?.querySelector(".step-icon");
     if (icon) icon.textContent = ok ? "✓" : "✗";
+    // Present tense to past, now that it genuinely IS past. A row left saying
+    // "Searching the web" beside a tick is a small lie that reads as a stuck UI.
+    const verb = head?.querySelector(".step-verb");
+    if (verb && verb.textContent === runningVerbFor(capability)) verb.textContent = verbFor(capability);
     if (Number.isFinite(durationMs) && durationMs >= 1000) {
       head?.appendChild(el("span", "step-time", `${(durationMs / 1000).toFixed(1)}s`));
     }
@@ -1323,8 +1387,19 @@ async function submit(text, { attachments = [], routing = null, display = null }
   if (attachments.length) {
     const list = el("div", "bubble-attachments");
     for (const file of attachments) {
+      // The picture, in the message it was sent with. A filename in a chip is
+      // not a record of what was attached — three screenshots from the same
+      // afternoon have three indistinguishable names.
+      if (file.kind === "image" && file.dataUrl) {
+        const thumb = el("img", "bubble-thumb");
+        thumb.src = file.dataUrl;
+        thumb.alt = file.name;
+        thumb.title = file.name;
+        list.appendChild(thumb);
+        continue;
+      }
       list.appendChild(el("span", "bubble-attachment",
-        `${file.kind === "image" ? "🖼" : "📄"} ${file.name}`));
+        `${file.kind === "folder" ? "📁" : "📄"} ${file.name}`));
     }
     bubble?.appendChild?.(list);
   }
@@ -1444,12 +1519,57 @@ sendButton.addEventListener("click", (event) => {
    ===========================================================================*/
 
 const fileInput = document.getElementById("fileInput");
+const imageInput = document.getElementById("imageInput");
+const folderInput = document.getElementById("folderInput");
 const attachButton = document.getElementById("attachButton");
+const attachMenu = document.getElementById("attachMenu");
 const attachmentStrip = document.getElementById("attachmentStrip");
 const modelSelect = document.getElementById("modelSelect");
 const modelHint = document.getElementById("modelHint");
 
 let attachedFiles = [];
+
+// ---- The "+" menu ------------------------------------------------------------
+//
+// WHY A MENU AND NOT A BUTTON. `webkitdirectory` is a property of the <input>,
+// not of the click, so "pick a file" and "pick a folder" are two different
+// inputs and the choice has to be made BEFORE the dialog opens. A single paperclip
+// could therefore never offer a folder — which is the attachment that matters
+// most here, because SYSCORA runs on the machine the folder is on.
+
+const PICKERS = { file: fileInput, image: imageInput, folder: folderInput };
+
+function openAttachMenu(open) {
+  if (!attachMenu || !attachButton) return;
+  attachMenu.hidden = !open;
+  attachButton.setAttribute("aria-expanded", String(open));
+  attachButton.classList.toggle("open", open);
+}
+
+attachButton?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  openAttachMenu(attachMenu.hidden);
+});
+
+attachMenu?.addEventListener("click", (event) => {
+  const choice = event.target.closest("button[data-pick]")?.dataset.pick;
+  if (!choice) return;
+  openAttachMenu(false);
+  // Cleared first, because picking the SAME file twice in a row fires no change
+  // event otherwise — the value has not changed, so the browser has nothing to
+  // report, and the attachment silently does not appear.
+  const input = PICKERS[choice];
+  if (!input) return;
+  input.value = "";
+  input.click();
+});
+
+// Anywhere else, and Escape. A menu that only closes by choosing something is a
+// menu you cannot back out of.
+document.addEventListener("click", () => openAttachMenu(false));
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && attachMenu && !attachMenu.hidden) openAttachMenu(false);
+});
 
 // Auto first, because it is the right answer for almost every request and the
 // only one that can pick a model able to read what has been attached.
@@ -1493,29 +1613,64 @@ function showComposerError(message) {
   modelHint.classList.add("error");
 }
 
+const humanBytes = (bytes) => {
+  const size = Number(bytes) || 0;
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(0)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+// The one line under each chip: what will actually be SENT for this attachment.
+// Not decoration — an attached PDF travels as extracted text and an image
+// travels as pixels to a model that may not be able to look at them, and the
+// user is entitled to know which before they press send rather than after.
+function attachmentNote(file) {
+  if (file.kind === "pending") return "reading…";
+  if (file.kind === "rejected") return file.error;
+  if (file.kind === "image") return `image · ${humanBytes(file.bytes)}`;
+  if (file.kind === "folder") {
+    return `${file.fileCount.toLocaleString()} file${file.fileCount === 1 ? "" : "s"} · ` +
+      (file.path ? "SYSCORA can open it where it is" : "listing only");
+  }
+  return `${file.extractedBy} · ${file.text.length.toLocaleString()} characters` +
+    (file.truncated ? " (clipped)" : "");
+}
+
 function renderAttachments() {
   if (!attachmentStrip) return;
   attachmentStrip.textContent = "";
   attachmentStrip.hidden = attachedFiles.length === 0;
   for (const [index, file] of attachedFiles.entries()) {
-    const chip = el("div", `attachment-chip${file.kind === "rejected" ? " bad" : ""}`);
-    chip.appendChild(el("span", "attachment-icon", file.kind === "image" ? "🖼" : file.kind === "rejected" ? "⚠" : "📄"));
+    const chip = el("div", `attachment-chip ${file.kind}`);
+
+    // AN IMAGE IS SHOWN, NOT NAMED. "screenshot-2026-08-23.png" tells you
+    // nothing about which screenshot it is, and the whole reason for attaching a
+    // picture is that the picture is the content.
+    if (file.kind === "image" && file.dataUrl) {
+      const thumb = el("img", "attachment-thumb");
+      thumb.src = file.dataUrl;
+      thumb.alt = file.name;
+      chip.appendChild(thumb);
+    } else {
+      const icon = el("span", "attachment-icon",
+        { folder: "📁", rejected: "⚠", pending: "○" }[file.kind] ?? "📄");
+      chip.appendChild(icon);
+    }
+
     const meta = el("div", "attachment-meta");
     meta.appendChild(el("span", "attachment-name", file.name));
-    // What actually happens to it, said plainly: a PDF becomes text before it
-    // travels, and the user should know that is what was sent.
-    meta.appendChild(el("span", "attachment-note",
-      file.kind === "rejected" ? file.error
-        : file.kind === "image" ? "sent as an image"
-        : `${file.extractedBy}, ${file.text.length.toLocaleString()} characters`));
+    meta.appendChild(el("span", "attachment-note", attachmentNote(file)));
     chip.appendChild(meta);
+
     const remove = el("button", "attachment-remove", "✕");
     remove.type = "button";
     remove.title = `Remove ${file.name}`;
     remove.addEventListener("click", () => {
       attachedFiles.splice(index, 1);
       renderAttachments();
-      describeModelChoice();
+      // Removing the image that could not be read has to clear the refusal it
+      // caused, or the composer goes on refusing a send that is now fine.
+      revalidateAttachments();
     });
     chip.appendChild(remove);
     attachmentStrip.appendChild(chip);
@@ -1524,13 +1679,32 @@ function renderAttachments() {
 
 function clearAttachments() {
   attachedFiles = [];
-  if (fileInput) fileInput.value = "";
+  for (const input of Object.values(PICKERS)) if (input) input.value = "";
   renderAttachments();
   describeModelChoice();
 }
 
+// Whether what is attached can be sent to the model that is selected, said as
+// soon as it is attached rather than when send is pressed. Called from every
+// path that changes either side of that question.
+function revalidateAttachments() {
+  const usable = attachedFiles.filter((file) => file.kind !== "rejected" && file.kind !== "pending");
+  if (!usable.length) return describeModelChoice();
+  const verdict = checkAttachments(modelSelect.value, usable);
+  if (!verdict.ok) return showComposerError(verdict.reason);
+  if (verdict.reason && modelSelect.value === AUTO) {
+    modelHint.textContent = verdict.reason;
+    modelHint.classList.remove("error");
+    return;
+  }
+  return describeModelChoice();
+}
+
 async function acceptFiles(files) {
   for (const file of files) {
+    // The chip appears BEFORE the file is read. Extracting a large PDF is a
+    // round trip to the daemon, and without this the composer sits still for a
+    // second after the dialog closes and looks as if the pick did not take.
     const chip = { name: file.name, kind: "pending", bytes: file.size };
     attachedFiles.push(chip);
     renderAttachments();
@@ -1540,26 +1714,42 @@ async function acceptFiles(files) {
     } catch (error) {
       prepared = { name: file.name, kind: "rejected", error: `${file.name} could not be read: ${error?.message ?? error}` };
     }
+    // By identity, not by index: another file finishing first, or the user
+    // removing a chip while this one was being read, moves everything along —
+    // and writing to a stale index overwrites somebody else's attachment.
     const at = attachedFiles.indexOf(chip);
     if (at >= 0) attachedFiles[at] = prepared;
     renderAttachments();
   }
   // Say immediately whether the current model can take what was just attached,
   // rather than waiting for the user to press send and be refused.
-  const usable = attachedFiles.filter((file) => file.kind !== "rejected");
-  const verdict = checkAttachments(modelSelect.value, usable);
-  if (!verdict.ok) showComposerError(verdict.reason);
-  else if (verdict.reason && modelSelect.value === AUTO && usable.length) {
-    modelHint.textContent = verdict.reason;
-    modelHint.classList.remove("error");
-  } else describeModelChoice();
+  revalidateAttachments();
 }
 
-if (attachButton) attachButton.addEventListener("click", () => fileInput.click());
+// A FOLDER IS ONE ATTACHMENT, NOT SIX HUNDRED.
+//
+// The folder picker hands over every file inside it, individually. Treated as
+// files that is somebody's whole project directory attached one chip at a time,
+// megabytes of node_modules read into the page to answer a question about one
+// file in it. What the user chose was a PLACE — so it is shown as one chip with
+// the folder's name on it, exactly as the picker was labelled.
+function acceptFolder(files) {
+  const folder = prepareFolder(files);
+  if (!folder) return;
+  attachedFiles.push(folder);
+  renderAttachments();
+  revalidateAttachments();
+}
+
 if (fileInput) fileInput.addEventListener("change", () => acceptFiles([...fileInput.files]));
+if (imageInput) imageInput.addEventListener("change", () => acceptFiles([...imageInput.files]));
+if (folderInput) folderInput.addEventListener("change", () => acceptFolder([...folderInput.files]));
 if (modelSelect) modelSelect.addEventListener("change", () => {
   localStorage.setItem("syscora_model", modelSelect.value);
-  describeModelChoice();
+  // Not describeModelChoice(): switching models with an image already attached
+  // has to re-run the capability check, or a refusal stays on screen after the
+  // user has fixed it — or worse, disappears when they have not.
+  revalidateAttachments();
 });
 
 // Drag and drop onto the whole conversation, because that is where people aim.
@@ -1568,8 +1758,68 @@ for (const eventName of ["dragover", "drop"]) {
     if (!event.dataTransfer?.types?.includes("Files")) return;
     event.preventDefault();
     document.body.classList.toggle("dragging", eventName === "dragover");
-    if (eventName === "drop") acceptFiles([...event.dataTransfer.files]);
+    if (eventName !== "drop") return;
+    document.body.classList.remove("dragging");
+    // A DROPPED FOLDER IS A FOLDER. `dataTransfer.files` lists a dropped
+    // directory as a single entry with an empty type and no readable bytes, so
+    // sending it through acceptFiles produced "not a file type this can read"
+    // for something the user had every reason to expect would work. The
+    // filesystem entry API is the only thing that can tell the two apart.
+    const items = [...(event.dataTransfer.items ?? [])];
+    const droppedDirectory = items.some((item) => item.webkitGetAsEntry?.()?.isDirectory);
+    if (droppedDirectory) return acceptDroppedDirectories(items);
+    acceptFiles([...event.dataTransfer.files]);
   });
+}
+
+// Walk a dropped directory into the same shape the folder picker produces, so
+// choosing a folder and dropping one end up at exactly one code path.
+//
+// BOUNDED, because somebody will drop C:\ on it. The walk stops at a file count
+// and a depth rather than running until the tab dies, and prepareFolder is
+// already honest about a listing being incomplete.
+const MAX_WALKED_FILES = 5000;
+const MAX_WALKED_DEPTH = 12;
+
+async function acceptDroppedDirectories(items) {
+  const collected = [];
+  const loose = [];
+
+  const walk = async (entry, prefix, depth) => {
+    if (collected.length >= MAX_WALKED_FILES || depth > MAX_WALKED_DEPTH) return;
+    if (entry.isFile) {
+      const file = await new Promise((resolve) => entry.file(resolve, () => resolve(null)));
+      if (!file) return;
+      // The picker sets webkitRelativePath and a dropped entry does not —
+      // everything downstream reads it to work out the folder's own name.
+      Object.defineProperty(file, "webkitRelativePath", { value: `${prefix}${file.name}`, configurable: true });
+      collected.push(file);
+      return;
+    }
+    if (!entry.isDirectory) return;
+    const inside = `${prefix}${entry.name}/`;
+    const reader = entry.createReader();
+    // readEntries hands back at most a hundred at a time and signals the end
+    // with an EMPTY batch, so a single call reads a hundred files and silently
+    // stops — which on a real project directory looks like most of it vanishing.
+    for (;;) {
+      const batch = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])));
+      if (!batch.length) break;
+      for (const child of batch) await walk(child, inside, depth + 1);
+    }
+  };
+
+  for (const item of items) {
+    const entry = item.webkitGetAsEntry?.();
+    if (entry?.isDirectory) await walk(entry, "", 0);
+    else if (entry?.isFile) {
+      const file = await new Promise((resolve) => entry.file(resolve, () => resolve(null)));
+      if (file) loose.push(file);
+    }
+  }
+  if (collected.length) acceptFolder(collected);
+  // A drop can be a folder AND some files beside it. Each goes where it belongs.
+  if (loose.length) acceptFiles(loose);
 }
 document.addEventListener("dragleave", (event) => {
   if (event.relatedTarget === null) document.body.classList.remove("dragging");
@@ -1587,6 +1837,13 @@ chatForm.addEventListener("submit", (e) => {
   e.preventDefault();
   if (runningSessionId) return;
   const text = chatInput.value.trim();
+  // A file still being read is not an attachment yet. Sending while one is
+  // pending would drop it silently — the model would answer about a document it
+  // was never given, which is the exact failure this product exists to prevent.
+  if (attachedFiles.some((file) => file.kind === "pending")) {
+    showComposerError("Still reading an attachment — one moment.");
+    return;
+  }
   const attachments = attachedFiles.filter((file) => file.kind !== "rejected");
   if (!text && !attachments.length) return;
 

@@ -36,12 +36,21 @@ function baseAdapter() {
   };
 }
 
-function toolsetOver(adapter) {
-  return buildToolset({ registry: createDefaultCapabilityRegistry(adapter), adapter, basePath: "C:\\work" });
+// The HTTP reader is stubbed to refuse by default. web_open tries an HTTP read
+// before spending a browser on the page, and without this stub these tests would
+// reach the real internet — one of them opens `https://example.com/`, which
+// exists. A suite that quietly depends on a network fails on an aeroplane and
+// passes on review.
+const NO_HTTP = async (url) => ({ ok: false, url, title: "", text: "", links: [], reason: "stubbed off" });
+
+function toolsetOver(adapter, { readPageOverHttp = NO_HTTP } = {}) {
+  return buildToolset({
+    registry: createDefaultCapabilityRegistry(adapter), adapter, basePath: "C:\\work", readPageOverHttp
+  });
 }
 
 // A toolset whose browser answers like a real page.
-function webToolset({ page = {}, elements = [], best = null, field = null, afterClick = null, typeResult = null } = {}) {
+function webToolset({ page = {}, elements = [], best = null, field = null, afterClick = null, typeResult = null, readPageOverHttp = NO_HTTP } = {}) {
   const calls = [];
   const state = {
     url: page.url ?? "https://example.com/",
@@ -79,8 +88,24 @@ function webToolset({ page = {}, elements = [], best = null, field = null, after
       }
     }
   };
-  return { toolset: toolsetOver(adapter), calls, adapter };
+  return { toolset: toolsetOver(adapter, { readPageOverHttp }), calls, adapter };
 }
+
+// A page that reads perfectly well over HTTP — the case that must NOT cost a
+// browser. Long enough to clear the readability threshold, which is what the
+// decision is actually made on.
+const httpPage = (overrides = {}) => async (url) => ({
+  ok: true,
+  url,
+  requestedUrl: url,
+  status: 200,
+  title: "The Story",
+  text: `Body of the story. ${"Something worth reading. ".repeat(30)}`,
+  links: [{ label: "Read more", href: "https://news.example/more" }],
+  readable: true,
+  reason: null,
+  ...overrides
+});
 
 const domTarget = (name) => ({
   found: true,
@@ -129,6 +154,86 @@ test("opening a page reads it through the DOM, not by taking a picture of a brow
   assert.match(result.text, /"Read more"/, "the page's own controls must be listed, by name");
   assert.ok(!calls.some((entry) => /capture|ocr/i.test(entry.operation)), "nothing should have looked at pixels");
   assert.ok(calls.some((entry) => entry.operation === "launch" && entry.params.url === "https://news.example/story"));
+});
+
+// ---- reading without a browser ----------------------------------------------
+
+test("a page that reads over HTTP does not cost a browser", async () => {
+  // Measured on 23 Aug 2026: nodejs.org came back complete in 490ms and
+  // Wikipedia in 670ms, against several seconds, a leftover Chromium process and
+  // a window on the user's screen for the same words.
+  const { toolset, calls } = webToolset({ readPageOverHttp: httpPage() });
+  const result = await toolset.execute("web_open", { url: "https://news.example/story" });
+  assert.equal(result.ok, true);
+  assert.match(result.text, /The Story/);
+  assert.match(result.text, /Body of the story/);
+  assert.match(result.text, /"Read more"/, "the page's links have to survive the cheaper route");
+  assert.ok(!calls.some((entry) => entry.operation === "launch"), "a browser was launched for a page that did not need one");
+});
+
+test("a page that does NOT read over HTTP still falls back to the browser", async () => {
+  // A framework-rendered application sends an empty shell. The decision is a
+  // MEASUREMENT of what arrived — a list of domains believed to need a browser
+  // would be wrong the week after it was written, and wrong silently.
+  const { toolset, calls } = webToolset({
+    page: { url: "https://app.example/", title: "Dashboard", text: "Rendered by the browser." },
+    readPageOverHttp: httpPage({ text: "", readable: false })
+  });
+  const result = await toolset.execute("web_open", { url: "https://app.example/" });
+  assert.equal(result.ok, true);
+  assert.match(result.text, /Rendered by the browser/);
+  assert.ok(calls.some((entry) => entry.operation === "launch"));
+});
+
+test("asking to reject a cookie banner means asking for a browser", async () => {
+  // A banner is a thing you PRESS. Answering over HTTP would succeed and quietly
+  // ignore the one instruction that was given.
+  const { toolset, calls } = webToolset({ readPageOverHttp: httpPage() });
+  await toolset.execute("web_open", { url: "https://news.example/story", rejectCookies: true });
+  assert.ok(calls.some((entry) => entry.operation === "launch"));
+  assert.ok(calls.some((entry) => entry.operation === "dismissCookieNotice"));
+});
+
+test("clicking after an HTTP read puts the browser on that page first", async () => {
+  // "The page" and "the controlled browser's page" stop being the same thing the
+  // moment web_open can answer without a browser — and a click acts on the
+  // SECOND one. Without this, a click lands on whatever the browser had open
+  // from an earlier turn and reports, perfectly truthfully, that it clicked
+  // something.
+  const { toolset, calls } = webToolset({
+    best: domTarget("Read more"),
+    readPageOverHttp: httpPage()
+  });
+  await toolset.execute("web_open", { url: "https://news.example/story" });
+  assert.ok(!calls.some((entry) => entry.operation === "launch"));
+  await toolset.execute("web_click", { text: "Read more" });
+  assert.ok(
+    calls.some((entry) => entry.operation === "launch" && entry.params.url === "https://news.example/story"),
+    "the browser was never sent to the page that was read"
+  );
+});
+
+test("driving a search engine through the browser is refused, and named", async () => {
+  // Observed live: handed a lookup, the model called `search`, disliked the
+  // results and then opened google.com/search in the controlled browser — which
+  // answered "unusual traffic" — then duckduckgo.com, which was blocked too.
+  // Three navigations to arrive back where it started, and to the user every one
+  // of them looked like the product failing to search.
+  const { toolset, calls } = webToolset({ readPageOverHttp: httpPage() });
+  const result = await toolset.execute("web_open", { url: "https://www.google.com/search?q=best+laptops+2026" });
+  assert.equal(result.ok, false);
+  assert.match(result.text, /search\(\{ query: "best laptops 2026" \}\)/, "the way out has to be the exact call to make");
+  assert.ok(!calls.some((entry) => entry.operation === "launch"), "it went to the browser anyway");
+});
+
+test("an ordinary page on a search engine's domain is still just a page", async () => {
+  // Pinning the refusal to the DOMAIN would refuse google.com/maps and
+  // news.google.com/rss/search as well, which this tool is exactly right for.
+  const { toolset } = webToolset({ readPageOverHttp: httpPage() });
+  for (const url of ["https://www.google.com/maps?q=coffee", "https://developers.google.com/search/docs"]) {
+    const result = await toolset.execute("web_open", { url });
+    assert.equal(result.ok, true, `${url} was refused, and it is not a search`);
+  }
 });
 
 test("a page is only opened over http(s)", async () => {

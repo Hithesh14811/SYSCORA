@@ -51,16 +51,47 @@ export function requirementsFor({ attachments = [] } = {}) {
   const needsImages = attachments.some((file) => file.kind === "image");
   // A document is TEXT by the time it reaches the model — see attachments.js,
   // which extracts before sending — so it needs no special capability beyond
-  // enough context to hold it.
+  // enough context to hold it. A folder is a listing, which is text too, and it
+  // has to be counted: a folder with three hundred entries in it is a few
+  // thousand characters and was previously invisible to this sum.
   const extractedChars = attachments
-    .filter((file) => file.kind === "document")
-    .reduce((total, file) => total + (file.text?.length ?? 0), 0);
+    .reduce((total, file) => total
+      + (file.kind === "document" ? file.text?.length ?? 0 : 0)
+      + (file.kind === "folder" ? (file.entries?.length ?? 0) * 60 : 0), 0);
   return {
     needsImages,
+    // Whether the images are somewhere SYSCORA could go and look at them, which
+    // decides what the refusal is able to offer. See noVisionAdvice.
+    imagesHavePaths: attachments.some((file) => file.kind === "image" && file.path),
     // Four characters to a token is the approximation used everywhere else in
     // this project; it is a ratio for comparing, not a tokeniser.
     approxTokens: Math.ceil(extractedChars / 4)
   };
+}
+
+/**
+ * What to say when an image has been attached and nothing configured can see.
+ *
+ * A REFUSAL THAT NAMES NO WAY OUT IS A DEAD END. This used to read "No
+ * configured model can read images." — true, final, and leaving the user holding
+ * a screenshot with nowhere to put it. Switching to Auto is not the answer
+ * either when Auto has already looked and found nothing, and telling them to
+ * pick another model is telling them to look for a door that is not there.
+ *
+ * The real way out is the thing that makes this product different from a chat
+ * window: SYSCORA is running ON the machine the picture is on, and it has eyes
+ * for the screen. Given the file's path it can open the image and look at it
+ * with the perception tools. So when the path is known — which it is in the
+ * desktop application — that is what the message offers, and it is offered as
+ * something to ASK for rather than done silently, because opening a window is a
+ * visible thing to do to somebody's screen.
+ */
+function noVisionAdvice(requirements = {}) {
+  const base = "The model configured here reads text, not pictures, so an attached image would not be looked at.";
+  return requirements.imagesHavePaths
+    ? `${base} SYSCORA can open it on this machine and look at it instead — ask it to, in your message. ` +
+      "Otherwise remove the image and describe what is in it."
+    : `${base} Describe what is in it instead, or save it on this machine and ask SYSCORA to open it.`;
 }
 
 /**
@@ -80,8 +111,9 @@ export function chooseModel(requirements = {}) {
     return {
       model: null,
       reason: requirements.needsImages
-        ? "No configured model can read images."
-        : "This is larger than any configured model's context window."
+        ? noVisionAdvice(requirements)
+        : "This is larger than any configured model's context window. Remove an attachment, or ask " +
+          "SYSCORA to read the file from your machine a part at a time."
     };
   }
   const cheapest = [...capable].sort((a, b) => a.costPerMTok - b.costPerMTok)[0];
@@ -110,10 +142,16 @@ export function checkAttachments(modelId, attachments = []) {
   if (!model) return { ok: false, reason: "That model is not configured." };
   const images = attachments.filter((file) => file.kind === "image");
   if (images.length && !model.capabilities.images) {
+    // Only offer Auto when Auto could actually help. Sending someone to a
+    // router that has nothing to route to is a refusal dressed as advice, and
+    // they find that out one click later.
+    const elsewhere = selectableModels().some((entry) => entry.capabilities.images);
     return {
       ok: false,
       model,
-      reason: `${model.label} cannot read images. Pick a model that can, or switch to Auto and one will be chosen for you.`
+      reason: elsewhere
+        ? `${model.label} cannot read images. Pick a model that can, or switch to Auto and one will be chosen for you.`
+        : noVisionAdvice(requirementsFor({ attachments }))
     };
   }
   return { ok: true, model, reason: null };

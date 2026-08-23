@@ -10,7 +10,15 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseResults, renderResults, searchWeb, unwrapRedirect } from "../../packages/fast-agent/src/web-search.js";
+import {
+  parseBingHtmlResults,
+  parseResults,
+  parseRssResults,
+  renderResults,
+  searchWeb,
+  unwrapBingClick,
+  unwrapRedirect
+} from "../../packages/fast-agent/src/web-search.js";
 
 const redirect = (url) => `//duckduckgo.com/l/?uddg=${encodeURIComponent(url)}&amp;rut=abc123`;
 
@@ -98,14 +106,122 @@ test("the limit is honoured", () => {
   assert.equal(parseResults(HTML_BODY, { limit: 1 }).length, 1);
 });
 
+// ---- Bing, which is what actually answers ------------------------------------
+//
+// On 23 Aug 2026 BOTH DuckDuckGo endpoints answered every query from this
+// machine with HTTP 202 and a challenge page, so search was down completely.
+// One operator is not a capability; these cover the second one.
+
+// Copied from the real feed, including the `<image>` block — which carries a
+// `<title>` and a `<link>` of its own and became an eleventh "result" the first
+// time this was parsed by matching tags rather than items.
+const RSS_BODY = `<?xml version="1.0" encoding="utf-8" ?><rss version="2.0"><channel>
+  <title>Bing: best laptop 2026</title>
+  <link>http://www.bing.com:80/search?q=best+laptop+2026</link>
+  <image><url>http://www.bing.com:80/s/a/rsslogo.gif</url><title>best laptop 2026</title><link>http://www.bing.com:80/search?q=best+laptop+2026</link></image>
+  <item><title>Best Laptops 2026: benchmarked picks</title><link>https://www.tomshardware.com/laptops/best-laptops</link><description>Our expert reviewers spend hours testing &amp; comparing products.</description></item>
+  <item><title><![CDATA[Best laptops 2026: Premium, budget & gaming]]></title><link>https://www.pcworld.com/best-laptops</link><description><![CDATA[Picks for every budget.]]></description></item>
+</channel></rss>`;
+
+// Bing's results page. The title anchor is inside the <h2>; the other anchors in
+// the block are deep links and a favicon, and taking "the first anchor in the
+// block" picked those up instead.
+const BING_HTML_BODY = `
+<ol id="b_results">
+  <li class="b_algo" data-id iid=SERP.5346>
+    <div class="tptt"><a href="https://www.tomshardware.com"><img class="rms_img"></a></div>
+    <h2><a href="https://www.tomshardware.com/laptops/best-laptops" h="ID=SERP,5000.1">Best Laptops 2026: benchmarked picks</a></h2>
+    <p class="b_lineclamp2">Our expert reviewers spend hours testing and comparing products.</p>
+  </li>
+  <li class="b_algo">
+    <h2><a href="https://www.bing.com/ck/a?!&amp;&amp;p=abc&amp;u=a1aHR0cHM6Ly93d3cucGN3b3JsZC5jb20vYmVzdC1sYXB0b3Bz&amp;ntb=1">Best laptops 2026 &amp; buying advice</a></h2>
+    <p>Picks for every budget.</p>
+  </li>
+</ol>`;
+
+test("an RSS feed of results parses to titles, URLs and snippets", () => {
+  const results = parseRssResults(RSS_BODY);
+  assert.equal(results.length, 2, "the channel's own <image> block became a result again");
+  assert.equal(results[0].title, "Best Laptops 2026: benchmarked picks");
+  assert.equal(results[0].url, "https://www.tomshardware.com/laptops/best-laptops");
+  assert.match(results[0].snippet, /testing & comparing/, "entities were left escaped");
+  // Bing switches between escaped text and CDATA depending on the query.
+  assert.equal(results[1].title, "Best laptops 2026: Premium, budget & gaming");
+  assert.equal(results[1].snippet, "Picks for every budget.");
+});
+
+test("Bing's results page parses, and the title anchor is the one in the heading", () => {
+  const results = parseBingHtmlResults(BING_HTML_BODY);
+  assert.equal(results.length, 2);
+  assert.equal(results[0].title, "Best Laptops 2026: benchmarked picks");
+  assert.equal(results[0].url, "https://www.tomshardware.com/laptops/best-laptops");
+  assert.match(results[0].snippet, /expert reviewers/);
+});
+
+test("Bing's click tracker is unwrapped to the page the user would actually visit", () => {
+  // A tracker URL is useless to both the model and the user: it names bing.com,
+  // so nothing can be reasoned about the source, and it expires.
+  assert.equal(parseBingHtmlResults(BING_HTML_BODY)[1].url, "https://www.pcworld.com/best-laptops");
+  assert.equal(unwrapBingClick("https://plain.example/x"), "https://plain.example/x");
+});
+
 // ---- the network behaviour, stubbed ----------------------------------------
 
+// Routed by hostname, because the endpoint list now spans two operators and
+// "everything that is not lite" is no longer one thing.
 const stub = (bodies) => async (url) => {
-  const which = String(url).includes("lite.duckduckgo") ? "lite" : "html";
+  const target = String(url);
+  const which = target.includes("bing.com") ? (bodies.bing === undefined ? "html" : "bing")
+    : target.includes("lite.duckduckgo") ? "lite"
+    : "html";
   const entry = bodies[which];
   if (entry instanceof Error) throw entry;
   return { ok: entry.status === undefined || entry.status === 200, status: entry.status ?? 200, text: async () => entry.body ?? "" };
 };
+
+test("one engine declining is not search being down", async () => {
+  // The failure that made a second operator necessary: both DuckDuckGo
+  // endpoints answering 202 meant search reported itself down for every query
+  // on the machine, for a day.
+  const found = await searchWeb("best laptop", {
+    fetchImpl: async (url) => (String(url).includes("duckduckgo")
+      ? { ok: true, status: 202, text: async () => "<html><body>verify</body></html>" }
+      : { ok: true, status: 200, text: async () => RSS_BODY })
+  });
+  assert.equal(found.ok, true);
+  assert.equal(found.provider, "bing-rss");
+  assert.equal(found.results.length, 2);
+});
+
+test("a browser's whole header set is sent, because that is what the 202 was about", async () => {
+  // The 202 challenge was this client's own request shape, not a rate limit: a
+  // user-agent claiming to be Chrome with none of Chrome's other headers beside
+  // it is a contradiction any bot check can read. Sending the full set turned
+  // both endpoints from 202-and-nothing into 200-with-results, measured live.
+  let sent = null;
+  await searchWeb("best laptop", {
+    fetchImpl: async (url, init) => {
+      sent = init.headers;
+      return { ok: true, status: 200, text: async () => LITE_BODY };
+    }
+  });
+  assert.match(sent["user-agent"], /Chrome\/124/);
+  for (const header of ["sec-ch-ua", "sec-fetch-mode", "sec-fetch-dest", "upgrade-insecure-requests"]) {
+    assert.ok(sent[header], `${header} was dropped — this is exactly what got us refused`);
+  }
+});
+
+test("a correct Bing answer is not condemned as a challenge", async () => {
+  // The challenge check used to look for DuckDuckGo's `uddg=` redirector in
+  // EVERY body, which is absent from every valid Bing response — so switching
+  // engines without making that marker per-endpoint would have rejected every
+  // result the new endpoints returned.
+  const found = await searchWeb("best laptop", {
+    fetchImpl: stub({ bing: { body: BING_HTML_BODY }, lite: { body: LITE_BODY }, html: { body: HTML_BODY } })
+  });
+  assert.equal(found.ok, true);
+  assert.ok(found.results.length > 0);
+});
 
 test("a search returns results and names which engine answered", async () => {
   const found = await searchWeb("ml internships", { fetchImpl: stub({ lite: { body: LITE_BODY }, html: { body: HTML_BODY } }) });
@@ -115,17 +231,21 @@ test("a search returns results and names which engine answered", async () => {
 });
 
 test("HTTP 202 is a challenge, not an answer, and says so", async () => {
-  // Observed live: after repeated automated searches from one address,
-  // DuckDuckGo answers 202 with a challenge page carrying no results and none
-  // of the words a CAPTCHA check looks for. Reported as "no results" it sends
-  // the model off to rephrase a query that was never the problem.
+  // A challenge page carries no results and none of the words a CAPTCHA check
+  // looks for. Reported as "no results" it sends the model off to rephrase a
+  // query that was never the problem.
   const found = await searchWeb("ml internships", {
     fetchImpl: async () => ({ ok: true, status: 202, text: async () => "<html><head><title>DuckDuckGo</title></head><body>nothing here</body></html>" })
   });
   assert.equal(found.ok, false);
-  assert.match(found.reason, /rate-limiting this machine/);
+  assert.match(found.reason, /declined the request \(HTTP 202\)/);
   assert.ok(!/no results could be parsed/.test(found.reason),
-    "a rate limit reported as an empty result set sends the model the wrong way");
+    "a refusal reported as an empty result set sends the model the wrong way");
+  // And it must not name a CAUSE it did not observe. This said "it is
+  // rate-limiting this machine" for a fortnight; the real cause was our own
+  // headers, and that sentence sent whoever read it off to wait out a limit
+  // that did not exist.
+  assert.ok(!/rate.?limit/i.test(found.reason), "a guess is being reported as a finding again");
 });
 
 test("a body with no result links at all is a challenge, not an empty result set", async () => {

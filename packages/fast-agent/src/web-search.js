@@ -19,14 +19,104 @@
 //
 // NO API KEY. A key would mean another credential in the state directory and an
 // account to keep funded, for a capability that has to work on a fresh install
-// with nothing configured. DuckDuckGo's HTML endpoint needs neither.
+// with nothing configured. None of the endpoints below need one.
+//
+// THE 202 WAS US, NOT THEM.
+//
+// On 23 Aug 2026 every search on this machine failed: both DuckDuckGo endpoints
+// answered HTTP 202 with a challenge page, and this file said so in the honest
+// words it had — "it is rate-limiting this machine". Which was wrong, and being
+// wrong in a plausible way is what made it cost a day. The same query, typed
+// into a real browser on the same machine at the same minute, returned ten
+// results immediately.
+//
+// The difference was the REQUEST SHAPE. This sent a user-agent claiming to be
+// Chrome and two other headers. A real Chrome also sends `sec-fetch-*`,
+// `sec-ch-ua*` and `upgrade-insecure-requests`, and their absence beside a
+// Chrome user-agent is a contradiction any bot check can read. Sending the whole
+// set turned both endpoints from 202-and-nothing into 200-with-ten-results,
+// measured directly. See BROWSER_HEADERS.
+//
+// The lesson generalises past this file: when an external service refuses us and
+// a browser on the same machine is not refused, the difference is ours to find.
+//
+// ONE ENGINE IS STILL NOT A CAPABILITY.
+//
+// Both entries here used to belong to DuckDuckGo, so one operator having a bad
+// day was search being down. Bing is a genuinely separate index, and the two
+// disagree in both directions — measured the same day on "best laptops of 2026",
+// DuckDuckGo returned PCMag, CNET, Forbes and Tom's Guide while Bing returned
+// four dictionary definitions of the word "best". (That was verified as Bing's
+// own ranking, in a real browser, and not a parsing fault here.) DuckDuckGo goes
+// first on that evidence; Bing is what answers when it cannot.
 
 const ENDPOINTS = [
-  // Lite first: same results, a fraction of the markup, so less to parse and
-  // less to go wrong.
-  { name: "duckduckgo-lite", url: (query) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}` },
-  { name: "duckduckgo-html", url: (query) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}` }
+  // A different operator with a different index, and the better ranking of the
+  // two on the queries this was measured against. Lite first: same results, a
+  // fraction of the markup, so less to parse and less to go wrong.
+  {
+    name: "duckduckgo-lite",
+    url: (query) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`,
+    parse: parseResults,
+    declined: (body) => !/uddg=/.test(body)
+  },
+  {
+    name: "duckduckgo-html",
+    url: (query) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+    parse: parseResults,
+    declined: (body) => !/uddg=/.test(body)
+  },
+  // Bing's RSS view: `<item><title><link><description>`, nothing else. There is
+  // no markup to keep up with, so this is the one endpoint whose parser cannot
+  // be broken by a redesign.
+  {
+    name: "bing-rss",
+    url: (query) => `https://www.bing.com/search?q=${encodeURIComponent(query)}&format=rss`,
+    parse: parseRssResults,
+    // An answer is a feed with items in it. Anything else — a challenge, an
+    // interstitial, an empty channel — is the engine declining.
+    declined: (body) => !/<item[\s>]/i.test(body)
+  },
+  // Same index, through the page a person would see. Kept because RSS is a
+  // secondary surface that Bing could withdraw, and because a query it answers
+  // with a "did you mean" and no feed items sometimes still has HTML results.
+  {
+    name: "bing-html",
+    url: (query) => `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=en`,
+    parse: parseBingHtmlResults,
+    declined: (body) => /detected unusual traffic|are you a robot|<title>\s*captcha/i.test(body)
+      || !/id="b_results"|class="b_algo"/.test(body)
+  }
 ];
+
+// WHAT A BROWSER ACTUALLY SENDS.
+//
+// A user-agent string claiming to be Chrome, with none of the headers Chrome
+// always sends beside it, is a contradiction — and it is the contradiction that
+// got this rejected, not the volume of requests. Every field below is one a real
+// Chrome 124 puts on a top-level navigation; together they are the difference
+// between HTTP 202 and a page of results, measured on both DuckDuckGo endpoints.
+//
+// This is not evasion of a rate limit or a paywall: the requests are one per
+// search, from a person's own machine, for the pages they asked to look at.
+// It is a client describing itself accurately.
+const BROWSER_HEADERS = {
+  "user-agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  // xml is in the list because one endpoint returns a feed.
+  accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "accept-language": "en-US,en;q=0.9",
+  "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "sec-fetch-dest": "document",
+  "sec-fetch-mode": "navigate",
+  "sec-fetch-site": "none",
+  "sec-fetch-user": "?1",
+  "upgrade-insecure-requests": "1"
+};
+
+export { BROWSER_HEADERS };
 
 const ENTITIES = {
   "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&#x27;": "'", "&nbsp;": " "
@@ -131,6 +221,90 @@ export function parseResults(html, { limit = 10 } = {}) {
 }
 
 /**
+ * Pull results out of an RSS feed of search results.
+ *
+ * `<item>` carries `<title>`, `<link>` and `<description>` and nothing else, so
+ * there is no page structure to guess at. Titles and descriptions may be either
+ * CDATA or entity-escaped depending on the query, which is the one wrinkle.
+ */
+export function parseRssResults(xml, { limit = 10 } = {}) {
+  const text = String(xml ?? "");
+  const results = [];
+  const seen = new Set();
+  const field = (item, tag) => {
+    const raw = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "i").exec(item)?.[1] ?? "";
+    return stripTags(raw.replace(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/, "$1"));
+  };
+  for (const match of text.matchAll(/<item[\s>][\s\S]*?<\/item>/gi)) {
+    if (results.length >= limit) break;
+    const item = match[0];
+    const url = field(item, "link");
+    const title = field(item, "title");
+    // A feed's own `<image>` block and any malformed entry are skipped rather
+    // than becoming a result with no destination.
+    if (!title || !/^https?:\/\//i.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    results.push({ title, url, snippet: field(item, "description").slice(0, 320) });
+  }
+  return results;
+}
+
+/**
+ * Pull results out of Bing's results page.
+ *
+ * Anchored on `class="b_algo"`, the one class Bing has kept across every
+ * redesign, and read one block at a time so a snippet can only come from the
+ * result it sits inside — the same rule as the DuckDuckGo parser, for the same
+ * reason: a snippet under the wrong link is a confident wrong statement about a
+ * page the user may click.
+ */
+export function parseBingHtmlResults(html, { limit = 10 } = {}) {
+  const text = String(html ?? "");
+  const results = [];
+  const seen = new Set();
+  // Every algorithmic result opens with this class; the block ends where the
+  // next one begins, or at the end of the result list.
+  const starts = [...text.matchAll(/<li[^>]*class="[^"]*\bb_algo\b[^"]*"/gi)].map((match) => match.index);
+  for (const [position, start] of starts.entries()) {
+    if (results.length >= limit) break;
+    const block = text.slice(start, starts[position + 1] ?? Math.min(text.length, start + 12000));
+    // The title anchor is the first one inside an <h2>. Bing also emits deep
+    // links, image anchors and "cached" anchors in the same block, and taking
+    // "the first anchor" picked those up.
+    const anchor = /<h2[^>]*>[\s\S]*?<a\b[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
+    if (!anchor) continue;
+    const url = decode(anchor[1]);
+    const title = stripTags(anchor[2]);
+    // Bing wraps some destinations in its own `/ck/a?` click tracker, whose real
+    // target is base64 in `u=a1…`. A tracker URL is useless to both the model
+    // and the user, so a result that is still wrapped after unwrapping is
+    // dropped rather than shown.
+    const destination = unwrapBingClick(url);
+    if (!title || !/^https?:\/\//i.test(destination)) continue;
+    if (/^https?:\/\/(www\.)?bing\.com/i.test(destination)) continue;
+    if (seen.has(destination)) continue;
+    seen.add(destination);
+    const snippet = /<p\b[^>]*>([\s\S]*?)<\/p>/i.exec(block)?.[1] ?? "";
+    results.push({ title, url: destination, snippet: stripTags(snippet).slice(0, 320) });
+  }
+  return results;
+}
+
+/** Bing's click tracker keeps the real destination base64url-encoded in `u=a1…`. */
+export function unwrapBingClick(href) {
+  const raw = String(href ?? "");
+  const match = /[?&]u=a1([A-Za-z0-9_-]+)/.exec(raw);
+  if (!match) return raw;
+  try {
+    const padded = match[1].replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = Buffer.from(padded, "base64").toString("utf8");
+    return /^https?:\/\//i.test(decoded) ? decoded : raw;
+  } catch {
+    return raw;
+  }
+}
+
+/**
  * Run a search. Returns `{ ok, query, results, provider, reason }`.
  *
  * Never throws: a failed search is a result the model reads and works around,
@@ -145,38 +319,40 @@ export async function searchWeb(query, { limit = 10, timeoutMs = 20000, fetchImp
   for (const endpoint of ENDPOINTS) {
     try {
       const response = await fetchImpl(endpoint.url(trimmed), {
-        headers: {
-          // A default Node user-agent is refused outright by every search
-          // engine. This is the same string the controlled browser sends.
-          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-          "accept": "text/html,application/xhtml+xml",
-          "accept-language": "en-US,en;q=0.9"
-        },
+        headers: BROWSER_HEADERS,
         signal: AbortSignal.timeout(timeoutMs)
       });
       const body = response.ok ? await response.text() : "";
       // "RATE LIMITED" AND "NOTHING MATCHED" ARE DIFFERENT ANSWERS.
       //
-      // They lead the model to different recoveries — wait or open a browser
-      // versus rephrase the query — so collapsing them into "no results" sends
-      // it the wrong way. Observed here: after repeated automated searches from
-      // one address, DuckDuckGo answers HTTP 202 with a challenge page carrying
-      // no results and none of the words this used to look for, and the search
-      // reported "no results could be parsed" for a query that had worked
-      // minutes earlier.
+      // They lead the model to different recoveries — try another engine or open
+      // a browser versus rephrase the query — so collapsing them into "no
+      // results" sends it the wrong way. Observed here: after repeated automated
+      // searches from one address, DuckDuckGo answers HTTP 202 with a challenge
+      // page carrying no results and none of the words this used to look for,
+      // and the search reported "no results could be parsed" for a query that
+      // had worked minutes earlier.
       //
       // 202 is the tell: a search engine that means "here are your results"
       // answers 200. Anything else, or a page whose <title> is a challenge, or
-      // a body with no result links in it at all, is the engine declining.
+      // a body with none of THIS endpoint's result markers in it, is the engine
+      // declining. The marker is per-endpoint — it used to be DuckDuckGo's
+      // `uddg=` redirector for every endpoint, which would now condemn every
+      // correct Bing answer as a challenge.
       const challenged = response.status === 202
         || /detected unusual traffic|are you a robot|<title>\s*captcha/i.test(body)
-        || (body.length > 0 && !/uddg=/.test(body));
+        || (body.length > 0 && endpoint.declined(body));
       if (!response.ok) { failures.push(`${endpoint.name}: HTTP ${response.status}`); continue; }
       if (challenged) {
-        failures.push(`${endpoint.name}: declined the request (HTTP ${response.status}) — it is rate-limiting this machine`);
+        // NOT "it is rate-limiting this machine". That was the wording here for
+        // a fortnight and it was a guess presented as a finding — the actual
+        // cause of every 202 measured was this client's own headers, and the
+        // sentence sent whoever read it off to wait for a limit that did not
+        // exist. Say what was observed and let the next endpoint try.
+        failures.push(`${endpoint.name}: declined the request (HTTP ${response.status}) and returned no results`);
         continue;
       }
-      const results = parseResults(body, { limit });
+      const results = endpoint.parse(body, { limit });
       if (results.length === 0) { failures.push(`${endpoint.name}: answered, but no results could be parsed`); continue; }
       return { ok: true, query: trimmed, results, provider: endpoint.name, reason: null };
     } catch (error) {

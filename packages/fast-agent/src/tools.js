@@ -49,6 +49,9 @@ import { createProgressReader, reportsProgress } from "./command-progress.js";
 // Searching the web without driving a browser. See web-search.js: a search is a
 // LIST, and a list is one HTTP round trip rather than six page loads.
 import { renderResults, searchWeb } from "./web-search.js";
+// And READING one without driving a browser either — the same argument one step
+// on. See web-page.js: the browser is kept for the pages that genuinely need it.
+import { fetchPage } from "./web-page.js";
 import { Reversal, createUndoJournal, timeLeft } from "./undo-journal.js";
 import { prepareFileUndo, restoreFile, describeFileChange } from "./undo-files.js";
 import { resolveStateDir } from "../../shared-types/src/state-path.js";
@@ -823,7 +826,13 @@ export function buildToolset({
   // Seam for tests: turning a captured PNG into a brightness grid. The real one
   // decodes the file; a test hands back a prepared grid rather than having to
   // synthesise valid PNGs.
-  readSignature = async (path) => screenSignature(await fs.readFile(path))
+  readSignature = async (path) => screenSignature(await fs.readFile(path)),
+  // Seam for tests, and a necessary one: web_open now tries an HTTP read before
+  // spending a browser on the page. Without this the toolset's unit tests would
+  // reach the real internet — one of them opens `https://example.com/`, which
+  // exists — and a suite that quietly depends on a network is a suite that fails
+  // on an aeroplane and passes on review.
+  readPageOverHttp = fetchPage
 } = {}) {
   // What the last look at the screen found, so a click can name an element
   // rather than a coordinate. Reset by every fresh observation.
@@ -845,6 +854,11 @@ export function buildToolset({
     // the exact defect that took two and a half cores for five sessions.
     stateDir: resolveStateDir(basePath),
     lastWindow: null,
+    // The last page read over HTTP rather than in the controlled browser, and
+    // the reason `escalateToBrowser` exists: once web_open can answer without a
+    // browser, "the page" and "the browser's page" are two different things, and
+    // everything that CLICKS acts on the second one.
+    httpPage: null,
     // WHAT WAS DONE AND HOW TO PUT IT BACK. See undo-journal.js.
     //
     // A previous session left the user's volume at 42% and could not restore it
@@ -1985,10 +1999,57 @@ export function buildToolset({
     return evidence({
       observed: `${where.url} ${JSON.stringify(String(where.title ?? ""))} — ` +
         `${String(page.text ?? "").length} characters of text and ${(page.elements ?? []).length} controls`,
-      method: "browser.currentState+read",
+      // HOW IT WAS READ, not how pages are usually read. A page fetched over
+      // HTTP was never in the controlled browser, and a receipt that names
+      // `browser.currentState` for it is a receipt describing a call that did
+      // not happen — which is the one thing a receipt may never do.
+      method: page.via === "http" ? "http.get+extract" : "browser.currentState+read",
       ...(actedVia ? { actedVia } : {}),
       verdict: CONFIRMED
     });
+  };
+
+  // READING A PAGE OVER HTTP, BEFORE SPENDING A BROWSER ON IT.
+  //
+  // See web-page.js. web_open used to mean: spawn a second Chromium, wait for
+  // CDP, navigate, poll until the DOM settled, serialise everything. Several
+  // seconds, a process left behind and a window on the user's screen, to obtain
+  // the words on an article — which arrive over plain HTTP in about half of one
+  // second with none of that.
+  //
+  // The fetched page is shaped like a `readOnce` reading so that ONE renderer
+  // draws both, and so that a fetched page and a browsed page cannot drift into
+  // saying different things about the same site.
+  const asPageReading = (fetched) => ({
+    state: { url: fetched.url, title: fetched.title },
+    // Links become elements with the shape webLines already knows how to print,
+    // so a fetched page lists what can be followed exactly as a browsed one does.
+    elements: fetched.links.map((link) => ({ text: link.label, role: "a", href: link.href, clickable: true })),
+    text: fetched.text,
+    via: "http"
+  });
+
+  // WHICH PAGE THE BROWSER IS ACTUALLY ON.
+  //
+  // Once web_open can answer over HTTP, "the page" and "the controlled browser's
+  // page" stop being the same thing — and web_click, web_type and web_scroll all
+  // act on the SECOND one. Without this, a click after an HTTP read would land
+  // on whatever the browser had open from an earlier turn, or on about:blank,
+  // and report perfectly truthfully that it clicked something. That is the
+  // "whose window is this" defect with a browser in place of a window.
+  //
+  // So: anything that ACTS puts the real browser on the page that was read
+  // first. It is a navigation the user never asked for, which is why it is
+  // announced in the result rather than done silently.
+  const escalateToBrowser = async () => {
+    const pending = state.httpPage;
+    if (!pending) return null;
+    state.httpPage = null;
+    await runCapability("browser.launch", { url: pending.url });
+    await runCapability("browser.wait", {
+      condition: "document.readyState", value: "complete", timeoutMs: 10000
+    }).catch(() => null);
+    return pending.url;
   };
 
   const renderWebPage = (page) => {
@@ -4924,8 +4985,60 @@ export function buildToolset({
       execute: async (args) => {
         const url = String(args.url ?? "");
         if (!/^https?:\/\//i.test(url)) throw new Error("Only http(s) URLs can be opened.");
+
+        // DRIVING A SEARCH ENGINE IS WHAT `search` IS FOR.
+        //
+        // Observed live on 23 Aug 2026: handed a lookup, the model called
+        // `search`, disliked the results, and then opened
+        // google.com/search?q=… in the controlled browser — which answered with
+        // "our systems have detected unusual traffic", so it tried
+        // duckduckgo.com/?q=… , which was blocked too. Three navigations and
+        // eight seconds to arrive back where it started, and every one of them
+        // looked to the user like the product failing to search.
+        //
+        // The lesson goes in the RESULT rather than in the tool description,
+        // where it is read at the moment it matters and costs nothing the rest
+        // of the time. Thrown, not returned, because there is no page here to
+        // report and a sentence about what to do instead is the whole content.
+        //
+        // The path is pinned to a SEARCH path — `/search`, `/html/`, `/lite/`
+        // or the bare root — rather than to the domain. Matching the domain
+        // alone would refuse google.com/maps?q=… and news.google.com/rss/search
+        // as well, which are ordinary pages this tool is exactly right for.
+        const engine = /^https?:\/\/(?:[a-z0-9-]+\.)*(google|bing|duckduckgo|yahoo|baidu|yandex|ecosia|brave)\.[a-z.]+\/(?:search|html\/?|lite\/?)?(?:[?#]|$)/i.exec(url);
+        if (engine && /[?&](q|query|p|wd|text)=/i.test(url)) {
+          const terms = decodeURIComponent(/[?&](?:q|query|p|wd|text)=([^&]*)/i.exec(url)?.[1] ?? "").replace(/\+/g, " ");
+          throw new Error(
+            `Do not drive ${engine[1]} through the browser — it blocks automated browsers and this will keep failing. ` +
+            `Call the search tool instead: search({ query: ${JSON.stringify(terms)} }). ` +
+            "It returns titles, URLs and snippets in one step, then use web_open on the result you want to read."
+          );
+        }
+
+        // HTTP FIRST. Measured against nodejs.org and Wikipedia on 23 Aug 2026:
+        // 490ms and 670ms respectively for the full text and every link, versus
+        // several seconds and a browser process for the same words.
+        //
+        // The decision to fall back is a MEASUREMENT of what came back, not a
+        // list of sites believed to need a browser: `readable` is false when a
+        // single-page application has sent its empty shell, and a domain list
+        // would be wrong the week after it was written and wrong silently.
+        //
+        // A cookie banner is a thing you press, so asking to reject one is
+        // asking for a browser; that request skips the fetch rather than
+        // succeeding over HTTP and quietly ignoring it.
+        if (args.rejectCookies !== true) {
+          const fetched = await readPageOverHttp(url);
+          if (fetched.ok && fetched.readable) {
+            state.httpPage = { url: fetched.url, at: Date.now() };
+            const page = asPageReading(fetched);
+            return { ...page, evidence: pageEvidence(page, "http.get") };
+          }
+        }
+
         // launch() reuses an already-running controlled browser and navigates it,
         // so this is both "start one" and "go there".
+        state.httpPage = null;
         await runCapability("browser.launch", { url });
         await runCapability("browser.wait", {
           condition: "document.readyState", value: "complete", timeoutMs: 10000
@@ -4962,6 +5075,21 @@ export function buildToolset({
       // after a click that navigated, which is precisely when the page has an
       // address and no content yet.
       execute: async (args) => {
+        // RE-READ THE PAGE THAT WAS READ, not a browser that was never opened.
+        //
+        // When web_open answered over HTTP there is no controlled browser, so
+        // asking it what it has open returns nothing — and web_read would have
+        // reported "the browser has no page open" about a page the model had
+        // just been shown the whole of. A selector is a DOM query, so that case
+        // still needs the browser and escalates.
+        if (state.httpPage && !args.selector) {
+          const fetched = await readPageOverHttp(state.httpPage.url);
+          if (fetched.ok) {
+            const page = asPageReading(fetched);
+            return { ...page, evidence: pageEvidence(page) };
+          }
+        }
+        await escalateToBrowser();
         const page = await readWebPage({ selector: args.selector, settle: true });
         return { ...page, evidence: pageEvidence(page) };
       },
@@ -4982,6 +5110,9 @@ export function buildToolset({
       execute: async (args) => {
         const wanted = String(args.text ?? "").trim();
         if (!wanted) throw new Error("web_click needs text: the visible label of the link or button.");
+        // A click acts on the CONTROLLED BROWSER's page, which after an HTTP
+        // read is not the page that was read. Put the browser there first.
+        await escalateToBrowser();
         // Things that DO something first. Only if nothing there answers to the
         // name is the net widened to page furniture, because clicking a heading
         // that merely contains the words is how a search result gets "opened"
@@ -5078,6 +5209,9 @@ export function buildToolset({
       preview: (args) => `${JSON.stringify(String(args.text).slice(0, 60))}${args.into ? ` into "${args.into}"` : ""}`,
       acts: true,
       execute: async (args) => {
+        // Same reason as web_click: typing needs the real browser to be on the
+        // page that was read, not on whatever it had open before.
+        await escalateToBrowser();
         const field = await runCapability("browser.findField", { text: args.into ?? null });
         if (!field?.found) {
           throw new Error(
@@ -5155,6 +5289,9 @@ export function buildToolset({
       preview: (args) => `${args.y ?? 600}px`,
       acts: true,
       execute: async (args) => {
+        // A fetched page arrived whole — there is nothing below the fold to
+        // scroll to — but the browser still has to be on it before it can move.
+        await escalateToBrowser();
         const scrolled = await runCapability("browser.scroll", { y: Number.isFinite(Number(args.y)) ? Number(args.y) : 600 });
         // `scrollAfter` is the document's own scrollY read after the scroll —
         // the page's state, not the scroll call's opinion of itself, which is

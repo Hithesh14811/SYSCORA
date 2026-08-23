@@ -50,17 +50,31 @@ test("Auto refuses rather than picking something blind for an image", () => {
     assert.ok(model?.capabilities.images, "the chosen model has to be one that can actually see");
   } else {
     assert.equal(model, null);
-    assert.match(reason, /cannot read images|No configured model/i);
+    assert.match(reason, /not pictures|cannot read images/i);
   }
 });
 
-test("an explicitly chosen model that cannot see refuses, and says what to do", () => {
+test("a refusal names a way out that actually exists", () => {
   const blind = MODELS.find((model) => !model.capabilities.images);
   if (!blind) return; // nothing to prove once every model can see
   const result = checkAttachments(blind.id, [anImage]);
   assert.equal(result.ok, false);
-  assert.match(result.reason, /cannot read images/);
-  assert.match(result.reason, /Auto/, "the message has to name the way out, not just the problem");
+
+  // A REFUSAL THAT NAMES NO WAY OUT IS A DEAD END, and one that names the WRONG
+  // way out is worse — the user follows it and finds nothing there. This used to
+  // say "switch to Auto and one will be chosen for you" unconditionally, which
+  // is only true when Auto has something to route to. When nothing configured
+  // can see, sending them to the router is sending them to a door that is not
+  // in the wall.
+  const anyCanSee = MODELS.some((model) => model.capabilities.images);
+  if (anyCanSee) {
+    assert.match(result.reason, /Auto|another model/i);
+  } else {
+    assert.ok(!/switch to Auto/i.test(result.reason),
+      "Auto is being offered as the way out when Auto has nothing to route to");
+    // The way out that IS real: SYSCORA runs on the machine the picture is on.
+    assert.match(result.reason, /describe|SYSCORA can open|ask SYSCORA/i);
+  }
 });
 
 test("a document is fine for a model that cannot see — it travels as text", () => {

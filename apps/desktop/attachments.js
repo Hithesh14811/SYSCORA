@@ -6,30 +6,45 @@
 // hunting for `pdftotext` on the machine to recover. That is the model doing
 // work the surface should have done before the request was ever sent.
 //
-// So: a document is extracted HERE, before it goes anywhere, and what travels
-// is text. An image is not extracted, because the point of an image is the
-// pixels; it travels as data and only to a model that can see.
+// So: a document is extracted BEFORE it goes anywhere, and what travels is text.
+// An image is not extracted, because the point of an image is the pixels.
 //
-// WHY EXTRACTION IS DONE IN THE PAGE
+// WHERE THE EXTRACTION HAPPENS, AND WHY IT MOVED.
 //
-// The alternative is uploading the bytes and extracting server-side, which
-// means a file endpoint, a temp directory, and a cleanup story for documents
-// that may be somebody's payslip. Extracting here means the bytes never leave
-// the machine and only the text the user is already asking about is sent.
+// It used to happen entirely in this file, which meant a hand-written PDF reader
+// that could only cope with UNCOMPRESSED content streams — so a PDF from any
+// modern exporter was refused — and every Word document was turned away with
+// "cannot be read in the browser". Both were true statements about a limitation
+// that did not need to exist: documents.js on the daemon side already reads
+// .pdf, .docx, .xlsx and .pptx properly, and the agent has been using it on
+// files it finds on disk all along. There is now ONE extractor, called from both
+// ends, over a loopback endpoint that writes nothing to disk.
+//
+// A plain text file is still read here. It needs no parser, and not making a
+// round trip for it is the difference between instant and not.
 
 export const MAX_FILE_BYTES = 20 * 1024 * 1024;
 // Enough for a long report, bounded so one attachment cannot fill the model's
 // context and push the actual question out of it.
 export const MAX_EXTRACTED_CHARS = 200_000;
+// A folder is attached as a LISTING, not as its contents. Somebody's Downloads
+// folder has forty thousand files in it and none of them is the question.
+export const MAX_FOLDER_ENTRIES = 300;
 
-const IMAGE_TYPES = /^image\/(png|jpeg|jpg|gif|webp|bmp)$/i;
-const TEXTUAL_EXTENSIONS = /\.(txt|md|markdown|csv|tsv|json|ya?ml|xml|html?|css|js|mjs|ts|tsx|jsx|py|java|c|cpp|cs|go|rs|rb|php|sh|ps1|sql|log|ini|toml|env)$/i;
+const IMAGE_TYPES = /^image\/(png|jpeg|jpg|gif|webp|bmp|avif)$/i;
+const TEXTUAL_EXTENSIONS = /\.(txt|md|markdown|csv|tsv|json|ya?ml|xml|html?|css|js|mjs|cjs|ts|tsx|jsx|py|java|c|h|cpp|cs|go|rs|rb|php|sh|ps1|bat|sql|log|ini|toml|env|srt|vtt|rst|tex)$/i;
+// What the daemon's extractor handles. Kept in step with isDocumentPath() in
+// packages/fast-agent/src/documents.js — a format listed here that it does not
+// know comes back as a clear refusal rather than as mojibake.
+const EXTRACTABLE_EXTENSIONS = /\.(pdf|docx|xlsx|pptx)$/i;
 
 export function kindOf(file) {
-  if (IMAGE_TYPES.test(file.type)) return "image";
-  if (/pdf$/i.test(file.type) || /\.pdf$/i.test(file.name)) return "pdf";
-  if (/\.(docx?|odt|rtf)$/i.test(file.name)) return "document-binary";
+  if (IMAGE_TYPES.test(file.type) || /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(file.name)) return "image";
+  if (EXTRACTABLE_EXTENSIONS.test(file.name) || /pdf$/i.test(file.type)) return "extractable";
   if (TEXTUAL_EXTENSIONS.test(file.name) || /^text\//i.test(file.type)) return "text";
+  // The old Office formats and the ODF ones are genuinely different file
+  // formats, not older versions of the new ones, and nothing here reads them.
+  if (/\.(docx?|xlsx?|pptx?|odt|ods|odp|rtf|pages)$/i.test(file.name)) return "document-unsupported";
   return "unknown";
 }
 
@@ -42,52 +57,83 @@ const readAsDataUrl = (file) => new Promise((resolve, reject) => {
   reader.readAsDataURL(file);
 });
 
-/**
- * Pull readable text out of a PDF without a PDF library.
- *
- * This is deliberately modest and says so. It decompresses nothing: it reads
- * the text-showing operators out of any content stream that is not compressed,
- * which covers PDFs produced by most exporters that do not use object streams.
- * When it finds nothing usable it returns null, and the caller says plainly
- * that the file could not be read here rather than sending forty thousand
- * characters of binary to a model and calling that an attachment.
- */
-function extractPdfText(bytes) {
-  // latin1 so byte values survive the round trip; the operators being looked
-  // for are all ASCII.
-  const raw = new TextDecoder("latin1").decode(bytes);
-  const out = [];
-  // ( ... ) Tj    and    [ (..) -250 (..) ] TJ
-  const showText = /\((?:\\.|[^\\()])*\)\s*Tj|\[(?:[^\]\\]|\\.)*\]\s*TJ/g;
-  for (const match of raw.matchAll(showText)) {
-    for (const piece of match[0].matchAll(/\((?:\\.|[^\\()])*\)/g)) {
-      out.push(
-        piece[0]
-          .slice(1, -1)
-          .replace(/\\([nrtbf])/g, (_, code) => ({ n: "\n", r: "", t: "\t", b: "", f: "\n" }[code] ?? ""))
-          .replace(/\\([()\\])/g, "$1")
-          .replace(/\\(\d{1,3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
-      );
-    }
-    out.push(" ");
-  }
-  const text = out.join("").replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-  // A handful of stray glyphs is not an extraction. If the file is mostly
-  // compressed streams this will find almost nothing, and saying so is the
-  // honest outcome.
-  return text.length >= 200 ? text : null;
+/** Base64 without the `data:` prefix, for the extraction endpoint. */
+async function readAsBase64(file) {
+  const dataUrl = await readAsDataUrl(file);
+  return dataUrl.slice(dataUrl.indexOf(",") + 1);
 }
+
+/**
+ * Where this file lives on the machine, when that can be known.
+ *
+ * The desktop shell exposes it (see preload.js); a plain browser cannot and
+ * returns null, which every caller treats as "send the contents instead".
+ */
+export function pathOf(file) {
+  try {
+    return window.syscora?.pathForFile?.(file) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+const humanBytes = (bytes) => {
+  const size = Number(bytes) || 0;
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(0)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+/**
+ * Hand the bytes to the daemon's document extractor.
+ *
+ * The daemon holds them in memory, pulls the text out and drops them; nothing
+ * is written to disk. Returns `{ ok, text, format, reason }`.
+ */
+async function extractOnDaemon(file) {
+  const response = await fetch("/api/attachments/extract", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: file.name, base64: await readAsBase64(file) })
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    return { ok: false, text: "", reason: detail.reason ?? `the extractor answered HTTP ${response.status}` };
+  }
+  return response.json();
+}
+
+/** How a document's text got here, for the line under the chip. */
+const EXTRACTED_BY = {
+  pdf: "text pulled out of the PDF",
+  docx: "read from the Word document",
+  xlsx: "read from the spreadsheet",
+  pptx: "read from the slides"
+};
 
 /**
  * Prepare one file for sending.
  *
  * Every returned attachment carries `kind`, which is what model routing is
- * decided from — see models.js — and either `text` or `dataUrl`, never both.
+ * decided from — see models.js — and its payload in exactly one of `text`,
+ * `dataUrl` or `entries`.
  */
 export async function prepareAttachment(file) {
-  const base = { name: file.name, bytes: file.size, mime: file.type || "application/octet-stream" };
+  const base = {
+    name: file.name,
+    bytes: file.size,
+    mime: file.type || "application/octet-stream",
+    // Null in a plain browser. When it is set, the agent can go and look at the
+    // real file rather than working only from what was pasted into the prompt.
+    path: pathOf(file)
+  };
   if (file.size > MAX_FILE_BYTES) {
-    return { ...base, kind: "rejected", error: `${file.name} is ${(file.size / 1048576).toFixed(1)} MB — the limit is ${MAX_FILE_BYTES / 1048576} MB.` };
+    return {
+      ...base,
+      kind: "rejected",
+      error: `${file.name} is ${humanBytes(file.size)} — the limit is ${MAX_FILE_BYTES / 1048576} MB.` +
+        (base.path ? " It is on this machine, so ask SYSCORA to open it from disk instead." : "")
+    };
   }
 
   const kind = kindOf(file);
@@ -97,29 +143,55 @@ export async function prepareAttachment(file) {
   }
 
   if (kind === "text") {
-    const text = (await readAsText(file)).slice(0, MAX_EXTRACTED_CHARS);
-    return { ...base, kind: "document", text, extractedBy: "read directly" };
+    const whole = await readAsText(file);
+    const text = whole.slice(0, MAX_EXTRACTED_CHARS);
+    return {
+      ...base,
+      kind: "document",
+      text,
+      truncated: whole.length > text.length,
+      extractedBy: "read as text"
+    };
   }
 
-  if (kind === "pdf") {
-    const text = extractPdfText(new Uint8Array(await file.arrayBuffer()));
-    if (!text) {
+  if (kind === "extractable") {
+    let extracted;
+    try {
+      extracted = await extractOnDaemon(file);
+    } catch (error) {
       return {
         ...base,
         kind: "rejected",
-        error: `${file.name} is a PDF whose text is compressed, so it cannot be read here. ` +
-          "Ask SYSCORA to open the file from your machine instead — it can use a PDF tool that is installed."
+        error: `${file.name} could not be sent for reading: ${error?.message ?? error}. ` +
+          "Is the SYSCORA daemon still running?"
       };
     }
-    return { ...base, kind: "document", text: text.slice(0, MAX_EXTRACTED_CHARS), extractedBy: "extracted from the PDF" };
+    if (!extracted.ok || !extracted.text) {
+      // "There is no text in it" and "it could not be read" are different
+      // answers with different next moves, and the extractor says which.
+      return {
+        ...base,
+        kind: "rejected",
+        error: `${file.name}: ${extracted.reason ?? "no readable text was found in it"}.` +
+          (base.path ? " Ask SYSCORA to look at the file on disk if you want it tried another way." : "")
+      };
+    }
+    const text = extracted.text.slice(0, MAX_EXTRACTED_CHARS);
+    return {
+      ...base,
+      kind: "document",
+      text,
+      truncated: extracted.text.length > text.length,
+      extractedBy: EXTRACTED_BY[extracted.format] ?? `read from the ${extracted.format}`
+    };
   }
 
-  if (kind === "document-binary") {
+  if (kind === "document-unsupported") {
     return {
       ...base,
       kind: "rejected",
-      error: `${file.name} is a Word document, which cannot be read in the browser. ` +
-        "Ask SYSCORA to open it from your machine — it can read it there."
+      error: `${file.name} is an older or non-Office format that cannot be read here. ` +
+        "Save it as .docx, .xlsx, .pptx or .pdf — or ask SYSCORA to open it from your machine."
     };
   }
 
@@ -127,16 +199,98 @@ export async function prepareAttachment(file) {
 }
 
 /**
- * The text block appended to the user's message for document attachments.
+ * Prepare a whole folder.
  *
- * Fenced and labelled so the model can tell the user's own words from the
- * file's contents. That boundary is the same one content-boundary.js enforces
- * on the way in: what was READ is not what was ASKED.
+ * A FOLDER IS A PLACE, NOT A PAYLOAD. Uploading the contents of somebody's
+ * project directory would be tens of megabytes of node_modules to answer a
+ * question about one file — and this agent drives the machine the folder is on,
+ * so what it needs is the path and a map, not the bytes. When the desktop shell
+ * can give the real path, the agent reads whatever it decides it needs with the
+ * filesystem tools it already has. In a plain browser it still gets the listing,
+ * which is enough to answer "what is in here".
+ */
+export function prepareFolder(files) {
+  const list = [...files];
+  if (list.length === 0) return null;
+  // webkitRelativePath is "TopFolder/sub/file.txt" for every file in the pick,
+  // so its first segment is the folder the user actually chose.
+  const rootName = String(list[0].webkitRelativePath ?? list[0].name).split("/")[0] || "folder";
+
+  // The folder's own path, derived from its first file's — Electron gives paths
+  // for FILES, never for directories, so this is the only way to it.
+  //
+  // Note what the relative path contains: "InvestorDemo/src/app.js", INCLUDING
+  // the chosen folder's own name. Stripping the whole of it leaves the folder's
+  // PARENT, which is not what was attached — get this wrong and the agent is
+  // handed C:\Users\me for a folder called InvestorDemo and goes looking through
+  // the whole profile. So the parent is found first and the name put back.
+  let path = null;
+  const firstPath = pathOf(list[0]);
+  const relative = String(list[0].webkitRelativePath ?? "");
+  if (firstPath && relative) {
+    const tail = relative.replace(/\//g, "\\");
+    if (firstPath.toLowerCase().endsWith(`\\${tail.toLowerCase()}`)) {
+      const parent = firstPath.slice(0, firstPath.length - tail.length - 1);
+      path = `${parent}\\${rootName}`;
+    }
+  }
+
+  const entries = list
+    .map((file) => ({ path: String(file.webkitRelativePath ?? file.name), bytes: file.size }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+
+  return {
+    kind: "folder",
+    name: rootName,
+    path,
+    fileCount: list.length,
+    bytes: list.reduce((total, file) => total + file.size, 0),
+    entries: entries.slice(0, MAX_FOLDER_ENTRIES),
+    // Named rather than silently dropped: a listing that stops without saying so
+    // reads as a complete listing, and the model would answer "there is no
+    // README in it" about a folder it was shown a third of.
+    omitted: Math.max(0, entries.length - MAX_FOLDER_ENTRIES)
+  };
+}
+
+/**
+ * The text block appended to the user's message for everything that travels as
+ * text — documents and folder listings.
+ *
+ * Fenced and labelled so the model can tell the user's own words from the file's
+ * contents. That boundary is the same one content-boundary.js enforces on the
+ * way in: what was READ is not what was ASKED.
  */
 export function describeAttachments(attachments) {
-  const documents = attachments.filter((file) => file.kind === "document" && file.text);
-  if (!documents.length) return "";
-  return documents
-    .map((file) => `\n\n--- Attached file: ${file.name} (${file.extractedBy}) ---\n${file.text}\n--- end of ${file.name} ---`)
-    .join("");
+  const blocks = [];
+  for (const item of attachments) {
+    if (item.kind === "document" && item.text) {
+      const where = item.path ? ` at ${item.path}` : "";
+      const clipped = item.truncated
+        ? `\n[… the rest of ${item.name} was not sent — it is longer than ${MAX_EXTRACTED_CHARS.toLocaleString()} characters]`
+        : "";
+      blocks.push(
+        `\n\n--- Attached file: ${item.name}${where} (${item.extractedBy}) ---\n` +
+        `${item.text}${clipped}\n--- end of ${item.name} ---`
+      );
+    }
+    if (item.kind === "folder") {
+      // The PATH first and on its own line, because it is the actionable part:
+      // with it the agent can list, read and search the folder itself instead of
+      // reasoning only from this snapshot.
+      const lines = [
+        `\n\n--- Attached folder: ${item.name} ---`,
+        item.path
+          ? `Full path on this machine: ${item.path}\n` +
+            "You can read, list and search inside it with the filesystem tools."
+          : "This browser cannot give the folder's path, so only the listing below is available.",
+        `${item.fileCount} file${item.fileCount === 1 ? "" : "s"}, ${humanBytes(item.bytes)}.`,
+        ...item.entries.map((entry) => `  ${entry.path} (${humanBytes(entry.bytes)})`)
+      ];
+      if (item.omitted) lines.push(`  … and ${item.omitted} more files not listed here.`);
+      lines.push(`--- end of ${item.name} ---`);
+      blocks.push(lines.join("\n"));
+    }
+  }
+  return blocks.join("");
 }

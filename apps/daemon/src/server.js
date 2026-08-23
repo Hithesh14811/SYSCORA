@@ -13,6 +13,10 @@ import { closeWindowsAutomationHost } from "../../../os-adapters/windows-host/sr
 import { resolveStateDir } from "../../../packages/shared-types/src/state-path.js";
 import { installCrashGuards, reportInterruptedRun } from "./crash-guard.js";
 import { reportPreflight } from "./preflight.js";
+// The same extractor the agent uses on files it finds on disk. See documents.js:
+// a .docx is a ZIP of XML and a .pdf is a set of FlateDecode streams, both of
+// which Node can take apart without a dependency.
+import { extractDocumentText, isDocumentPath } from "../../../packages/fast-agent/src/documents.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,13 +29,17 @@ function sendJson(response, statusCode, payload) {
 
 // Cap request bodies so a large or endless POST cannot exhaust daemon memory.
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024; // 1 MiB is ample for intents.
+// An attached document is the one thing a user legitimately sends that is bigger
+// than an intent. base64 costs a third on top of the file, so this holds the
+// 20 MB the composer accepts with room over.
+const MAX_ATTACHMENT_BODY_BYTES = 30 * 1024 * 1024;
 
-async function readJsonBody(request) {
+async function readJsonBody(request, limit = MAX_REQUEST_BODY_BYTES) {
   const chunks = [];
   let total = 0;
   for await (const chunk of request) {
     total += chunk.length;
-    if (total > MAX_REQUEST_BODY_BYTES) {
+    if (total > limit) {
       const error = new Error("Request body exceeds maximum allowed size.");
       error.statusCode = 413;
       throw error;
@@ -490,6 +498,56 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           summary: true,
           limit,
           sessions
+        });
+        return;
+      }
+
+      // A DOCUMENT THE USER ATTACHED, TURNED INTO SOMETHING A MODEL CAN READ.
+      //
+      // WHY THIS IS SERVER-SIDE AT ALL, when the composer already reads plain
+      // text files itself: a .docx, .xlsx and .pptx are ZIP archives of XML, and
+      // a real .pdf keeps its text in FlateDecode streams. None of that comes
+      // apart in a browser without shipping a parser to it — the page's own PDF
+      // reader could only handle uncompressed content streams, and every Word
+      // document was refused with "cannot be read in the browser". Meanwhile
+      // documents.js, which the agent already uses on files it finds on disk,
+      // reads all four properly. One extractor, used from both ends.
+      //
+      // NOTHING IS WRITTEN. The bytes are extracted from memory and dropped;
+      // there is no upload directory, no temp file and no cleanup story for a
+      // document that may be somebody's payslip. The daemon is bound to
+      // 127.0.0.1 and this route needs the API token like every other one, so
+      // the file never leaves the machine — only the text the user is asking
+      // about is sent anywhere, and only to the model they chose.
+      if (request.method === "POST" && requestUrl.pathname === "/api/attachments/extract") {
+        const body = await readJsonBody(request, MAX_ATTACHMENT_BODY_BYTES);
+        const name = String(body?.name ?? "").trim();
+        const base64 = String(body?.base64 ?? "");
+        if (!name || !base64) {
+          sendJson(response, 400, { ok: false, reason: "Both a file name and its contents are required." });
+          return;
+        }
+        // The extension decides the parser, so a name without one cannot be
+        // read — and saying that is better than guessing a format and returning
+        // whatever mojibake falls out.
+        if (!isDocumentPath(name)) {
+          sendJson(response, 400, {
+            ok: false,
+            reason: `${name} is not a document format this can read (.pdf, .docx, .xlsx and .pptx are).`
+          });
+          return;
+        }
+        const buffer = Buffer.from(base64, "base64");
+        const extracted = extractDocumentText(name, buffer);
+        // An empty extraction is not a failure of the reader — a scanned PDF is
+        // a photograph of a page and there is no text in it to find. The reason
+        // travels so the composer can say which of the two happened.
+        sendJson(response, 200, {
+          ok: Boolean(extracted.text),
+          name,
+          format: extracted.format,
+          text: extracted.text,
+          reason: extracted.reason ?? null
         });
         return;
       }

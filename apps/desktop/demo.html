@@ -91,13 +91,45 @@
         <!-- Attachments sit ABOVE the input, where they read as part of the
              message being composed rather than as a toolbar. -->
         <div id="attachmentStrip" class="attachment-strip" hidden></div>
-        <textarea id="chatInput" rows="1" placeholder="Ask SYSCORA to do something..." required></textarea>
+        <!-- NOT `required`. It was, and that made a message with an attachment
+             and no typed words unsendable: the browser's own validation fires
+             first, so the submit event never reached the handler and pressing
+             send did nothing at all — you attached a folder, pressed the button,
+             and the application appeared to be broken. The same attribute is
+             what used to swallow the STOP button mid-run, for the same reason.
+             Emptiness is checked in the submit handler, where "empty" can mean
+             "no text AND nothing attached". -->
+        <textarea id="chatInput" rows="1" placeholder="Ask SYSCORA to do something..."></textarea>
         <div class="composer-controls">
-          <input id="fileInput" type="file" multiple hidden
-                 accept="image/*,.pdf,.txt,.md,.csv,.json,.log,.js,.ts,.py,.java,.html,.css,.yml,.yaml,.xml,.sql" />
-          <button id="attachButton" class="composer-button" type="button" title="Attach files">
-            <span aria-hidden="true">📎</span><span class="composer-button-text">Attach</span>
-          </button>
+          <!-- THREE PICKERS, NOT ONE.
+               A single <input type="file"> cannot offer a folder: `webkitdirectory`
+               is a property of the input, not of the click, so choosing between a
+               file and a folder has to be made before the dialog opens. That is
+               what the menu behind "+" is for — and it is also why every other
+               assistant has the same three-item menu. -->
+          <input id="fileInput" type="file" multiple hidden />
+          <input id="imageInput" type="file" multiple hidden accept="image/*" />
+          <input id="folderInput" type="file" hidden webkitdirectory directory />
+          <div class="attach">
+            <button id="attachButton" class="composer-icon" type="button"
+                    aria-haspopup="menu" aria-expanded="false" aria-label="Attach" title="Attach files, images or a folder">
+              <span aria-hidden="true">＋</span>
+            </button>
+            <div id="attachMenu" class="attach-menu" role="menu" hidden>
+              <button type="button" role="menuitem" data-pick="image">
+                <span class="attach-menu-icon" aria-hidden="true">🖼</span>
+                <span><strong>Photos &amp; images</strong><em>png, jpg, webp…</em></span>
+              </button>
+              <button type="button" role="menuitem" data-pick="file">
+                <span class="attach-menu-icon" aria-hidden="true">📄</span>
+                <span><strong>Files</strong><em>pdf, docx, xlsx, pptx, text and code</em></span>
+              </button>
+              <button type="button" role="menuitem" data-pick="folder">
+                <span class="attach-menu-icon" aria-hidden="true">📁</span>
+                <span><strong>Folder</strong><em>SYSCORA works on it where it lives</em></span>
+              </button>
+            </div>
+          </div>
           <!-- Auto is a ROUTER, not a default: it picks the cheapest model that
                can actually do what the request needs, and says which and why.
                See models.js. -->
