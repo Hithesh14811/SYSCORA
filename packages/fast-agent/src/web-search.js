@@ -40,52 +40,97 @@
 // The lesson generalises past this file: when an external service refuses us and
 // a browser on the same machine is not refused, the difference is ours to find.
 //
-// ONE ENGINE IS STILL NOT A CAPABILITY.
+// ONE ENGINE IS NOT A CAPABILITY, AND ASKING THEM IN TURN IS NOT ENOUGH.
 //
-// Both entries here used to belong to DuckDuckGo, so one operator having a bad
-// day was search being down. Bing is a genuinely separate index, and the two
-// disagree in both directions — measured the same day on "best laptops of 2026",
-// DuckDuckGo returned PCMag, CNET, Forbes and Tom's Guide while Bing returned
-// four dictionary definitions of the word "best". (That was verified as Bing's
-// own ranking, in a real browser, and not a parsing fault here.) DuckDuckGo goes
-// first on that evidence; Bing is what answers when it cannot.
+// The list below used to be tried in ORDER, first one that answers wins. That
+// hides a bad answer behind a successful request, and the benchmark makes the
+// shape of it embarrassingly clear. Measured 23 Aug 2026 over twelve queries
+// (`node scripts/bench-search.mjs`):
+//
+//   answered by DuckDuckGo   8/8 with a good result at rank 1
+//   answered by Bing         0/4 with a good result ANYWHERE in eight
+//
+// Bing was not slightly worse. Asked for "python asyncio TaskGroup example" it
+// returned python.org's home page and a W3Schools index; asked "how to stop
+// windows 11 from reopening apps after restart" it returned the dictionary
+// definition of "stop"; asked "where can i buy the chepest iphone 17pro" it
+// returned Canva and the dictionary definition of "can". It collapses a long
+// query to its first recognisable entity. Falling back to that is worse than
+// failing, because a failure says so and this does not.
+//
+// DuckDuckGo also rate-limits under burst — twelve queries in ten seconds and it
+// starts answering 202 — which is exactly when the fallback fires. So the good
+// engine goes away and the bad one speaks for us.
+//
+// SO: ASK EVERYONE AT ONCE, AND RANK BY AGREEMENT.
+//
+// The indexes are queried in PARALLEL, and their rankings are fused with
+// Reciprocal Rank Fusion. Agreement between operators who built their indexes
+// independently is a quality signal that costs nothing to compute and is very
+// hard to fake: docs.python.org is returned for that query by DuckDuckGo AND
+// Yahoo, while "Anti-Oppressive Social Work Practice" is returned by Bing and by
+// nobody else. Consensus is what demotes it — no rule about dictionaries, no
+// blocklist, nothing that has to be maintained.
+//
+// An INDEX is the unit, not an endpoint. DuckDuckGo's lite and html pages are
+// one opinion served twice, and counting them as two voters would let one
+// operator outvote the others.
 
-const ENDPOINTS = [
-  // A different operator with a different index, and the better ranking of the
-  // two on the queries this was measured against. Lite first: same results, a
-  // fraction of the markup, so less to parse and less to go wrong.
+// Bing's own index, reached through Yahoo's ranking of it. Worth having as a
+// separate voter precisely because the ranking differs so much: on the two
+// queries Bing destroyed above, Yahoo returned SuperFastPython and
+// docs.python.org, then HelpDeskGeek and How-To Geek. Same crawl, different
+// judgement, and the judgement is what was broken.
+const YAHOO_ENDPOINT = {
+  name: "yahoo",
+  url: (query) => `https://search.yahoo.com/search?p=${encodeURIComponent(query)}`,
+  parse: parseYahooResults,
+  declined: (body) => !/r\.search\.yahoo\.com/.test(body)
+};
+
+const INDEXES = [
   {
-    name: "duckduckgo-lite",
-    url: (query) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`,
-    parse: parseResults,
-    declined: (body) => !/uddg=/.test(body)
+    name: "duckduckgo",
+    endpoints: [
+      // Lite first: same results, a fraction of the markup, so less to parse and
+      // less to go wrong.
+      {
+        name: "duckduckgo-lite",
+        url: (query) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`,
+        parse: parseResults,
+        declined: (body) => !/uddg=/.test(body)
+      },
+      {
+        name: "duckduckgo-html",
+        url: (query) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+        parse: parseResults,
+        declined: (body) => !/uddg=/.test(body)
+      }
+    ]
   },
+  { name: "yahoo", endpoints: [YAHOO_ENDPOINT] },
   {
-    name: "duckduckgo-html",
-    url: (query) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-    parse: parseResults,
-    declined: (body) => !/uddg=/.test(body)
-  },
-  // Bing's RSS view: `<item><title><link><description>`, nothing else. There is
-  // no markup to keep up with, so this is the one endpoint whose parser cannot
-  // be broken by a redesign.
-  {
-    name: "bing-rss",
-    url: (query) => `https://www.bing.com/search?q=${encodeURIComponent(query)}&format=rss`,
-    parse: parseRssResults,
-    // An answer is a feed with items in it. Anything else — a challenge, an
-    // interstitial, an empty channel — is the engine declining.
-    declined: (body) => !/<item[\s>]/i.test(body)
-  },
-  // Same index, through the page a person would see. Kept because RSS is a
-  // secondary surface that Bing could withdraw, and because a query it answers
-  // with a "did you mean" and no feed items sometimes still has HTML results.
-  {
-    name: "bing-html",
-    url: (query) => `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=en`,
-    parse: parseBingHtmlResults,
-    declined: (body) => /detected unusual traffic|are you a robot|<title>\s*captcha/i.test(body)
-      || !/id="b_results"|class="b_algo"/.test(body)
+    name: "bing",
+    endpoints: [
+      // Bing's RSS view: `<item><title><link><description>`, nothing else. No
+      // markup to keep up with, so this is the one endpoint whose parser cannot
+      // be broken by a redesign.
+      {
+        name: "bing-rss",
+        url: (query) => `https://www.bing.com/search?q=${encodeURIComponent(query)}&format=rss`,
+        parse: parseRssResults,
+        // An answer is a feed with items in it. Anything else — a challenge, an
+        // interstitial, an empty channel — is the engine declining.
+        declined: (body) => !/<item[\s>]/i.test(body)
+      },
+      {
+        name: "bing-html",
+        url: (query) => `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=en`,
+        parse: parseBingHtmlResults,
+        declined: (body) => /detected unusual traffic|are you a robot|<title>\s*captcha/i.test(body)
+          || !/id="b_results"|class="b_algo"/.test(body)
+      }
+    ]
   }
 ];
 
@@ -118,12 +163,28 @@ const BROWSER_HEADERS = {
 
 export { BROWSER_HEADERS };
 
+// Deciding which of the fused candidates are actually about the question. See
+// search-rank.js: consensus is free, the snippet is nearly free, and reading the
+// page is spent only on the few a search cannot settle any other way.
+import { rerank } from "./search-rank.js";
+
+// Punctuation entities are here because titles are FULL of them and a title
+// reading "The best laptops in 2026 &mdash; tested, reviewed" is what the model
+// then repeats to the user.
 const ENTITIES = {
-  "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&#x27;": "'", "&nbsp;": " "
+  "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'", "&#x27;": "'", "&nbsp;": " ",
+  "&mdash;": "—", "&ndash;": "–", "&hellip;": "…", "&rsquo;": "’", "&lsquo;": "‘",
+  "&rdquo;": "”", "&ldquo;": "“", "&rsaquo;": "›", "&lsaquo;": "‹", "&raquo;": "»", "&laquo;": "«",
+  "&apos;": "'", "&middot;": "·", "&bull;": "•", "&times;": "×", "&trade;": "™", "&reg;": "®", "&copy;": "©"
 };
 const decode = (value) => String(value ?? "")
-  .replace(/&(?:amp|lt|gt|quot|nbsp|#39|#x27);/g, (entity) => ENTITIES[entity] ?? entity)
-  .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)));
+  .replace(/&(?:amp|lt|gt|quot|nbsp|#39|#x27|mdash|ndash|hellip|[lr]squo|[lr]dquo|[lr]saquo|[lr]aquo|apos|middot|bull|times|trade|reg|copy);/g,
+    (entity) => ENTITIES[entity] ?? entity)
+  .replace(/&#x([0-9a-f]+);/gi, (whole, hex) => {
+    const code = Number.parseInt(hex, 16);
+    return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : whole;
+  })
+  .replace(/&#(\d+);/g, (whole, code) => (Number(code) > 0 ? String.fromCodePoint(Number(code)) : whole));
 
 const stripTags = (html) => decode(String(html ?? "").replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
 
@@ -290,6 +351,62 @@ export function parseBingHtmlResults(html, { limit = 10 } = {}) {
   return results;
 }
 
+/**
+ * Pull results out of Yahoo's results page.
+ *
+ * Every outbound link is wrapped in `r.search.yahoo.com/…/RU=<encoded>/RK=…`,
+ * and nothing else on the page uses that shape — so it is the anchor to look
+ * for, the same way `uddg=` is for DuckDuckGo. No classes, no block structure,
+ * nothing that changes when they restyle.
+ */
+export function parseYahooResults(html, { limit = 10 } = {}) {
+  const text = String(html ?? "");
+  const results = [];
+  const seen = new Set();
+  for (const match of text.matchAll(/<a\b[^>]*href="https:\/\/r\.search\.yahoo\.com\/[^"]*?RU=([^/"]+)\/RK=[^"]*"[^>]*>([\s\S]*?)<\/a>/gi)) {
+    if (results.length >= limit) break;
+    let url;
+    try {
+      url = decodeURIComponent(match[1]);
+    } catch {
+      continue;
+    }
+    if (!/^https?:\/\//i.test(url)) continue;
+    // Yahoo's own chrome — the logo, sign-in, the footer — goes through the same
+    // redirector as the results do.
+    if (/^https?:\/\/([a-z0-9-]+\.)*yahoo\.com/i.test(url)) continue;
+    // PAID PLACEMENT IS NOT A RESULT. Yahoo serves Bing's ads through
+    // `bing.com/aclick`, and on "best laptops of 2026" the entire visible top of
+    // the page was five of them. An advertisement returned as the best answer to
+    // a question is the worst thing this can do — the user cannot tell, and the
+    // model certainly cannot.
+    if (/^https?:\/\/([a-z0-9-]+\.)*bing\.com\/aclick/i.test(url)) continue;
+    if (/[?&](ad_|gclid|msclkid)=/i.test(url)) continue;
+    if (seen.has(url)) continue;
+
+    // THE HEADING, OR NOTHING.
+    //
+    // The anchor wraps a breadcrumb div AND the heading, and the breadcrumb runs
+    // straight into the title with no separator once the tags come off:
+    // "Pythonhttps://docs.python.org › 3 › libraryCoroutines and Tasks". There
+    // is no regular expression that can take that apart, because nothing marks
+    // where "library" ends and "Coroutines" begins.
+    //
+    // So a result without an <h3> is skipped rather than guessed at. Every
+    // organic Yahoo result has one; what does not is chrome, an advertisement,
+    // or one of their special blocks — none of which should be returned as an
+    // answer. And a genuine page missing here is almost always returned by
+    // another index anyway, with a title that came out clean.
+    const heading = /<h3\b[^>]*>([\s\S]*?)<\/h3>/i.exec(match[2])?.[1];
+    if (!heading) continue;
+    const title = stripTags(heading).trim();
+    if (!title || /^https?:\/\//i.test(title)) continue;
+    seen.add(url);
+    results.push({ title, url, snippet: "" });
+  }
+  return results;
+}
+
 /** Bing's click tracker keeps the real destination base64url-encoded in `u=a1…`. */
 export function unwrapBingClick(href) {
   const raw = String(href ?? "");
@@ -305,70 +422,295 @@ export function unwrapBingClick(href) {
 }
 
 /**
- * Run a search. Returns `{ ok, query, results, provider, reason }`.
+ * Ask ONE index, trying its endpoints in order until one answers.
  *
- * Never throws: a failed search is a result the model reads and works around,
- * exactly like a non-zero exit code, and the whole point of this file is that
- * it can say "the engine refused" rather than silently returning nothing.
+ * Two endpoints of the same index are the same opinion served twice, so the
+ * first that answers is the whole of that index's vote. Returns
+ * `{ name, endpoint, results, failures }`, with an empty `results` when the
+ * index had nothing to say.
  */
-export async function searchWeb(query, { limit = 10, timeoutMs = 20000, fetchImpl = fetch } = {}) {
-  const trimmed = String(query ?? "").trim();
-  if (!trimmed) return { ok: false, query: trimmed, results: [], provider: null, reason: "No search terms were given." };
-
+async function askIndex(index, query, { limit, timeoutMs, fetchImpl, retries = 1 }) {
   const failures = [];
-  for (const endpoint of ENDPOINTS) {
+
+  // One attempt at one endpoint. Returns the results, or null with a reason
+  // recorded — and `retry` when the reason was transient enough to be worth
+  // asking the same endpoint again.
+  const attempt = async (endpoint) => {
     try {
-      const response = await fetchImpl(endpoint.url(trimmed), {
+      const response = await fetchImpl(endpoint.url(query), {
         headers: BROWSER_HEADERS,
         signal: AbortSignal.timeout(timeoutMs)
       });
       const body = response.ok ? await response.text() : "";
+      if (!response.ok) {
+        failures.push(`${endpoint.name}: HTTP ${response.status}`);
+        // A 500 IS A HICCUP; A 202 IS AN ANSWER.
+        //
+        // Yahoo intermittently returns HTTP 500 with an empty body — caught live
+        // on 23 Aug 2026, where it looked exactly like a parser that had stopped
+        // working until the status was printed. It is the second-best index here
+        // and it has only one endpoint, so losing its vote to a blip costs real
+        // quality, and one immediate retry recovers it.
+        return { results: null, retry: response.status >= 500 };
+      }
+
       // "RATE LIMITED" AND "NOTHING MATCHED" ARE DIFFERENT ANSWERS.
       //
-      // They lead the model to different recoveries — try another engine or open
-      // a browser versus rephrase the query — so collapsing them into "no
-      // results" sends it the wrong way. Observed here: after repeated automated
-      // searches from one address, DuckDuckGo answers HTTP 202 with a challenge
-      // page carrying no results and none of the words this used to look for,
-      // and the search reported "no results could be parsed" for a query that
-      // had worked minutes earlier.
+      // They lead to different recoveries — try another index or open a browser
+      // versus rephrase the query — so collapsing them into "no results" sends
+      // the model the wrong way.
       //
       // 202 is the tell: a search engine that means "here are your results"
-      // answers 200. Anything else, or a page whose <title> is a challenge, or
-      // a body with none of THIS endpoint's result markers in it, is the engine
-      // declining. The marker is per-endpoint — it used to be DuckDuckGo's
-      // `uddg=` redirector for every endpoint, which would now condemn every
-      // correct Bing answer as a challenge.
+      // answers 200. Anything else, or a page whose <title> is a challenge, or a
+      // body with none of THIS endpoint's result markers in it, is the engine
+      // declining. The marker is per-endpoint — it was once DuckDuckGo's
+      // `uddg=` redirector for every endpoint, which would condemn every
+      // correct Bing and Yahoo answer as a challenge.
       const challenged = response.status === 202
         || /detected unusual traffic|are you a robot|<title>\s*captcha/i.test(body)
         || (body.length > 0 && endpoint.declined(body));
-      if (!response.ok) { failures.push(`${endpoint.name}: HTTP ${response.status}`); continue; }
       if (challenged) {
-        // NOT "it is rate-limiting this machine". That was the wording here for
-        // a fortnight and it was a guess presented as a finding — the actual
-        // cause of every 202 measured was this client's own headers, and the
-        // sentence sent whoever read it off to wait for a limit that did not
-        // exist. Say what was observed and let the next endpoint try.
+        // NOT "it is rate-limiting this machine". That wording was a guess
+        // presented as a finding, and it sent whoever read it off to wait out a
+        // limit that did not exist — the cause was this client's own headers.
+        // Say what was observed. And never retry: a challenge is a considered
+        // refusal, so asking again is both useless and rude.
         failures.push(`${endpoint.name}: declined the request (HTTP ${response.status}) and returned no results`);
-        continue;
+        return { results: null, retry: false };
       }
-      const results = endpoint.parse(body, { limit });
-      if (results.length === 0) { failures.push(`${endpoint.name}: answered, but no results could be parsed`); continue; }
-      return { ok: true, query: trimmed, results, provider: endpoint.name, reason: null };
+
+      // Over-fetch. Fusion needs more than it returns: a page ranked seventh by
+      // two indexes and unseen by the third is a better answer than one ranked
+      // second by a single index, and it cannot win a vote it was not in.
+      const results = endpoint.parse(body, { limit: Math.max(limit * 2, 12) });
+      if (results.length === 0) {
+        failures.push(`${endpoint.name}: answered, but no results could be parsed`);
+        return { results: null, retry: false };
+      }
+      return { results, retry: false };
     } catch (error) {
       failures.push(`${endpoint.name}: ${String(error?.message ?? error).slice(0, 80)}`);
+      // A socket that hung up or a timeout is the same class of accident as a
+      // 500, and worth exactly one more try.
+      return { results: null, retry: true };
+    }
+  };
+
+  for (const endpoint of index.endpoints) {
+    for (let tries = 0; tries <= retries; tries += 1) {
+      const outcome = await attempt(endpoint);
+      if (outcome.results) return { name: index.name, endpoint: endpoint.name, results: outcome.results, failures };
+      if (!outcome.retry) break;
     }
   }
+  return { name: index.name, endpoint: null, results: [], failures };
+}
 
-  return {
-    ok: false,
+// Two URLs are the same result if they point at the same page. Without this the
+// vote is split — `docs.python.org/3/library/asyncio-task.html` from one index
+// and the same URL with a trailing slash and `?highlight=` from another count as
+// two pages with one vote each instead of one page with two, which is precisely
+// backwards.
+export function canonicalUrl(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    parsed.hostname = parsed.hostname.replace(/^www\./i, "").toLowerCase();
+    parsed.protocol = "https:";
+    // Campaign and session parameters identify the referrer, not the page.
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (/^(utm_|ref$|referrer|fbclid|gclid|msclkid|igshid|mc_[ce]id|_ga|source$|src$)/i.test(key)) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    const path = parsed.pathname.replace(/\/+$/, "") || "/";
+    const query = parsed.searchParams.toString();
+    return `${parsed.hostname}${path}${query ? `?${query}` : ""}`;
+  } catch {
+    return String(url ?? "").trim().toLowerCase();
+  }
+}
+
+// RECIPROCAL RANK FUSION.
+//
+// score(page) = Σ over indexes that returned it of 1 / (K + rank).
+//
+// It is the standard way to merge rankings whose scores are not comparable —
+// and no two search engines' scores are comparable, because none of them tells
+// us what they are. It needs no training, no model and no tuning, and it has the
+// property that matters here: a page two independent indexes both rank highly
+// beats a page one index loves and the others have never heard of.
+//
+// K=60 is the value from the original TREC work and is deliberately large: it
+// flattens the difference between rank 1 and rank 3 so that AGREEMENT counts for
+// more than one engine's confidence. That is exactly the behaviour wanted, given
+// that the engine most confident about "Anti-Oppressive Social Work Practice"
+// put it at rank 1.
+const RRF_K = 60;
+
+export function fuseRankings(rankings, { limit = 10 } = {}) {
+  const pages = new Map();
+  for (const ranking of rankings) {
+    for (const [rank, result] of ranking.results.entries()) {
+      const key = canonicalUrl(result.url);
+      if (!key) continue;
+      const existing = pages.get(key);
+      const contribution = 1 / (RRF_K + rank + 1);
+      if (!existing) {
+        pages.set(key, {
+          ...result,
+          score: contribution,
+          // Which indexes returned it, kept because it is the evidence for the
+          // ranking and because a result every engine agrees on is worth saying
+          // so about.
+          foundBy: [ranking.name],
+          bestRank: rank
+        });
+        continue;
+      }
+      existing.score += contribution;
+      if (!existing.foundBy.includes(ranking.name)) existing.foundBy.push(ranking.name);
+      existing.bestRank = Math.min(existing.bestRank, rank);
+      // Keep the best title and snippet available across indexes. Yahoo returns
+      // no snippet at all and DuckDuckGo's are good, so a page found by both
+      // should carry DuckDuckGo's description rather than an empty string.
+      if (!existing.snippet && result.snippet) existing.snippet = result.snippet;
+      if (result.title.length > existing.title.length && result.title.length < 120) existing.title = result.title;
+    }
+  }
+  return [...pages.values()]
+    .sort((left, right) => right.score - left.score
+      // Ties broken by how many indexes agreed, then by the best rank any of
+      // them gave it. Both are more meaningful than insertion order.
+      || right.foundBy.length - left.foundBy.length
+      || left.bestRank - right.bestRank)
+    .slice(0, limit);
+}
+
+// REPEATING A SEARCH IS FREE, AND NOT REPEATING IT IS WORTH MORE THAN THE TIME.
+//
+// The agent searches several times per question — four times in one measured
+// run, often for overlapping things — and a conversation comes back to the same
+// subject across turns. Every one of those is a request against somebody's free
+// endpoint, and the endpoints keep count.
+//
+// That count is the real reason this is here, not the milliseconds. Measured
+// with the benchmark at `--repeat 3` (36 searches in eleven seconds), DuckDuckGo
+// and Yahoo both start answering 202 partway through, and the queries at the end
+// of the run are answered by Bing ALONE — which is the engine whose answers are
+// worst. So a burst does not merely slow search down: it silently swaps the good
+// indexes out for the bad one, and the result still looks like a success.
+//
+// Bounded, and short: search results go stale, and the point is to collapse the
+// bursts within one piece of work rather than to remember yesterday's answer.
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_MAX = 120;
+const cache = new Map();
+
+// The separator is not decoration: without it a limit of 1 and the query "23"
+// key the same as a limit of 12 and the query "3".
+const cacheKey = (query, limit) => `${limit} ${query.toLowerCase().replace(/\s+/g, " ")}`;
+
+function cacheGet(key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  // Re-inserted so the map stays in least-recently-used order for the eviction
+  // below; a Map iterates in insertion order, which is what makes this work.
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry.value;
+}
+
+function cacheSet(key, value) {
+  cache.set(key, { at: Date.now(), value });
+  while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+}
+
+/** Exported for the benchmark, which must measure the engines and not this. */
+export function clearSearchCache() {
+  cache.clear();
+}
+
+/**
+ * Run a search. Returns `{ ok, query, results, provider, reason }`.
+ *
+ * Never throws: a failed search is a result the model reads and works around,
+ * exactly like a non-zero exit code, and the whole point of this file is that it
+ * can say "the engines refused" rather than silently returning nothing.
+ */
+export async function searchWeb(query, {
+  limit = 10,
+  timeoutMs = 20000,
+  fetchImpl = fetch,
+  // The benchmark turns this off: it exists to measure the engines, and a cache
+  // hit would measure this file instead.
+  useCache = true
+} = {}) {
+  const trimmed = String(query ?? "").trim();
+  if (!trimmed) return { ok: false, query: trimmed, results: [], provider: null, reason: "No search terms were given." };
+
+  const key = cacheKey(trimmed, limit);
+  if (useCache) {
+    const hit = cacheGet(key);
+    // `cached` travels on the result so nothing downstream can mistake a
+    // remembered answer for a fresh one — a ten-minute-old price or score is
+    // still an old one, and the caller is entitled to know which it has.
+    if (hit) return { ...hit, cached: true };
+  }
+
+  // IN PARALLEL. Asked in turn, the wall clock is the sum and — worse — the
+  // first engine to answer decides the result on its own. Asked at once, the
+  // wall clock is the slowest one and every answer gets a vote.
+  const asked = await Promise.all(
+    INDEXES.map((index) => askIndex(index, trimmed, { limit, timeoutMs, fetchImpl })
+      // askIndex already catches per-endpoint; this is the belt for anything it
+      // could not have anticipated. One index throwing must never lose the rest.
+      .catch((error) => ({ name: index.name, endpoint: null, results: [], failures: [String(error?.message ?? error)] })))
+  );
+
+  const answered = asked.filter((index) => index.results.length > 0);
+  if (answered.length === 0) {
+    return {
+      ok: false,
+      query: trimmed,
+      results: [],
+      provider: null,
+      // Every endpoint's own words, because "search failed" tells the model
+      // nothing about whether to retry, rephrase, or open a browser instead.
+      reason: asked.flatMap((index) => index.failures).join("; ")
+    };
+  }
+
+  // Fuse over MORE than will be returned, then rerank, then cut. Reranking only
+  // the final ten cannot promote the right answer from eleventh, which is where
+  // one engine's disagreement often leaves it.
+  const fused = fuseRankings(answered, { limit: Math.max(limit * 2, 16) });
+  const ranked = rerank(trimmed, fused);
+
+  const found = {
+    ok: true,
     query: trimmed,
-    results: [],
-    provider: null,
-    // Every endpoint's own words, because "search failed" tells the model
-    // nothing about whether to retry, rephrase, or open a browser instead.
-    reason: failures.join("; ")
+    results: ranked.slice(0, limit),
+    // Which indexes actually voted. Named in the plural because it is now a
+    // consensus rather than one engine's opinion, and because "two of three
+    // agreed" is worth being able to see when an answer looks wrong.
+    provider: answered.map((index) => index.name).join("+"),
+    indexes: answered.map((index) => index.endpoint),
+    // Kept even on success: an index that declined is why a result set is
+    // thinner than usual, and it is invisible otherwise.
+    reason: null,
+    declined: asked.filter((index) => index.results.length === 0).flatMap((index) => index.failures)
   };
+
+  // Only a result worth repeating is remembered. Caching a thin answer from one
+  // struggling index would pin the worst ten minutes of the day in place, and
+  // the burst that produced it is exactly when that would happen.
+  if (useCache && found.results.length > 0) cacheSet(key, found);
+  return found;
 }
 
 /** How the results are shown to the model and, through it, to the user. */

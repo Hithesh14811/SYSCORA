@@ -213,6 +213,51 @@ test("clicking after an HTTP read puts the browser on that page first", async ()
   );
 });
 
+test("scrolling a page read over HTTP moves through text already in hand", async () => {
+  // Observed live 23 Aug 2026, and it cost eleven seconds and three wasted
+  // calls: a fetched page arrives WHOLE — Tom's Guide came back as 69,000
+  // characters — and the renderer shows 2,500 of it. The model correctly
+  // concluded the rest was further down and called web_scroll, which escalated
+  // to the controlled browser, threw away all the text already held, and landed
+  // on a DIFFERENT page (the last one fetched, not the one it meant).
+  const long = Array.from({ length: 400 }, (whole, index) => `Paragraph ${index} of the article about laptops.`).join("\n");
+  const { toolset, calls } = webToolset({ readPageOverHttp: httpPage({ text: long }) });
+
+  const opened = await toolset.execute("web_open", { url: "https://news.example/long" });
+  assert.match(opened.text, /Showing characters 0/, "the model was not told there is more of the page");
+  assert.match(opened.text, /Paragraph 0 /);
+
+  const scrolled = await toolset.execute("web_scroll", { y: 600 });
+  assert.equal(scrolled.ok, true);
+  assert.ok(!calls.some((entry) => entry.operation === "launch"),
+    "a browser was launched to scroll a page that was already downloaded");
+  // The new part comes BACK, rather than the model being told to go and read it.
+  // That saves a whole round trip through the model for every scroll.
+  assert.ok(!/Paragraph 0 /.test(scrolled.text), "the same window was returned again");
+  assert.match(scrolled.text, /Paragraph \d+ of the article/);
+});
+
+test("scrolling past the end of a fetched page says so instead of pretending", async () => {
+  const { toolset } = webToolset({ readPageOverHttp: httpPage({ text: "Short but readable. ".repeat(40) }) });
+  await toolset.execute("web_open", { url: "https://news.example/short" });
+  const scrolled = await toolset.execute("web_scroll", { y: 5000 });
+  assert.match(scrolled.text, /end of the page/);
+});
+
+test("re-reading a page fetched over HTTP costs no second fetch", async () => {
+  let fetches = 0;
+  const { toolset } = webToolset({
+    readPageOverHttp: async (url) => {
+      fetches += 1;
+      return (await httpPage()(url));
+    }
+  });
+  await toolset.execute("web_open", { url: "https://news.example/story" });
+  await toolset.execute("web_read", {});
+  await toolset.execute("web_read", {});
+  assert.equal(fetches, 1, "the same article was downloaded again to re-read it");
+});
+
 test("driving a search engine through the browser is refused, and named", async () => {
   // Observed live: handed a lookup, the model called `search`, disliked the
   // results and then opened google.com/search in the controlled browser — which

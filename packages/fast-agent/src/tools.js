@@ -2020,14 +2020,38 @@ export function buildToolset({
   // The fetched page is shaped like a `readOnce` reading so that ONE renderer
   // draws both, and so that a fetched page and a browsed page cannot drift into
   // saying different things about the same site.
-  const asPageReading = (fetched) => ({
+  const asPageReading = (fetched, { from = 0 } = {}) => ({
     state: { url: fetched.url, title: fetched.title },
     // Links become elements with the shape webLines already knows how to print,
     // so a fetched page lists what can be followed exactly as a browsed one does.
     elements: fetched.links.map((link) => ({ text: link.label, role: "a", href: link.href, clickable: true })),
-    text: fetched.text,
+    // A WINDOW ONTO THE PAGE, NOT THE WHOLE OF IT.
+    //
+    // The fetch returns everything — Tom's Guide came back as 69,000 characters
+    // — and the renderer clips to 2,500. So the model saw an article's opening
+    // paragraph, correctly concluded the rest was further down, and called
+    // web_scroll. Which escalated to the controlled browser, threw away the
+    // complete text we already had, landed on a DIFFERENT page (the last one
+    // opened over HTTP, not the one it meant), and cost eleven seconds. It then
+    // did it twice more before the loop guard stopped it. Caught live 23 Aug 2026.
+    //
+    // Scrolling a page held in memory is moving this window, and that is what
+    // web_scroll now does for an HTTP page: instant, no network, no browser, and
+    // it reaches the part of the article the answer is actually in.
+    text: String(fetched.text ?? "").slice(from, from + HTTP_WINDOW_CHARS),
+    reading: { from, total: String(fetched.text ?? "").length },
     via: "http"
   });
+
+  // How much of a fetched page is shown at once. Matched to the renderer's own
+  // clip so that what is selected here is what actually arrives — a window
+  // larger than the clip would be silently truncated again, which is exactly the
+  // failure this whole mechanism exists to fix.
+  const HTTP_WINDOW_CHARS = MAX_SCREEN_TEXT_CHARS;
+  // Overlapped by a couple of hundred characters, so a sentence that straddles
+  // the boundary is readable in one of the two windows rather than cut in half
+  // in both.
+  const HTTP_WINDOW_STEP = HTTP_WINDOW_CHARS - 250;
 
   // WHICH PAGE THE BROWSER IS ACTUALLY ON.
   //
@@ -2084,8 +2108,20 @@ export function buildToolset({
         "if it is still empty, this page cannot be read this way and the answer has to come from " +
         "somewhere else.";
     }
+    // HOW MUCH OF THE PAGE THIS IS.
+    //
+    // Without this line the model is shown 2,500 characters of a 69,000
+    // character article with nothing to say the rest exists — so it either
+    // answers from the introduction or goes hunting for a way to see more. Both
+    // were observed. Naming the window and the way to move it turns "there must
+    // be more somewhere" into one obvious call.
+    const window = page.reading && page.reading.total > page.text.length
+      ? `Showing characters ${page.reading.from}–${page.reading.from + page.text.length} of ${page.reading.total}. ` +
+        "Call web_scroll to move further down this page — it is already downloaded, so that costs nothing."
+      : null;
     return [
       `Page: ${state.title ? `"${state.title}" — ` : ""}${state.url}`,
+      window,
       // A WEB PAGE IS THE LEAST TRUSTWORTHY THING THIS AGENT READS. Anyone can
       // put words on one, and the agent arrives at it because it was asked to
       // look something up.
@@ -4934,7 +4970,14 @@ export function buildToolset({
           injected,
           evidence: evidence({
             observed: found.ok
-              ? `${found.results.length} results for ${JSON.stringify(found.query)} from ${found.provider}`
+              // A REMEMBERED ANSWER SAYS SO. Search results are cached for ten
+              // minutes so a burst of related queries does not get the good
+              // indexes rate-limited — see web-search.js. But a ten-minute-old
+              // price or score is still an old one, and a receipt that reports a
+              // cached answer as a fresh observation is a receipt claiming
+              // something was looked at when it was not.
+              ? `${found.results.length} results for ${JSON.stringify(found.query)} from ${found.provider}` +
+                (found.cached ? " (cached within the last ten minutes)" : "")
               : `no results for ${JSON.stringify(found.query)}: ${found.reason}`,
             method: "web.search",
             verdict: found.ok ? CONFIRMED : REFUTED
@@ -5030,7 +5073,10 @@ export function buildToolset({
         if (args.rejectCookies !== true) {
           const fetched = await readPageOverHttp(url);
           if (fetched.ok && fetched.readable) {
-            state.httpPage = { url: fetched.url, at: Date.now() };
+            // The WHOLE page is kept, not just the part being shown. That is
+            // what makes web_scroll free afterwards, and what stops web_read
+            // fetching the same article a second time.
+            state.httpPage = { ...fetched, at: Date.now(), offset: 0 };
             const page = asPageReading(fetched);
             return { ...page, evidence: pageEvidence(page, "http.get") };
           }
@@ -5080,14 +5126,12 @@ export function buildToolset({
         // When web_open answered over HTTP there is no controlled browser, so
         // asking it what it has open returns nothing — and web_read would have
         // reported "the browser has no page open" about a page the model had
-        // just been shown the whole of. A selector is a DOM query, so that case
-        // still needs the browser and escalates.
+        // just been shown. The text is already held, so this costs no network
+        // either. A selector is a DOM query, so that case still needs the
+        // browser and escalates.
         if (state.httpPage && !args.selector) {
-          const fetched = await readPageOverHttp(state.httpPage.url);
-          if (fetched.ok) {
-            const page = asPageReading(fetched);
-            return { ...page, evidence: pageEvidence(page) };
-          }
+          const page = asPageReading(state.httpPage, { from: state.httpPage.offset });
+          return { ...page, evidence: pageEvidence(page) };
         }
         await escalateToBrowser();
         const page = await readWebPage({ selector: args.selector, settle: true });
@@ -5289,8 +5333,50 @@ export function buildToolset({
       preview: (args) => `${args.y ?? 600}px`,
       acts: true,
       execute: async (args) => {
-        // A fetched page arrived whole — there is nothing below the fold to
-        // scroll to — but the browser still has to be on it before it can move.
+        // SCROLLING A PAGE HELD IN MEMORY IS MOVING THE READING WINDOW.
+        //
+        // A fetched page arrived WHOLE — there is no fold and nothing to load —
+        // so escalating to the controlled browser for this was the worst of both
+        // worlds: it discarded 69,000 characters of text already in hand, opened
+        // a browser at whichever page was fetched LAST rather than the one the
+        // model meant, and took eleven seconds to end up with less. Observed
+        // live on 23 Aug 2026, three times in one request before the loop guard
+        // stopped it.
+        //
+        // Moving the window instead is instant, needs no network, and lands on
+        // the part of the article the answer is in — which is all the model
+        // wanted when it asked to scroll.
+        if (state.httpPage) {
+          const page = state.httpPage;
+          const total = String(page.text ?? "").length;
+          const requested = Number.isFinite(Number(args.y)) ? Number(args.y) : 600;
+          // The argument is in pixels because that is what a browser scroll
+          // takes. Here it is a direction and a rough magnitude, and a step of
+          // the window is the honest translation of it.
+          const steps = Math.max(1, Math.round(Math.abs(requested) / 600));
+          const moved = (requested < 0 ? -1 : 1) * steps * HTTP_WINDOW_STEP;
+          const before = page.offset;
+          page.offset = Math.max(0, Math.min(page.offset + moved, Math.max(0, total - 250)));
+          return {
+            httpReading: true,
+            url: page.url,
+            moved: page.offset !== before,
+            from: page.offset,
+            total,
+            atEnd: page.offset + HTTP_WINDOW_CHARS >= total,
+            page: asPageReading(page, { from: page.offset }),
+            evidence: evidence({
+              observed: page.offset === before
+                ? `the reading position is still ${before} of ${total} characters of ${page.url}`
+                : `the reading position moved from ${before} to ${page.offset} of ${total} characters of ${page.url}`,
+              method: "http.readingWindow",
+              actedVia: "web_scroll",
+              verdict: page.offset === before ? REFUTED : CONFIRMED
+            })
+          };
+        }
+        // No fetched page: this is the controlled browser, and it has to be on
+        // the page before it can move.
         await escalateToBrowser();
         const scrolled = await runCapability("browser.scroll", { y: Number.isFinite(Number(args.y)) ? Number(args.y) : 600 });
         // `scrollAfter` is the document's own scrollY read after the scroll —
@@ -5308,9 +5394,27 @@ export function buildToolset({
           })
         };
       },
-      render: (result) => (result.moved
-        ? confirmed(result, `Scrolled to ${result.scrollAfter?.y ?? "?"}. Call web_read to see what is there now.`)
-        : refuted(result, "The page did not move — you are already at the end of it."))
+      render: (result) => {
+        // A page read over HTTP is already in hand, so moving through it RETURNS
+        // the new part rather than telling the model to go and read it. That
+        // saves a whole round trip through the model for every scroll, which is
+        // the expensive half of what scrolling used to cost.
+        if (result.httpReading) {
+          if (!result.moved) {
+            return refuted(result, result.atEnd
+              ? "That is the end of the page — there is nothing further down. Everything it says has been read."
+              : "The reading position did not move; you are already at the top of the page.");
+          }
+          return confirmed(result, [
+            `Reading ${result.url} from character ${result.from} of ${result.total}` +
+              `${result.atEnd ? " — this is the end of the page." : "."}`,
+            renderWebPage(result.page)
+          ].join("\n\n"));
+        }
+        return result.moved
+          ? confirmed(result, `Scrolled to ${result.scrollAfter?.y ?? "?"}. Call web_read to see what is there now.`)
+          : refuted(result, "The page did not move — you are already at the end of it.");
+      }
     },
     {
       name: "undo",

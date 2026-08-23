@@ -1,0 +1,397 @@
+{
+  "_comment": [
+    "THE RULER FOR SEARCH. Without this, 'better search' is a feeling.",
+    "",
+    "Each query names domains that ANSWER it and domains that are a wrong turn.",
+    "The wrong turns are not hypothetical — every one listed under `bad` was",
+    "actually returned by a live engine for that exact query, which is what makes",
+    "them worth measuring. `poison@3` is the metric that catches the failure that",
+    "started this: on 23 Aug 2026 Bing answered 'best laptops of 2026' with four",
+    "dictionary definitions of the word 'best', and nothing in the pipeline noticed",
+    "because the search had technically succeeded.",
+    "",
+    "`good` is deliberately a list of SITES rather than exact URLs. Exact URLs rot",
+    "within weeks and would turn this into a test of whether a page has been",
+    "renamed. A site that publishes the answer is a stable enough target to compare",
+    "two rankings against.",
+    "",
+    "THE RULE FOR ADDING TO `good`, because otherwise this stops being a ruler.",
+    "",
+    "The first version of these lists was written from memory and was wrong: it",
+    "marked 'MySQL vs PostgreSQL: The Write-Heavy Showdown' a MISS for the",
+    "postgres-vs-mysql query, because medium.com had not been listed. Three of the",
+    "twelve queries were punishing correct answers, and tuning a ranker against",
+    "that would have been tuning it towards the mistake.",
+    "",
+    "So a site may be added ONLY when the page it returned for THIS query has a",
+    "title that states the query's intent outright — 'How to Stop Windows 11 From",
+    "Reopening Apps After Restart' for the windows query. It may NOT be added",
+    "because the current implementation happened to return it. That distinction is",
+    "the whole difference between correcting a ruler and bending one.",
+    "",
+    "Queries are phrased the way the agent actually phrases them — taken from real",
+    "transcripts, including the sloppy ones. A benchmark of well-formed queries",
+    "measures a search engine nobody is using."
+  ],
+  "queries": [
+    {
+      "id": "laptops-roundup",
+      "query": "best laptops of 2026",
+      "why": "The query that exposed the whole problem. Reviewers answer it; dictionaries do not.",
+      "good": [
+        "pcmag.com",
+        "cnet.com",
+        "tomsguide.com",
+        "tomshardware.com",
+        "wired.com",
+        "forbes.com",
+        "pcworld.com",
+        "nytimes.com",
+        "rtings.com",
+        "techradar.com",
+        "laptopmag.com",
+        "theverge.com",
+        "zdnet.com",
+        "digitaltrends.com",
+        "engadget.com",
+        "businessinsider.com",
+        "trustedreviews.com",
+        "expertreviews.co.uk",
+        "which.co.uk"
+      ],
+      "bad": [
+        "merriam-webster.com",
+        "dictionary.cambridge.org",
+        "thefreedictionary.com",
+        "wordreference.com",
+        "britannica.com",
+        "bestundertaking.net",
+        "collinsdictionary.com",
+        "vocabulary.com"
+      ]
+    },
+    {
+      "id": "internship-longtail",
+      "query": "spring 2027 J-1 internship USA AI",
+      "why": "Long tail with an acronym and a year. Bing collapsed this to the Spring Java framework.",
+      "good": [
+        "linkedin.com",
+        "github.com",
+        "indeed.com",
+        "glassdoor.com",
+        "handshake.com",
+        "joinhandshake.com",
+        "simplify.jobs",
+        "opportunitiesfeed.com",
+        "reigngigs.com",
+        "internships.com",
+        "wayup.com",
+        "ziprecruiter.com",
+        "cultureshock.com",
+        "intrax.com",
+        "cicdvisa.com",
+        "j1visa.state.gov",
+        "internshala.com",
+        "prosple.com",
+        "jobrapido.com",
+        "builtin.com",
+        "levels.fyi",
+        "ripplematch.com",
+        "untapped.io",
+        "jobright.ai"
+      ],
+      "bad": [
+        "spring.io",
+        "start.spring.io",
+        "geeksforgeeks.org",
+        "tpointtech.com",
+        "javatpoint.com",
+        "baeldung.com"
+      ]
+    },
+    {
+      "id": "release-notes",
+      "query": "Node.js 24 release notes changes",
+      "why": "A technical lookup with one obviously correct primary source.",
+      "good": [
+        "nodejs.org",
+        "github.com",
+        "nodesource.com",
+        "logrocket.com",
+        "versions.dev",
+        "versionlog.com",
+        "snyk.io",
+        "betterstack.com"
+      ],
+      "bad": [
+        "w3schools.com",
+        "npmjs.com"
+      ]
+    },
+    {
+      "id": "recent-event",
+      "query": "who won the 2026 world cup",
+      "why": "A recent fact. Tests freshness, not just relevance.",
+      "good": [
+        "wikipedia.org",
+        "fifa.com",
+        "bbc.com",
+        "espn.com",
+        "reuters.com",
+        "apnews.com",
+        "nytimes.com",
+        "theguardian.com",
+        "skysports.com",
+        "cbssports.com",
+        "msn.com",
+        "olympics.com",
+        "sportingnews.com",
+        "goal.com",
+        "foxsports.com",
+        "sportskeeda.com",
+        "worldcupwiki.com",
+        "usatoday.com",
+        "nbcsports.com"
+      ],
+      "bad": [
+        "merriam-webster.com",
+        "amazon.com",
+        "ebay.com"
+      ]
+    },
+    {
+      "id": "error-message",
+      "query": "docker ENOSPC no space left on device fix",
+      "why": "An error string. The answer is on a forum or in docs, never on a marketing page.",
+      "good": [
+        "stackoverflow.com",
+        "docs.docker.com",
+        "github.com",
+        "serverfault.com",
+        "askubuntu.com",
+        "superuser.com",
+        "forums.docker.com",
+        "unix.stackexchange.com",
+        "digitalocean.com",
+        "linuxize.com",
+        "baeldung.com",
+        "stackexchange.com",
+        "tecmit.com",
+        "cloudbees.com",
+        "pcloudz.com",
+        "sentry.io",
+        "bobcares.com",
+        "geeksforgeeks.org"
+      ],
+      "bad": [
+        "docker.com/pricing",
+        "amazon.com",
+        "youtube.com"
+      ]
+    },
+    {
+      "id": "streaming-availability",
+      "query": "Premalu 2024 movie streaming where to watch",
+      "why": "Taken from a live transcript. There is one kind of site that answers this.",
+      "good": [
+        "justwatch.com",
+        "wikipedia.org",
+        "imdb.com",
+        "hotstar.com",
+        "netflix.com",
+        "primevideo.com",
+        "themoviedb.org",
+        "reelgood.com",
+        "moviesanywhere.com",
+        "jiocinema.com",
+        "sonyliv.com",
+        "zee5.com",
+        "bookmyshow.com",
+        "filmibeat.com",
+        "indiatimes.com",
+        "ottplay.com",
+        "binged.com"
+      ],
+      "bad": [
+        "merriam-webster.com",
+        "quora.com"
+      ]
+    },
+    {
+      "id": "india-commerce",
+      "query": "iPhone 17 Pro cheapest price India",
+      "why": "Taken from a live transcript. Regional commerce, where a US-centric index answers badly.",
+      "good": [
+        "flipkart.com",
+        "amazon.in",
+        "croma.com",
+        "reliancedigital.in",
+        "apple.com",
+        "smartprix.com",
+        "91mobiles.com",
+        "gadgets360.com",
+        "mysmartprice.com",
+        "vijaysales.com",
+        "sangeethamobiles.com",
+        "poorvikamobile.com",
+        "pricebefore.com",
+        "indiatimes.com",
+        "ndtv.com",
+        "beebom.com",
+        "cashify.in",
+        "pricee.com"
+      ],
+      "bad": [
+        "ebay.com",
+        "aliexpress.com",
+        "wish.com"
+      ]
+    },
+    {
+      "id": "how-to",
+      "query": "how to stop windows 11 from reopening apps after restart",
+      "why": "A natural-language how-to. Tests whether a question survives as a question.",
+      "good": [
+        "microsoft.com",
+        "superuser.com",
+        "howtogeek.com",
+        "windowscentral.com",
+        "tenforums.com",
+        "elevenforum.com",
+        "reddit.com",
+        "answers.microsoft.com",
+        "makeuseof.com",
+        "xda-developers.com",
+        "pcworld.com",
+        "lifewire.com",
+        "windowsreport.com",
+        "helpdeskgeek.com",
+        "allthings.how",
+        "digitash.com",
+        "ghacks.net",
+        "guidingtech.com",
+        "beebom.com",
+        "nerdschalk.com"
+      ],
+      "bad": [
+        "merriam-webster.com",
+        "amazon.com"
+      ]
+    },
+    {
+      "id": "docs-lookup",
+      "query": "python asyncio TaskGroup example",
+      "why": "An API lookup where the official docs should outrank content farms.",
+      "good": [
+        "docs.python.org",
+        "stackoverflow.com",
+        "github.com",
+        "realpython.com",
+        "python.org",
+        "superfastpython.com",
+        "pymotw.com",
+        "medium.com",
+        "dev.to",
+        "geeksforgeeks.org",
+        "sglmr.com",
+        "iditect.com",
+        "betterstack.com",
+        "pythoncheatsheet.org"
+      ],
+      "bad": [
+        "w3schools.com",
+        "tutorialspoint.com",
+        "javatpoint.com"
+      ]
+    },
+    {
+      "id": "comparison",
+      "query": "postgres vs mysql for a write heavy workload",
+      "why": "A comparison, where vendor marketing is the wrong answer and engineering writing is the right one.",
+      "good": [
+        "stackoverflow.com",
+        "percona.com",
+        "cybertec-postgresql.com",
+        "planetscale.com",
+        "aws.amazon.com",
+        "digitalocean.com",
+        "news.ycombinator.com",
+        "reddit.com",
+        "dbconvert.com",
+        "enterprisedb.com",
+        "prisma.io",
+        "timescale.com",
+        "vettabase.com",
+        "severalnines.com",
+        "medium.com",
+        "upcloud.com",
+        "acecloud.ai",
+        "bytebase.com",
+        "instaclustr.com",
+        "tigerdata.com",
+        "sqlpipe.com"
+      ],
+      "bad": [
+        "merriam-webster.com",
+        "upwork.com",
+        "fiverr.com"
+      ]
+    },
+    {
+      "id": "sloppy-spelling",
+      "query": "where can i buy the chepest iphone 17pro",
+      "why": "Copied verbatim from a live transcript, misspelling and all. Real queries are not clean.",
+      "good": [
+        "flipkart.com",
+        "amazon.in",
+        "croma.com",
+        "reliancedigital.in",
+        "apple.com",
+        "smartprix.com",
+        "91mobiles.com",
+        "gadgets360.com",
+        "mysmartprice.com",
+        "amazon.com",
+        "bestbuy.com",
+        "vijaysales.com",
+        "pricebefore.com",
+        "cashify.in",
+        "pricee.com",
+        "beebom.com",
+        "ndtv.com"
+      ],
+      "bad": [
+        "merriam-webster.com",
+        "dictionary.cambridge.org"
+      ]
+    },
+    {
+      "id": "entity-plus-attribute",
+      "query": "Ashish Chanchlani most viewed video",
+      "why": "A person plus an attribute. Tests whether the attribute survives the entity match.",
+      "good": [
+        "youtube.com",
+        "wikipedia.org",
+        "socialblade.com",
+        "statista.com",
+        "indiatimes.com",
+        "hindustantimes.com",
+        "ndtv.com",
+        "indianexpress.com",
+        "reddit.com",
+        "quora.com",
+        "viralpitch.co",
+        "trackalytics.com",
+        "m.youtube.com",
+        "famousbirthdays.com",
+        "wikitubia.fandom.com",
+        "fandom.com",
+        "starsunfolded.com"
+      ],
+      "bad": [
+        "merriam-webster.com",
+        "linkedin.com/jobs"
+      ]
+    }
+  ]
+}
