@@ -501,7 +501,12 @@ export class AgentRuntime {
       // means nothing at all.
       //
       // So they go to whoever is watching right now and nowhere else.
-      if (event.type === "TOOL_PROGRESS") {
+      //
+      // TOOL_STREAMING is the same kind of thing at the other end of a step: the
+      // model composing the call, byte count climbing, every event superseded by
+      // the next and all of them superseded by the TOOL_STARTED that follows. It
+      // is worth watching and worthless to keep.
+      if (event.type === "TOOL_PROGRESS" || event.type === "TOOL_STREAMING") {
         this.onSessionEvent?.(session.sessionId, record);
         return;
       }

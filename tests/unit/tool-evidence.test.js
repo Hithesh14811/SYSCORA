@@ -187,6 +187,22 @@ const SUCCESS_CALLS = [
   { tool: "read_file", args: { path: "C:\\notes.txt" }, file: ["c:\\notes.txt", "a line"] },
   { tool: "write_file", args: { path: "C:\\fresh.txt", contents: "written body" } },
   { tool: "edit_file", args: { path: "C:\\edit.txt", old: "before", new: "after" }, file: ["c:\\edit.txt", "before\n"] },
+  // WRITES A REAL FILE, so it gets a real directory. It goes to the filesystem
+  // directly rather than through `filesystem.write`, because what it writes is
+  // bytes rather than text — and its receipt comes from reading those bytes
+  // back through documents.js, which is a parser that has never heard of the
+  // writer. A stub here would prove nothing at all: the whole claim is that the
+  // PDF on disk is one an independent extractor can read.
+  {
+    tool: "create_document",
+    args: {
+      filename: "Evidence check",
+      format: "pdf",
+      title: "Evidence check",
+      content: "## A heading\n\nA paragraph with **bold** in it.\n\n- one\n- two"
+    },
+    needsRealFolder: true
+  },
   // Two tools answer a question when called with nothing and change something
   // when called with an argument. Only the second is an action, and the receipt
   // for a pure reading names no capability that acted because none did.
@@ -198,6 +214,16 @@ const SUCCESS_CALLS = [
   // tests/unit/web-search.test.js against a stubbed fetch.
   { tool: "search", args: { query: "syscora evidence test" }, readOnly: true },
   { tool: "web_open", args: { url: "https://example.com/" } },
+  // Reaches api.github.com in production, like `search` above. Whatever comes
+  // back — the repository, a 404, or GitHub having a bad afternoon — a receipt
+  // comes with it, which is the whole thing this file exists to prove. The
+  // parsing and the rate-limit path are tested against a stubbed fetch in
+  // tests/unit/github-read.test.js, where they can be made to fail on demand.
+  { tool: "github", args: { repo: "sindresorhus/slugify" }, readOnly: true },
+  // The dispatcher for capabilities the agent saved itself. `list` is the one
+  // action that needs nothing on disk and reaches no network, and it still has
+  // to carry a receipt — see capabilities.js.
+  { tool: "capability", args: { action: "list" }, readOnly: true },
   { tool: "web_read", args: {} },
   { tool: "web_click", args: { text: "Next" } },
   { tool: "web_type", args: { text: "hello", into: "Search" } },
@@ -206,6 +232,14 @@ const SUCCESS_CALLS = [
   { tool: "volume", args: {}, label: "volume (read)", readOnly: true },
   { tool: "close_app", args: { application: "app" } },
   { tool: "remember", args: { fact: "the project lives in C:\\work" }, needsNotes: true },
+  // Draws a card and sends nothing — `readOnly`, because it names no capability
+  // that acted, and there is nothing in the world for a reading to check. The
+  // fact that it CANNOT send is asserted separately, in email-draft.test.js.
+  {
+    tool: "email_draft",
+    args: { to: "someone@example.com", subject: "Hello", body: "A short note." },
+    readOnly: true
+  },
   { tool: "wait", args: { ms: 1 } },
   { tool: "batch", args: { steps: [{ tool: "wait", args: { ms: 1 } }] } },
   // Undo needs something on the record to put back, so the volume moves first.
@@ -222,11 +256,17 @@ const SUCCESS_CALLS = [
 // Where `remember` writes. A real directory, thrown away afterwards, because the
 // note it writes has to be readable back for the tool to prove it wrote it.
 let notesRoot = null;
+// Where `create_document` writes. Also a real directory, and for a stronger
+// reason: its receipt is the file being read back by an independent parser, so
+// there has to BE a file.
+let documentsRoot = null;
 test.before(async () => {
   notesRoot = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-evidence-"));
+  documentsRoot = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-documents-"));
 });
 test.after(async () => {
   if (notesRoot) await fs.rm(notesRoot, { recursive: true, force: true }).catch(() => {});
+  if (documentsRoot) await fs.rm(documentsRoot, { recursive: true, force: true }).catch(() => {});
 });
 
 async function runOne(call) {
@@ -234,7 +274,8 @@ async function runOne(call) {
   const { toolset } = harness({ files, basePath: call.needsNotes ? notesRoot : undefined });
   if (call.needsReading) await toolset.execute("screen", { application: "app" });
   if (call.needsUndoable) await toolset.execute("volume", { percent: 40 });
-  const outcome = await toolset.execute(call.tool, call.args);
+  const args = call.needsRealFolder ? { ...call.args, folder: documentsRoot } : call.args;
+  const outcome = await toolset.execute(call.tool, args);
   return { outcome, raw: outcome.raw };
 }
 

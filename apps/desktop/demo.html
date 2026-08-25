@@ -4,56 +4,200 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SYSCORA</title>
+    <link rel="icon" href="/icon.ico" sizes="any" />
     <link rel="stylesheet" href="/demo.css" />
   </head>
   <body>
     <header class="demo-topbar">
-      <div class="brand">
-        <span class="logo">◆</span>
-        <div>
-          <h1>SYSCORA</h1>
-          <p>Tell your computer what you want done.</p>
-        </div>
-      </div>
+      <!-- THE TAGLINE WENT. No chat application puts its own strapline in the
+           chrome above the conversation; it is marketing on a surface somebody
+           is trying to work in, and it competed with the product name. -->
+      <!-- THE LEFT OF THIS BAR IS GONE, and it took the second copy of two
+           controls with it. The panel toggle and the product's name were sitting
+           in a strip above a rail that now carries both — so the window had two
+           SYSCORA wordmarks a centimetre apart and two ways to collapse the same
+           panel. The rail is never fully hidden now (it collapses to icons), so
+           the toggle has somewhere permanent to live and does not need a
+           lifeboat out here. What is left is the one thing that belongs to the
+           window rather than to the rail: the ⋯ menu, hard right. -->
+      <div class="topbar-left"></div>
       <div class="topbar-actions">
+        <!-- A STATUS THAT IS ALWAYS GREEN IS NOT A STATUS. "Ready" sat in the
+             chrome permanently, which is noise on every good day and easy to
+             miss on the one bad one. This is silent while the daemon answers and
+             impossible to miss when it stops — which is the only time the reading
+             is worth any of the user's attention. It has to live OUT here rather
+             than in the menu below: a failure nobody can see until they open a
+             menu is a failure nobody sees. -->
+        <span id="healthPill" class="health-pill" hidden>Not connected</span>
         <!-- Conversations are kept in this client's own storage. There is no
              account yet, so "your chats" means the chats on this machine, in
-             this browser or this desktop application. -->
-        <button id="chatsButton" class="topbar-button" type="button" title="Previous chats">
-          <span aria-hidden="true">☰</span> Chats
-        </button>
-        <button id="newChatButton" class="topbar-button" type="button" title="Start a new chat">
-          <span aria-hidden="true">✚</span> New chat
-        </button>
-        <label class="debug-toggle">
-          <!-- This said "Ready", in green, always — it was markup, not a reading.
-               With the daemon stopped it went on saying Ready while every request
-               failed, which is the worst thing a status indicator can do. It is
-               now driven by /api/health. -->
-          <span id="healthDot" class="status-dot" aria-hidden="true"></span>
-          <span id="healthLabel">Connecting…</span>
-          <input id="debugToggle" type="checkbox" />
-          Developer mode
-        </label>
+             this browser or this desktop application.
+             This one is hidden by CSS while the sidebar is open, because the
+             sidebar has its own — two identical buttons a hand's width apart is
+             a surface that has not decided where anything lives. -->
+        <!-- "New chat" was here too. It is the first row of the rail, and the
+             rail is always on screen now, so this was the third control in the
+             window doing that job. -->
+
+        <!-- DEVELOPER MODE IS NOT CHROME. It is a real switch — it shows the raw
+             session JSON — and it was sitting in the top bar of a product for
+             people who do not read JSON, next to a status word, in a checkbox.
+             It is still one click away, behind the control every application
+             puts this kind of thing behind. -->
+        <div class="more">
+          <button id="moreButton" class="icon-button" type="button"
+                  aria-haspopup="menu" aria-expanded="false" aria-label="More" title="More">
+            <svg class="icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true" fill="currentColor">
+              <circle cx="5.5" cy="12" r="1.6" /><circle cx="12" cy="12" r="1.6" /><circle cx="18.5" cy="12" r="1.6" />
+            </svg>
+          </button>
+          <div id="moreMenu" class="more-menu" role="menu" hidden>
+            <!-- WHAT YOU CAN DO TO THE CHAT YOU ARE LOOKING AT. Filled by
+                 chatActionItems() in demo.js — the SAME function that fills the
+                 menu behind each row in the rail, because two menus offering
+                 "Delete" written out twice is two places for them to stop
+                 agreeing about what Delete does. -->
+            <div id="moreChatActions" class="menu-group"></div>
+            <div class="menu-rule" role="separator"></div>
+            <div class="more-status">
+              <!-- This said "Ready", in green, always — it was markup, not a
+                   reading. With the daemon stopped it went on saying Ready while
+                   every request failed, which is the worst thing a status
+                   indicator can do. It is now driven by /api/health. -->
+              <span id="healthDot" class="status-dot" aria-hidden="true"></span>
+              <span id="healthLabel">Connecting…</span>
+            </div>
+            <!-- WHICH MAILBOX THIS APPLICATION CAN SEND FROM, and the way to
+                 take that away. A connection that can only be revoked on
+                 Google's website is one most people never revoke. Hidden
+                 entirely until an account is actually connected — an empty row
+                 saying "not connected" is a setting about nothing. -->
+            <div id="mailAccounts" class="more-mail" hidden></div>
+            <label class="debug-toggle" role="menuitemcheckbox">
+              <input id="debugToggle" type="checkbox" />
+              <span>Developer mode<em>Show the raw session behind each answer</em></span>
+            </label>
+          </div>
+        </div>
       </div>
     </header>
 
     <!-- Slides over the transcript rather than sitting beside it, so the chat
          column keeps every pixel it has today whatever the window width. -->
     <div id="chatsBackdrop" class="chats-backdrop" hidden></div>
-    <aside id="chatsPanel" class="chats-panel" hidden aria-label="Previous chats">
-      <header class="chats-panel-head">
-        <h2>Chats</h2>
-        <button id="chatsClose" class="icon-button" type="button" aria-label="Close">✕</button>
+
+    <!-- The row menu, ONE of it, moved to whichever row asked for it. A menu per
+         row would be twenty-five menus in the document for a list you can only
+         have one menu open on, and it would have to be rebuilt on every render.
+         It sits at the top level so a rail that scrolls or clips cannot cut it
+         off — the same mistake the composer made with its two pop-ups. -->
+    <div id="chatMenu" class="more-menu chat-menu" role="menu" hidden></div>
+    <!-- THE PANEL CARRIES THE PRODUCT'S NAME, and the top bar stops repeating it.
+         A sidebar whose header says "CHATS" over a window whose header says
+         "SYSCORA" is two headers for one window. The brand goes where every
+         assistant puts it — at the top of the rail — and the two controls beside
+         it are the two things you do to the rail itself: find something in it,
+         and put it away. -->
+    <aside id="chatsPanel" class="chats-panel" hidden aria-label="Chats">
+      <header class="side-head">
+        <!-- THE MARK IS THE WAY BACK. Collapsed, the rail is 60px of icons and
+             there is no room for a wordmark AND a control to reopen it — so the
+             mark becomes the control: hover it and it turns into the panel icon,
+             which is a picture of what clicking will do. Expanded it is just the
+             brand and does nothing, because there is a collapse button two
+             centimetres to its right and a logo that quietly closes your sidebar
+             is a trap. -->
+        <button id="railToggle" class="side-brand" type="button" aria-label="Expand the sidebar" title="Expand">
+          <span class="side-brand-mark">
+            <img class="logo" src="/logo.png" width="26" height="26" alt="" aria-hidden="true" />
+            <svg class="side-brand-expand icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+                 fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="16" rx="3.2" />
+              <path d="M9.5 4v16" />
+            </svg>
+          </span>
+          <span class="side-brand-name">SYSCORA</span>
+        </button>
+        <div class="side-head-actions">
+          <button id="chatsSearchToggle" class="icon-button" type="button"
+                  aria-expanded="false" aria-controls="chatSearch" aria-label="Search chats" title="Search chats">
+            <svg class="icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"
+                 fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+              <circle cx="10.9" cy="10.9" r="6.3" /><path d="M15.6 15.6l4.4 4.4" />
+            </svg>
+          </button>
+          <!-- The same icon as the button that opened it, so the two read as one
+               control in two places rather than as "open" and "close". -->
+          <button id="chatsClose" class="icon-button" type="button" aria-label="Hide the sidebar" title="Hide the sidebar">
+            <svg class="icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+                 fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4.3" y="5.3" width="4.2" height="13.4" rx="1.5" fill="currentColor" stroke="none" />
+              <rect x="3" y="4" width="18" height="16" rx="3.2" />
+              <path d="M9.5 4v16" />
+            </svg>
+          </button>
+        </div>
       </header>
-      <button id="panelNewChat" class="new-chat-row" type="button">
-        <span aria-hidden="true">✚</span> New chat
-      </button>
+
+      <!-- EVERY ROW HERE GOES SOMEWHERE. The reference this was drawn from has
+           seven — Images, Library, Plugins, Projects, Codex — and SYSCORA has no
+           equivalent of any of them. A nav row that does nothing is the exact
+           defect this codebase keeps finding (see desktop-suggestions.test.js:
+           the one-click suggestions were dead for weeks because the markup and
+           the handlers were two lists that drifted). So there are two rows,
+           because there are two things. -->
+      <nav class="side-nav" aria-label="Actions">
+        <button id="panelNewChat" class="side-nav-item" type="button">
+          <svg class="icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+               fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16.4 3.9a2 2 0 0 1 2.8 2.8L9 16.9l-3.7 1 1-3.7z" />
+            <path d="M14.6 5.7l3.7 3.7" />
+          </svg>
+          <span>New chat</span>
+        </button>
+        <button id="chatsSearchItem" class="side-nav-item" type="button" aria-controls="chatSearch">
+          <svg class="icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+               fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+            <circle cx="10.9" cy="10.9" r="6.3" /><path d="M15.6 15.6l4.4 4.4" />
+          </svg>
+          <span>Search chats</span>
+        </button>
+      </nav>
+
+      <!-- A list you cannot search is a list you scroll. Twenty-five chats fit
+           in this panel and none of them are titled by you — they take their
+           name from the first thing you asked — so finding the one you want by
+           eye means reading all of them.
+           FOLDED AWAY UNTIL ASKED FOR: an always-open search field on a list of
+           six chats is a control that is wrong more often than it is right, and
+           it was taking the room the list wanted. -->
+      <div class="chat-search" hidden>
+        <svg class="icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"
+             fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <circle cx="10.9" cy="10.9" r="6.3" /><path d="M15.6 15.6l4.4 4.4" />
+        </svg>
+        <input id="chatSearch" type="search" placeholder="Search chats" aria-label="Search chats" />
+      </div>
+
       <ul id="chatList" class="chat-list"></ul>
-      <p class="chats-note muted">
-        Kept on this machine only. There are no accounts yet, so these do not follow you to another
-        computer — and clearing this browser's storage clears them.
-      </p>
+
+      <!-- WHAT THE REFERENCE PUTS HERE IS AN ACCOUNT, AND THERE IS NO ACCOUNT.
+           SYSCORA has no sign-in and nothing to upgrade to, so the footer says
+           the true version of the same thing: which machine this is, and whether
+           the daemon behind it is answering. The status line is driven by
+           setDaemonReachable() — the same one reading that drives the pill in
+           the top bar — because two places saying different things about the
+           same daemon is worse than one place saying nothing. -->
+      <footer class="side-foot">
+        <span class="side-avatar" aria-hidden="true">
+          <img src="/logo.png" width="30" height="30" alt="" />
+        </span>
+        <span class="side-who">
+          <strong>This machine</strong>
+          <em id="sideStatus">Connecting…</em>
+        </span>
+      </footer>
     </aside>
 
     <!-- Connect panel: shown only for browser-only launch (no injected token). -->
@@ -76,18 +220,92 @@
           <h2>What would you like SYSCORA to do?</h2>
           <p class="muted">Ask naturally. SYSCORA can answer, inspect, and act while keeping you
             updated in the same conversation.</p>
+          <!-- SIX PILLS BECAME SIX CARDS. The first screen was a heading, a
+               sentence and a column of grey lozenges, which is a lot of empty
+               window and tells a new user nothing about what this can do. Each
+               card now carries the KIND of thing it is as well as the request,
+               so the set reads as a map of the product rather than as six
+               arbitrary examples. The `data-text` each one sends is unchanged. -->
           <div class="suggestions" id="suggestions">
-            <button class="suggestion" data-text="Tell me about this computer and what development tools are installed.">Tell me about this computer</button>
-            <button class="suggestion" data-text="What's using port 3000?">What's using port 3000?</button>
-            <button class="suggestion" data-text="Create a folder called Investor Demo on my Desktop and put a readme.txt inside it.">Create a folder on my Desktop</button>
-            <button class="suggestion" data-text="Check if Git is installed.">Check if Git is installed</button>
-            <button class="suggestion" data-text="Search WinGet for VLC.">Search for VLC</button>
-            <button class="suggestion" data-text="Inspect this project and tell me what I need to run it.">Inspect this project</button>
+            <button class="suggestion" data-text="Tell me about this computer and what development tools are installed.">
+              <span class="suggestion-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3.2" y="4.4" width="17.6" height="12.4" rx="2.4" /><path d="M8.8 20.2h6.4M12 16.8v3.4" />
+                </svg>
+              </span>
+              <span class="suggestion-text">
+                <strong>Tell me about this computer</strong>
+                <em>Specs, disks and what's installed</em>
+              </span>
+            </button>
+            <button class="suggestion" data-text="What's using port 3000?">
+              <span class="suggestion-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10.9" cy="10.9" r="6.3" /><path d="M15.6 15.6l4.4 4.4" />
+                </svg>
+              </span>
+              <span class="suggestion-text">
+                <strong>What's using port 3000?</strong>
+                <em>Find the process and stop it</em>
+              </span>
+            </button>
+            <button class="suggestion" data-text="Create a folder called Investor Demo on my Desktop and put a readme.txt inside it.">
+              <span class="suggestion-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3.8 7.6a2.3 2.3 0 0 1 2.3-2.3h3l2 2.4h6.9a2.3 2.3 0 0 1 2.3 2.3v6.7a2.3 2.3 0 0 1-2.3 2.3H6.1a2.3 2.3 0 0 1-2.3-2.3z" />
+                </svg>
+              </span>
+              <span class="suggestion-text">
+                <strong>Create a folder on my Desktop</strong>
+                <em>Make files and write into them</em>
+              </span>
+            </button>
+            <button class="suggestion" data-text="Search the web for what changed in the latest Node.js LTS and summarise it.">
+              <span class="suggestion-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="8.3" /><path d="M3.7 12h16.6" /><path d="M12 3.7c2.1 2.3 3.2 5.2 3.2 8.3S14.1 18 12 20.3C9.9 18 8.8 15.1 8.8 12S9.9 6 12 3.7z" />
+                </svg>
+              </span>
+              <span class="suggestion-text">
+                <strong>Look something up online</strong>
+                <em>Read real pages, cite the sources</em>
+              </span>
+            </button>
+            <button class="suggestion" data-text="Draft an email to my team saying tomorrow's standup is moved to 11am.">
+              <span class="suggestion-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="5.2" width="18" height="13.6" rx="2.6" /><path d="M3.6 7l7.3 5.3a2 2 0 0 0 2.2 0L20.4 7" />
+                </svg>
+              </span>
+              <span class="suggestion-text">
+                <strong>Draft an email</strong>
+                <em>You edit it and press Send</em>
+              </span>
+            </button>
+            <button class="suggestion" data-text="Inspect this project and tell me what I need to run it.">
+              <span class="suggestion-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M5 7.5l4.2 4.5L5 16.5" /><path d="M12.4 16.6h6.4" />
+                </svg>
+              </span>
+              <span class="suggestion-text">
+                <strong>Inspect a project</strong>
+                <em>Attach a folder with +, then ask</em>
+              </span>
+            </button>
           </div>
         </div>
       </section>
 
       <form id="chatForm" class="chat-bar">
+        <!-- THE GLASS LIVES IN HERE, NOT ON THE FORM.
+             The composer used to carry `overflow: hidden` so its travelling
+             specular could not escape its rounded corners — and a menu is a
+             child of the composer, so BOTH pop-up menus were clipped to the
+             composer's own box. You pressed "+" and saw the bottom third of one
+             row. The sheen now has its own clipped layer and the composer
+             clips nothing, which is the whole fix. -->
+        <span class="composer-sheen" aria-hidden="true"></span>
         <!-- Attachments sit ABOVE the input, where they read as part of the
              message being composed rather than as a toolbar. -->
         <div id="attachmentStrip" class="attachment-strip" hidden></div>
@@ -113,32 +331,86 @@
           <div class="attach">
             <button id="attachButton" class="composer-icon" type="button"
                     aria-haspopup="menu" aria-expanded="false" aria-label="Attach" title="Attach files, images or a folder">
-              <span aria-hidden="true">＋</span>
+              <svg class="icon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"
+                   fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+                <path d="M12 5.5v13M5.5 12h13" />
+              </svg>
             </button>
             <div id="attachMenu" class="attach-menu" role="menu" hidden>
               <button type="button" role="menuitem" data-pick="image">
-                <span class="attach-menu-icon" aria-hidden="true">🖼</span>
+                <span class="attach-menu-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+                       stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="4.5" width="18" height="15" rx="3" />
+                    <circle cx="8.6" cy="10" r="1.6" />
+                    <path d="M3.4 16.6l4.3-4a2 2 0 0 1 2.7 0l6.2 5.8M14.5 14l1.6-1.5a2 2 0 0 1 2.7 0l1.9 1.7" />
+                  </svg>
+                </span>
                 <span><strong>Photos &amp; images</strong><em>png, jpg, webp…</em></span>
               </button>
               <button type="button" role="menuitem" data-pick="file">
-                <span class="attach-menu-icon" aria-hidden="true">📄</span>
+                <span class="attach-menu-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+                       stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M13.5 3.2H7a2.8 2.8 0 0 0-2.8 2.8v12a2.8 2.8 0 0 0 2.8 2.8h10a2.8 2.8 0 0 0 2.8-2.8V9.5z" />
+                    <path d="M13.5 3.2V9.5h6.3" />
+                  </svg>
+                </span>
                 <span><strong>Files</strong><em>pdf, docx, xlsx, pptx, text and code</em></span>
               </button>
               <button type="button" role="menuitem" data-pick="folder">
-                <span class="attach-menu-icon" aria-hidden="true">📁</span>
+                <span class="attach-menu-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+                       stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3.2 7.4a2.4 2.4 0 0 1 2.4-2.4h3.3l2.1 2.5h7.4a2.4 2.4 0 0 1 2.4 2.4v7.3a2.4 2.4 0 0 1-2.4 2.4H5.6a2.4 2.4 0 0 1-2.4-2.4z" />
+                  </svg>
+                </span>
                 <span><strong>Folder</strong><em>SYSCORA works on it where it lives</em></span>
               </button>
             </div>
           </div>
+          <!-- The hint takes the slack between the two ends of the row, so the
+               attach control stays on the left edge and the model picker stays
+               with the send button on the right. -->
+          <span id="modelHint" class="model-hint"></span>
           <!-- Auto is a ROUTER, not a default: it picks the cheapest model that
                can actually do what the request needs, and says which and why.
                See models.js. -->
-          <label class="model-picker" title="Which model answers">
-            <span class="model-picker-icon" aria-hidden="true">◇</span>
-            <select id="modelSelect" aria-label="Model"></select>
-          </label>
-          <span id="modelHint" class="model-hint"></span>
-          <button id="sendButton" type="submit" aria-label="Send message" title="Send (Enter)">&#8593;</button>
+          <!-- A NATIVE <select> IS A HOLE IN THE SURFACE.
+               It is drawn by Windows, not by this stylesheet — grey, square, with
+               its own font and its own dropdown — so on a composer built out of
+               glass it was the one control that looked like it belonged to
+               another application. It is still HERE, and it is still the source
+               of truth: every existing code path reads and writes
+               `modelSelect.value` and dispatches `change`. What is new is a
+               button and a menu drawn in front of it. -->
+          <!-- ON THE RIGHT, BESIDE SEND. It sat next to "+" on the left, where
+               it read as a second attachment control and its menu opened over
+               the attach menu. Which model answers is a property of the message
+               about to be sent, so it belongs at the end of the row it is sent
+               from — and its menu opens right-aligned, away from the other. -->
+          <div class="model-picker">
+            <select id="modelSelect" aria-label="Model" class="model-native"></select>
+            <button id="modelButton" class="model-button" type="button"
+                    aria-haspopup="menu" aria-expanded="false" title="Which model answers">
+              <svg class="model-picker-icon" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"
+                   fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round">
+                <path d="M12 3.4l8.2 4.7v8.2L12 21l-8.2-4.7V8.1z" />
+              </svg>
+              <span id="modelButtonLabel">Auto</span>
+              <svg class="model-caret" viewBox="0 0 24 24" width="12" height="12" aria-hidden="true"
+                   fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6.5 9.5l5.5 5.5 5.5-5.5" />
+              </svg>
+            </button>
+            <div id="modelMenu" class="model-menu" role="menu" hidden></div>
+          </div>
+          <button id="sendButton" type="submit" aria-label="Send message" title="Send (Enter)">
+            <svg class="icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"
+                 fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 19V5.6M5.8 11.8L12 5.4l6.2 6.4" />
+            </svg>
+          </button>
         </div>
 <!-- The "Auto-approve" checkbox that lived here is gone. The agent loop has no
          approval gate to skip, so on every request that reaches it the toggle did

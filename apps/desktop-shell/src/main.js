@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, Menu, shell } from "electron";
 import crypto from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -61,7 +61,17 @@ function createWindow({ port, apiToken }) {
   const window = new BrowserWindow({
     width: 1200,
     height: 800,
+    minWidth: 480,
+    minHeight: 520,
     title: "SYSCORA",
+    icon: path.join(__dirname, "../../desktop/icon.ico"),
+    // Nothing is painted for the first frame or two and the default is white, so
+    // starting the window dark is the difference between opening an application
+    // and watching one boot.
+    backgroundColor: "#080a0f",
+    // Shown once there is something to show. A window that appears empty and
+    // then fills in reads as slow even when it is not.
+    show: false,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -73,14 +83,84 @@ function createWindow({ port, apiToken }) {
     }
   });
 
+  window.once("ready-to-show", () => window.show());
+  sendLinksToTheRealBrowser(window, port);
   window.loadURL(`http://127.0.0.1:${port}`);
   return window;
+}
+
+// A LINK IN AN ANSWER HAS TO GO SOMEWHERE, AND IT MUST NOT BE HERE.
+//
+// The agent answers research questions with URLs, and the renderer turns them
+// into real `<a target="_blank">` links — but nothing in this process had ever
+// been told what to do with one, and the two defaults are both wrong:
+//
+//   * `target="_blank"` reaches Electron's window-open path, and a window opened
+//     that way INHERITS this window's webPreferences — including the preload
+//     that exposes the daemon's API token to the page. That would hand a
+//     stranger's website a credential that drives this machine. It is the
+//     reason this is a security fix and not a convenience one.
+//   * a plain click navigates THIS window, so the chat surface is replaced by
+//     the web page and the conversation is gone, with no back button on a
+//     window that has no menu bar.
+//
+// Both now do the same thing: hand the URL to the browser the user actually
+// uses, and leave the application where it was. Only http(s) — a `file:` link in
+// an answer opening something on this machine with one click is not a thing this
+// window should be able to do, and the agent has tools for that anyway.
+function sendLinksToTheRealBrowser(window, port) {
+  const isOurOwnPage = (url) => {
+    try {
+      const target = new URL(url);
+      return target.hostname === "127.0.0.1" && target.port === String(port);
+    } catch {
+      return false;
+    }
+  };
+  const openOutside = (url) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => { /* no browser, nothing to do */ });
+  };
+
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    openOutside(url);
+    return { action: "deny" };
+  });
+
+  window.webContents.on("will-navigate", (event, url) => {
+    if (isOurOwnPage(url)) return;
+    event.preventDefault();
+    openOutside(url);
+  });
+}
+
+// NO MENU BAR. `File Edit View Window Help` above the conversation is Electron's
+// default, not a decision, and it is the first thing that says "this is a web
+// page in a wrapper" — no chat application on this desktop has one.
+//
+// It carries the reload and devtools accelerators, though, so they are put back
+// explicitly: losing Ctrl+R while developing is a bad trade for a tidy window,
+// and a user who presses F12 by accident gets nothing, which is correct.
+function removeMenuBarKeepingItsShortcuts(window) {
+  Menu.setApplicationMenu(null);
+  window.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown") return;
+    const key = String(input.key ?? "").toLowerCase();
+    if ((input.control || input.meta) && key === "r") {
+      window.webContents.reload();
+      event.preventDefault();
+    }
+    if (key === "f12" || ((input.control || input.meta) && input.shift && key === "i")) {
+      window.webContents.toggleDevTools();
+      event.preventDefault();
+    }
+  });
 }
 
 app.whenReady().then(async () => {
   const daemon = startDaemon();
   await waitForDaemon(daemon.port);
-  createWindow(daemon);
+  const window = createWindow(daemon);
+  removeMenuBarKeepingItsShortcuts(window);
 });
 
 app.on("window-all-closed", () => {

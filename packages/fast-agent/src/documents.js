@@ -174,54 +174,286 @@ function readXlsx(entries) {
 }
 
 // ---- PDF ---------------------------------------------------------------------
+//
+// THE FIRST VERSION OF THIS RETURNED BINARY AND CALLED IT TEXT.
+//
+// A resume attached to the composer on 23 Aug 2026 came back as 52,220
+// characters that were 19.7% printable — "PTZgi*HUµÏ[­­vtuwy|£®°" — and the
+// composer sent every one of them to the model as "text pulled out of the PDF".
+// The agent, reading its own garbage, went hunting for `pdftotext` on the
+// machine. Three separate defects, each enough on its own:
+//
+//   1. EVERY stream was scanned, including the four embedded font programs
+//      (539 KB, 328 KB, 589 KB, 322 KB of compressed TrueType). They inflate
+//      perfectly — being unreadable is not the same as being broken — and a
+//      font program contains the letters `BT` and plenty of brackets, so the
+//      text scanner found "strings" in it all day. A content stream is ASCII
+//      operators; a font is not. That is the test, and it is cheap.
+//   2. THE TEXT WAS NOT IN BRACKETS AT ALL. This PDF, like everything Word,
+//      Canva and Google Docs export, uses `/Encoding /Identity-H`: the content
+//      stream says `[<002C>-0.859<002F>...] TJ`, where `002C` is a GLYPH index
+//      in a subsetted font, not a character. The old reader only understood
+//      `(literal)` strings, so it found nothing in the one stream that mattered
+//      and everything in the four that did not. Each font carries a `/ToUnicode`
+//      CMap — an ASCII table mapping those glyph codes back to characters — and
+//      following it is what turns `<002C>` into `H`.
+//   3. `/\((?:\\.|[^\\()])*\)/g` HANGS on binary input. Two nested quantifiers
+//      over 500 KB of font program backtracks for minutes; a diagnostic run had
+//      to be killed at two. The scanner below is a single linear pass and has no
+//      backtracking to do.
+//
+// The result on the file that started it: 2,932 characters, 99.2% printable,
+// which is the resume. `tests/unit/document-reading.test.js` builds a PDF of
+// this exact shape rather than checking one in.
 
-// The text-showing operators. `Tj` and `'` take one string; `TJ` takes an array
-// of strings and kerning numbers, which is why a line of a PDF is usually a
-// dozen fragments rather than a sentence.
-const PDF_STRING = /\((?:\\.|[^\\()])*\)/g;
+const UNPRINTABLE = /[^\x09\x0A\x0D\x20-\x7E]/g;
+
+/**
+ * Is this a stream of PDF operators, or is it a font, an image or a colour
+ * profile? Sampled rather than measured whole: the answer never changes after
+ * the first few thousand characters and these streams run to half a megabyte.
+ */
+function looksTextual(text) {
+  if (!text) return false;
+  const sample = text.length > 4000 ? text.slice(0, 4000) : text;
+  return sample.replace(UNPRINTABLE, "").length / sample.length > 0.9;
+}
+
+function inflateOrRaw(body) {
+  try {
+    return zlib.inflateSync(Buffer.from(body, "latin1")).toString("latin1");
+  } catch {
+    // Not deflated, or deflated with a filter this does not implement. An
+    // uncompressed content stream is readable as it stands; anything else is
+    // caught by looksTextual and dropped.
+    return body;
+  }
+}
+
+/**
+ * The file with every stream body blanked, same length so every offset still
+ * lines up.
+ *
+ * Objects have to be found by scanning for `N 0 obj`, and half a megabyte of
+ * compressed font contains that byte sequence by chance. Indexing the raw file
+ * therefore overwrites the real object 11 with a fragment of a typeface, and
+ * every font lookup after it silently fails — which is exactly what happened
+ * the first time this was written.
+ */
+function blankStreams(text) {
+  let out = "";
+  let at = 0;
+  const opening = /stream\r?\n?/g;
+  let match;
+  while ((match = opening.exec(text))) {
+    const from = match.index + match[0].length;
+    const to = text.indexOf("endstream", from);
+    if (to === -1) break;
+    out += text.slice(at, from) + " ".repeat(to - from);
+    at = to;
+    // Past the whole of "endstream" — its last six letters are "stream", so
+    // resuming any earlier matches it and swallows every object up to the next
+    // stream. That cost an afternoon.
+    opening.lastIndex = to + "endstream".length;
+  }
+  return out + text.slice(at);
+}
+
+/** Where each indirect object's body begins and ends, by object number. */
+function indexObjects(skeleton) {
+  const objects = new Map();
+  const header = /(\d+)\s+\d+\s+obj/g;
+  let match;
+  while ((match = header.exec(skeleton))) {
+    const start = match.index + match[0].length;
+    const end = skeleton.indexOf("endobj", start);
+    objects.set(Number(match[1]), { start, end: end === -1 ? skeleton.length : end });
+  }
+  return objects;
+}
+
+/** The decompressed stream inside one object, or null when it holds none. */
+function streamIn(text, range) {
+  if (!range) return null;
+  const slice = text.slice(range.start, range.end);
+  const opening = /stream\r?\n?/.exec(slice);
+  if (!opening) return null;
+  const from = opening.index + opening[0].length;
+  const to = slice.indexOf("endstream", from);
+  return to === -1 ? null : inflateOrRaw(slice.slice(from, to));
+}
+
+const HEX_PAIR = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/;
+const HEX_TRIPLE = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/;
+
+/** UTF-16BE hex, as ToUnicode always writes its destinations. */
+function fromHex(hex) {
+  let out = "";
+  for (let at = 0; at + 4 <= hex.length; at += 4) out += String.fromCharCode(Number.parseInt(hex.slice(at, at + 4), 16));
+  return out;
+}
+
+/** glyph code → the character it stands for, from one `/ToUnicode` CMap. */
+function parseToUnicode(cmap) {
+  const map = new Map();
+  for (const section of cmap.split("beginbfchar").slice(1)) {
+    for (const pair of section.split("endbfchar")[0].match(new RegExp(HEX_PAIR.source, "g")) ?? []) {
+      const [, code, value] = HEX_PAIR.exec(pair);
+      map.set(Number.parseInt(code, 16), fromHex(value));
+    }
+  }
+  for (const section of cmap.split("beginbfrange").slice(1)) {
+    for (const row of section.split("endbfrange")[0].match(new RegExp(HEX_TRIPLE.source, "g")) ?? []) {
+      const [, low, high, value] = HEX_TRIPLE.exec(row);
+      const from = Number.parseInt(low, 16);
+      const to = Number.parseInt(high, 16);
+      const base = Number.parseInt(value, 16);
+      // Bounded: a corrupt range saying 0000–FFFF must not build 65,536 entries
+      // per font on a file nobody asked to be slow.
+      for (let code = from; code <= to && code - from < 4096; code++) {
+        map.set(code, String.fromCharCode(base + (code - from)));
+      }
+    }
+  }
+  return map;
+}
+
+/**
+ * Every font named in the file's resource dictionaries, with its ToUnicode
+ * table.
+ *
+ * Keyed by the RESOURCE name (`/F1`) because that is what the content stream
+ * selects with `Tf`. Where two pages give the same name to different fonts the
+ * tables are merged, first one winning: imperfect, and far better than decoding
+ * with no table at all. A document whose fonts carry no ToUnicode cannot be
+ * decoded by anyone without the font program itself, and says so below.
+ */
+function fontsByName(text, skeleton, objects) {
+  const fonts = new Map();
+  const dictionaries = /\/Font\s*<<([\s\S]{0,4000}?)>>/g;
+  const reference = /\/([A-Za-z0-9]+)\s+(\d+)\s+\d+\s+R/;
+  let dictionary;
+  while ((dictionary = dictionaries.exec(skeleton))) {
+    for (const entry of dictionary[1].match(new RegExp(reference.source, "g")) ?? []) {
+      const [, name, number] = reference.exec(entry);
+      const font = objects.get(Number(number));
+      if (!font) continue;
+      const toUnicode = /\/ToUnicode\s+(\d+)\s+\d+\s+R/.exec(skeleton.slice(font.start, font.end));
+      if (!toUnicode) continue;
+      const cmap = streamIn(text, objects.get(Number(toUnicode[1])));
+      if (!cmap) continue;
+      const parsed = parseToUnicode(cmap);
+      const known = fonts.get(name);
+      if (!known) fonts.set(name, parsed);
+      else for (const [code, value] of parsed) if (!known.has(code)) known.set(code, value);
+    }
+  }
+  return fonts;
+}
+
+const ESCAPE = /\\([nrtbf()\\]|[0-7]{1,3})/g;
 
 function decodePdfString(raw) {
-  return raw
-    .slice(1, -1)
-    .replace(/\\([nrtbf()\\]|[0-7]{1,3})/g, (whole, escape) => {
-      const simple = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", "(": "(", ")": ")", "\\": "\\" }[escape];
-      if (simple !== undefined) return simple;
-      return String.fromCharCode(Number.parseInt(escape, 8));
-    });
+  return raw.replace(ESCAPE, (whole, escape) => {
+    const simple = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", "(": "(", ")": ")", "\\": "\\" }[escape];
+    return simple === undefined ? String.fromCharCode(Number.parseInt(escape, 8)) : simple;
+  });
+}
+
+/**
+ * One content stream, read left to right.
+ *
+ * A single pass, because the alternative is a regex with nested quantifiers and
+ * that is what used to hang. It tracks only what is needed to read words in the
+ * right order: which font is selected, and where a line ends.
+ */
+function readContentStream(chunk, fonts) {
+  const lines = [];
+  let line = "";
+  let font = null;
+  const endLine = () => {
+    const text = line.replace(/\s+/g, " ").trim();
+    if (text) lines.push(text);
+    line = "";
+  };
+
+  for (let at = 0; at < chunk.length; at++) {
+    const character = chunk[at];
+
+    if (character === "(") {
+      let depth = 1;
+      let cursor = at + 1;
+      let raw = "";
+      while (cursor < chunk.length && depth > 0) {
+        const next = chunk[cursor];
+        if (next === "\\") { raw += next + (chunk[cursor + 1] ?? ""); cursor += 2; continue; }
+        if (next === "(") depth++;
+        else if (next === ")") { depth--; if (depth === 0) break; }
+        raw += next;
+        cursor++;
+      }
+      if (depth === 0) { line += decodePdfString(raw); at = cursor; }
+      continue;
+    }
+
+    // `<...>` is a hex string; `<<` opens a dictionary and is not one.
+    if (character === "<" && chunk[at + 1] !== "<") {
+      const close = chunk.indexOf(">", at);
+      if (close === -1) continue;
+      const hex = chunk.slice(at + 1, close).replace(/[^0-9A-Fa-f]/g, "");
+      at = close;
+      const table = font ? fonts.get(font) : null;
+      if (table) {
+        // Identity-H: two bytes per glyph, and the table says which character.
+        for (let cursor = 0; cursor + 4 <= hex.length; cursor += 4) {
+          line += table.get(Number.parseInt(hex.slice(cursor, cursor + 4), 16)) ?? "";
+        }
+      } else {
+        // No table for this font. One byte per character is the common simple
+        // encoding; anything that is not printable is dropped rather than
+        // guessed at, because a guess here is mojibake in the answer.
+        for (let cursor = 0; cursor + 2 <= hex.length; cursor += 2) {
+          const byte = Number.parseInt(hex.slice(cursor, cursor + 2), 16);
+          if (byte >= 32 && byte < 127) line += String.fromCharCode(byte);
+        }
+      }
+      continue;
+    }
+
+    if (character === "/") {
+      const selected = /^\/([A-Za-z0-9]+)\s+[\d.-]+\s+Tf/.exec(chunk.slice(at, at + 48));
+      if (selected) font = selected[1];
+      continue;
+    }
+
+    // A newline in a PDF is a positioning operator, not a character: Td, TD, T*
+    // and Tm all move the cursor, and ET ends the text object.
+    if (character === "T" && "dD*m".includes(chunk[at + 1])) endLine();
+    else if (character === "E" && chunk[at + 1] === "T") endLine();
+  }
+  endLine();
+  return lines.join("\n");
 }
 
 function readPdf(buffer) {
-  // Page content is normally one deflate stream per page. Uncompressed PDFs
-  // exist too, so the raw bytes are searched as well.
-  const chunks = [];
   const text = buffer.toString("latin1");
-  const streamPattern = /stream\r?\n?([\s\S]*?)endstream/g;
-  let match = streamPattern.exec(text);
-  while (match) {
-    const body = Buffer.from(match[1], "latin1");
-    try {
-      chunks.push(zlib.inflateSync(body).toString("latin1"));
-    } catch {
-      // Not deflated, or deflated with something else. If it happens to be
-      // readable content it is picked up by the raw pass below.
-      chunks.push(match[1]);
-    }
-    match = streamPattern.exec(text);
-  }
+  const skeleton = blankStreams(text);
+  const objects = indexObjects(skeleton);
+  const fonts = fontsByName(text, skeleton, objects);
 
-  const lines = [];
-  for (const chunk of chunks) {
-    // Only inside a text object; a string elsewhere is a name or a bookmark.
-    for (const block of chunk.split(/\bBT\b/).slice(1)) {
-      const body = block.split(/\bET\b/)[0];
-      const pieces = (body.match(PDF_STRING) ?? []).map(decodePdfString);
-      if (pieces.length === 0) continue;
-      // A newline in a PDF is a positioning operator, not a character.
-      const line = pieces.join("").replace(/\s+/g, " ").trim();
-      if (line) lines.push(line);
-    }
+  const pages = [];
+  const streams = /stream\r?\n?([\s\S]*?)endstream/g;
+  let stream;
+  while ((stream = streams.exec(text))) {
+    const body = inflateOrRaw(stream[1]);
+    // A font, an image or an ICC profile. Skipping these is the whole first
+    // defect: they are the streams that produced the mojibake.
+    if (!looksTextual(body)) continue;
+    if (!/\bBT\b/.test(body)) continue;
+    const page = readContentStream(body, fonts);
+    if (page) pages.push(page);
   }
-  return lines.join("\n");
+  return pages.join("\n");
 }
 
 // ---- The one entry point -----------------------------------------------------
@@ -244,14 +476,29 @@ export function extractDocumentText(filePath, buffer) {
   const format = EXTENSION.exec(String(filePath ?? ""))?.[1]?.toLowerCase() ?? "";
   if (format === "pdf") {
     const text = readPdf(buffer);
-    return text.trim()
-      ? { format, text }
-      : {
-          format,
-          text: "",
-          reason: "this PDF has no extractable text — it is almost certainly a scan, " +
-            "a photograph of a page, or it stores its text in a way this cannot read"
-        };
+    if (!text.trim()) {
+      return {
+        format,
+        text: "",
+        reason: "this PDF has no extractable text — it is almost certainly a scan, " +
+          "a photograph of a page, or it stores its text in a way this cannot read"
+      };
+    }
+    // THE BACKSTOP, AND THE REASON IT EXISTS. Everything above is careful about
+    // which streams it reads, and a PDF nobody has thought of yet will get past
+    // all of it. Mojibake handed over as text is the worst of the three possible
+    // answers: the reader cannot tell it from a badly written document, and the
+    // agent spends its budget trying to make sense of noise. Refusing is
+    // recoverable — the file is still on the machine and can be opened.
+    if (!looksTextual(text)) {
+      return {
+        format,
+        text: "",
+        reason: "the text in this PDF could not be decoded — its fonts carry no readable " +
+          "character map, so what came out was not text"
+      };
+    }
+    return { format, text };
   }
 
   const entries = readZipEntries(buffer);

@@ -1572,3 +1572,4448 @@ body {
   .attach-menu { min-width: 240px; }
   .bubble.user { max-width: 88%; }
 }
+
+/* ==========================================================================
+   PASS 3 — the chrome, and the line length
+   ==========================================================================
+   Two things were left after the surface itself was good, and both were about
+   the frame rather than the content:
+
+   1. THE READING MEASURE. 848px at 14.5px is about 95 characters a line. Every
+      application people read long answers in — ChatGPT, Claude, anything with
+      a typographer near it — lands between 65 and 80, because past that the eye
+      loses the start of the next line. Narrower and slightly larger is the same
+      amount of text and markedly less work to read.
+   2. THE CONTROLS WERE COMPETING WITH THE CONVERSATION. A permanent green
+      "Ready", a developer checkbox and a strapline, all in the bar above
+      somebody's work. Chrome should be silent until it has something to say.
+   ========================================================================== */
+
+.demo-layout { max-width: 768px; }
+body { font-size: 15px; }
+
+/* Long-form answers get the leading that goes with the measure. */
+.agent-answer, .agent-says { font-size: 15px; line-height: 1.68; }
+.agent-answer p { margin: 0 0 .85em; }
+.agent-answer p:last-child { margin-bottom: 0; }
+
+/* --- top bar -------------------------------------------------------------- */
+
+.brand { align-items: center; }
+/* The wordmark stands on its own now the strapline has gone. */
+.brand h1 { font-size: 15px; font-weight: 620; letter-spacing: .2px; }
+
+.topbar-actions { gap: 6px; }
+
+/* Silent while everything works. See the comment in demo.html: a status nobody
+   can see until they open a menu is not a status. */
+.health-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px;
+  font-size: 12px; font-weight: 500;
+  color: #ffb3ad;
+  background: rgba(255, 107, 98, .12);
+  border: 1px solid rgba(255, 107, 98, .3);
+  border-radius: 999px;
+}
+.health-pill[hidden] { display: none; }
+.health-pill::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: #ff6b62;
+}
+
+.more { position: relative; display: inline-flex; }
+.topbar-actions .icon-button {
+  width: 30px; height: 30px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 15px;
+  line-height: 1;
+}
+.topbar-actions .icon-button:hover { background: var(--panel-2); border-color: var(--border-soft); }
+.topbar-actions .icon-button.open { background: var(--panel-2); border-color: var(--border); color: var(--text); }
+
+.more-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  min-width: 250px;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-3);
+  animation: menu-rise .13s ease-out;
+}
+.more-menu[hidden] { display: none; }
+
+.more-status {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: 4px;
+}
+.status-dot.offline { background: var(--danger); box-shadow: 0 0 0 3px rgba(255, 107, 98, .16); }
+
+/* The switch keeps its meaning where it now lives: a menu row, with the line
+   that says what it does, because "Developer mode" alone is a question. */
+.more-menu .debug-toggle {
+  display: flex; align-items: flex-start; gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+  background: transparent;
+  border: 0; border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.more-menu .debug-toggle:hover { background: var(--panel-2); }
+.more-menu .debug-toggle input { margin: 2px 0 0; accent-color: var(--accent); }
+.more-menu .debug-toggle span { display: flex; flex-direction: column; gap: 2px; }
+.more-menu .debug-toggle em { font-style: normal; font-size: 11.5px; color: var(--muted); }
+
+/* --- what a finished turn costs ------------------------------------------- */
+/*
+ * Kept — a product that spends the user's money should say how much, and this
+ * is one of the few places any assistant does. But it is a footnote about the
+ * answer, not part of it, so it reads as one until it is looked at.
+ */
+.turn-cost {
+  font-size: 11.5px;
+  color: #55637a;
+  letter-spacing: .1px;
+  transition: color .15s ease;
+}
+.turn:hover .turn-cost { color: var(--muted); }
+
+/* --- small things that separate a product from a page --------------------- */
+
+::selection { background: rgba(91, 157, 255, .28); }
+/* The caret in the composer, and every focusable thing, uses the one accent. */
+.chat-bar textarea { caret-color: var(--accent); }
+/* A send button that is dark when there is nothing to send says so before it is
+   pressed. */
+#sendButton:disabled { opacity: .45; cursor: default; box-shadow: none; }
+
+@media (max-width: 700px) {
+  .brand h1 { font-size: 14px; }
+  .topbar-button span[aria-hidden] + * { display: none; }
+}
+
+/* --- the empty state, placed rather than dropped in ----------------------- */
+/*
+ * It sat against the top of the window with the composer a long way below it and
+ * nothing in between — the first screen of an application should not read as a
+ * page that has not finished loading. `margin: auto 0` in the feed's flex column
+ * puts the greeting, the sentence and the six starters as one block in the
+ * middle of the space they have, which is where every assistant puts them.
+ */
+.welcome { margin: auto 0; padding: 0 0 12px; }
+.suggestions { margin-top: 22px; }
+
+/* --- the answer itself ---------------------------------------------------- */
+/*
+ * MEASURED, NOT GUESSED. The rendered answer lives in `.md`, and it was 15px in
+ * a 722px column: about 100 characters a line, where every application people
+ * read long answers in sits between 65 and 85. Past that the eye loses its place
+ * coming back to the left margin, which is the difference between reading an
+ * answer and scanning it.
+ *
+ * Slightly larger type in a slightly narrower column is the whole fix.
+ *
+ * THE FIRST ATTEMPT AT THIS MEASURED NOTHING. A probe span with
+ * `white-space: pre` was handed text containing newlines, so it returned the
+ * width of the longest LINE and called it the width of every character — which
+ * made a 105-character line report as 84 and would have been "measured" either
+ * way. Re-measured with canvas `measureText`, Inter at 16px averages 7.09px a
+ * character on this answer, so the column follows from the character count
+ * rather than the other way round: 640px is ~90 characters, which is where
+ * ChatGPT and Claude sit once their own font metrics are accounted for.
+ */
+.demo-layout { max-width: 640px; }
+.md { font-size: 16px; line-height: 1.66; }
+.md p { margin: 0 0 .85em; }
+.md ul, .md ol { margin: 0 0 .85em; }
+.md h2 { font-size: 18px; }
+.md h3 { font-size: 16.5px; }
+.agent-answer, .agent-says { font-size: 16px; line-height: 1.66; }
+/* The user's own words, level with the answer they are about. */
+.bubble.user { font-size: 15.5px; }
+
+/* ==========================================================================
+   PASS 4 — MATERIAL, DEPTH AND ATMOSPHERE
+   ==========================================================================
+   The surface was correct and flat: white text on near-black, with nothing
+   between the two. Everything below adds the three things a flat surface is
+   missing, and adds nothing that has to be maintained afterwards:
+
+   1. ATMOSPHERE. A window that is 60% empty black reads as unfinished. Three
+      very low-alpha auroras and a grid that fades out turn that emptiness into
+      depth. Static gradients — no images, no canvas, no JavaScript.
+   2. MATERIAL. Every raised thing gets a real edge: a 1px hairline that is a
+      GRADIENT rather than a flat grey, drawn with the padding-box/border-box
+      trick so it costs one background and no extra element.
+   3. A VOICE. The assistant's turn had no anchor at all — its words simply
+      began. A thin luminous rail in the margin gives the answer a left edge to
+      belong to, and it sits OUTSIDE the text column so not one word moves.
+
+   Restraint is the point. Two accents, one hue family, low alpha everywhere;
+   nothing pulses, nothing bounces, and the one animated thing is behind
+   prefers-reduced-motion.
+   ========================================================================== */
+
+:root {
+  --accent-2: #8b7bf5;          /* violet, for the far end of every gradient */
+  --accent-3: #4fd1e0;          /* cyan, used only where something is live */
+  --hairline: linear-gradient(140deg, rgba(139, 123, 245, .38), rgba(91, 157, 255, .16) 45%, rgba(79, 209, 224, .22));
+  --hairline-soft: linear-gradient(140deg, rgba(139, 123, 245, .2), rgba(91, 157, 255, .08) 50%, rgba(79, 209, 224, .12));
+  --glass: rgba(18, 22, 31, .72);
+  --glass-strong: rgba(20, 25, 35, .9);
+}
+
+/* --- the room the conversation is in -------------------------------------- */
+
+body {
+  background:
+    radial-gradient(1000px 620px at 12% -12%, rgba(91, 157, 255, .1), transparent 62%),
+    radial-gradient(900px 560px at 88% 6%, rgba(139, 123, 245, .085), transparent 60%),
+    radial-gradient(1100px 700px at 50% 118%, rgba(79, 209, 224, .05), transparent 62%),
+    var(--bg);
+}
+
+/* The grid is what makes it read as a SURFACE rather than a void — and it is
+   masked away before it reaches the text, so it is felt and not seen. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    linear-gradient(rgba(140, 170, 220, .035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(140, 170, 220, .035) 1px, transparent 1px);
+  background-size: 46px 46px;
+  -webkit-mask-image: radial-gradient(1200px 800px at 50% 0%, #000 0%, transparent 78%);
+  mask-image: radial-gradient(1200px 800px at 50% 0%, #000 0%, transparent 78%);
+}
+
+/* A vignette, so the window has corners. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background: radial-gradient(120% 90% at 50% 45%, transparent 55%, rgba(0, 0, 0, .55) 100%);
+}
+
+.demo-topbar, .demo-layout, .chats-panel, .connect-panel { position: relative; z-index: 1; }
+
+/* --- the top bar ---------------------------------------------------------- */
+
+.demo-topbar {
+  border-bottom: 0;
+  box-shadow: 0 1px 0 rgba(140, 170, 220, .07), 0 8px 24px -18px rgba(0, 0, 0, .9);
+}
+.brand .logo {
+  box-shadow:
+    0 2px 14px rgba(91, 157, 255, .38),
+    0 0 0 1px rgba(140, 170, 220, .14),
+    inset 0 1px 0 rgba(255, 255, 255, .34);
+}
+.brand h1 {
+  background: linear-gradient(96deg, #ffffff, #c3d4f2 70%);
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+/* The chrome buttons take the hairline too, so the bar reads as one material. */
+.topbar-button, .topbar-actions .icon-button {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--bg-raised), var(--bg-raised)) padding-box,
+    var(--hairline-soft) border-box;
+}
+.topbar-button:hover, .topbar-actions .icon-button:hover {
+  background:
+    linear-gradient(var(--panel-2), var(--panel-2)) padding-box,
+    var(--hairline) border-box;
+}
+
+/* --- the assistant gets a left edge --------------------------------------- */
+/*
+ * In the margin, never in the column: `left: -20px` puts the rail beside the
+ * answer without moving a single character of it. Hidden on a narrow window,
+ * where there is no margin to put it in.
+ */
+.turn { position: relative; }
+
+@media (min-width: 780px) {
+  .turn::before {
+    content: "";
+    position: absolute;
+    left: -20px;
+    top: 4px;
+    bottom: 26px;
+    width: 2px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, var(--accent) 0%, var(--accent-2) 42%, rgba(139, 123, 245, 0) 100%);
+    opacity: .55;
+  }
+  /* The point of origin: a small bright node where the answer starts. */
+  .turn::after {
+    content: "";
+    position: absolute;
+    left: -23px;
+    top: 2px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px rgba(91, 157, 255, .14), 0 0 12px rgba(91, 157, 255, .6);
+  }
+}
+
+/* --- the user's own words ------------------------------------------------- */
+
+.bubble.user {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(150deg, rgba(38, 46, 66, .95), rgba(26, 31, 43, .95)) padding-box,
+    var(--hairline) border-box;
+  box-shadow: 0 10px 30px -18px rgba(91, 157, 255, .55), inset 0 1px 0 rgba(255, 255, 255, .05);
+}
+
+/* --- what it did, as instrument readouts ---------------------------------- */
+
+.step {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--glass), var(--glass)) padding-box,
+    var(--hairline-soft) border-box;
+  box-shadow: 0 12px 28px -22px rgba(0, 0, 0, .95);
+  transition: background .16s ease, box-shadow .16s ease;
+}
+.step:hover {
+  background:
+    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
+    var(--hairline) border-box;
+  box-shadow: 0 16px 34px -22px rgba(0, 0, 0, 1);
+}
+/* The tick is a state, so it is given the weight of one. */
+.step-icon {
+  color: var(--ok);
+  text-shadow: 0 0 10px rgba(70, 196, 106, .5);
+}
+.step.running .step-icon { color: var(--accent-3); text-shadow: 0 0 10px rgba(79, 209, 224, .55); }
+/* `.bad`, not `.failed`. finishStep() sets `ok ? "ok" : "bad"` (demo.js), so the
+   first version of this rule styled a class that never exists and a failed tool
+   call was drawn exactly like one that worked — on the surface whose entire
+   argument is showing what really happened. */
+.step.bad .step-icon, .step-error { color: var(--danger); text-shadow: 0 0 10px rgba(255, 107, 98, .4); }
+.step.bad {
+  background:
+    linear-gradient(100deg, rgba(255, 107, 98, .08), var(--glass) 44%) padding-box,
+    linear-gradient(140deg, rgba(255, 107, 98, .5), rgba(255, 107, 98, .14)) border-box;
+}
+/* The tool's name and its argument are machine facts: monospace, tinted, quiet. */
+.step-tool {
+  background: rgba(91, 157, 255, .1);
+  border: 1px solid rgba(91, 157, 255, .16);
+  border-radius: 6px;
+  padding: 1px 7px;
+  color: #a9c6f5;
+}
+.step-arg { background: rgba(140, 170, 220, .06); border-radius: 6px; padding: 2px 8px; }
+.step-time { font-variant-numeric: tabular-nums; }
+
+/* A step still running says so with light rather than with a spinner: one slow
+   sweep along its top edge. This is the only thing on the surface that moves,
+   and it does not move for anyone who has asked for less motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .step.running { position: relative; overflow: hidden; }
+  .step.running::after {
+    content: "";
+    position: absolute;
+    inset: 0 auto auto 0;
+    height: 1px;
+    width: 38%;
+    background: linear-gradient(90deg, transparent, var(--accent-3), transparent);
+    animation: sweep 1.9s ease-in-out infinite;
+    opacity: .8;
+  }
+  @keyframes sweep {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(360%); }
+  }
+}
+
+/* --- thinking ------------------------------------------------------------- */
+
+.thinking-summary { color: var(--muted); letter-spacing: .2px; }
+.thinking-box { border-left: 2px solid rgba(139, 123, 245, .3); }
+
+/* --- how a run ended ------------------------------------------------------ */
+/*
+ * Three states, three colours. `bad` is the only one allowed to be red: a run
+ * that did most of the work and stopped at a ceiling is amber, because a person
+ * has to be able to tell those apart from across the room. Both used to be the
+ * same alarm-coloured box. See renderFinal() in demo.js.
+ */
+.result-card {
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 13px 15px;
+  background:
+    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
+    var(--hairline-soft) border-box;
+}
+.result-card .badge {
+  display: inline-block;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  font-weight: 640;
+  letter-spacing: .5px;
+  text-transform: uppercase;
+}
+.result-card.partial {
+  border-left: 3px solid var(--warn);
+  background: linear-gradient(100deg, rgba(224, 166, 58, .09), rgba(20, 25, 35, .9) 42%);
+}
+.result-card.partial .badge { color: var(--warn); }
+.result-card.bad {
+  border-left: 3px solid var(--danger);
+  background: linear-gradient(100deg, rgba(255, 107, 98, .09), rgba(20, 25, 35, .9) 42%);
+}
+.result-card.bad .badge { color: var(--danger); }
+
+/* --- the answer ----------------------------------------------------------- */
+
+.md strong { color: #f4f8ff; }
+.md h2, .md h3 { letter-spacing: -.2px; }
+/* A link should look like one before it is hovered and like a control after. */
+.md a {
+  border-bottom-color: rgba(91, 157, 255, .3);
+  transition: color .13s ease, border-color .13s ease;
+}
+.md a:hover { color: #8fbcff; border-bottom-color: var(--accent); }
+.md code { background: rgba(140, 170, 220, .08); border-color: rgba(140, 170, 220, .14); }
+.md blockquote { border-left-color: rgba(139, 123, 245, .45); }
+
+.turn-cost { font-variant-numeric: tabular-nums; }
+
+/* --- the composer --------------------------------------------------------- */
+
+.chat-bar {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(180deg, rgba(20, 25, 35, .96), rgba(13, 16, 23, .96)) padding-box,
+    var(--hairline-soft) border-box;
+  box-shadow: 0 24px 60px -32px rgba(0, 0, 0, 1), inset 0 1px 0 rgba(255, 255, 255, .035);
+}
+.chat-bar:focus-within {
+  background:
+    linear-gradient(180deg, rgba(22, 28, 40, .98), rgba(14, 18, 26, .98)) padding-box,
+    var(--hairline) border-box;
+  box-shadow: 0 24px 60px -30px rgba(0, 0, 0, 1), 0 0 0 3px rgba(91, 157, 255, .1);
+}
+#sendButton {
+  background: linear-gradient(150deg, #6ea8ff, #5b74e8 60%, #7b62e0);
+  box-shadow: 0 4px 16px rgba(91, 157, 255, .4), inset 0 1px 0 rgba(255, 255, 255, .3);
+}
+#sendButton:hover { box-shadow: 0 6px 22px rgba(91, 157, 255, .55), inset 0 1px 0 rgba(255, 255, 255, .35); }
+
+/* --- the empty state ------------------------------------------------------ */
+
+.suggestion {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--bg-raised), var(--bg-raised)) padding-box,
+    var(--hairline-soft) border-box;
+}
+.suggestion:hover {
+  background:
+    linear-gradient(var(--panel), var(--panel)) padding-box,
+    var(--hairline) border-box;
+  box-shadow: 0 14px 34px -22px rgba(91, 157, 255, .7);
+}
+
+/* --- panels --------------------------------------------------------------- */
+
+.more-menu, .attach-menu, .chats-panel, .connect-card {
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
+    var(--hairline) border-box;
+  backdrop-filter: blur(18px) saturate(140%);
+}
+
+/* A scrollbar in the accent's family rather than a grey stripe. */
+* { scrollbar-color: rgba(91, 157, 255, .22) transparent; }
+*::-webkit-scrollbar-thumb { background: rgba(91, 157, 255, .22); background-clip: content-box; }
+*::-webkit-scrollbar-thumb:hover { background: rgba(91, 157, 255, .38); background-clip: content-box; }
+
+/* --- room for the rail ----------------------------------------------------- */
+/*
+ * THE RAIL WAS DRAWN AND NEVER SEEN. `.feed` scrolls, and a scroll container
+ * clips at its PADDING edge — so a decoration at `left: -20px` on a turn whose
+ * box starts at the content edge was painted straight into the clip. Measured by
+ * capturing the window and finding nothing there.
+ *
+ * The fix is to give the feed a left padding for the rail to live in, and to
+ * widen the column by exactly that much so the line length is unchanged, and to
+ * push the composer over by the same amount so it still lines up with the text.
+ * Three numbers that have to agree, which is why they are together.
+ */
+.demo-layout { max-width: 666px; }
+.feed { padding-left: 26px; }
+/* `width: auto` is load-bearing. The composer carries an explicit width from an
+   earlier pass, so a left margin on its own pushed it 26px PAST the right edge
+   of the text it is supposed to line up with — measured at 983 against the
+   feed's 957, and visible in a capture as a composer wider than the answer. */
+.chat-bar { margin-left: 26px; width: auto; }
+
+/* ==========================================================================
+   PASS 5 — GLASS, A LIVE OBJECT, AND A STEP THAT SAYS WHAT IT FOUND
+   ==========================================================================
+   Three things the user named, in their order of importance:
+
+   1. "a slow spinning glass ball kind of thing as the agent works, until it
+      stops." There was nothing moving after the first two seconds of a run, so
+      a stalled run and a working one looked identical. See startWorking().
+   2. "the tool run interface looks outdated." A settled step showed which tool
+      ran and with what, and hid the answer behind a disclosure arrow. It now
+      carries its result on the row and sits on the turn's rail as a timeline.
+   3. "a professional liquid glass kind of look."
+
+   ON LIQUID GLASS, AND WHAT IS DELIBERATELY NOT DONE HERE. The full Apple
+   effect is refraction: an SVG displacement map fed to `backdrop-filter:
+   url(#f)`, which Chromium alone supports — and this window IS Chromium, so it
+   was available. It is not used on the composer or the top bar on purpose:
+   those sit over a SCROLLING feed, the displacement map is rebuilt on resize,
+   and a repaint of that weight on every scroll frame is a real cost paid
+   constantly for an effect noticed once. What is here instead is the part of
+   glass the eye actually reads — a heavy saturated backdrop blur, a bright rim
+   where the light catches the top edge, a dark inner floor, and one slow
+   specular travelling across it. Cheap, and it survives a scroll.
+   ========================================================================== */
+
+/* --- the material --------------------------------------------------------- */
+
+.demo-topbar {
+  backdrop-filter: blur(26px) saturate(190%) brightness(1.06);
+  -webkit-backdrop-filter: blur(26px) saturate(190%) brightness(1.06);
+  background: rgba(9, 12, 18, .55);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .07),
+    0 1px 0 rgba(140, 170, 220, .08),
+    0 10px 30px -22px rgba(0, 0, 0, 1);
+}
+
+.chat-bar {
+  position: relative;
+  overflow: hidden;
+  backdrop-filter: blur(30px) saturate(200%) brightness(1.05);
+  -webkit-backdrop-filter: blur(30px) saturate(200%) brightness(1.05);
+  background:
+    linear-gradient(180deg, rgba(24, 30, 42, .74), rgba(12, 16, 24, .82)) padding-box,
+    var(--hairline) border-box;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .1),
+    inset 0 -18px 30px -26px rgba(0, 0, 0, .9),
+    0 26px 64px -34px rgba(0, 0, 0, 1);
+}
+/* The light along the top edge — the single cue that reads as "this is glass"
+   rather than "this is a grey box with a blur behind it". */
+.chat-bar::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .34) 22%, rgba(255, 255, 255, .5) 50%, rgba(255, 255, 255, .34) 78%, transparent);
+  pointer-events: none;
+}
+/* And one slow specular travelling across it while the composer has focus, so
+   the surface feels lit rather than printed. Focus only: a sheen that never
+   stops is a distraction on a surface people type into. */
+@media (prefers-reduced-motion: no-preference) {
+  .chat-bar:focus-within::after {
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0; left: -40%;
+    width: 40%;
+    pointer-events: none;
+    background: linear-gradient(100deg, transparent, rgba(150, 190, 255, .07) 40%, rgba(190, 215, 255, .11) 50%, rgba(150, 190, 255, .07) 60%, transparent);
+    animation: sheen 5.5s ease-in-out infinite;
+  }
+  @keyframes sheen {
+    0% { transform: translateX(0); opacity: 0; }
+    12% { opacity: 1; }
+    88% { opacity: 1; }
+    100% { transform: translateX(360%); opacity: 0; }
+  }
+}
+
+.more-menu, .attach-menu, .chats-panel, .connect-card {
+  backdrop-filter: blur(28px) saturate(190%);
+  -webkit-backdrop-filter: blur(28px) saturate(190%);
+  background:
+    linear-gradient(180deg, rgba(24, 30, 42, .82), rgba(14, 18, 27, .88)) padding-box,
+    var(--hairline) border-box;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .09), var(--shadow-3);
+}
+
+/* --- the glass ball ------------------------------------------------------- */
+/*
+ * Three layers, and the ORDER is the whole trick: the liquid turns underneath,
+ * the highlight does not turn. A specular that rotates with the body reads as a
+ * spinning marble; one that stays put reads as a fixed light source and a
+ * moving fluid, which is what glass does.
+ */
+
+.working {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 0;
+  font-size: 13.5px;
+  color: var(--text-dim);
+}
+
+.glass-ball {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  border-radius: 50%;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 118%, rgba(91, 157, 255, .3), transparent 58%),
+    radial-gradient(circle at 50% 50%, rgba(22, 28, 42, .96), rgba(9, 12, 19, .98));
+  box-shadow:
+    inset 0 -7px 14px -6px rgba(0, 0, 0, .95),
+    inset 0 5px 12px -6px rgba(255, 255, 255, .3),
+    0 0 0 1px rgba(140, 170, 220, .16),
+    0 0 22px -4px rgba(91, 157, 255, .5);
+}
+/* the liquid */
+.glass-ball::before {
+  content: "";
+  position: absolute;
+  inset: -34%;
+  background: conic-gradient(from 0deg,
+    rgba(79, 209, 224, 0) 0deg,
+    rgba(79, 209, 224, .5) 70deg,
+    rgba(139, 123, 245, .62) 160deg,
+    rgba(91, 157, 255, .34) 250deg,
+    rgba(79, 209, 224, 0) 340deg);
+  filter: blur(5px);
+}
+/* the light, which does not move */
+.glass-ball::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 34% 26%, rgba(255, 255, 255, .82), rgba(255, 255, 255, .12) 26%, transparent 44%),
+    radial-gradient(circle at 68% 78%, rgba(255, 255, 255, .1), transparent 30%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Slow on purpose. A fast spinner reads as anxious, and this thing is on
+     screen for a minute at a time. */
+  .glass-ball::before { animation: ball-turn 11s linear infinite; }
+  @keyframes ball-turn { to { transform: rotate(360deg); } }
+}
+
+.working-label { letter-spacing: .1px; }
+/* The number people actually use — it is how you tell thinking from stuck. */
+.working-time {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(140, 170, 220, .07);
+}
+.working-time:empty { display: none; }
+
+/* --- steps, as a timeline on the turn's rail ------------------------------ */
+
+@media (min-width: 780px) {
+  /* Each step gets its node ON the rail, so five tool calls read as a sequence
+     rather than as five cards that happen to be stacked. */
+  .step { position: relative; }
+  .step::before {
+    content: "";
+    position: absolute;
+    left: -21px;
+    top: 15px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--muted);
+    box-shadow: 0 0 0 3px var(--bg);
+  }
+  .step.ok::before { background: var(--ok); box-shadow: 0 0 0 3px var(--bg), 0 0 10px rgba(70, 196, 106, .7); }
+  .step.bad::before { background: var(--danger); box-shadow: 0 0 0 3px var(--bg), 0 0 10px rgba(255, 107, 98, .7); }
+  .step.running::before { background: var(--accent-3); box-shadow: 0 0 0 3px var(--bg), 0 0 12px rgba(79, 209, 224, .85); }
+}
+
+/* The head is a single row that must not wrap: verb, tool, argument, result,
+   time. The argument and the result are the two that can be any length, so they
+   are the two that shrink. */
+.step-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.step-arg { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* What it found, on the row. See finishStep(): a settled step used to say only
+   which tool ran, and the answer needed a click. */
+.step-result {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  padding-left: 2px;
+  border-left: 1px solid rgba(140, 170, 220, .16);
+  padding-left: 10px;
+}
+.step-time { flex: 0 0 auto; margin-left: auto; }
+.step-chevron { flex: 0 0 auto; }
+
+/* An empty output block was still drawing its frame — a fenced box with nothing
+   in it, which reads as "the tool returned nothing" when the tool simply had
+   nothing to preview. */
+.step-output:empty { display: none; }
+
+/* ==========================================================================
+   PASS 6 — THE SHELL: A DOCKED SIDEBAR, THE SCROLLBAR AT THE EDGE, AND A
+   MODEL PICKER THAT BELONGS TO THIS APPLICATION
+   ==========================================================================
+   Four things the user named, and one they did not:
+
+   1. "new chat and chats is weirdly placed — put it on the side, collapsible,
+      and it should adjust the chat pane." The list used to slide OVER the
+      conversation behind a dark backdrop, which is a phone pattern on a
+      24-inch screen. It is a column now: the chat pane narrows to make room.
+   2. "move the scroll bar to the extreme right." It was at the right edge of
+      the 666px text COLUMN, floating in the middle of the window, because the
+      column was the scrolling box. The scrolling box is now the whole pane and
+      the text is centred inside it with padding, so the bar is at the window
+      edge where every application puts it — and the line length is unchanged.
+   3. "it looks like a Windows 7 bar." Restyled below.
+   4. "the model dropdown is still the same, absolutely pathetic." It was a
+      native <select>, drawn by Windows and not by this stylesheet. Replaced by
+      a button and a menu; the <select> is still underneath and still the source
+      of truth. See fillModelPicker().
+   5. Not named: the topbar buttons were the only things in the window with no
+      hover state worth the name, and the caret in a glass composer was default
+      blue-grey. Both fixed.
+   ========================================================================== */
+
+/* --- the shell ------------------------------------------------------------ */
+
+body {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-areas:
+    "topbar topbar"
+    "side   main";
+  height: 100vh;
+  overflow: hidden;
+}
+.demo-topbar { grid-area: topbar; }
+.chats-panel { grid-area: side; }
+.demo-layout { grid-area: main; }
+
+/* Docked: a column of its own, in the grid, so `hidden` collapses it to
+   nothing and the conversation simply takes the space back. */
+.chats-panel {
+  position: static;
+  width: 268px;
+  height: auto;
+  min-height: 0;
+  transform: none;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid rgba(140, 170, 220, .08);
+  border-radius: 0;
+  box-shadow: none;
+  background: linear-gradient(180deg, rgba(16, 20, 29, .72), rgba(11, 14, 21, .78));
+  backdrop-filter: blur(26px) saturate(180%);
+  -webkit-backdrop-filter: blur(26px) saturate(180%);
+}
+.chats-panel[hidden] { display: none; }
+.chats-panel .chat-list { flex: 1; min-height: 0; overflow-y: auto; }
+/* Docked, there is nothing to close BACK to — the button in the top bar is the
+   toggle. The × only makes sense when it is covering something. */
+#chatsClose { display: none; }
+.chats-backdrop[hidden] { display: none; }
+
+/* The conversation fills whatever is left, and the SCROLLING BOX is the pane —
+   not the text column. That is the entire scrollbar fix. */
+.demo-layout {
+  max-width: none;
+  width: auto;
+  margin: 0;
+  padding: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The measure, kept exactly as measured: 640px of text, plus 26px for the rail.
+   Centred with padding rather than with a max-width, so the box that scrolls is
+   still the full pane. */
+.feed {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  padding-left: max(26px, calc(50% - 320px));
+  padding-right: max(16px, calc(50% - 346px));
+}
+.chat-bar {
+  width: min(100% - 32px, 640px);
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* On a narrow window the sidebar has nothing to take space from, so it goes
+   back to covering — which is what the backdrop is for. */
+@media (max-width: 900px) {
+  .chats-panel {
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    z-index: 40;
+    width: min(300px, 84vw);
+    box-shadow: var(--shadow-3);
+  }
+  #chatsClose { display: inline-grid; }
+  .chats-backdrop { position: fixed; inset: 0; z-index: 39; }
+}
+
+/* --- the scrollbar -------------------------------------------------------- */
+/*
+ * "It looks like a Windows 7 bar." It was 10px of flat grey with a square
+ * track. A scrollbar on a dark glass surface should be a hint that something
+ * continues, not a piece of furniture: no track at all, a rounded thumb that is
+ * barely there until the pointer is near it.
+ */
+* { scrollbar-width: thin; scrollbar-color: rgba(140, 170, 220, .18) transparent; }
+*::-webkit-scrollbar { width: 12px; height: 12px; }
+*::-webkit-scrollbar-track { background: transparent; border: 0; }
+*::-webkit-scrollbar-thumb {
+  background: rgba(140, 170, 220, .16);
+  background-clip: content-box;
+  border: 4px solid transparent;
+  border-radius: 999px;
+  transition: background .15s ease;
+}
+*::-webkit-scrollbar-thumb:hover { background: rgba(150, 185, 255, .38); background-clip: content-box; }
+*::-webkit-scrollbar-thumb:active { background: rgba(150, 185, 255, .55); background-clip: content-box; }
+*::-webkit-scrollbar-corner { background: transparent; }
+
+/* --- the sidebar's contents ----------------------------------------------- */
+
+.chats-panel-head { padding: 14px 14px 8px; }
+.chats-panel-head h2 { font-size: 12px; font-weight: 620; letter-spacing: .8px; text-transform: uppercase; color: var(--muted); }
+
+.new-chat-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: calc(100% - 20px);
+  margin: 0 10px 10px;
+  padding: 9px 12px;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 520;
+  color: var(--text);
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background:
+    linear-gradient(var(--bg-raised), var(--bg-raised)) padding-box,
+    var(--hairline-soft) border-box;
+}
+.new-chat-row:hover {
+  background:
+    linear-gradient(var(--panel-2), var(--panel-2)) padding-box,
+    var(--hairline) border-box;
+}
+
+.chat-list { padding: 0 8px 8px; margin: 0; list-style: none; }
+.chat-open {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-open:hover { background: rgba(140, 170, 220, .07); color: var(--text); }
+.chats-note { padding: 10px 14px 14px; font-size: 11px; line-height: 1.5; }
+
+/* --- the model picker ----------------------------------------------------- */
+
+.model-picker { position: relative; display: inline-flex; border: 0; background: none; padding: 0; }
+/* Present for every existing code path and for a browser that never runs the
+   script — just not seen. `display: none` would take it out of the form. */
+.model-native {
+  position: absolute;
+  width: 1px; height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.model-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px 6px 9px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 520;
+  color: var(--text-dim);
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background:
+    linear-gradient(rgba(24, 30, 42, .8), rgba(18, 23, 33, .8)) padding-box,
+    var(--hairline-soft) border-box;
+  transition: color .13s ease, background .13s ease;
+}
+.model-button:hover, .model-button.open {
+  color: var(--text);
+  background:
+    linear-gradient(rgba(32, 40, 56, .9), rgba(24, 30, 42, .9)) padding-box,
+    var(--hairline) border-box;
+}
+.model-picker-icon { color: var(--accent); font-size: 11px; }
+.model-caret { font-size: 10px; color: var(--muted); }
+
+.model-menu {
+  position: absolute;
+  bottom: calc(100% + 9px);
+  left: 0;
+  z-index: 30;
+  min-width: 268px;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background:
+    linear-gradient(180deg, rgba(24, 30, 42, .86), rgba(14, 18, 27, .9)) padding-box,
+    var(--hairline) border-box;
+  backdrop-filter: blur(28px) saturate(190%);
+  -webkit-backdrop-filter: blur(28px) saturate(190%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .08), var(--shadow-3);
+  animation: menu-rise .13s ease-out;
+}
+.model-menu[hidden] { display: none; }
+
+.model-menu-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.model-menu-item:hover { background: rgba(140, 170, 220, .08); }
+.model-menu-tick { width: 12px; color: transparent; font-size: 11px; line-height: 1.5; }
+.model-menu-item.chosen .model-menu-tick { color: var(--accent); }
+.model-menu-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.model-menu-text strong { font-size: 13px; font-weight: 540; }
+.model-menu-text em { font-style: normal; font-size: 11.5px; color: var(--muted); }
+
+/* --- small things --------------------------------------------------------- */
+
+.chat-bar textarea { caret-color: var(--accent-3); }
+.topbar-button:active, .topbar-actions .icon-button:active { transform: translateY(1px); }
+/* The sidebar toggle should look pressed while the sidebar is open — it is a
+   state, not a one-off action. */
+body.sidebar-open #chatsButton {
+  color: var(--text);
+  background:
+    linear-gradient(var(--panel-2), var(--panel-2)) padding-box,
+    var(--hairline) border-box;
+}
+
+/* --- the top bar, once the sidebar owns the chat list --------------------- */
+
+.demo-topbar { justify-content: space-between; }
+.topbar-left { display: flex; align-items: center; gap: 10px; }
+
+/* The toggle reads as a state, so it is drawn as one: pressed while the panel
+   is open, quiet while it is not. */
+.sidebar-toggle {
+  width: 32px; height: 32px;
+  font-size: 15px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  background: transparent;
+}
+.sidebar-toggle:hover {
+  color: var(--text);
+  background:
+    linear-gradient(var(--panel-2), var(--panel-2)) padding-box,
+    var(--hairline-soft) border-box;
+}
+body.sidebar-open .sidebar-toggle {
+  color: var(--text);
+  background:
+    linear-gradient(var(--panel-2), var(--panel-2)) padding-box,
+    var(--hairline) border-box;
+}
+/* One "New chat", never two: the sidebar has its own. */
+body.sidebar-open #newChatButton { display: none; }
+
+/* --- the connect panel is an OVERLAY, not a column ------------------------ */
+/*
+ * Caught by measuring, not by looking: the shell became a grid, and every child
+ * of <body> that is not assigned an area gets auto-placed into it. The connect
+ * panel — shown only on a browser-only launch, where there is no injected token
+ * — is `display: flex`, so it took a 420px COLUMN beside the conversation
+ * instead of covering the window. The Electron app never showed it, so nothing
+ * on screen said anything was wrong; `body { grid-template-columns }` read
+ * "420px 860px" and that is what gave it away.
+ *
+ * Anything else that ends up under <body> without an area belongs on top of the
+ * layout too, which is what the second rule is for.
+ */
+.connect-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  background: rgba(6, 8, 13, .72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.connect-panel[hidden] { display: none; }
+body > *:not(.demo-topbar):not(.chats-panel):not(.demo-layout):not(script) { grid-area: main; }
+
+/* ==========================================================================
+   PASS 7 — THE MENUS THAT COULD NOT BE SEEN, AND THE MATERIAL AROUND THEM
+   ==========================================================================
+   Five things the user named, and the first is the one that mattered:
+
+   1. "when you click on + to attach a file or folder, it opens inside the text
+      section — the entire selection pane is not visible at all. Same with the
+      model selection, and they overlap."
+      CAUSE, MEASURED: `.chat-bar` was given `overflow: hidden` in PASS 5 so its
+      travelling specular could not escape the rounded corners. Both menus are
+      CHILDREN of the composer, and they open upward — so the composer clipped
+      its own menus to its own box and you saw the bottom third of one row. The
+      overlap was the second half of it: nothing closed one menu when the other
+      opened, so they were drawn on top of each other.
+      FIX: the specular gets its own clipped layer (`.composer-sheen`), the
+      composer clips nothing, and opening either menu closes the other.
+   2. "keep the model selection button to the right near the send button." Done
+      in the markup; its menu is right-aligned here so it opens away from "+"
+      instead of across it.
+   3. "the sidebar is collapsed with 3 horizontal lines, which is outdated."
+      A hamburger means "there is a menu behind this". This button shows and
+      hides a PANEL, so it is drawn as one.
+   4. "when the model uses a tool or runs a command, the card is trash."
+      Rebuilt below: a real icon per tool in a chip, the outcome as its own
+      marker at the end of the row, and an order that does not depend on which
+      order the JavaScript happened to append things in.
+   5. "a beautiful glassmorphic, liquid glass kind of interface."
+
+   ON ORDER, AND WHY IT IS SET EXPLICITLY. `.step-chevron` is appended when the
+   row is created and `.step-result` and `.step-time` when it finishes — so in
+   DOM order the disclosure arrow sat in the MIDDLE of the row, between the
+   argument and the result, and both `margin-left: auto`s cancelled because the
+   result was already eating the free space. Flex `order` pins the layout to
+   what it means rather than to when it arrived.
+   ========================================================================== */
+
+:root {
+  /* Glass, restated. The old values were a flat dark tint; these are a lit
+     material — a brighter top, a darker floor, and a rim that is a gradient
+     rather than a grey. */
+  --glass: rgba(20, 26, 38, .58);
+  --glass-strong: rgba(24, 31, 44, .74);
+  --glass-rim: linear-gradient(150deg, rgba(255, 255, 255, .22), rgba(139, 123, 245, .16) 38%, rgba(91, 157, 255, .07) 62%, rgba(79, 209, 224, .16));
+  --glass-rim-soft: linear-gradient(150deg, rgba(255, 255, 255, .11), rgba(139, 123, 245, .08) 40%, rgba(91, 157, 255, .04) 64%, rgba(79, 209, 224, .08));
+  --hairline: var(--glass-rim);
+  --hairline-soft: var(--glass-rim-soft);
+  /* One shared elevation for anything that floats over the conversation. */
+  --lift: 0 32px 70px -30px rgba(0, 0, 0, .95), 0 8px 24px -14px rgba(0, 0, 0, .7);
+  --radius-lg: 22px;
+}
+
+/* Every inline icon in this window is on the same 24-unit grid and inherits the
+   colour of the control it is in, so nothing has its own weight or baseline. */
+.icon { display: block; flex: 0 0 auto; }
+button > .icon { pointer-events: none; }
+
+/* --- the mark ------------------------------------------------------------- */
+/*
+ * It was a white diamond drawn in CSS on a gradient tile, because there was no
+ * mark. The real one is white line-art with a glow, so it needs no tile: the
+ * glow IS the elevation, and a tile would put a hard-edged square around a
+ * shape whose whole character is that it is open.
+ */
+.brand .logo {
+  display: block;
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  filter: drop-shadow(0 1px 10px rgba(129, 176, 255, .45));
+}
+.brand h1 { font-size: 14.5px; font-weight: 640; letter-spacing: .34px; }
+
+/* --- the sidebar toggle --------------------------------------------------- */
+
+.sidebar-toggle { display: grid; place-items: center; }
+.sidebar-toggle .panel-fill { transition: opacity .18s ease; }
+body.sidebar-open .sidebar-toggle .panel-fill { opacity: .55; }
+.sidebar-toggle:hover .panel-fill { opacity: .3; }
+body.sidebar-open .sidebar-toggle:hover .panel-fill { opacity: .7; }
+
+.topbar-button { display: inline-flex; align-items: center; gap: 7px; }
+.topbar-actions .icon-button { display: grid; place-items: center; }
+
+/* --- the composer, unclipped ---------------------------------------------- */
+
+.chat-bar {
+  /* THE LINE THAT FIXES THE MENUS. Everything that needed clipping now has its
+     own layer; the composer itself must clip nothing, because its children
+     include two pop-up menus that open above it. */
+  overflow: visible;
+  padding: 12px 12px 10px;
+  border-radius: var(--radius-lg);
+}
+/* Moved into `.composer-sheen`. Left as `content: none` rather than deleted
+   from PASS 5 so the reason survives next to the rule it replaced. */
+.chat-bar::before { content: none; }
+.chat-bar:focus-within::after { content: none; }
+
+.composer-sheen {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  pointer-events: none;
+}
+/* The light along the top edge — the single cue that reads as "this is glass"
+   rather than "this is a grey box with a blur behind it". */
+.composer-sheen::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .3) 20%, rgba(255, 255, 255, .52) 50%, rgba(255, 255, 255, .3) 80%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .chat-bar:focus-within .composer-sheen::after {
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0; left: -40%;
+    width: 40%;
+    background: linear-gradient(100deg, transparent, rgba(150, 190, 255, .06) 40%, rgba(190, 215, 255, .1) 50%, rgba(150, 190, 255, .06) 60%, transparent);
+    animation: sheen 5.5s ease-in-out infinite;
+  }
+}
+/* Above the sheen. Without this the tint is painted over the text being typed —
+   positioned layers paint after in-flow ones. */
+.chat-bar > .attachment-strip,
+.chat-bar > textarea,
+.chat-bar > .composer-controls { position: relative; z-index: 1; }
+
+.chat-bar textarea { padding: 8px 8px 4px; font-size: 15.5px; line-height: 1.55; }
+
+/* --- the controls row ----------------------------------------------------- */
+
+.composer-controls { gap: 8px; padding: 6px 2px 0; align-items: center; }
+/* The hint takes the slack, which is what keeps "+" hard left and the model
+   picker hard right next to send. */
+.model-hint { flex: 1 1 auto; min-width: 0; padding-left: 2px; }
+.model-picker { flex: 0 0 auto; }
+.composer-controls #sendButton { margin-left: 0; }
+
+.composer-icon {
+  width: 34px; height: 34px;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  background:
+    linear-gradient(rgba(26, 33, 47, .6), rgba(19, 25, 36, .6)) padding-box,
+    var(--glass-rim-soft) border-box;
+}
+.composer-icon:hover {
+  color: var(--text);
+  background:
+    linear-gradient(rgba(36, 45, 63, .8), rgba(26, 33, 47, .8)) padding-box,
+    var(--glass-rim) border-box;
+}
+/* It turns into an x by rotating rather than by swapping glyphs, which is how it
+   stays in place while the menu is open. */
+.composer-icon.open { color: var(--text); transform: rotate(45deg); }
+
+#sendButton {
+  display: grid;
+  place-items: center;
+  width: 34px; height: 34px;
+  flex: 0 0 auto;
+}
+#sendButton.stopping {
+  background: linear-gradient(150deg, #ff8079, #e0544c);
+  box-shadow: 0 4px 16px rgba(255, 107, 98, .35), inset 0 1px 0 rgba(255, 255, 255, .28);
+}
+
+/* --- the two menus -------------------------------------------------------- */
+
+.attach-menu, .model-menu {
+  z-index: 60;
+  min-width: 280px;
+  padding: 7px;
+  border-radius: 18px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .1), var(--lift);
+}
+.attach-menu { bottom: calc(100% + 12px); left: 0; }
+/* RIGHT-ALIGNED, because the button it belongs to is now at the right end of
+   the row. Left-aligned it would open across the composer and off the edge. */
+.model-menu { bottom: calc(100% + 12px); left: auto; right: 0; }
+
+.attach-menu button, .model-menu-item { padding: 9px 10px; border-radius: 12px; }
+.attach-menu button:hover, .model-menu-item:hover { background: rgba(140, 170, 220, .09); }
+
+.attach-menu-icon {
+  width: 32px; height: 32px;
+  border: 1px solid rgba(140, 170, 220, .1);
+  border-radius: 11px;
+  color: var(--text-dim);
+  background: rgba(140, 170, 220, .07);
+}
+.attach-menu button:hover .attach-menu-icon { color: var(--text); background: rgba(140, 170, 220, .13); }
+
+.model-button { padding: 7px 11px 7px 10px; gap: 7px; }
+.model-picker-icon { color: var(--accent); }
+.model-caret { color: var(--muted); transition: transform .15s ease; }
+.model-button.open .model-caret { transform: rotate(180deg); }
+.model-menu-tick { display: grid; place-items: center; width: 14px; padding-top: 2px; }
+
+@media (max-width: 620px) {
+  /* A hint squeezed down to three words and an ellipsis is worse than no hint:
+     it takes the room the two controls need. */
+  .model-hint { display: none; }
+  .attach-menu, .model-menu { min-width: min(280px, 74vw); }
+}
+
+/* --- a tool call ---------------------------------------------------------- */
+/*
+ * What was wrong with it: an emoji in a system font for an icon, a tick that
+ * replaced that icon the moment the step finished (so a finished stack of rows
+ * said nothing about what had actually been done), a disclosure arrow stranded
+ * in the middle of the row, and a red glow on anything that failed.
+ *
+ * What it is now: a chip carrying the tool's own icon for the life of the row,
+ * the sentence, the tool id and its argument, what it found, and the outcome as
+ * a small marker at the end where an outcome belongs.
+ */
+
+.step {
+  border-radius: 15px;
+  border: 1px solid transparent;
+  border-left-width: 1px;
+  background:
+    linear-gradient(var(--glass), var(--glass)) padding-box,
+    var(--glass-rim-soft) border-box;
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .05), 0 10px 26px -22px rgba(0, 0, 0, .95);
+}
+.step:hover {
+  background:
+    linear-gradient(var(--glass-strong), var(--glass-strong)) padding-box,
+    var(--glass-rim) border-box;
+}
+details.step > summary:hover { background: transparent; }
+
+/* ONE LINE, ALWAYS. `flex-wrap: wrap` survived from the generation where the
+   head was a paragraph of fragments: a long stderr line pushed the result onto
+   a second row and left the outcome marker floating in the middle of a
+   two-line card. Every part that can be any length already ellipsises. */
+.step-head { padding: 9px 11px; gap: 9px; font-size: 13px; flex-wrap: nowrap; }
+
+.step-icon {
+  order: 1;
+  display: grid;
+  place-items: center;
+  width: 27px; height: 27px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(140, 170, 220, .1);
+  border-radius: 9px;
+  background: rgba(140, 170, 220, .06);
+  color: var(--text-dim);
+  /* The old rule put a coloured glow on the glyph. A 10px halo behind a 12px
+     icon is not emphasis, it is blur. */
+  text-shadow: none;
+  transition: color .16s ease, background .16s ease, border-color .16s ease;
+}
+.step-icon svg { width: 15px; height: 15px; }
+.step.running .step-icon {
+  color: var(--accent-3);
+  background: rgba(79, 209, 224, .12);
+  border-color: rgba(79, 209, 224, .3);
+  animation: none;
+}
+.step.bad .step-icon { color: #ff8a83; background: rgba(255, 107, 98, .1); border-color: rgba(255, 107, 98, .28); }
+.step.ok:hover .step-icon { color: var(--text); }
+
+/* WHAT SHRINKS FIRST IS A DECISION, NOT AN ACCIDENT.
+   Flex shrinks every flexible item at once, weighted by its factor, so with the
+   default of 1 everywhere the row narrowed by cutting "Searched the web" down
+   to "Searche…" while the argument beside it kept a comfortable 34 characters.
+   The sentence is the thing a person reads; it shrinks last. */
+.step-verb {
+  order: 2;
+  /* Does not shrink at all. The argument and the result both have
+     `overflow: hidden`, so their automatic minimum size is zero and they can
+     give up every pixel they have before this ever needs to. A subgoal long
+     enough to matter is capped by max-width instead. */
+  flex: 0 0 auto;
+  max-width: 26ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 520;
+  color: var(--text);
+}
+.step-tool {
+  order: 3;
+  flex: 0 0 auto;
+  font-size: 11px;
+  letter-spacing: .2px;
+  color: #a4bfe8;
+  background: rgba(91, 157, 255, .09);
+  border: 1px solid rgba(91, 157, 255, .13);
+  border-radius: 7px;
+  padding: 2px 7px;
+}
+.step-arg { order: 4; flex: 0 1 auto; flex-shrink: 6; max-width: 34ch; }
+.step-result {
+  order: 5;
+  flex: 1 1 auto;
+  flex-shrink: 9;
+  padding-left: 10px;
+  border-left: 1px solid rgba(140, 170, 220, .14);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+/* THE OUTCOME, AT THE END OF THE ROW. It used to overwrite the tool's icon at
+   the START of it — so a finished transcript was a column of identical ticks
+   and you could no longer see at a glance that it had searched, then read a
+   file, then run a command. */
+.step-state {
+  order: 6;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 17px; height: 17px;
+  border-radius: 50%;
+}
+.step-state svg { width: 11px; height: 11px; }
+.step-state.ok { color: #6fe09a; background: rgba(70, 196, 106, .14); }
+.step-state.bad { color: #ff8a83; background: rgba(255, 107, 98, .16); }
+.step-state.unknown { width: 7px; height: 7px; background: rgba(140, 170, 220, .3); }
+
+.step-time { order: 7; flex: 0 0 auto; margin-left: 0; font-size: 11.5px; color: var(--muted); }
+
+/* Drawn, not a glyph: a triangle from the system font arrives at whatever size
+   and baseline that font feels like. */
+.step-chevron {
+  order: 8;
+  position: relative;
+  width: 15px; height: 15px;
+  margin-left: 0;
+  color: var(--muted);
+  transition: transform .16s ease, color .16s ease;
+}
+.step-chevron::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 5px; height: 5px;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  border-radius: 1px;
+  transform: rotate(-45deg);
+}
+details.step[open] .step-chevron { transform: none; }
+details.step[open] .step-chevron::before { transform: rotate(45deg); }
+details.step > summary:hover .step-chevron { color: var(--text-dim); }
+
+.step-output {
+  margin: 0 9px 9px;
+  padding: 11px 12px;
+  border: 1px solid rgba(140, 170, 220, .07);
+  border-radius: 11px;
+  background: rgba(4, 6, 10, .55);
+  font-size: 12px;
+  color: #b9c7da;
+}
+.step-output.search-results {
+  margin: 0 9px 8px;
+  padding: 2px 10px 8px;
+  border: 0;
+  border-top: 1px solid rgba(140, 170, 220, .08);
+  border-radius: 0;
+  background: transparent;
+}
+.step-error { margin: 0 11px 10px; font-size: 12.5px; color: #ff8a83; text-shadow: none; }
+.step-progress { margin: 0 11px 11px; }
+.progress-track { background: rgba(4, 6, 10, .7); }
+.progress-fill { background: linear-gradient(90deg, var(--accent-3), var(--accent)); }
+
+/* A step still running says so with light rather than with a spinner: one slow
+   sweep along its top edge, in the same cyan as its chip. */
+@media (prefers-reduced-motion: no-preference) {
+  .step.running::after { height: 1.5px; opacity: .9; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .step.running .step-icon { animation: none; }
+}
+
+/* The timeline nodes in the margin line up with the chip, not with the old
+   text-sized icon. */
+@media (min-width: 780px) {
+  .step::before { top: 18px; }
+}
+
+/* --- one live line, not two ----------------------------------------------- */
+/*
+ * `.turn-status` and `.working` are both fed by setStatus(), so for the first
+ * seconds of every request the screen said the same word twice, one line under
+ * the other — with a pulsing dot beside one and a spinning glass ball beside
+ * the other. The working row is the better of the two: it carries the elapsed
+ * seconds, which is how a person tells thinking from stuck. The status line
+ * stays in the DOM (several code paths remove it by hand and the ARIA live
+ * region belongs to it) and simply does not draw while the other is there.
+ */
+.turn:has(.working) > .turn-status { display: none; }
+
+/* The ball is the one live object on screen, so it is worth the pixels. */
+.working { gap: 11px; font-size: 14px; }
+.glass-ball { width: 24px; height: 24px; flex: 0 0 24px; }
+
+/* --- everything else that floats ------------------------------------------ */
+
+.more-menu {
+  z-index: 60;
+  border-radius: 18px;
+  padding: 7px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .1), var(--lift);
+}
+.more-menu .debug-toggle { border-radius: 12px; }
+.connect-card { border-radius: 24px; }
+
+.more-menu, .attach-menu, .model-menu, .chats-panel, .connect-card {
+  backdrop-filter: blur(34px) saturate(200%) brightness(1.04);
+  -webkit-backdrop-filter: blur(34px) saturate(200%) brightness(1.04);
+  background:
+    linear-gradient(165deg, rgba(28, 36, 51, .76), rgba(15, 20, 30, .84)) padding-box,
+    var(--glass-rim) border-box;
+}
+
+.chat-bar {
+  backdrop-filter: blur(34px) saturate(200%) brightness(1.05);
+  -webkit-backdrop-filter: blur(34px) saturate(200%) brightness(1.05);
+  background:
+    linear-gradient(180deg, rgba(28, 36, 51, .66), rgba(13, 17, 26, .78)) padding-box,
+    var(--glass-rim) border-box;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .1),
+    inset 0 -20px 34px -30px rgba(0, 0, 0, .9),
+    var(--lift);
+}
+.chat-bar:focus-within {
+  background:
+    linear-gradient(180deg, rgba(32, 41, 58, .74), rgba(15, 20, 30, .82)) padding-box,
+    var(--glass-rim) border-box;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .14),
+    var(--lift),
+    0 0 0 3px rgba(91, 157, 255, .09);
+}
+
+/* --- the conversation ----------------------------------------------------- */
+
+.bubble.user {
+  border-radius: 20px 20px 7px 20px;
+  padding: 11px 16px;
+  background:
+    linear-gradient(150deg, rgba(44, 55, 79, .7), rgba(27, 34, 50, .7)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07), 0 12px 30px -22px rgba(0, 0, 0, .9);
+}
+
+.suggestion { border-radius: 15px; }
+.suggestion:hover { box-shadow: 0 16px 36px -26px rgba(91, 157, 255, .8); }
+
+.attachment-chip {
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background:
+    linear-gradient(rgba(30, 38, 54, .7), rgba(22, 28, 41, .7)) padding-box,
+    var(--glass-rim-soft) border-box;
+}
+.attachment-icon, .attachment-thumb { border-radius: 10px; }
+.attachment-icon { color: var(--text-dim); }
+.attachment-icon svg { width: 17px; height: 17px; }
+.attachment-chip.rejected .attachment-icon { color: #ff8a83; }
+.attachment-chip.folder .attachment-icon { color: #e8be6a; }
+.attachment-remove {
+  display: grid;
+  place-items: center;
+  width: 22px; height: 22px;
+  padding: 0;
+  border-radius: 7px;
+}
+.attachment-remove svg { width: 12px; height: 12px; }
+
+.bubble-attachment { display: inline-flex; align-items: center; gap: 6px; }
+.bubble-attachment svg { width: 13px; height: 13px; opacity: .8; }
+
+.model-menu-tick svg { width: 12px; height: 12px; }
+.chat-delete { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; }
+.chat-delete svg { width: 12px; height: 12px; }
+.new-chat-row { display: flex; align-items: center; gap: 9px; }
+/* NO `display` HERE. PASS 6 hides this button entirely while the sidebar is
+   docked and brings it back as `inline-grid` on a narrow window; setting a
+   display value in this block would put a dead ✕ back into the docked panel. */
+#chatsClose { place-items: center; width: 26px; height: 26px; padding: 0; }
+
+/* --- the sidebar ---------------------------------------------------------- */
+
+.chats-panel {
+  background: linear-gradient(180deg, rgba(18, 23, 34, .62), rgba(10, 13, 20, .72));
+  backdrop-filter: blur(34px) saturate(190%);
+  -webkit-backdrop-filter: blur(34px) saturate(190%);
+  border-right: 1px solid rgba(140, 170, 220, .07);
+}
+.new-chat-row { border-radius: 14px; }
+.chat-open { border-radius: 11px; }
+.chat-list li.active .chat-open {
+  color: var(--text);
+  background: rgba(140, 170, 220, .1);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* ==========================================================================
+   PASS 8 — GLASS THAT IS ACTUALLY GLASS
+   ==========================================================================
+   "I don't think it's still glassmorphic."
+
+   They were right, and the reason is one line of physics rather than taste:
+   BACKDROP-FILTER HAS NOTHING TO FILTER. Every panel here was already doing
+   `blur(34px) saturate(200%)` — over a background that was #080a0f with three
+   aurora washes at 5-10% alpha. Blurring near-black gives near-black; saturating
+   a grey gives a grey. The whole apparatus of glass was running and producing a
+   dark rectangle, which is exactly what it looked like.
+
+   Glass is not a material, it is a RELATIONSHIP: you see it because something
+   colourful behind it is being bent. So this pass spends its effort behind the
+   panels, not on them:
+
+   1. THE ROOM IS LIT. The ambient auroras go from ~7% to 22-30% alpha and get
+      bigger and more separated in hue, so at any point on screen there is a
+      colour for the glass to pick up. The grid stays, because a straight line
+      seen through a blur is the cue that says "there is a pane here".
+   2. THE PANELS GET THINNER, NOT DARKER. Fill alpha drops from ~.8 to ~.42-.55.
+      A panel you cannot see through is a panel, not glass.
+   3. EVERY PANE GETS A LIT EDGE. A bright top-left rim and a dark bottom-right
+      one — that pair is what the eye reads as thickness, and it is the single
+      biggest difference between "translucent box" and "pane of glass".
+   4. SPECULARS. One soft highlight across the top of each large surface.
+
+   Cost: no images, no canvas, no JavaScript, one extra pseudo-element on three
+   elements. Everything animated is behind prefers-reduced-motion.
+   ========================================================================== */
+
+:root {
+  /* Thin enough to see through. These are the numbers that decide whether the
+     whole thing reads as glass, so they are together and named. */
+  --glass: rgba(28, 36, 54, .42);
+  --glass-strong: rgba(34, 44, 66, .55);
+
+  /* A lit edge is TWO edges. One gradient cannot be bright at the top-left and
+     dark at the bottom-right, so the rim is a single gradient that runs from a
+     near-white highlight through nothing to a shadow. */
+  --glass-rim: linear-gradient(145deg,
+    rgba(255, 255, 255, .5) 0%,
+    rgba(190, 205, 255, .16) 26%,
+    rgba(10, 14, 24, .3) 62%,
+    rgba(255, 255, 255, .12) 100%);
+  --glass-rim-soft: linear-gradient(145deg,
+    rgba(255, 255, 255, .26) 0%,
+    rgba(190, 205, 255, .08) 30%,
+    rgba(10, 14, 24, .22) 66%,
+    rgba(255, 255, 255, .07) 100%);
+  --hairline: var(--glass-rim);
+  --hairline-soft: var(--glass-rim-soft);
+
+  /* The blur every pane uses. One value, so panes at different depths do not
+     look like they are made of different materials. */
+  --frost: blur(30px) saturate(180%) brightness(1.12);
+  --frost-deep: blur(44px) saturate(200%) brightness(1.16);
+
+  --lift: 0 30px 64px -28px rgba(0, 0, 0, .9), 0 6px 18px -10px rgba(0, 0, 0, .55);
+}
+
+/* --- the room -------------------------------------------------------------- */
+/*
+ * The colour the glass is made of. Four auroras rather than three, further
+ * apart in hue and an order of magnitude stronger than before — at these alphas
+ * a blurred panel picks up a visible tint that changes as it moves across the
+ * window, which is the whole effect.
+ */
+body {
+  background:
+    radial-gradient(920px 620px at 8% -10%, rgba(72, 132, 255, .3), transparent 60%),
+    radial-gradient(780px 560px at 92% 2%, rgba(150, 96, 255, .26), transparent 58%),
+    radial-gradient(760px 620px at 78% 96%, rgba(56, 200, 220, .17), transparent 60%),
+    radial-gradient(680px 520px at 14% 88%, rgba(228, 96, 178, .13), transparent 62%),
+    #05070c;
+}
+
+/* The grid is the reason a blur reads as a PANE: a straight line going soft
+   behind something is the oldest depth cue there is. Brighter than before,
+   because it now has to survive being seen through 30px of blur. */
+body::before {
+  background-image:
+    linear-gradient(rgba(170, 200, 255, .07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(170, 200, 255, .07) 1px, transparent 1px);
+  background-size: 54px 54px;
+  -webkit-mask-image: radial-gradient(1400px 1000px at 50% 0%, #000 0%, transparent 82%);
+  mask-image: radial-gradient(1400px 1000px at 50% 0%, #000 0%, transparent 82%);
+}
+
+/* The vignette has to come back down: it was drowning the auroras at the edges,
+   which is where the composer and the sidebar are. */
+body::after {
+  background: radial-gradient(130% 100% at 50% 42%, transparent 62%, rgba(0, 0, 0, .42) 100%);
+}
+
+/* --- one recipe, used by every pane ---------------------------------------- */
+/*
+ * `.pane` is not a class anything carries — it is this comment. The five
+ * surfaces below all get the same four things in the same order, and they are
+ * written out per selector rather than shared, because each needs a different
+ * fill and they must not drift into looking like different materials.
+ */
+
+.demo-topbar {
+  background: rgba(18, 24, 40, .34);
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .13),
+    inset 0 -1px 0 rgba(0, 0, 0, .3),
+    0 12px 34px -26px rgba(0, 0, 0, .95);
+}
+
+.chats-panel {
+  background: linear-gradient(170deg, rgba(30, 39, 60, .4), rgba(14, 19, 32, .48));
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  border-right: 1px solid rgba(255, 255, 255, .07);
+  box-shadow: inset 1px 0 0 rgba(255, 255, 255, .06);
+}
+
+.chat-bar {
+  background:
+    linear-gradient(165deg, rgba(46, 58, 86, .46), rgba(16, 21, 34, .5)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .16),
+    inset 0 -22px 40px -34px rgba(0, 0, 0, .8),
+    var(--lift);
+}
+.chat-bar:focus-within {
+  background:
+    linear-gradient(165deg, rgba(56, 70, 104, .52), rgba(18, 24, 38, .54)) padding-box,
+    var(--glass-rim) border-box;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .22),
+    var(--lift),
+    0 0 0 3px rgba(120, 170, 255, .12);
+}
+/* The rim light along the top edge, brighter now that there is something behind
+   it for the light to be coming from. */
+.composer-sheen::before {
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .4) 18%, rgba(255, 255, 255, .68) 50%, rgba(255, 255, 255, .4) 82%, transparent);
+}
+/* A soft specular pooled in the top-left of the pane. Static — the travelling
+   one already exists on focus, and two moving highlights is a disco. */
+.composer-sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(120% 90% at 12% -30%, rgba(255, 255, 255, .1), transparent 58%);
+}
+/* …which the focus animation replaces, so they never both run. */
+@media (prefers-reduced-motion: no-preference) {
+  .chat-bar:focus-within .composer-sheen::after {
+    background: linear-gradient(100deg, transparent, rgba(180, 210, 255, .1) 40%, rgba(220, 235, 255, .16) 50%, rgba(180, 210, 255, .1) 60%, transparent);
+    inset: 0 auto 0 -40%;
+    width: 40%;
+  }
+}
+
+.more-menu, .attach-menu, .model-menu, .connect-card {
+  background:
+    linear-gradient(165deg, rgba(48, 60, 90, .5), rgba(18, 24, 38, .56)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2), var(--lift);
+}
+
+/* The user's own words: the most glass-like thing on screen, because it floats
+   over the lit background with nothing behind it. */
+.bubble.user {
+  background:
+    linear-gradient(150deg, rgba(74, 92, 140, .42), rgba(30, 39, 62, .46)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost);
+  -webkit-backdrop-filter: var(--frost);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .2),
+    inset 0 -12px 24px -22px rgba(0, 0, 0, .7),
+    0 14px 34px -24px rgba(0, 0, 0, .85);
+}
+
+/* A tool row is a small pane of the same glass, one step thinner. */
+.step {
+  background:
+    linear-gradient(160deg, var(--glass-strong), var(--glass)) padding-box,
+    var(--glass-rim-soft) border-box;
+  backdrop-filter: var(--frost);
+  -webkit-backdrop-filter: var(--frost);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .1),
+    0 12px 28px -24px rgba(0, 0, 0, .9);
+}
+.step:hover {
+  background:
+    linear-gradient(160deg, rgba(46, 58, 88, .62), rgba(30, 39, 60, .5)) padding-box,
+    var(--glass-rim) border-box;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .16), 0 16px 34px -24px rgba(0, 0, 0, .95);
+}
+/* The failed row keeps the red wash, at the new transparency. */
+.step.bad {
+  background:
+    linear-gradient(150deg, rgba(255, 107, 98, .16), rgba(34, 30, 42, .5) 46%) padding-box,
+    linear-gradient(145deg, rgba(255, 160, 152, .6), rgba(255, 107, 98, .14) 60%, rgba(0, 0, 0, .3)) border-box;
+}
+/* Output is the one thing that must NOT be glass: it is a terminal, and text on
+   a moving translucent background is unreadable. */
+.step-output {
+  background: rgba(3, 5, 9, .72);
+  border-color: rgba(255, 255, 255, .06);
+}
+
+.suggestion {
+  background:
+    linear-gradient(160deg, rgba(40, 51, 78, .34), rgba(20, 26, 42, .38)) padding-box,
+    var(--glass-rim-soft) border-box;
+  backdrop-filter: var(--frost);
+  -webkit-backdrop-filter: var(--frost);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .1);
+}
+.suggestion:hover {
+  background:
+    linear-gradient(160deg, rgba(56, 71, 108, .48), rgba(28, 36, 56, .5)) padding-box,
+    var(--glass-rim) border-box;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2), 0 16px 36px -24px rgba(0, 0, 0, .9);
+}
+
+.attachment-chip {
+  background:
+    linear-gradient(160deg, rgba(52, 66, 98, .5), rgba(26, 33, 52, .52)) padding-box,
+    var(--glass-rim-soft) border-box;
+  backdrop-filter: var(--frost);
+  -webkit-backdrop-filter: var(--frost);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .13);
+}
+
+.composer-icon {
+  background:
+    linear-gradient(rgba(58, 72, 106, .4), rgba(30, 38, 58, .4)) padding-box,
+    var(--glass-rim-soft) border-box;
+}
+.composer-icon:hover {
+  background:
+    linear-gradient(rgba(74, 92, 134, .55), rgba(40, 50, 76, .55)) padding-box,
+    var(--glass-rim) border-box;
+}
+.model-button {
+  background:
+    linear-gradient(rgba(58, 72, 106, .4), rgba(30, 38, 58, .42)) padding-box,
+    var(--glass-rim-soft) border-box;
+}
+.model-button:hover, .model-button.open {
+  background:
+    linear-gradient(rgba(78, 96, 140, .58), rgba(42, 53, 80, .58)) padding-box,
+    var(--glass-rim) border-box;
+}
+.topbar-button, .topbar-actions .icon-button {
+  background:
+    linear-gradient(rgba(48, 60, 90, .3), rgba(26, 33, 52, .32)) padding-box,
+    var(--glass-rim-soft) border-box;
+}
+.topbar-button:hover, .topbar-actions .icon-button:hover {
+  background:
+    linear-gradient(rgba(70, 87, 128, .5), rgba(36, 46, 70, .5)) padding-box,
+    var(--glass-rim) border-box;
+}
+.new-chat-row {
+  background:
+    linear-gradient(rgba(52, 66, 98, .36), rgba(26, 33, 52, .38)) padding-box,
+    var(--glass-rim-soft) border-box;
+}
+.new-chat-row:hover {
+  background:
+    linear-gradient(rgba(74, 92, 134, .55), rgba(38, 48, 74, .55)) padding-box,
+    var(--glass-rim) border-box;
+}
+
+/* Text has to hold up against a brighter, busier background. */
+.md, .agent-answer, .agent-says { color: #f2f6fd; }
+.turn-cost { color: #7c8aa4; }
+.suggestion { color: #cfdaea; }
+.suggestion:hover { color: #fff; }
+
+/* On a light-heavy background the old scrollbar disappeared. */
+*::-webkit-scrollbar-thumb { background: rgba(190, 212, 255, .2); background-clip: content-box; }
+*::-webkit-scrollbar-thumb:hover { background: rgba(200, 220, 255, .42); background-clip: content-box; }
+
+/* ==========================================================================
+   PASS 8b — WHAT YOU CAN DO TO A MESSAGE ALREADY SENT
+   ==========================================================================
+   Copy on anything, Edit on your own messages. Hidden until the message is
+   hovered or something inside it has keyboard focus — a row of buttons under
+   every line of a long transcript is noise, and a control that exists only on
+   hover cannot be reached without a mouse.
+   ========================================================================== */
+
+.msg-actions {
+  display: flex;
+  gap: 2px;
+  margin-top: 6px;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity .14s ease, transform .14s ease;
+  pointer-events: none;
+}
+/* UNDER the bubble, not inside it. In flow they made the user's own message
+   permanently taller by a row of buttons that is invisible most of the time,
+   and put two grey icons on the one piece of glass in the window. Absolute puts
+   them in the gap the feed already leaves between messages, so nothing moves
+   when they appear. */
+.bubble.user { position: relative; }
+.bubble.user .msg-actions {
+  position: absolute;
+  /* NO GAP. `top: calc(100% + 3px)` left three pixels of dead space between the
+     bubble and the buttons, and moving the pointer down to click one crossed
+     it: for those three pixels the pointer was over neither, `:hover` went
+     false, opacity went to 0 and pointer-events to none — so the row vanished
+     the instant you reached for it and the click landed on the page behind.
+     The row now starts at the bubble's own edge and carries the spacing as its
+     own padding, which makes the two hover targets touch. */
+  top: 100%;
+  right: 2px;
+  margin-top: 0;
+  padding-top: 4px;
+  justify-content: flex-end;
+}
+/* And a wider landing area than the icons themselves, for the same reason: a
+   28px-tall strip is a small thing to hit on the way down. The padding is on
+   the ROW, so it is part of the hover target without moving the buttons. */
+.bubble.user .msg-actions { padding-bottom: 4px; padding-left: 14px; }
+
+/* A BEAT BEFORE IT GOES. Even touching targets are easy to slip off by a pixel
+   mid-movement, and a row that flickers out under the cursor is worse than one
+   that lingers. Appearing stays instant; only leaving is delayed. */
+.msg-actions { transition: opacity .14s ease .18s, transform .14s ease .18s; }
+.bubble:hover .msg-actions,
+.bubble:focus-within .msg-actions,
+.turn:hover > .msg-actions,
+.turn:focus-within > .msg-actions {
+  transition-delay: 0s;
+}
+.bubble:hover .msg-actions,
+.bubble:focus-within .msg-actions,
+.turn:hover > .msg-actions,
+.turn:focus-within > .msg-actions {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+/* Touch has no hover, so there is nothing to reveal — show them always. */
+@media (hover: none) {
+  .msg-actions { opacity: 1; transform: none; pointer-events: auto; }
+}
+
+.msg-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: color .12s ease, background .12s ease;
+}
+.msg-action svg { width: 13px; height: 13px; }
+.msg-action:hover { color: var(--text); background: rgba(190, 212, 255, .12); }
+/* The label is for the widest windows only; the icon carries it otherwise, and
+   the button keeps its aria-label either way. */
+.msg-action-label { display: none; }
+/* The confirmation is the word changing, so the word has to be visible for it —
+   at every window width, not only the wide ones. */
+.msg-action.done { color: #6fe09a; }
+.msg-action.failed { color: var(--danger); }
+.msg-action.done .msg-action-label,
+.msg-action.failed .msg-action-label { display: inline; }
+
+/* --- editing a message in place ------------------------------------------- */
+
+.bubble.user.editing { width: min(100%, 640px); max-width: 100%; }
+/* Everything the bubble normally shows is hidden rather than removed, so Cancel
+   cannot lose the message it is cancelling out of. */
+.bubble.user.editing > *:not(.msg-edit) { display: none; }
+
+.msg-edit { display: flex; flex-direction: column; gap: 9px; }
+.msg-edit-field {
+  width: 100%;
+  min-height: 40px;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15.5px;
+  line-height: 1.55;
+  resize: none;
+  outline: none;
+  caret-color: var(--accent-3);
+}
+.msg-edit-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.msg-edit-cancel, .msg-edit-send {
+  padding: 6px 15px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 520;
+  cursor: pointer;
+}
+.msg-edit-cancel { background: rgba(190, 212, 255, .1); color: var(--text-dim); }
+.msg-edit-cancel:hover { background: rgba(190, 212, 255, .18); color: var(--text); }
+.msg-edit-send {
+  background: linear-gradient(150deg, #6ea8ff, #5b74e8 60%, #7b62e0);
+  color: #fff;
+  box-shadow: 0 4px 16px rgba(91, 157, 255, .38), inset 0 1px 0 rgba(255, 255, 255, .28);
+}
+.msg-edit-send:hover { box-shadow: 0 6px 22px rgba(91, 157, 255, .5), inset 0 1px 0 rgba(255, 255, 255, .34); }
+
+@media (min-width: 820px) {
+  .msg-action-label { display: inline; }
+}
+
+/* ==========================================================================
+   PASS 9 — THE COMPOSE CARD
+   ==========================================================================
+   The one object on this surface that does something irreversible, so it is
+   the one object drawn to look like it: a pane with a header naming the
+   account it will send FROM, real form fields, and a single filled button.
+
+   It is a form, not a bubble, and it must not read as one — a message that
+   looks like the transcript around it is a message people scroll past.
+   ========================================================================== */
+
+.mail-card {
+  margin: 4px 0 2px;
+  border: 1px solid transparent;
+  border-radius: 18px;
+  overflow: hidden;
+  background:
+    linear-gradient(165deg, rgba(48, 61, 92, .5), rgba(18, 24, 38, .56)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18), var(--lift);
+}
+
+.mail-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 15px;
+  border-bottom: 1px solid rgba(255, 255, 255, .07);
+}
+.mail-account { display: flex; align-items: center; gap: 9px; min-width: 0; color: var(--text-dim); }
+.mail-account svg { flex: 0 0 auto; color: var(--accent); }
+.mail-account-text {
+  font-size: 13px;
+  font-weight: 520;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mail-state {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .3px;
+  color: var(--text-dim);
+  background: rgba(190, 212, 255, .12);
+}
+.mail-state.ok { color: #6fe09a; background: rgba(70, 196, 106, .16); }
+
+.mail-body { padding: 4px 15px 12px; }
+
+.mail-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, .06);
+}
+.mail-row[hidden] { display: none; }
+.mail-label {
+  flex: 0 0 52px;
+  padding-top: 5px;
+  font-size: 12.5px;
+  font-weight: 560;
+  color: var(--muted);
+}
+.mail-field { flex: 1 1 auto; min-width: 0; }
+
+.mail-addresses { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+
+.mail-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 5px 3px 10px;
+  border: 1px solid rgba(140, 175, 255, .28);
+  border-radius: 999px;
+  background: rgba(120, 160, 255, .14);
+  font-size: 12.5px;
+  color: var(--text);
+}
+.mail-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mail-chip-remove {
+  display: grid;
+  place-items: center;
+  width: 18px; height: 18px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.mail-chip-remove:hover { background: rgba(255, 255, 255, .16); color: #fff; }
+
+.mail-input {
+  flex: 1 1 90px;
+  min-width: 90px;
+  padding: 5px 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+  caret-color: var(--accent-3);
+}
+.mail-input::placeholder { color: var(--muted); }
+.mail-subject { width: 100%; font-size: 14.5px; font-weight: 520; }
+
+.mail-message {
+  width: 100%;
+  margin-top: 12px;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 14.5px;
+  line-height: 1.62;
+  resize: none;
+  outline: none;
+  caret-color: var(--accent-3);
+}
+
+.mail-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 15px 13px;
+  border-top: 1px solid rgba(255, 255, 255, .07);
+}
+.mail-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.mail-note.bad { color: #ff9a93; }
+.mail-note.ok { color: #6fe09a; }
+.mail-note:empty { display: none; }
+
+.mail-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: 0 0 auto; }
+
+.mail-cc-toggle {
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background:
+    linear-gradient(rgba(58, 72, 106, .4), rgba(30, 38, 58, .42)) padding-box,
+    var(--glass-rim-soft) border-box;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.mail-cc-toggle:hover { color: var(--text); }
+.mail-cc-toggle[hidden] { display: none; }
+
+.mail-connect, .mail-send {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 560;
+  cursor: pointer;
+}
+/* Google's button, in this window's material rather than Google's chrome. */
+.mail-connect {
+  color: var(--text);
+  background: rgba(255, 255, 255, .1);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .18);
+}
+.mail-connect:hover { background: rgba(255, 255, 255, .16); }
+.mail-connect svg { fill: currentColor; stroke: none; }
+
+.mail-send {
+  color: #fff;
+  background: linear-gradient(150deg, #6ea8ff, #5b74e8 60%, #7b62e0);
+  box-shadow: 0 4px 16px rgba(91, 157, 255, .4), inset 0 1px 0 rgba(255, 255, 255, .3);
+}
+.mail-send:hover:not(:disabled) { box-shadow: 0 6px 22px rgba(91, 157, 255, .55), inset 0 1px 0 rgba(255, 255, 255, .36); }
+.mail-send:disabled { opacity: .45; cursor: default; box-shadow: none; }
+
+/* Sent. Nothing here is a form any more, and it must not look like one. */
+.mail-card.sending { opacity: .8; }
+.mail-card.sent {
+  background:
+    linear-gradient(165deg, rgba(38, 62, 52, .5), rgba(16, 24, 30, .56)) padding-box,
+    linear-gradient(145deg, rgba(160, 240, 195, .4), rgba(70, 196, 106, .12) 55%, rgba(0, 0, 0, .3)) border-box;
+}
+.mail-card.sent .mail-account svg { color: #6fe09a; }
+.mail-card.sent .mail-row { border-bottom-color: rgba(255, 255, 255, .04); }
+.mail-card.sent input, .mail-card.sent textarea { color: var(--text-dim); }
+
+@media (max-width: 620px) {
+  .mail-row { flex-direction: column; gap: 2px; }
+  .mail-label { flex: none; padding-top: 0; }
+  .mail-foot { flex-wrap: wrap; }
+}
+
+/* A draft from a chat that was re-opened: readable, and not a control. */
+.mail-card.archived { opacity: .82; }
+.mail-card.archived .mail-row { border-bottom-color: rgba(255, 255, 255, .04); }
+.mail-card.archived input, .mail-card.archived textarea { color: var(--text-dim); }
+.mail-card.archived .mail-chip { background: rgba(120, 160, 255, .08); border-color: rgba(140, 175, 255, .16); }
+.mail-card.archived .mail-foot { justify-content: flex-start; }
+
+/* --- the connected account, in the ⋯ menu --------------------------------- */
+
+.more-mail {
+  padding: 4px 2px 6px;
+  margin: 0 0 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, .06);
+  font-size: 13px;
+}
+.more-mail[hidden] { display: none; }
+.more-mail-head {
+  padding: 4px 8px 6px;
+  font-size: 11px;
+  font-weight: 620;
+  letter-spacing: .7px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.more-mail-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: 10px;
+}
+.more-mail-row:hover { background: rgba(190, 212, 255, .07); }
+.more-mail-text { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.more-mail-address {
+  color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.more-mail-text em {
+  flex: 0 0 auto;
+  font-style: normal;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.more-mail-disconnect {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 5px 11px;
+  border: 1px solid rgba(255, 107, 98, .3);
+  border-radius: 999px;
+  background: rgba(255, 107, 98, .1);
+  color: #ff9a93;
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.more-mail-disconnect:hover { background: rgba(255, 107, 98, .18); color: #ffb3ad; }
+.more-mail-disconnect:disabled { opacity: .5; cursor: default; }
+
+/* ==========================================================================
+   PASS 10a — THE COMPOSER GREW A TOOLBAR AND AN ACCOUNT PICKER
+   ==========================================================================
+   "Why will the user use our application instead of Gmail if they cannot
+   format text like it?" — right question. And: more than one account, because
+   people have more than one.
+   ========================================================================== */
+
+/* --- which account this goes out as --------------------------------------- */
+
+.mail-account-wrap { position: relative; display: inline-flex; min-width: 0; }
+
+.mail-account {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 5px 9px 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  cursor: pointer;
+  transition: background .13s ease, color .13s ease, border-color .13s ease;
+}
+.mail-account:hover, .mail-account.open {
+  color: var(--text);
+  background: rgba(190, 212, 255, .09);
+  border-color: rgba(255, 255, 255, .1);
+}
+.mail-account:disabled { cursor: default; background: transparent; border-color: transparent; }
+.mail-account > svg:first-child { flex: 0 0 auto; color: var(--accent); }
+.mail-account-text {
+  font-size: 13px;
+  font-weight: 520;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mail-account-caret { flex: 0 0 auto; color: var(--muted); transition: transform .15s ease; }
+.mail-account.open .mail-account-caret { transform: rotate(180deg); }
+/* No choice to make, so nothing that looks like a control. */
+.mail-account.mail-account-flat .mail-account-caret { display: none; }
+
+.mail-account-menu {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  z-index: 60;
+  min-width: 250px;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: 15px;
+  background:
+    linear-gradient(165deg, rgba(48, 60, 90, .5), rgba(18, 24, 38, .56)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2), var(--lift);
+  animation: menu-rise .13s ease-out;
+}
+.mail-account-menu[hidden] { display: none; }
+
+.mail-account-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.mail-account-item:hover { background: rgba(190, 212, 255, .1); }
+.mail-account-tick { display: grid; place-items: center; width: 14px; flex: 0 0 auto; color: transparent; }
+.mail-account-item.chosen .mail-account-tick { color: var(--accent); }
+.mail-account-add { color: var(--text-dim); }
+.mail-account-add .mail-account-tick { color: var(--muted); }
+.mail-account-add:hover { color: var(--text); }
+.mail-account-address { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* --- the formatting toolbar ------------------------------------------------ */
+
+.mail-compose { margin-top: 10px; }
+
+.mail-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  padding: 4px;
+  margin-bottom: 8px;
+  border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 12px;
+  background: rgba(10, 14, 22, .35);
+}
+.mail-toolbar-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: rgba(255, 255, 255, .1);
+}
+
+.mail-tool {
+  display: grid;
+  place-items: center;
+  width: 30px; height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.mail-tool:hover { background: rgba(190, 212, 255, .13); color: var(--text); }
+/* On, as in "the caret is inside bold text". Read from the engine's own
+   queryCommandState, so the button cannot disagree with the document. */
+.mail-tool.on {
+  color: #cfe0ff;
+  background: rgba(120, 160, 255, .22);
+  box-shadow: inset 0 0 0 1px rgba(150, 185, 255, .3);
+}
+/* Nothing selected, so there is nothing to link. */
+@media (prefers-reduced-motion: no-preference) {
+  .mail-tool.nudge { animation: tool-nudge .35s ease-in-out 2; }
+  @keyframes tool-nudge {
+    0%, 100% { transform: translateX(0); }
+    30% { transform: translateX(-2px); }
+    70% { transform: translateX(2px); }
+  }
+}
+.mail-tool.nudge { color: #ff9a93; }
+
+/* --- the message itself ---------------------------------------------------- */
+
+.mail-message {
+  min-height: 132px;
+  max-height: 460px;
+  overflow-y: auto;
+  padding: 4px 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 14.5px;
+  line-height: 1.62;
+  outline: none;
+  caret-color: var(--accent-3);
+  word-break: break-word;
+}
+.mail-message:empty::before {
+  content: "Write your message…";
+  color: var(--muted);
+  pointer-events: none;
+}
+.mail-message p { margin: 0 0 .85em; }
+.mail-message p:last-child { margin-bottom: 0; }
+.mail-message ul, .mail-message ol { margin: 0 0 .85em; padding-left: 22px; }
+.mail-message li { margin: 3px 0; }
+.mail-message a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.mail-message blockquote {
+  margin: 0 0 .85em;
+  padding-left: 12px;
+  border-left: 2px solid rgba(190, 212, 255, .28);
+  color: var(--text-dim);
+}
+.mail-message strong, .mail-message b { font-weight: 650; color: #fff; }
+
+/* --- the link box ---------------------------------------------------------- */
+
+.mail-link-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+  padding: 5px 6px 5px 10px;
+  border: 1px solid rgba(255, 255, 255, .1);
+  border-radius: 11px;
+  background: rgba(10, 14, 22, .45);
+}
+.mail-link-row[hidden] { display: none; }
+.mail-link-input { flex: 1 1 auto; min-width: 0; font-size: 13px; }
+.mail-link-input.bad { color: #ff9a93; }
+.mail-link-apply {
+  flex: 0 0 auto;
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(120, 160, 255, .22);
+  color: #dbe7ff;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 540;
+  cursor: pointer;
+}
+.mail-link-apply:hover { background: rgba(120, 160, 255, .34); }
+.mail-link-cancel {
+  display: grid;
+  place-items: center;
+  width: 24px; height: 24px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.mail-link-cancel:hover { color: var(--text); background: rgba(190, 212, 255, .12); }
+
+/* Sent and archived cards keep the formatting but stop being controls. */
+.mail-card.sent .mail-message, .mail-card.archived .mail-message { color: var(--text-dim); min-height: 0; }
+.mail-card.sent .mail-message:empty::before, .mail-card.archived .mail-message:empty::before { content: none; }
+
+/* ==========================================================================
+   PASS 11 — TAKE THE GRADIENTS OUT
+   ==========================================================================
+   "It still looks like gradient AI slop with no life."
+
+   Correct, and PASS 8 is why. Asked for glass, I reached for four large
+   radial gradients in four different hues — blue, violet, cyan, magenta — at
+   25-30% alpha, because backdrop-filter needs something behind it to be
+   visible at all. That solved the physics and created the cliche: a big soft
+   multicoloured wash behind translucent panels is the single most recognisable
+   signature of a machine-generated interface, and no amount of blur makes it
+   look considered.
+
+   WHAT REAL DARK SOFTWARE DOES INSTEAD. Look at anything with a designer near
+   it and the background is one near-neutral colour. The depth does not come
+   from hue. It comes from:
+
+   1. WHITE AT LOW ALPHA. Every raised surface is white over the base at 3-8%,
+      not a coloured gradient. That is what makes a stack of panels read as one
+      material lit from one direction, and it is why glass over it looks like
+      frosted GREY glass, which is what glass actually looks like.
+   2. GRAIN. Real surfaces have texture. One fine noise layer at 3% turns a
+      flat fill into a material, and its absence is most of why a CSS gradient
+      reads as a CSS gradient. This is an inline SVG feTurbulence — no image
+      file, no request, no JavaScript.
+   3. ONE LIGHT. A single cool wash at the top, low enough to be felt and not
+      seen, so panels near the top of the window are fractionally brighter than
+      panels near the bottom. That is a light source. Four coloured blobs are
+      not.
+   4. THE ACCENT IS SPENT ON CONTROLS. Blue appears on the send button, the
+      focus ring, links and the on-state of a toolbar button. Nowhere else.
+
+   Everything below is colour and material only. Not one layout rule changes,
+   which is deliberate: the arrangement was not the problem.
+   ========================================================================== */
+
+:root {
+  /* One neutral, very slightly cool. Every surface above it is white at a
+     stated alpha, so the whole ladder is one decision instead of nine hex
+     codes that drift apart. */
+  --bg: #0a0b0e;
+  --bg-raised: rgba(255, 255, 255, .026);
+  --panel: rgba(255, 255, 255, .04);
+  --panel-2: rgba(255, 255, 255, .062);
+  --panel-3: rgba(255, 255, 255, .085);
+
+  --border: rgba(255, 255, 255, .09);
+  --border-soft: rgba(255, 255, 255, .055);
+  --border-strong: rgba(255, 255, 255, .15);
+
+  --text: #ecedf0;
+  --text-dim: #a4a7b0;
+  --muted: #71757f;
+
+  --accent: #5b9dff;
+  --accent-2: #7c8cff;
+  --accent-3: #63d9e6;
+
+  /* Glass: white, thin, neutral. The tint that was here has gone — a panel
+     with its own hue is a panel, not a pane. */
+  --glass: rgba(255, 255, 255, .045);
+  --glass-strong: rgba(255, 255, 255, .075);
+
+  /* A LIT EDGE IS TWO EDGES, and both are white. Bright where the light lands,
+     dark where it does not, no colour in either. */
+  --glass-rim: linear-gradient(145deg,
+    rgba(255, 255, 255, .34) 0%,
+    rgba(255, 255, 255, .1) 26%,
+    rgba(0, 0, 0, .26) 62%,
+    rgba(255, 255, 255, .09) 100%);
+  --glass-rim-soft: linear-gradient(145deg,
+    rgba(255, 255, 255, .17) 0%,
+    rgba(255, 255, 255, .05) 30%,
+    rgba(0, 0, 0, .18) 66%,
+    rgba(255, 255, 255, .045) 100%);
+  --hairline: var(--glass-rim);
+  --hairline-soft: var(--glass-rim-soft);
+
+  --frost: blur(24px) saturate(140%) brightness(1.1);
+  --frost-deep: blur(40px) saturate(150%) brightness(1.14);
+
+  /* Shadows do the work the gradients were doing. Two of them: a tight one
+     that seats an element, and a long soft one that lifts it. */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .5);
+  --shadow-2: 0 8px 24px -12px rgba(0, 0, 0, .8);
+  --shadow-3: 0 28px 60px -24px rgba(0, 0, 0, .95);
+  --lift: 0 24px 56px -24px rgba(0, 0, 0, .92), 0 4px 14px -6px rgba(0, 0, 0, .6);
+  --ring: 0 0 0 3px rgba(91, 157, 255, .17);
+}
+
+/* --- the room -------------------------------------------------------------- */
+/*
+ * ONE light, from above, in a colour so weak it reads as brightness rather than
+ * as blue. Compare the four-hue version this replaces: that had to be strong to
+ * be seen through a blur, and anything strong enough to be seen through a blur
+ * is far too strong to sit behind text.
+ */
+body {
+  background:
+    radial-gradient(1100px 560px at 50% -14%, rgba(120, 160, 235, .12), transparent 66%),
+    radial-gradient(760px 500px at 84% 104%, rgba(120, 140, 200, .05), transparent 62%),
+    var(--bg);
+}
+
+/* The grid, quieter now that it is not competing with a light show. Straight
+   lines going soft behind a pane are the depth cue; they do not need to shout. */
+body::before {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, .028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, .028) 1px, transparent 1px);
+  background-size: 56px 56px;
+  -webkit-mask-image: radial-gradient(1300px 900px at 50% 0%, #000 0%, transparent 80%);
+  mask-image: radial-gradient(1300px 900px at 50% 0%, #000 0%, transparent 80%);
+}
+
+/*
+ * GRAIN, and the vignette under it.
+ *
+ * The noise is one inline SVG: fractal turbulence, tiled by the browser, at a
+ * few percent. At that strength nobody sees it and everybody feels it — it is
+ * the difference between a surface and a fill. `mix-blend-mode: overlay` keeps
+ * it out of the blacks, so the dark parts stay clean instead of going grey.
+ */
+body::after {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.4'/%3E%3C/svg%3E"),
+    radial-gradient(135% 105% at 50% 40%, transparent 60%, rgba(0, 0, 0, .5) 100%);
+  background-size: 160px 160px, cover;
+  mix-blend-mode: overlay;
+  opacity: .5;
+}
+/* Anybody who has asked for less motion has usually asked for less of
+   everything; the grain is decoration and it costs a composite layer. */
+@media (prefers-reduced-motion: reduce) {
+  body::after {
+    background-image: radial-gradient(135% 105% at 50% 40%, transparent 60%, rgba(0, 0, 0, .5) 100%);
+    mix-blend-mode: normal;
+    opacity: 1;
+  }
+}
+
+/* --- the panes, restated in white ------------------------------------------ */
+
+.demo-topbar {
+  background: rgba(255, 255, 255, .035);
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .09),
+    inset 0 -1px 0 rgba(0, 0, 0, .4),
+    0 10px 30px -26px rgba(0, 0, 0, 1);
+}
+
+.chats-panel {
+  background: rgba(255, 255, 255, .022);
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  border-right: 1px solid rgba(255, 255, 255, .06);
+  box-shadow: inset -1px 0 0 rgba(0, 0, 0, .3);
+}
+
+.chat-bar {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, .075), rgba(255, 255, 255, .035)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .14),
+    inset 0 -20px 36px -34px rgba(0, 0, 0, .9),
+    var(--lift);
+}
+.chat-bar:focus-within {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, .095), rgba(255, 255, 255, .045)) padding-box,
+    var(--glass-rim) border-box;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .2), var(--lift), var(--ring);
+}
+.composer-sheen::after { background: radial-gradient(120% 90% at 14% -34%, rgba(255, 255, 255, .07), transparent 56%); }
+
+.more-menu, .attach-menu, .model-menu, .connect-card, .mail-account-menu {
+  background:
+    linear-gradient(165deg, rgba(38, 40, 48, .84), rgba(20, 21, 26, .88)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .14), var(--lift);
+}
+
+/* The user's own words. Raised, neutral, and the brightest pane on screen —
+   which is what makes it read as "this one is mine" without a colour. */
+.bubble.user {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, .1), rgba(255, 255, 255, .055)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost);
+  -webkit-backdrop-filter: var(--frost);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .16),
+    0 12px 28px -20px rgba(0, 0, 0, .9);
+}
+
+.step {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, .055), rgba(255, 255, 255, .03)) padding-box,
+    var(--glass-rim-soft) border-box;
+  backdrop-filter: var(--frost);
+  -webkit-backdrop-filter: var(--frost);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .08), 0 10px 24px -22px rgba(0, 0, 0, .9);
+}
+.step:hover {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, .085), rgba(255, 255, 255, .045)) padding-box,
+    var(--glass-rim) border-box;
+}
+/* A failed row is the ONE place a hue is allowed to flood a panel, because it
+   is the one place the colour is the message. */
+.step.bad {
+  background:
+    linear-gradient(150deg, rgba(255, 107, 98, .14), rgba(255, 255, 255, .035) 46%) padding-box,
+    linear-gradient(145deg, rgba(255, 168, 160, .5), rgba(255, 107, 98, .12) 60%, rgba(0, 0, 0, .28)) border-box;
+}
+.step-output { background: rgba(0, 0, 0, .42); border-color: rgba(255, 255, 255, .05); }
+.step-tool { color: #9fb8dd; background: rgba(120, 160, 235, .1); border-color: rgba(120, 160, 235, .16); }
+.step-arg { background: rgba(255, 255, 255, .045); }
+
+.suggestion {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, .045), rgba(255, 255, 255, .022)) padding-box,
+    var(--glass-rim-soft) border-box;
+  backdrop-filter: var(--frost);
+  -webkit-backdrop-filter: var(--frost);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07);
+  color: var(--text-dim);
+}
+.suggestion:hover {
+  color: var(--text);
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, .085), rgba(255, 255, 255, .045)) padding-box,
+    var(--glass-rim) border-box;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .16), 0 14px 30px -22px rgba(0, 0, 0, .9);
+}
+
+.attachment-chip, .mail-card {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, .075), rgba(255, 255, 255, .04)) padding-box,
+    var(--glass-rim) border-box;
+  backdrop-filter: var(--frost);
+  -webkit-backdrop-filter: var(--frost);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .13), var(--shadow-2);
+}
+.mail-card {
+  backdrop-filter: var(--frost-deep);
+  -webkit-backdrop-filter: var(--frost-deep);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .14), var(--lift);
+}
+.mail-card.sent {
+  background:
+    linear-gradient(160deg, rgba(70, 196, 106, .12), rgba(255, 255, 255, .035) 48%) padding-box,
+    linear-gradient(145deg, rgba(150, 235, 185, .42), rgba(70, 196, 106, .1) 58%, rgba(0, 0, 0, .28)) border-box;
+}
+.mail-toolbar { background: rgba(0, 0, 0, .26); border-color: rgba(255, 255, 255, .06); }
+.mail-link-row { background: rgba(0, 0, 0, .3); border-color: rgba(255, 255, 255, .08); }
+
+.composer-icon, .model-button, .topbar-button, .topbar-actions .icon-button, .new-chat-row, .mail-cc-toggle {
+  background:
+    linear-gradient(rgba(255, 255, 255, .06), rgba(255, 255, 255, .03)) padding-box,
+    var(--glass-rim-soft) border-box;
+}
+.composer-icon:hover, .model-button:hover, .model-button.open,
+.topbar-button:hover, .topbar-actions .icon-button:hover, .new-chat-row:hover, .mail-cc-toggle:hover {
+  background:
+    linear-gradient(rgba(255, 255, 255, .11), rgba(255, 255, 255, .06)) padding-box,
+    var(--glass-rim) border-box;
+}
+body.sidebar-open #chatsButton, body.sidebar-open .sidebar-toggle {
+  background:
+    linear-gradient(rgba(255, 255, 255, .11), rgba(255, 255, 255, .06)) padding-box,
+    var(--glass-rim) border-box;
+}
+
+/* --- the accent, spent where it means something ---------------------------- */
+
+/* The brand mark keeps its glow; it is the one piece of art in the window. */
+.brand .logo { filter: drop-shadow(0 1px 9px rgba(150, 185, 255, .34)); }
+/* The wordmark and the greeting were both gradients across their letters. One
+   colour, one weight — a sentence that is worth reading carries itself. */
+.brand h1 {
+  background: none;
+  -webkit-text-fill-color: currentColor;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.welcome h2 {
+  background: none;
+  -webkit-text-fill-color: currentColor;
+  color: #f7f8fa;
+  font-weight: 620;
+  letter-spacing: -.024em;
+}
+
+#sendButton, .mail-send, .msg-edit-send {
+  background: linear-gradient(180deg, #6aa5ff, #4d7fe8);
+  box-shadow: 0 3px 12px rgba(77, 127, 232, .38), inset 0 1px 0 rgba(255, 255, 255, .28);
+}
+#sendButton:hover, .mail-send:hover:not(:disabled), .msg-edit-send:hover {
+  background: linear-gradient(180deg, #7db2ff, #5b8df0);
+  box-shadow: 0 5px 18px rgba(77, 127, 232, .5), inset 0 1px 0 rgba(255, 255, 255, .34);
+}
+.chat-bar textarea { caret-color: var(--accent); }
+.md a, .mail-message a { color: #8ab6ff; }
+
+/* --- life: things that answer when you touch them -------------------------- */
+/*
+ * "No life" is also this. A surface with no press state feels like a picture of
+ * an application rather than an application. None of these move anything by
+ * more than a pixel.
+ */
+button:active:not(:disabled) { transform: translateY(.5px); }
+#sendButton:active:not(:disabled) { transform: scale(.94); }
+.step { transition: background .18s ease, box-shadow .18s ease, border-color .18s ease; }
+.msg-action, .mail-tool, .mail-account { transition: background .12s ease, color .12s ease, border-color .12s ease; }
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Each turn arrives rather than appearing. Once, on the container — not on
+     every row inside it, which is how a transcript ends up shimmering. */
+  .turn, .bubble.user, .mail-card { animation: rise .16s cubic-bezier(.22, .8, .3, 1); }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: none; }
+  }
+}
+
+/* --- type, tightened ------------------------------------------------------- */
+
+.md h2, .md h3 { letter-spacing: -.015em; }
+.step-verb { letter-spacing: -.005em; }
+.md strong { color: #fbfcfe; }
+
+/* The scrollbar, neutral like everything else. */
+* { scrollbar-color: rgba(255, 255, 255, .16) transparent; }
+*::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .14); background-clip: content-box; }
+*::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .3); background-clip: content-box; }
+
+/* ==========================================================================
+   PASS 12 — READABLE, AND NOT EMPTY
+   ==========================================================================
+   Two complaints, and the first one is measurable rather than a matter of
+   taste: "the gradients are right now such that you can't even read some text
+   properly because of the gray."
+
+   MEASURED, NOT GUESSED. WCAG contrast of every dim colour against the real
+   composited background — the page base with a panel's white overlay on top of
+   it, which is what text actually sits on here:
+
+       --text     #ecedf0   15.3:1   fine
+       --text-dim #a4a7b0    7.5:1   fine
+       --muted    #71757f    3.9:1   FAILS (AA needs 4.5:1)
+
+   `--muted` is not a minor colour. It is the model hint, every step argument,
+   every attachment note, the mail labels, the placeholder in the composer, the
+   timestamps in the sidebar and the "Thought for a moment" line. One value
+   under the threshold made a third of the interface hard to read, and PASS 11
+   made it worse by raising the panels' `brightness()` — which lifts whatever
+   is behind them into exactly the grey range the text was in.
+
+   Three fixes, in order of how much each was worth:
+   1. --muted goes to 5.3:1 and --text-dim to 8.7:1.
+   2. The panel `brightness()` comes down, so a pane stops lightening the
+      background into its own text.
+   3. Panels get a little more opaque, so text sits on a consistent ground
+      instead of on whatever happens to be behind that part of the window.
+
+   Then the second: "our application looks empty and boring." The first screen
+   was a heading, a sentence and six grey lozenges. It is six cards now, each
+   saying what KIND of thing it is, and the sidebar — previously one button and
+   a lot of nothing — has search and date grouping.
+   ========================================================================== */
+
+:root {
+  /* Both measured against a panel, not against the page: the page is the
+     easier background and quoting it would have been flattering the numbers. */
+  --text: #eff0f3;      /* 15.9:1 */
+  --text-dim: #b6b9c2;  /*  8.7:1 */
+  --muted: #8b8f9a;     /*  5.3:1 */
+
+  /* A pane should not act as a light. 1.14 was lifting the background behind
+     every panel toward the grey its own secondary text was written in. */
+  --frost: blur(24px) saturate(135%) brightness(1.04);
+  --frost-deep: blur(40px) saturate(145%) brightness(1.06);
+}
+
+/* Slightly more opaque, so a line of text reads the same wherever the panel
+   happens to be over the window. */
+.step {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, .075), rgba(255, 255, 255, .045)) padding-box,
+    var(--glass-rim-soft) border-box;
+}
+.bubble.user {
+  background:
+    linear-gradient(160deg, rgba(255, 255, 255, .12), rgba(255, 255, 255, .07)) padding-box,
+    var(--glass-rim) border-box;
+}
+
+/* The grain and the vignette both sit UNDER the content, but a translucent
+   panel lets them through — so the vignette was darkening text at the edges of
+   the window, which is where the composer and the sidebar are. */
+body::after { opacity: .38; }
+
+/* Things that were quietly under the line. */
+.turn-cost { color: #8b8f9a; }
+.step-arg { color: #c3c7d0; }
+.agent-observed, .thinking-body, .thinking-summary { color: #a2a6b0; }
+.chat-bar textarea::placeholder, .mail-input::placeholder { color: #8b8f9a; }
+.mail-label { color: #9ba0aa; }
+.attachment-note, .chat-open .chat-when { color: #90949e; }
+.search-hit-snippet { color: #a2a6b0; }
+.md code { color: #dfe4ee; }
+.step-output { color: #ccd2dc; }
+
+/* ==========================================================================
+   The first screen
+   ========================================================================== */
+
+.welcome { padding-bottom: 4px; }
+.welcome h2 { margin-bottom: 10px; }
+.welcome .muted { color: var(--text-dim); font-size: 14.5px; }
+
+.suggestions { gap: 10px; margin-top: 26px; }
+
+.suggestion {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 13px 14px;
+  border-radius: 16px;
+  text-align: left;
+}
+.suggestion-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, .08);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, .05);
+  color: var(--text-dim);
+  transition: color .14s ease, background .14s ease, border-color .14s ease;
+}
+.suggestion:hover .suggestion-icon {
+  color: #a9caff;
+  background: rgba(110, 165, 255, .16);
+  border-color: rgba(110, 165, 255, .28);
+}
+.suggestion-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.suggestion-text strong {
+  font-size: 13.5px;
+  font-weight: 560;
+  color: var(--text);
+  letter-spacing: -.005em;
+}
+.suggestion-text em {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.suggestion:hover .suggestion-text em { color: var(--text-dim); }
+
+/* ==========================================================================
+   The sidebar, carrying something
+   ========================================================================== */
+
+.chat-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 10px 8px;
+  padding: 7px 11px;
+  border: 1px solid rgba(255, 255, 255, .07);
+  border-radius: 11px;
+  background: rgba(0, 0, 0, .25);
+  color: var(--muted);
+  transition: border-color .14s ease, background .14s ease;
+}
+.chat-search:focus-within {
+  border-color: rgba(110, 165, 255, .38);
+  background: rgba(0, 0, 0, .35);
+}
+.chat-search .icon { flex: 0 0 auto; }
+.chat-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+  caret-color: var(--accent);
+}
+.chat-search input::placeholder { color: var(--muted); }
+/* Chromium draws its own X on a search input, in its own grey, at its own
+   size — the one control in this window not drawn by this stylesheet. */
+.chat-search input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+
+.chat-group {
+  padding: 12px 10px 5px;
+  font-size: 10.5px;
+  font-weight: 640;
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.chat-list li.chat-group:first-child { padding-top: 4px; }
+
+.chat-open .chat-title { font-size: 13px; }
+.chat-open .chat-when { font-size: 11px; margin-top: 2px; }
+.chat-list .empty { color: var(--muted); font-size: 12.5px; padding: 14px 10px; }
+
+/* ==========================================================================
+   Odds and ends the density change exposed
+   ========================================================================== */
+
+/* A single-column list of cards at a narrow width is fine; two is better once
+   there is room, and the old breakpoint left a lot of white space at 900px. */
+@media (min-width: 760px) {
+  .suggestions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* The mail card sat flush against the answer above it. */
+.mail-card { margin: 4px 0 2px; }
+
+/* ==========================================================================
+   PASS 12 — the composer grows, and a tool call stops shouting
+   --------------------------------------------------------------------------
+   Two complaints, one functional and one about the surface. The rules live down
+   here rather than being edited into the passes above because each one
+   overrides something that is still correct in its own generation; nothing
+   above is changed, this is the layer that has the last word.
+   ========================================================================== */
+
+/* --- 1. THE COMPOSER GROWS WITH THE TEXT ---------------------------------- */
+
+/* THE DEFECT: `#chatInput` has carried `flex: 1` since PASS 1, when `.chat-bar`
+   was a flex ROW and the textarea sat beside the send button. A later pass
+   turned the composer into `flex-direction: column` — which makes the main axis
+   VERTICAL — and left the item alone. `flex: 1` is `flex-basis: 0%`, and a
+   flex-basis REPLACES `height` for main-axis sizing. So demo.js computed the
+   right height, set it inline, and layout discarded it: measured live in the
+   running app, inline `height: 160px` against a computed `41.25px`. You typed a
+   paragraph, the box stayed one line tall, and the text scrolled up out of
+   sight above the caret.
+
+   `flex: 0 0 auto` gives `height` back its meaning. The ID selector is not
+   decoration — the rule being overridden is `#chatInput`, and no class can
+   reach it. */
+#chatInput {
+  flex: 0 0 auto;
+  /* THE ONLY CEILING. demo.js sets the natural height and this clamps it, so
+     the growth limit is one number in one place; it used to be hard-coded in
+     both files, which is how they drifted. `40vh` keeps it sane on a short
+     window, `340px` stops it eating a tall one. */
+  max-height: min(340px, 40vh);
+  overflow-y: auto;
+  /* A later pass set these on `.chat-bar textarea` and this `#chatInput` rule
+     outranked it, so the composer has been running on the older, tighter type
+     the whole time. Restated at the specificity that actually wins. */
+  padding: 10px 10px 6px;
+  font-size: 15.5px;
+  line-height: 1.55;
+}
+/* Once it is tall enough to scroll it needs a scrollbar that belongs to a
+   rounded glass box, not the browser's grey slab against the corner. */
+#chatInput::-webkit-scrollbar { width: 10px; }
+#chatInput::-webkit-scrollbar-track { background: transparent; }
+#chatInput::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .13);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 99px;
+}
+#chatInput::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .24); background-clip: content-box; }
+
+/* --- 2. A TOOL CALL IS EVIDENCE, NOT AN ANNOUNCEMENT ---------------------- */
+
+/* WHAT IT LOOKED LIKE: every tool call was a full-width floating card with a
+   15px radius, a drop shadow, a 27px framed icon badge, a coloured stripe down
+   its left edge, TWO differently tinted capsules side by side inside a 13px
+   row, and — on a failure — a maroon gradient washed across the whole box.
+   Five channels drawing one boolean, and a run of six steps read as a stack of
+   toys rather than as a record of what the machine did.
+
+   WHAT IT IS NOW: a log. Consecutive steps join into one block with a hairline
+   between them, the way a terminal or a diff does, so ten of them are one
+   object on the page instead of ten. Colour is spent only where it carries
+   information — which tool ran, and how it ended. */
+
+.step {
+  border-radius: 10px;
+  /* No lift. Evidence is part of the conversation, not floating above it, and
+     a shadow under each of six stacked rows is six shadows. */
+  box-shadow: none;
+  background:
+    linear-gradient(rgba(255, 255, 255, .028), rgba(255, 255, 255, .028)) padding-box,
+    linear-gradient(rgba(255, 255, 255, .07), rgba(255, 255, 255, .07)) border-box;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  margin: 0;
+  transition: background .14s ease;
+}
+/* THE COLOURED STRIPE GOES. It is the third place the same boolean was drawn —
+   after the icon's tint and the marker at the end of the row — and it is the
+   one that made a settled transcript look like a column of notifications. */
+.step.ok, .step.bad, .step.running, .step.unknown { border-left-color: transparent; }
+
+/* ONE BLOCK, NOT A STACK OF CARDS. Adjacent steps share an edge, so the seam
+   between two rows is a single hairline instead of two borders and a gap.
+
+   THE GAP IS THE TURN'S, NOT THE STEP'S. `.turn` is a flex column with `gap`,
+   and gap is not a margin: an item cannot opt out of it, it can only pull back
+   across it. So the cancelling margin has to equal the gap exactly, and a
+   hard-coded `-9px` here would silently reopen the seam the day somebody
+   retuned the turn's spacing. Both ends now read the same custom property. */
+.turn { --turn-gap: 9px; gap: var(--turn-gap); }
+.step + .step {
+  margin-top: calc(-1 * var(--turn-gap) - 1px);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.step:has(+ .step) {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+/* The block as a whole gets the breathing room the individual rows gave up. */
+.step:first-of-type { margin-top: 6px; }
+.step:last-of-type { margin-bottom: 6px; }
+/* Lifted in z, not in shadow, so the hovered row's border is the one drawn over
+   the seam rather than half of it disappearing under its neighbour. */
+.step:hover {
+  position: relative;
+  z-index: 1;
+  box-shadow: none;
+  background:
+    linear-gradient(rgba(255, 255, 255, .052), rgba(255, 255, 255, .052)) padding-box,
+    linear-gradient(rgba(255, 255, 255, .12), rgba(255, 255, 255, .12)) border-box;
+}
+/* An open step is being read, so it leaves the block and becomes its own card
+   again — a step still running with a progress bar in it, or one that failed
+   and stayed open because its output is the reason the reader is here. */
+.step[open] {
+  position: relative;
+  z-index: 1;
+  border-radius: 10px;
+  margin-top: 2px;
+  margin-bottom: 2px;
+}
+.step[open] + .step {
+  border-top-left-radius: 10px;
+  border-top-right-radius: 10px;
+  margin-top: 2px;
+}
+
+.step-head { padding: 7px 11px 7px 9px; gap: 8px; font-size: 12.5px; }
+
+/* The icon carries WHICH tool ran, which is what makes a column of rows
+   scannable at a glance, so it stays — at the size of a glyph rather than of an
+   app icon, and without the frame that made every row look like a list item in
+   a phone's settings screen. */
+.step-icon {
+  width: 20px; height: 20px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+.step-icon svg { width: 14px; height: 14px; }
+.step.running .step-icon { color: var(--accent-3); background: transparent; border: 0; }
+.step.bad .step-icon { color: #ff8a83; background: transparent; border: 0; }
+.step:hover .step-icon { color: var(--text-dim); }
+
+.step-verb { font-weight: 500; color: var(--text-dim); max-width: 30ch; }
+.step:hover .step-verb, .step[open] .step-verb { color: var(--text); }
+
+/* CAPSULES OFF. The tool id and its argument are machine facts and they already
+   read as machine facts in monospace; boxing each one in its own tinted,
+   bordered pill is what made the row look like a toy. The separation those were
+   drawn for is carried by colour and by one thin divider instead. */
+.step-tool {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 11.5px;
+  letter-spacing: .1px;
+  color: #7f93b5;
+}
+.step-arg {
+  background: transparent;
+  padding: 0;
+  font-size: 11.5px;
+  color: var(--muted);
+  max-width: 40ch;
+}
+.step-result {
+  padding-left: 9px;
+  border-left: 1px solid rgba(255, 255, 255, .08);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* The outcome, small, at the end. A tick that needs a filled disc behind it to
+   be visible is a tick being asked to do too much. */
+.step-state.ok { color: #5cc98b; background: transparent; }
+.step-state.bad { color: #ff8a83; background: transparent; }
+.step-state.unknown { background: rgba(255, 255, 255, .22); }
+.step-state svg { width: 12px; height: 12px; }
+
+/* A FAILURE IS MARKED, NOT WASHED. The gradient across the whole card made the
+   one row you most need to read the hardest row to read — the output sat on a
+   red field. The tint is flat and faint now, and the emphasis is carried by the
+   edge. This is the ONE place a coloured stripe earns its keep: it is the only
+   row in the block that is not like the others, and the block is the thing the
+   eye is scanning. */
+.step.bad {
+  border-left: 2px solid rgba(255, 107, 98, .55);
+  background:
+    linear-gradient(rgba(255, 107, 98, .035), rgba(255, 107, 98, .035)) padding-box,
+    linear-gradient(rgba(255, 107, 98, .22), rgba(255, 107, 98, .22)) border-box;
+}
+.step.bad:hover {
+  background:
+    linear-gradient(rgba(255, 107, 98, .06), rgba(255, 107, 98, .06)) padding-box,
+    linear-gradient(rgba(255, 107, 98, .34), rgba(255, 107, 98, .34)) border-box;
+}
+.step.bad .step-verb { color: #ffb0aa; }
+/* Its output is the reason the row stayed open, so it is read on the same flat
+   dark ground as every other output rather than through the red. */
+.step.bad .step-output { background: rgba(0, 0, 0, .34); }
+
+/* The output is the evidence. Flat, dark and monospace, divided from the
+   summary by a rule rather than by a rounded box inside a rounded box. */
+.step-output {
+  margin: 0;
+  padding: 10px 12px 12px 13px;
+  background: rgba(0, 0, 0, .28);
+  border-top: 1px solid rgba(255, 255, 255, .06);
+  border-radius: 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #b9c4d4;
+}
+.step-chevron { color: var(--muted); }
+
+/* --- 3. THE ROOM THE CONVERSATION IS IN ----------------------------------- */
+
+/* The surface was flat near-black end to end: correct, legible, and with
+   nothing in it to suggest the window has any depth. One very soft pool of
+   light behind everything, fixed to the viewport so it does not travel with the
+   transcript, and dilute enough that it never sits under text as a colour cast. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(90% 60% at 50% -12%, rgba(91, 157, 255, .085), transparent 62%),
+    radial-gradient(70% 50% at 12% 8%, rgba(139, 123, 245, .06), transparent 60%),
+    radial-gradient(80% 55% at 92% 96%, rgba(79, 209, 224, .045), transparent 62%);
+}
+
+/* The one line that says what the product is, given the weight of one. */
+.welcome h2 {
+  background: linear-gradient(96deg, var(--text) 20%, #bacef3 62%, #9fb4ea);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: -.6px;
+}
+
+/* A suggestion is a button and it was not behaving like one: nothing moved
+   under the pointer to say it could be pressed. */
+.suggestion {
+  transition: transform .16s cubic-bezier(.2, .7, .3, 1), background .16s ease, border-color .16s ease, box-shadow .16s ease;
+}
+.suggestion:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, .16);
+  box-shadow: 0 14px 30px -20px rgba(0, 0, 0, .95), inset 0 1px 0 rgba(255, 255, 255, .07);
+}
+.suggestion:active { transform: translateY(0); }
+.suggestion-icon { transition: color .16s ease, background .16s ease, border-color .16s ease; }
+.suggestion:hover .suggestion-icon {
+  color: var(--accent);
+  border-color: rgba(91, 157, 255, .3);
+  background: rgba(91, 157, 255, .1);
+}
+
+/* ==========================================================================
+   PASS 13 — the rail, and the thing that says it is thinking
+   ========================================================================== */
+
+/* --- 1. THE SIDEBAR ------------------------------------------------------- */
+
+/* WHAT WAS WRONG: the panel opened with "CHATS" in small caps above a pill the
+   size of a button on a phone, then a permanently-open search field, then the
+   list — so by the time you reached the thing you came for, two thirds of the
+   rail was chrome. And the window already had the product's name in the bar
+   above, so the rail's own heading was the second heading for one window.
+   The brand moves into the rail, the search folds away, the rows get quiet, and
+   the footer says which machine this is. */
+
+.chats-panel { padding: 0; gap: 0; }
+
+.side-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 13px 8px 8px 14px;
+  flex: 0 0 auto;
+}
+.side-brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.side-brand .logo { width: 26px; height: 26px; flex: 0 0 26px; }
+.side-brand span {
+  font-size: 17px;
+  font-weight: 680;
+  letter-spacing: -.2px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.side-head-actions { display: flex; align-items: center; gap: 1px; flex: 0 0 auto; }
+/* DOCKED, THERE IS STILL SOMETHING TO CLOSE. An earlier pass hid this button
+   whenever the rail was docked, on the reasoning that a docked panel covers
+   nothing — but the rail takes 268px from the conversation whether it covers it
+   or not, and the control for giving that back belongs where the rail is, not
+   only in the bar above it. */
+#chatsClose { display: inline-flex; }
+
+.side-nav { display: flex; flex-direction: column; gap: 1px; padding: 2px 8px 8px; flex: 0 0 auto; }
+.side-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: background .13s ease, color .13s ease;
+}
+.side-nav-item .icon { flex: 0 0 auto; color: var(--text-dim); transition: color .13s ease; }
+.side-nav-item:hover { background: rgba(255, 255, 255, .06); }
+.side-nav-item:hover .icon { color: var(--text); }
+/* `.active` is set by openChatSearch() while the field is showing, so the row
+   and the field can never disagree about whether search is on. */
+.side-nav-item.active { background: rgba(255, 255, 255, .07); }
+.side-nav-item.active .icon { color: var(--accent); }
+.icon-button.active { color: var(--accent); }
+
+.chat-search { margin: 0 8px 8px; }
+.chat-search[hidden] { display: none; }
+
+/* "RECENTS", and the date buckets under it. These were already grouped by day —
+   the reference has one flat label because ChatGPT's rail is one flat list, and
+   throwing away a grouping that already works to match a picture would be
+   copying the drawing instead of the idea. */
+.chat-group {
+  padding: 10px 12px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .3px;
+  text-transform: none;
+  color: var(--muted);
+}
+.chat-list { padding: 0 8px 4px; }
+.chat-list li { gap: 2px; }
+.chat-open {
+  padding: 7px 10px;
+  border-radius: 9px;
+  font-size: 13.5px;
+  color: var(--text-dim);
+}
+/* ONE LINE. The row carried the date a second time, under a heading that had
+   just said it — so a rail of ten chats was twenty lines of text to read six
+   titles. The heading keeps the date; the row keeps the name. */
+.chat-open .chat-when { display: none; }
+.chat-list li.active .chat-open {
+  /* The filled rounded row from the reference, and no accent bar: a fill and a
+     stripe are two ways of saying the same thing about the same row. */
+  background: rgba(255, 255, 255, .085);
+  box-shadow: none;
+  color: var(--text);
+  font-weight: 500;
+}
+.chat-list li.active .chat-open:hover { background: rgba(255, 255, 255, .11); }
+
+/* The note about where chats are kept moved out of the rail — it was four lines
+   of explanation permanently occupying the bottom of a navigation surface. */
+.chats-note { display: none; }
+
+.side-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  margin-top: auto;
+  padding: 10px 12px 12px;
+  border-top: 1px solid rgba(255, 255, 255, .06);
+}
+.side-avatar {
+  display: grid;
+  place-items: center;
+  width: 30px; height: 30px;
+  flex: 0 0 30px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .06);
+  overflow: hidden;
+}
+.side-avatar img { width: 22px; height: 22px; }
+.side-who { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
+.side-who strong { font-size: 13px; font-weight: 560; color: var(--text); }
+.side-who em {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The one state worth colouring. Everything else in this footer is furniture. */
+.side-who em.offline { color: #ff8a83; }
+
+/* --- 2. THE SPHERE -------------------------------------------------------- */
+
+/* WHAT WAS THERE: a dark marble with a conic smear rotating inside it. It read
+   as a loading spinner wearing a costume, and at 26px the smear was mud.
+   WHAT IT IS NOW: a soap bubble — thin-film interference on the rim, a bright
+   refracted core that blooms and turns inside it, and a glow that breathes.
+   Three layers rather than two pseudo-elements, because the core has to move
+   independently of the film; that is the whole difference between "spinning"
+   and "alive".
+   CSS only, on purpose. This sits on screen for a minute at a time during every
+   run, and a canvas or a WebGL context for a 30px ornament is a second thing
+   that can fail while the user is waiting to find out whether the first one
+   did. */
+.glass-ball {
+  width: 30px; height: 30px; flex: 0 0 30px;
+  overflow: visible;
+  background: none;
+  box-shadow:
+    0 0 14px -3px rgba(110, 190, 255, .5),
+    0 0 26px -6px rgba(200, 130, 255, .3);
+  isolation: isolate;
+}
+/* The old marble's two layers, superseded. Left as `content: none` rather than
+   deleted from PASS 6 so the rule they replaced is still readable next to them. */
+.glass-ball::before, .glass-ball::after { content: none; }
+
+/* THE FILM. A full-spectrum conic ring, masked to a shell so the middle stays
+   open, and blurred because a soap film has no edges. */
+.orb-film {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(
+    #7ef3ff 0deg, #a8f2c8 42deg, #fff0a6 82deg,
+    #ff9ec4 132deg, #ff6f6a 176deg, #c98cff 226deg,
+    #6ea8ff 284deg, #7ef3ff 360deg);
+  -webkit-mask: radial-gradient(circle at 50% 50%, transparent 40%, #000 60%, #000 92%, transparent 100%);
+  mask: radial-gradient(circle at 50% 50%, transparent 40%, #000 60%, #000 92%, transparent 100%);
+  filter: blur(1.6px) saturate(1.15);
+  opacity: .92;
+}
+/* THE CORE. The refracted shape inside the bubble — two overlapping lobes that
+   turn and swell on a different, slower cycle than the film, so the two never
+   line up and the thing never looks like one rotating object. */
+.orb-core {
+  position: absolute;
+  inset: 13%;
+  border-radius: 50%;
+  background:
+    radial-gradient(ellipse 74% 48% at 39% 37%, #ffffff, rgba(198, 228, 255, .78) 40%, rgba(150, 200, 255, .18) 66%, transparent 78%),
+    radial-gradient(ellipse 48% 74% at 64% 61%, rgba(226, 246, 255, .95), rgba(255, 198, 238, .5) 44%, transparent 76%);
+  filter: blur(1.3px);
+}
+/* THE LIGHT, which does not move: a highlight that travels with the rotation is
+   a highlight coming from a lamp that is orbiting the room. */
+.orb-gloss {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 33% 23%, rgba(255, 255, 255, .95), rgba(255, 255, 255, .16) 15%, transparent 30%),
+    /* Just enough shading at the bottom of the shell to read as a sphere. It
+       used to be a full vignette, which fought the film for the rim and turned
+       the whole interior to mud. */
+    radial-gradient(circle at 50% 108%, rgba(0, 0, 0, .42), transparent 46%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Three different periods, none of them a multiple of another, so the loop is
+     ~10 minutes long instead of 9 seconds. Slow on purpose: a fast bubble reads
+     as anxious, and this is on screen while somebody waits. */
+  .orb-film { animation: orb-spin 9s linear infinite; }
+  .orb-core { animation: orb-bloom 7.3s ease-in-out infinite; }
+  .glass-ball { animation: orb-breathe 5.5s ease-in-out infinite; }
+
+  @keyframes orb-spin { to { transform: rotate(360deg); } }
+  @keyframes orb-bloom {
+    0%, 100% { transform: rotate(0deg) scale(.84); }
+    34%      { transform: rotate(128deg) scale(1.05); }
+    67%      { transform: rotate(242deg) scale(.92); }
+  }
+  @keyframes orb-breathe {
+    0%, 100% {
+      box-shadow: 0 0 14px -3px rgba(110, 190, 255, .5), 0 0 26px -6px rgba(200, 130, 255, .3);
+    }
+    50% {
+      box-shadow: 0 0 21px -2px rgba(150, 230, 255, .72), 0 0 40px -6px rgba(255, 150, 220, .42);
+    }
+  }
+}
+
+/* ==========================================================================
+   PASS 14 — a rail that collapses instead of leaving, and a sphere in focus
+   ========================================================================== */
+
+/* --- 1. THE TOP BAR IS ALMOST NOTHING NOW --------------------------------- */
+
+/* Its left half held a panel toggle and a wordmark, and the rail now carries
+   both — so the window had two SYSCORA marks a centimetre apart and two
+   controls for one panel. What is left belongs to the WINDOW rather than to the
+   rail: the dots menu. It gets no bar of its own. */
+.demo-topbar {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-bottom: 0;
+  box-shadow: none;
+  padding: 8px 12px;
+  min-height: 0;
+}
+.demo-topbar::before, .demo-topbar::after { content: none; }
+.topbar-left { display: none; }
+/* `space-between` was correct when there were two groups in here. With one left
+   it pushes the ⋯ to the START — the menu ended up in the top-LEFT corner,
+   directly above the rail's own mark. Measured, not guessed at. */
+.demo-topbar { justify-content: flex-end; }
+
+/* --- 2. COLLAPSED IS A COLUMN OF ICONS, NOT AN ABSENCE -------------------- */
+
+.chats-panel { width: 272px; transition: width .16s cubic-bezier(.2, .7, .3, 1); }
+/* Never collapsed to zero. The rule this overrides is what made "closed" mean
+   "gone", which is the whole thing PASS 14 changes. */
+.chats-panel[hidden] { display: flex; }
+
+body.rail-collapsed .chats-panel { width: 60px; }
+/* Everything that needs a width to be legible goes; everything that is a 20px
+   glyph stays. */
+body.rail-collapsed .side-brand-name,
+body.rail-collapsed .side-head-actions,
+body.rail-collapsed .side-nav-item span,
+body.rail-collapsed .chat-search,
+body.rail-collapsed .chat-list,
+body.rail-collapsed .side-who { display: none; }
+
+body.rail-collapsed .side-head { padding: 13px 0 8px; justify-content: center; }
+body.rail-collapsed .side-nav { padding: 2px 0 8px; align-items: center; }
+body.rail-collapsed .side-nav-item { width: 40px; justify-content: center; padding: 9px 0; }
+body.rail-collapsed .side-foot { justify-content: center; padding: 10px 0 12px; }
+
+/* THE MARK IS THE WAY BACK. It is inert while the rail is open — a logo that
+   quietly closes your sidebar is a trap — and a real button when it is the only
+   control left. On hover it becomes the panel icon, which is a picture of what
+   the click does rather than a label for it. */
+.side-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+.side-brand-mark {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 30px; height: 30px;
+  flex: 0 0 30px;
+  border-radius: 9px;
+  transition: background .13s ease;
+}
+.side-brand-mark .logo, .side-brand-expand {
+  grid-area: 1 / 1;
+  transition: opacity .13s ease;
+}
+.side-brand-expand { opacity: 0; color: var(--text); }
+body.rail-collapsed .side-brand { cursor: pointer; }
+body.rail-collapsed .side-brand:hover .side-brand-mark,
+body.rail-collapsed .side-brand:focus-visible .side-brand-mark { background: rgba(255, 255, 255, .08); }
+body.rail-collapsed .side-brand:hover .logo,
+body.rail-collapsed .side-brand:focus-visible .logo { opacity: 0; }
+body.rail-collapsed .side-brand:hover .side-brand-expand,
+body.rail-collapsed .side-brand:focus-visible .side-brand-expand { opacity: 1; }
+
+/* Narrow windows still overlay when EXPANDED — a 60px rail covers nothing. */
+@media (max-width: 900px) {
+  body.rail-collapsed .chats-panel { position: static; width: 60px; box-shadow: none; }
+}
+
+/* --- 3. WHAT YOU CAN DO TO A CHAT ---------------------------------------- */
+
+/* Hidden until the row is under the pointer, because a rail of twenty-five
+   chats with fifty permanently visible buttons on it is not a list any more.
+   A pinned chat keeps its pin showing — that is the state, not a control. */
+.chat-list li { display: flex; align-items: center; gap: 1px; }
+.chat-open { flex: 1 1 auto; min-width: 0; }
+.chat-pin, .chat-more {
+  visibility: hidden;
+  flex: 0 0 auto;
+  width: 26px; height: 26px;
+  border-radius: 7px;
+  color: var(--muted);
+}
+.chat-pin svg, .chat-more svg { width: 15px; height: 15px; }
+.chat-list li:hover .chat-pin,
+.chat-list li:hover .chat-more,
+.chat-list li.active .chat-pin,
+.chat-list li.active .chat-more,
+.chat-pin:focus-visible, .chat-more:focus-visible,
+.chat-more[aria-expanded="true"],
+.chat-list li.pinned .chat-pin { visibility: visible; }
+.chat-pin:hover, .chat-more:hover { color: var(--text); background: rgba(255, 255, 255, .08); }
+/* THE SAME SHAPE, FILLED. Two different icons for pinned and not-pinned is two
+   things to recognise; an outline and a fill is one. */
+.chat-list li.pinned .chat-pin { color: var(--accent); }
+.chat-list li.pinned .chat-pin svg path:last-child { fill: currentColor; }
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.menu-item svg { width: 16px; height: 16px; flex: 0 0 16px; color: var(--muted); }
+.menu-item:hover { background: rgba(255, 255, 255, .07); color: var(--text); }
+.menu-item:hover svg { color: var(--text-dim); }
+/* Delete is the only thing in this menu that `undo` cannot reach, so it is the
+   only thing in it that is coloured. */
+.menu-item.danger:hover { background: rgba(255, 107, 98, .1); color: #ff8a83; }
+.menu-item.danger:hover svg { color: #ff8a83; }
+.menu-rule { height: 1px; margin: 5px 6px; background: rgba(255, 255, 255, .07); }
+.menu-group { display: flex; flex-direction: column; gap: 1px; }
+
+/* The row menu is positioned in the viewport by openChatMenu(), so it must not
+   inherit the corner-anchoring the top-bar menu has. */
+.chat-menu { position: fixed; top: 0; left: 0; right: auto; min-width: 208px; }
+
+/* --- 4. DOWNLOAD CHAT AS PDF --------------------------------------------- */
+
+/* There is no PDF library here and there is not going to be one — the browser
+   and Electron both write a real PDF from the print dialog, drawn by the same
+   engine that drew the conversation. What that needs from the stylesheet is a
+   version of the page with nothing in it but the transcript. */
+@media print {
+  .demo-topbar, .chats-panel, .chats-backdrop, .chat-bar, .more-menu,
+  .chat-menu, .suggestions, .connect-panel, .working { display: none !important; }
+  body, .demo-layout, .feed {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+    color: #111 !important;
+  }
+  body::before { content: none !important; }
+  .feed { padding: 0 !important; }
+  /* Ink, not glass. Every pane in this application is a translucent dark
+     surface, and printed on white that is a grey box round every paragraph. */
+  .bubble, .step, .msg, .turn {
+    background: none !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    box-shadow: none !important;
+    color: #111 !important;
+    border-color: #ccc !important;
+  }
+  .bubble.user { border: 1px solid #ccc !important; }
+  .step-output { background: #f4f4f4 !important; color: #222 !important; max-height: none !important; }
+  /* A tool call is evidence, and the evidence is the reason to keep the paper.
+     A collapsed <details> prints as one line, so they are all opened. */
+  .step > .step-output { display: block !important; }
+  .step-chevron { display: none !important; }
+  a { color: #111 !important; text-decoration: underline; }
+}
+
+/* --- 5. THE SPHERE, IN FOCUS --------------------------------------------- */
+
+/* IT WAS BLURRED ON PURPOSE AND THE PURPOSE WAS WRONG. PASS 13 blurred the film
+   and the core to fake the softness of a rendered bubble, and at 30px a 1.6px
+   blur is a fifth of the radius — so the thing meant to look soft just looked
+   out of focus. The reference is SHARP: hard specular edges on the inner lobes,
+   a crisp bright rim, and the only soft thing in it is the glow OUTSIDE the
+   sphere. So: no blur on the film, none on the core, and the size goes up to
+   34px, which buys back the detail the blur was hiding.
+
+   The rotation is a real tumble now rather than a spin. The reference lobes turn
+   about an axis that is not the screen normal — they foreshorten and come back —
+   and rotate3d under a perspective gives that for the cost of one transform. A
+   flat rotate() is what made the old one read as a spinner in a costume. */
+.glass-ball {
+  width: 34px; height: 34px; flex: 0 0 34px;
+  perspective: 90px;
+}
+.orb-film {
+  /* The rim only, and a tighter shell than PASS 13 — with the blur gone the
+     conic seam would show anywhere the band is wide. */
+  -webkit-mask: radial-gradient(circle at 50% 50%, transparent 52%, #000 66%, #000 95%, transparent 100%);
+  mask: radial-gradient(circle at 50% 50%, transparent 52%, #000 66%, #000 95%, transparent 100%);
+  filter: none;
+  opacity: 1;
+}
+.orb-core {
+  inset: 10%;
+  filter: none;
+  /* Sharper stops than PASS 13: the lobes have edges in the reference, and a
+     gradient fading to nothing over 40% of its radius has none. */
+  background:
+    radial-gradient(ellipse 66% 42% at 38% 36%, #ffffff 0 26%, rgba(186, 222, 255, .92) 48%, rgba(120, 175, 255, .3) 64%, transparent 70%),
+    radial-gradient(ellipse 42% 66% at 64% 62%, rgba(236, 250, 255, .98) 0 22%, rgba(255, 190, 240, .72) 46%, rgba(190, 130, 255, .22) 64%, transparent 70%),
+    radial-gradient(ellipse 54% 54% at 52% 50%, rgba(255, 255, 255, .5) 0 12%, transparent 34%);
+  transform-style: preserve-3d;
+}
+.orb-gloss {
+  background:
+    radial-gradient(circle at 32% 21%, rgba(255, 255, 255, 1) 0 5%, rgba(255, 255, 255, .3) 12%, transparent 26%),
+    radial-gradient(circle at 50% 108%, rgba(0, 0, 0, .38), transparent 44%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .orb-film { animation: orb-spin 9s linear infinite; }
+  /* THE TUMBLE. An axis off the screen normal, so the lobes turn THROUGH the
+     picture rather than across it, and the scale is what reads as them swelling
+     toward you and falling away. */
+  .orb-core { animation: orb-tumble 8.2s cubic-bezier(.45, 0, .55, 1) infinite; }
+  .glass-ball { animation: orb-breathe 5.5s ease-in-out infinite; }
+
+  /* THE AXIS IS Z-DOMINANT, AND THAT IS THE WHOLE TRICK. The first version used
+     `rotate3d(.3, 1, .2, …)` — dominated by Y — so a flat layer turned edge-on
+     twice per revolution and the inside of the bubble emptied out for a
+     noticeable stretch of every cycle. Caught on screen, not reasoned about: at
+     190° the core was a sliver and the sphere read as broken rather than deep.
+     With Z dominant it always faces you; the small x and y terms are what make
+     it lean and foreshorten, which is the part that reads as three dimensions. */
+  @keyframes orb-tumble {
+    0%   { transform: rotate3d(.26, .34, 1, 0deg) scale(.92); }
+    25%  { transform: rotate3d(.26, .34, 1, 108deg) scale(1.05); }
+    50%  { transform: rotate3d(.26, .34, 1, 187deg) scale(.94); }
+    75%  { transform: rotate3d(.26, .34, 1, 291deg) scale(1.02); }
+    100% { transform: rotate3d(.26, .34, 1, 360deg) scale(.92); }
+  }
+}
+
+/* ==========================================================================
+   PASS 15 — the rail reaches the top, the menu comes to the front, and the
+   sphere stops starting over
+   ========================================================================== */
+
+/* --- 1. NO STRIP ABOVE THE RAIL ------------------------------------------ */
+
+/* The shell grid was laid out when the top bar was a real header spanning the
+   window:
+
+       "topbar topbar"
+       "side   main"
+
+   The top bar is now one button in a corner, so that first row was 46px of
+   nothing sitting on top of the rail — a band of empty chrome above a column
+   that is supposed to run the height of the window. The rail spans both rows
+   instead, and the bar keeps only the column it actually has something in. */
+body {
+  grid-template-areas:
+    "side topbar"
+    "side main";
+}
+
+/* --- 2. THE ⋯ MENU WAS BEHIND THE CONVERSATION --------------------------- */
+
+/* THE BUG, AND IT IS A STACKING-CONTEXT BUG RATHER THAN A z-index ONE.
+   An earlier pass gave four siblings the SAME layer:
+
+       .demo-topbar, .demo-layout, .chats-panel, .connect-panel
+         { position: relative; z-index: 1; }
+
+   Equal z-index means document order decides, and `.demo-layout` comes after
+   `.demo-topbar` — so the whole conversation painted over the whole top bar.
+   The menu's own `z-index: 40` could not save it: that number is only compared
+   with its SIBLINGS inside the top bar's context, and the context itself was
+   underneath. The menu was drawn, it was the right size, it was in the right
+   place, and every click went through it to the transcript behind. Exactly the
+   symptom reported: a box you can see and cannot press.
+
+   It also had to be found by looking rather than by reasoning about the menu,
+   because nothing about the menu is wrong. */
+.demo-topbar { z-index: 30; }
+/* Above the bar, because on a narrow window it slides over everything. */
+.chats-panel { z-index: 40; }
+
+/* --- 3. THE WORKING ROW IS LAST BY ORDER, NOT BY BEING MOVED ------------- */
+
+/* `keepWorkingLast()` used to re-append this row after every step. Re-inserting
+   a node restarts every CSS animation on it and on its children, so a run that
+   fired four tool calls in six seconds reset the sphere four times and it read
+   as broken. The row is now never touched; it is simply drawn last. */
+.working { order: 99; }
+/* Everything else keeps document order. Stated rather than left to the initial
+   value, because `order` is one of those properties where relying on the
+   default is how the next person gets a surprise. */
+.turn > * { order: 0; }
+.turn > .working { order: 99; }
+
+/* --- 4. THE SPHERE ------------------------------------------------------- */
+
+/* WHAT THE REFERENCE ACTUALLY HAS, looked at again rather than remembered: the
+   shell is a thin iridescent film — a hard red-orange arc down one side, cyan
+   and white opposite — and INSIDE it a single smooth ribbon that folds over on
+   itself, carrying specular white along its crease and splitting into spectral
+   colour where it thins. It is one surface catching light, not a glow.
+
+   That is three things this did not have: a ribbon with an EDGE, colour that
+   travels ALONG the form rather than sitting in fixed lobes, and a shape that
+   CHANGES rather than only turning. All three are here now, and none of them
+   costs a canvas. */
+
+.glass-ball {
+  width: 36px; height: 36px; flex: 0 0 36px;
+  perspective: 110px;
+  /* The blend modes below need somewhere to stop. Without this they would
+     composite against the transcript behind the row. */
+  isolation: isolate;
+}
+
+/* THE FILM. Warmer and harder than PASS 14 — the reference's rim has a real
+   red in it, and the band is narrow enough that the conic seam falls off the
+   edge of the mask rather than showing as a line. */
+.orb-film {
+  background: conic-gradient(
+    from 0deg,
+    #6fe9ff 0deg, #7dfbc4 38deg, #f3ffa8 72deg,
+    #ff9d5c 104deg, #ff3d2e 140deg, #ff6bd0 176deg,
+    #a86bff 214deg, #4d8cff 258deg, #48d8ff 306deg, #6fe9ff 360deg);
+  -webkit-mask: radial-gradient(circle at 50% 50%, transparent 55%, #000 68%, #000 94%, transparent 100%);
+  mask: radial-gradient(circle at 50% 50%, transparent 55%, #000 68%, #000 94%, transparent 100%);
+  filter: saturate(1.25) contrast(1.1);
+  opacity: 1;
+}
+
+/* THE RIBBON. Two layers of it, counter-turning on periods that do not divide
+   into one another, screen-blended so where they cross reads as light through
+   light — which is what a caustic is. One layer alone can only turn; two make
+   the form appear to fold.
+
+   The morphing border-radius is what gives it an edge that MOVES. A radial
+   gradient fading to nothing has no silhouette at 36px; a shaped box clipped by
+   its own radius does, and the radius is animated on a period of its own so the
+   silhouette is never the same twice through a whole loop. */
+/* OUTLINED, NOT FILLED — and that is the difference between a ribbon and a
+   smudge. The first version filled each blob with big bright radial gradients
+   and screen-blended the pair. Two white-centred layers under `screen` add to
+   white, so the inside of the bubble came out as one pale mass with no form in
+   it at all; caught on screen at 11x, where it was obvious and at 36px would
+   just have looked "blurry" again.
+
+   The reference's interior is mostly DARK. What you actually see is the EDGE of
+   a folded surface: a bright rim where the ribbon turns away, a hard specular
+   along its crease, and spectral colour where it thins. So each blob is
+   transparent through the middle and lit around its own morphing silhouette —
+   which means the animated border-radius is drawing the ribbon rather than just
+   clipping a fill. */
+.orb-core, .orb-core-2 {
+  position: absolute;
+  border-radius: 62% 38% 46% 54% / 58% 54% 46% 42%;
+  will-change: transform, border-radius, filter;
+}
+.orb-core {
+  inset: 11%;
+  background:
+    /* the crease: one hard specular line across the fold */
+    linear-gradient(112deg, transparent 38%, rgba(255, 255, 255, .92) 47%, rgba(255, 255, 255, .92) 51%, transparent 60%),
+    /* the warm side, where the reference turns orange and gold */
+    radial-gradient(closest-side at 72% 72%, transparent 52%, rgba(255, 168, 96, .5) 72%, rgba(255, 226, 180, .85) 86%, transparent 100%),
+    /* the lit edge of the surface itself */
+    radial-gradient(closest-side at 50% 50%, transparent 50%, rgba(96, 158, 255, .34) 68%, rgba(238, 248, 255, .95) 84%, rgba(150, 200, 255, .4) 93%, transparent 100%);
+}
+.orb-core-2 {
+  inset: 21%;
+  border-radius: 44% 56% 58% 42% / 48% 42% 58% 52%;
+  /* Only the SECOND ribbon screens, so where the two cross reads as light
+     through light — a caustic — while neither one alone can blow out. */
+  mix-blend-mode: screen;
+  opacity: .85;
+  background:
+    linear-gradient(58deg, transparent 40%, rgba(255, 255, 255, .7) 49%, transparent 58%),
+    radial-gradient(closest-side at 38% 68%, transparent 54%, rgba(190, 120, 255, .45) 74%, rgba(255, 186, 244, .8) 88%, transparent 100%),
+    radial-gradient(closest-side at 50% 50%, transparent 52%, rgba(110, 215, 255, .38) 70%, rgba(226, 250, 255, .9) 86%, transparent 100%);
+}
+
+/* THE LIGHT, which does not move. A highlight that travels with the rotation is
+   a highlight coming from a lamp orbiting the room. Two stops only, and the
+   first one is tiny and pure white: that hard little dot is most of what makes
+   a sphere read as glass rather than as a coloured circle. */
+.orb-gloss {
+  background:
+    radial-gradient(circle at 31% 20%, #ffffff 0 4%, rgba(255, 255, 255, .34) 11%, transparent 24%),
+    radial-gradient(circle at 72% 82%, rgba(255, 255, 255, .16) 0 5%, transparent 20%),
+    radial-gradient(circle at 50% 110%, rgba(0, 0, 0, .4), transparent 42%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* FIVE PERIODS, NO TWO OF THEM COMMENSURATE — 9, 8.2, 11.6, 13.1, 5.5. The
+     combined loop is minutes long, so watching it for the length of a real run
+     never shows you the same frame twice. That is the whole difference between
+     "animated" and "looping". */
+  .orb-film { animation: orb-spin 9s linear infinite; }
+  .orb-core {
+    animation:
+      orb-tumble 8.2s cubic-bezier(.45, 0, .55, 1) infinite,
+      orb-morph 11.6s ease-in-out infinite,
+      orb-hue 13.1s linear infinite;
+  }
+  /* The second ribbon turns the OTHER way and morphs on a different beat, which
+     is what stops the pair reading as one rigid object. */
+  .orb-core-2 {
+    animation:
+      orb-tumble-back 10.4s cubic-bezier(.45, 0, .55, 1) infinite,
+      orb-morph-2 9.3s ease-in-out infinite,
+      orb-hue 13.1s linear infinite reverse;
+  }
+  .glass-ball { animation: orb-breathe 5.5s ease-in-out infinite; }
+
+  /* Z-dominant, as PASS 14 found the hard way: a Y-dominant axis turns a flat
+     layer edge-on twice a revolution and the bubble empties out. */
+  @keyframes orb-tumble {
+    0%   { transform: rotate3d(.26, .34, 1, 0deg) scale(.94); }
+    25%  { transform: rotate3d(.26, .34, 1, 108deg) scale(1.04); }
+    50%  { transform: rotate3d(.26, .34, 1, 187deg) scale(.96); }
+    75%  { transform: rotate3d(.26, .34, 1, 291deg) scale(1.02); }
+    100% { transform: rotate3d(.26, .34, 1, 360deg) scale(.94); }
+  }
+  @keyframes orb-tumble-back {
+    0%   { transform: rotate3d(.4, .2, -1, 0deg) scale(1.02); }
+    33%  { transform: rotate3d(.4, .2, -1, 126deg) scale(.9); }
+    66%  { transform: rotate3d(.4, .2, -1, 238deg) scale(1.06); }
+    100% { transform: rotate3d(.4, .2, -1, 360deg) scale(1.02); }
+  }
+  /* THE SILHOUETTE. Four corner radii on two axes is eight numbers, and moving
+     them independently is what makes an organic form rather than an ellipse
+     changing size. */
+  @keyframes orb-morph {
+    0%   { border-radius: 62% 38% 46% 54% / 58% 54% 46% 42%; }
+    25%  { border-radius: 44% 56% 62% 38% / 42% 62% 38% 58%; }
+    50%  { border-radius: 55% 45% 36% 64% / 64% 40% 60% 36%; }
+    75%  { border-radius: 38% 62% 54% 46% / 50% 58% 42% 50%; }
+    100% { border-radius: 62% 38% 46% 54% / 58% 54% 46% 42%; }
+  }
+  @keyframes orb-morph-2 {
+    0%   { border-radius: 44% 56% 58% 42% / 48% 42% 58% 52%; }
+    33%  { border-radius: 60% 40% 38% 62% / 58% 60% 40% 42%; }
+    66%  { border-radius: 36% 64% 56% 44% / 40% 46% 54% 60%; }
+    100% { border-radius: 44% 56% 58% 42% / 48% 42% 58% 52%; }
+  }
+  /* THE COLOUR TRAVEL. A full turn of the wheel over thirteen seconds, which is
+     slow enough that you never catch it changing and fast enough that the form
+     is a different colour by the time you look back. The two ribbons run it in
+     opposite directions so they are never the same hue at the same moment. */
+  @keyframes orb-hue {
+    to { filter: hue-rotate(360deg) saturate(1.15); }
+  }
+}
+
+/* ==========================================================================
+   PASS 16 — the sphere stays when the run ends, and it gets its edges back
+   ========================================================================== */
+
+/* --- 1. STOPPED, NOT GONE ------------------------------------------------ */
+
+/* The row was removed the moment a run settled, so the one object that had been
+   on screen for the whole turn vanished at the exact moment the answer arrived.
+   The transcript twitched, and the thing that had been telling you it was alive
+   left no trace that it had ever run. It stays now, frozen at whatever frame it
+   reached — which is why every layer had to look right stopped as well as
+   moving, and why the morph keyframes below are smooth rather than posed. */
+.working.done {
+  /* Calmer than a live one without being greyed out: this is a record, not a
+     disabled control. */
+  opacity: .88;
+  transition: opacity .5s ease;
+}
+/* `paused` rather than `none`. Setting `animation: none` would snap every layer
+   back to its unanimated position — the ribbons would jump to their starting
+   silhouette at the instant the answer appeared, which is the twitch this
+   change exists to remove. Paused holds the frame it was on. */
+.working.done .glass-ball,
+.working.done .glass-ball > span { animation-play-state: paused; }
+/* The elapsed time is the one thing worth keeping: how long it took is a fact
+   about the turn. The word went in stop(), because "Working…" beside a finished
+   answer is the small lie that reads as a stuck interface. */
+.working.done .working-time { color: var(--muted); }
+
+/* A settled row is not a status any more, so it must stop suppressing the
+   turn's status line. It happens to be harmless today — settle() clears that
+   line first — but a `:has()` that stays true forever is a trap for whoever
+   next puts something in there. */
+.turn:has(.working:not(.done)) > .turn-status { display: none; }
+.turn:has(.working.done) > .turn-status { display: revert; }
+
+/* --- 2. THE EDGES ------------------------------------------------------- */
+
+/* WHAT WAS STILL SOFT, AND WHY. PASS 15 got the structure right — a dark
+   interior with the ribbon drawn as a lit silhouette — but its gradient stops
+   spanned about a third of each blob's radius, so every "edge" was a 6px ramp
+   on a 36px sphere. Nothing was blurred; everything was just gradual, which
+   looks the same.
+   The stops are now tight bands. A thin-film edge in the reference goes from
+   nothing to white and back inside a few pixels, and it fringes — violet on one
+   side of the highlight, warm on the other — because that is what a thin film
+   does to white light. That fringe is the single biggest thing separating this
+   from a glowing blob, and it costs two extra colour stops. */
+
+.orb-film {
+  /* A narrower shell reads as thinner glass, and it lets the interior come
+     further out to the rim where the reference's ribbon actually reaches. */
+  -webkit-mask: radial-gradient(circle at 50% 50%, transparent 62%, #000 73%, #000 95%, transparent 100%);
+  mask: radial-gradient(circle at 50% 50%, transparent 62%, #000 73%, #000 95%, transparent 100%);
+  filter: saturate(1.45) contrast(1.22) brightness(1.06);
+}
+
+/* A LIT SURFACE, NOT A WIREFRAME — and this is the second time these stops
+   have been wrong in the opposite direction.
+   PASS 15 ramped over a third of the radius, so every edge was a 6px gradient
+   on a 36px sphere and the whole thing read as soft. Tightening them turned the
+   ribbons into hairline rings: the inner 61% was fully transparent, so what was
+   left was an outline with nothing inside it. Both were checked at 9x and both
+   were obviously wrong there and merely "a bit off" at real size, which is why
+   they went in.
+   What a folded surface actually needs is BOTH: a body that is shaded rather
+   than empty, and a crest that arrives quickly. So the fill starts at a low
+   alpha from the centre and the last 20% of the radius carries the ramp — and
+   the ramp fringes violet-to-white-to-cyan, because that is what a thin film
+   does to white light and it is the single cue that says "iridescent" rather
+   than "glowing". */
+.orb-core {
+  inset: 9%;
+  background:
+    /* THE CREASE. Wide enough to be a specular on a curved surface at 36px —
+       the previous 3% of the box was one pixel, which is a drawn line. */
+    linear-gradient(112deg,
+      transparent 38%, rgba(150, 200, 255, .32) 43%,
+      rgba(236, 246, 255, .92) 47%, #ffffff 50%, rgba(255, 236, 214, .8) 53%,
+      rgba(255, 190, 140, .3) 57%, transparent 62%),
+    /* THE WARM TURN — where the surface rolls away from the light. */
+    radial-gradient(closest-side at 73% 74%,
+      rgba(120, 40, 20, .12) 0 46%, rgba(255, 138, 52, .55) 70%,
+      rgba(255, 224, 180, .92) 84%, rgba(255, 170, 96, .4) 91%, transparent 97%),
+    /* THE LIT EDGE. Body first, then the fringe in the outer fifth. */
+    radial-gradient(closest-side at 50% 50%,
+      rgba(46, 76, 168, .22) 0 38%, rgba(90, 90, 220, .34) 56%,
+      rgba(122, 120, 255, .6) 68%, rgba(120, 205, 255, .88) 78%,
+      #ffffff 85%, rgba(186, 236, 255, .5) 90%, transparent 97%);
+  /* A CRESCENT, NOT A RING — the last thing standing between this and the
+     reference. `closest-side` is concentric by definition, so a lit rim drawn
+     that way circles the whole blob evenly and reads as a wire hoop. A real
+     surface is lit from ONE side and falls into shadow on the other. Masking
+     the layer with a directional ramp turns each hoop into a crescent, which is
+     what the eye reads as a curved surface turning away from the light. The
+     angle matches the specular in .orb-gloss, because they are the same lamp. */
+  -webkit-mask: linear-gradient(158deg, #000 8%, rgba(0, 0, 0, .82) 38%, rgba(0, 0, 0, .3) 68%, rgba(0, 0, 0, .08) 92%);
+  mask: linear-gradient(158deg, #000 8%, rgba(0, 0, 0, .82) 38%, rgba(0, 0, 0, .3) 68%, rgba(0, 0, 0, .08) 92%);
+}
+
+.orb-core-2 {
+  inset: 20%;
+  opacity: .8;
+  background:
+    linear-gradient(58deg,
+      transparent 40%, rgba(210, 236, 255, .35) 45%,
+      #ffffff 49.5%, rgba(255, 200, 245, .55) 54%, transparent 60%),
+    radial-gradient(closest-side at 36% 70%,
+      rgba(70, 20, 120, .14) 0 46%, rgba(178, 96, 255, .5) 70%,
+      rgba(255, 206, 252, .9) 85%, transparent 96%),
+    radial-gradient(closest-side at 50% 50%,
+      rgba(20, 80, 130, .2) 0 40%, rgba(60, 170, 235, .45) 62%,
+      rgba(96, 216, 255, .82) 76%, #ffffff 85%,
+      rgba(170, 240, 255, .45) 90%, transparent 97%);
+  /* The second ribbon is lit from the OTHER side, which is what makes the pair
+     read as two surfaces at different angles rather than as one doubled up. */
+  -webkit-mask: linear-gradient(-42deg, #000 10%, rgba(0, 0, 0, .78) 40%, rgba(0, 0, 0, .26) 72%, rgba(0, 0, 0, .06) 94%);
+  mask: linear-gradient(-42deg, #000 10%, rgba(0, 0, 0, .78) 40%, rgba(0, 0, 0, .26) 72%, rgba(0, 0, 0, .06) 94%);
+}
+
+/* --- 3. THE LIGHT ------------------------------------------------------- */
+
+/* Three things a sphere needs and this had one and a half of: a hard specular
+   where the source is, a soft BOUNCE on the opposite lower edge (which is what
+   stops the bottom reading as a hole), and enough contact shadow to sit it in
+   the page. The specular stays fixed — one that travels with the rotation is a
+   lamp orbiting the room. */
+.orb-gloss {
+  background:
+    /* the source: small, pure, and hard-edged */
+    radial-gradient(circle at 30% 19%, #ffffff 0 3.5%, rgba(255, 255, 255, .42) 8%, transparent 17%),
+    /* its bloom, wide and faint */
+    radial-gradient(circle at 32% 22%, rgba(226, 242, 255, .22) 0 14%, transparent 34%),
+    /* the bounce: a crescent along the lower-right inside of the shell */
+    radial-gradient(circle at 78% 84%, rgba(190, 226, 255, .3) 0 6%, transparent 22%),
+    /* and the weight underneath it */
+    radial-gradient(circle at 50% 112%, rgba(0, 0, 0, .46), transparent 40%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* SIX POSES, NOT FOUR, AND NO EASING BETWEEN THEM.
+     PASS 15 eased between four keyframes, which reads as four positions being
+     visited rather than one surface moving: the form paused at every pose. Six
+     poses on a linear timing gives continuous travel — the shape is always
+     changing at roughly the same rate, which is what a real surface does. The
+     poses are also chosen so the first and last are the SAME, or the loop
+     jumps once every eleven seconds. */
+  @keyframes orb-morph {
+    0%   { border-radius: 62% 38% 46% 54% / 58% 54% 46% 42%; }
+    17%  { border-radius: 52% 48% 60% 40% / 46% 62% 38% 54%; }
+    34%  { border-radius: 42% 58% 63% 37% / 40% 60% 40% 60%; }
+    50%  { border-radius: 55% 45% 36% 64% / 64% 40% 60% 36%; }
+    67%  { border-radius: 64% 36% 42% 58% / 56% 36% 64% 44%; }
+    84%  { border-radius: 38% 62% 54% 46% / 50% 58% 42% 50%; }
+    100% { border-radius: 62% 38% 46% 54% / 58% 54% 46% 42%; }
+  }
+  @keyframes orb-morph-2 {
+    0%   { border-radius: 44% 56% 58% 42% / 48% 42% 58% 52%; }
+    20%  { border-radius: 56% 44% 44% 56% / 60% 52% 48% 40%; }
+    40%  { border-radius: 60% 40% 38% 62% / 58% 60% 40% 42%; }
+    60%  { border-radius: 46% 54% 62% 38% / 42% 54% 46% 58%; }
+    80%  { border-radius: 36% 64% 56% 44% / 40% 46% 54% 60%; }
+    100% { border-radius: 44% 56% 58% 42% / 48% 42% 58% 52%; }
+  }
+  .orb-core { animation-timing-function: linear, linear, linear; }
+  .orb-core-2 { animation-timing-function: linear, linear, linear; }
+
+  /* The glow follows the ribbons rather than pulsing on its own clock: brighter
+     as they swell, dimmer as they fall away. Still its own period, so the two
+     drift in and out of phase instead of locking. */
+  @keyframes orb-breathe {
+    0%, 100% {
+      box-shadow: 0 0 13px -3px rgba(110, 190, 255, .52), 0 0 26px -7px rgba(200, 130, 255, .32);
+    }
+    50% {
+      box-shadow: 0 0 22px -2px rgba(160, 232, 255, .78), 0 0 44px -6px rgba(255, 150, 220, .46);
+    }
+  }
+}
+
+/* ============================================================================
+   PASS 17 — THE THREE THINGS THAT MADE A LIVE TURN UNREADABLE
+   ----------------------------------------------------------------------------
+   Reported from a real run on 25 Aug 2026, all three of them the same defect
+   wearing different clothes: the surface knew what was happening and was not
+   drawing it.
+
+     1. A second round of thinking went into the box from the FIRST round, which
+        was already sealed and collapsed at the top of the turn. On screen: the
+        word "Thinking…", a timer at 59s, and nothing to open. Fixed in demo.js
+        (streamReasoning) — every round gets its own box. The rules here only
+        keep the boxes from stacking into a wall.
+     2. A tool call is streamed like everything else, and for `write_file` the
+        argument IS the file — so a minute could pass with no row on screen.
+        `.step.pending` is that row.
+     3. The answer was shown as literal characters until the turn ended and only
+        then reflowed, so a code block existed for about a second, at the end,
+        after you had watched it arrive as grey text. It is parsed as it streams
+        now, and it has a copy button, because a code block you cannot copy is a
+        code block you retype.
+   ========================================================================== */
+
+/* --- 1. a turn thinks more than once -------------------------------------- */
+
+/* Consecutive rounds read as one column of scratch work rather than as separate
+   cards. Only the LIVE one gets the accent rail — that is the one worth looking
+   at, and it is how you tell "still going" from "went". */
+.thinking-box + .thinking-box { margin-top: -2px; }
+.thinking-box:not(.done) { border-left-color: rgba(91, 157, 255, .55); }
+
+/* --- 2. the call being written -------------------------------------------- */
+
+/* Deliberately quieter than a running step: nothing has touched the machine
+   yet, and a row that looks identical to one that ran would be saying so. No
+   chevron, because there is nothing inside it to open. */
+.step.pending {
+  border-left-color: rgba(140, 170, 220, .28);
+  opacity: .82;
+}
+.step.pending .step-head { cursor: default; }
+.step.pending .step-icon { color: var(--muted); }
+.step.pending .step-verb { color: var(--text-dim); }
+/* The byte count. `:empty` hides it for the first few hundred bytes — a counter
+   that reads "12 bytes" beside a file is noise, and one that sits at zero reads
+   as stuck. */
+.step-pending-size {
+  /* THE ROW IS ORDERED BY `order`, NOT BY SOURCE. Every other part of a step
+     head carries one (icon 1 … chevron 8), so a new child with the default of 0
+     is drawn FIRST — the byte count landed to the left of the tool's own icon.
+     Found in the browser, not by reading: the markup appends it last. */
+  order: 7;
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--muted);
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(140, 170, 220, .07);
+  white-space: nowrap;
+}
+.step-pending-size:empty { display: none; }
+@media (prefers-reduced-motion: no-preference) {
+  /* The same heartbeat the running rows use, so "in progress" looks the same
+     whichever half of a step it is in. */
+  .step.pending .step-icon { animation: pulse 1.6s ease-in-out infinite; }
+}
+
+/* --- 3. markdown while it streams, and a copy button ---------------------- */
+
+/* `.md-stream` was the OLD unparsed node: a div of literal characters that
+   needed pre-wrap to keep its newlines. The stream is real markdown now, so the
+   node carries `.md` like any finished answer and this class marks only that it
+   is still arriving. The rule is kept because the class name appears in older
+   saved transcripts, which are replayed through the same renderer. */
+.md-stream { white-space: pre-wrap; line-height: 1.6; }
+
+/* A caret at the end of the last line, so a stream that has paused between
+   tokens is visibly still open. Drawn as a pseudo-element rather than inserted
+   into the text, which would put a character inside anything the user copies. */
+.md-streaming > *:last-child::after,
+.md-streaming > .code-block:last-child pre.md-code code::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  opacity: .8;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .md-streaming > *:last-child::after,
+  .md-streaming > .code-block:last-child pre.md-code code::after {
+    animation: caret-blink 1.05s steps(1) infinite;
+  }
+  @keyframes caret-blink { 0%, 49% { opacity: .85; } 50%, 100% { opacity: 0; } }
+}
+/* ON THE LAST CHARACTER OF THE CODE, NOT UNDER THE BOX. `:last-child` of a
+   streaming answer that ends mid-fence is the code-block WRAPPER, and a caret
+   on that is a block-level element after a block-level element — it landed on
+   its own line below the code, looking like a stray cursor rather than the end
+   of the text. Seen in the browser at 800px, not by reading the rule. The
+   wrapper's own caret is cancelled and the one above puts it inside <code>. */
+.md-streaming > .code-block:last-child::after { content: none; }
+
+/* The block: a header bar carrying the language and the copy button, and the
+   <pre> underneath it. Built in the DOM rather than by the markdown parser —
+   see enhanceCodeBlocks in markdown.js for why that boundary matters. */
+.code-block {
+  margin: 0 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0b0f16;
+}
+.code-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px 5px 12px;
+  background: rgba(140, 170, 220, .05);
+  border-bottom: 1px solid var(--border);
+  min-height: 30px;
+}
+.code-lang {
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: .3px;
+  color: var(--muted);
+  text-transform: lowercase;
+}
+/* The button goes to the right whether or not the fence named a language. */
+.code-copy {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+.code-copy svg { width: 13px; height: 13px; }
+.code-copy:hover { color: var(--text); background: rgba(140, 170, 220, .1); border-color: var(--border); }
+.code-copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.code-copy.copied { color: var(--ok); }
+
+/* The <pre> has lost its own frame to the wrapper above, so it keeps only the
+   padding and the horizontal scroll. */
+.md .code-block > pre.md-code {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* ============================================================================
+   THE FILE CARD
+   ----------------------------------------------------------------------------
+   A turn that produced a document used to end with a path inside a sentence.
+   The complaint, 25 Aug 2026: "chatgpt would have ... given a direct file to
+   click and open". Same argument as the mail card — when the outcome of a turn
+   is a THING rather than a paragraph, the transcript should hold the thing.
+   ========================================================================== */
+
+/* THREE ROWS IN ONE COLUMN, NOT NAMED AREAS.
+ *
+ * This was `grid-template-areas: "icon body" "note actions"`, which put the note
+ * in the ICON's column — so the moment a card had a note the 42px column grew to
+ * fit a sentence and pushed the buttons out to the right of it. Seen in the
+ * browser on the replayed card, which is the only one that carries a note before
+ * anything is clicked. Explicit row and column placement cannot do that: the
+ * icon owns the first row of the first column, and everything else stacks under
+ * the filename. */
+.file-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0 13px;
+  margin: 10px 0 2px;
+  padding: 14px 15px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 13px;
+}
+
+.file-icon {
+  grid-row: 1;
+  grid-column: 1;
+  align-self: center;
+  display: grid;
+  place-items: center;
+  width: 42px; height: 42px;
+  border-radius: 10px;
+  color: var(--accent);
+  background: rgba(91, 157, 255, .12);
+  border: 1px solid rgba(91, 157, 255, .2);
+}
+/* The formats people recognise by colour before they read the name. Anything
+   else keeps the accent, which is honest — it says "a file" without claiming
+   to be a kind of file it is not. */
+.file-icon.fmt-pdf { color: #ff8a83; background: rgba(255, 107, 98, .12); border-color: rgba(255, 107, 98, .22); }
+.file-icon.fmt-docx { color: #7fa9ff; background: rgba(91, 157, 255, .12); border-color: rgba(91, 157, 255, .22); }
+.file-icon.fmt-xlsx,
+.file-icon.fmt-csv { color: #6fe09a; background: rgba(70, 196, 106, .12); border-color: rgba(70, 196, 106, .22); }
+.file-icon.fmt-html { color: #e0b46f; background: rgba(224, 180, 111, .12); border-color: rgba(224, 180, 111, .22); }
+
+.file-body { grid-row: 1; grid-column: 2; min-width: 0; }
+.file-name {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* What is IN it, not just how big it is. "3 pages · 1,240 words" is the line
+   that says whether the thing asked for actually got written. */
+.file-facts { margin-top: 2px; font-size: 12px; color: var(--text-dim); }
+/* NO `direction: rtl` HERE, HOWEVER TEMPTING.
+ *
+ * The obvious trick for a long path is to flip the direction so the ellipsis
+ * falls at the START and the tail stays readable. It is not worth it: `\` and
+ * `:` are bidi-neutral, so the reordering rules apply to a string whose whole
+ * job is to be an exact path somebody can read aloud or retype, and the element
+ * already holds the FOLDER rather than the full path — which is short enough
+ * that an ellipsis at the end costs nothing. */
+.file-path {
+  margin-top: 3px;
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-actions {
+  grid-row: 2;
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+.file-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+.file-button:hover:not(:disabled) { background: rgba(140, 170, 220, .12); border-color: rgba(140, 170, 220, .3); }
+.file-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.file-button:disabled { opacity: .45; cursor: default; }
+.file-button.primary { background: rgba(91, 157, 255, .16); border-color: rgba(91, 157, 255, .34); color: #cfe0ff; }
+.file-button.primary:hover:not(:disabled) { background: rgba(91, 157, 255, .24); }
+
+.file-note { grid-row: 3; grid-column: 2; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.file-note.ok { color: var(--ok); }
+.file-note.bad { color: var(--danger); }
+.file-note:empty { display: none; }
+
+/* Replayed out of a saved chat: this daemon has no record of making that file,
+   so Open would be refused. The path stays and the card says why. */
+.file-card.replayed .file-icon { opacity: .7; }

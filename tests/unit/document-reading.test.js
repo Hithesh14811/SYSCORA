@@ -113,6 +113,73 @@ test("text in a PDF is found whether or not the stream is compressed", () => {
   assert.match(extractDocumentText("statement.pdf", compressed).text, /Statement of account/);
 });
 
+// EVERYTHING WORD, CANVA AND GOOGLE DOCS EXPORT LOOKS LIKE THIS.
+//
+// `/Encoding /Identity-H` puts glyph indices in the content stream — `<002C>`
+// where an `H` belongs — and the only way back is the font's `/ToUnicode` CMap.
+// A resume of exactly this shape was handed to the composer and came back as
+// 52,220 characters of binary, because the reader understood only `(literal)`
+// strings and scanned the embedded font programs looking for them.
+//
+// The font stream here is deliberately the kind that used to poison the output:
+// it inflates perfectly, it contains `BT`, and it is full of brackets.
+test("a PDF that encodes its text as glyph indices is read through the font's map", () => {
+  const cmap =
+    "/CIDInit /ProcSet findresource begin begincmap\n" +
+    "1 begincodespacerange <0000> <FFFF> endcodespacerange\n" +
+    "4 beginbfchar\n<0003> <0020>\n<002C> <0048>\n<002F> <0049>\n<0064> <0054>\nendbfchar\n" +
+    "endcmap end";
+  const content = "BT\n/F1 12 Tf\n1 0 0 -1 72 720 Tm\n[<002C>-0.85<002F>-0.60<0064>2.0<0003><002C>] TJ\nET";
+  const fontProgram = Buffer.concat([
+    Buffer.from("BT (", "latin1"),
+    Buffer.from(Array.from({ length: 400 }, (unused, at) => (at * 37) % 256)),
+    Buffer.from(") Tj ET", "latin1")
+  ]);
+
+  const parts = [];
+  const push = (chunk) => parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "latin1"));
+  push("%PDF-1.7\n");
+  push("3 0 obj\n<< /Type /Page /Resources 4 0 R /Contents 7 0 R >>\nendobj\n");
+  push("4 0 obj\n<< /Font <<\n/F1 5 0 R\n>> >>\nendobj\n");
+  push("5 0 obj\n<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 6 0 R >>\nendobj\n");
+  push(`6 0 obj\n<< /Length ${cmap.length} >>\nstream\n`);
+  push(cmap);
+  push("\nendstream\nendobj\n");
+  // The font program, carrying an object header inside its bytes — which is how
+  // the real file overwrote object 5 and lost every font lookup after it.
+  push("8 0 obj\n<< /Length1 400 >>\nstream\n");
+  push(Buffer.from("5 0 obj rubbish ", "latin1"));
+  push(zlib.deflateSync(fontProgram));
+  push("\nendstream\nendobj\n");
+  push(`7 0 obj\n<< /Length ${content.length} >>\nstream\n`);
+  push(content);
+  push("\nendstream\nendobj\n");
+
+  const read = extractDocumentText("resume.pdf", Buffer.concat(parts));
+  assert.equal(read.format, "pdf");
+  assert.equal(read.text, "HIT H", "the glyph indices must come back as the characters their ToUnicode map names");
+  assert.ok(!/[^\x09\x0A\x0D\x20-\x7E]/.test(read.text), `nothing unprintable may reach the caller: ${JSON.stringify(read.text)}`);
+});
+
+// The honesty backstop. Whatever gets past the stream filtering, mojibake must
+// never be handed over as though it were the document: a refusal can be
+// recovered from, and text that is not text cannot.
+test("a PDF whose text cannot be decoded is refused rather than returned as noise", () => {
+  const noise = Buffer.concat([
+    Buffer.from("BT /F9 12 Tf 72 720 Td (", "latin1"),
+    Buffer.from(Array.from({ length: 600 }, (unused, at) => 128 + (at % 120))),
+    Buffer.from(") Tj ET", "latin1")
+  ]);
+  const pdf = Buffer.concat([
+    Buffer.from(`%PDF-1.4\n1 0 obj\n<< /Length ${noise.length} >>\nstream\n`, "latin1"),
+    noise,
+    Buffer.from("\nendstream\nendobj\n", "latin1")
+  ]);
+  const read = extractDocumentText("scanned.pdf", pdf);
+  assert.equal(read.text, "");
+  assert.match(read.reason, /scan|could not be decoded/i);
+});
+
 // A scan is a photograph of a page. Returning empty space for one would read as
 // an empty document, which is a different and much worse answer than "there is
 // no text in here to read".

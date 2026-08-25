@@ -50,7 +50,16 @@ const MUST_SURVIVE_UNCHANGED = [
   ["the user's own email address, which is the subject of the work", "hitheshs096@gmail.com"],
   ["a long URL with no credential in it", "https://www.google.com/about/careers/applications/jobs"],
   ["an ordinary sentence from a chat", "Hey Kasharp Family! The badminton court is ready, the price is 250"],
-  ["a long readable automation id", "ChatListItemGridViewItemContainer"]
+  ["a long readable automation id", "ChatListItemGridViewItemContainer"],
+  // Live, 23 Aug 2026: the agent saved this file, listed the folder to find it
+  // again, and was handed `***REDACTED***.txt`. It called read_file on the
+  // placeholder, got ENOENT, and spent five steps working around its own
+  // redactor. 32 characters, upper and lower case and a digit — the credential
+  // shape exactly, and an entirely ordinary filename.
+  ["a file the agent saved itself", "J1_Internships_Software_Engineer.txt"],
+  ["a downloaded document", "Hithesh_4CB23AI034_RESUME_Final.pdf"],
+  ["a branch name", "feature/Add-Support-For-Windows11-Snap"],
+  ["an environment variable a script sets", "SYSCORA_STATE_DIR_Override2026"]
 ];
 
 test("a credential shaped like any vendor's key never reaches the model", () => {

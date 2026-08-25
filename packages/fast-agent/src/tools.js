@@ -20,6 +20,7 @@
 // result as text sized to what the next decision needs.
 
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import {
   classifyShellCommand,
@@ -45,6 +46,7 @@ import { buildPath, flattenPath } from "./stroke-path.js";
 import { describeMachine, readMachineProfile } from "./machine-profile.js";
 import { describeNotes, forgetNote, readNotes, rememberNote } from "./notes.js";
 import { extractDocumentText, isDocumentPath } from "./documents.js";
+import { DOCUMENT_FORMATS, makeDocument } from "./make-document.js";
 import { createProgressReader, reportsProgress } from "./command-progress.js";
 // Searching the web without driving a browser. See web-search.js: a search is a
 // LIST, and a list is one HTTP round trip rather than six page loads.
@@ -52,6 +54,18 @@ import { renderResults, searchWeb } from "./web-search.js";
 // And READING one without driving a browser either — the same argument one step
 // on. See web-page.js: the browser is kept for the pages that genuinely need it.
 import { fetchPage } from "./web-page.js";
+// And reading a REPOSITORY without cloning it. See github.js: the API is JSON,
+// which web-page.js refuses by design, and the HTML page is 583 KB of furniture.
+import { MAX_FILE_CHARS, parseRepoReference, readFile, readReadme, readRepository, readTree } from "./github.js";
+// Capabilities the agent saved for itself. Data, not code — see capabilities.js
+// for why, and for the prompt-budget argument that decides the whole shape.
+import {
+  describeCapabilities,
+  listCapabilities,
+  readCapability,
+  runCapability as runSavedCapability,
+  saveCapability
+} from "./capabilities.js";
 import { Reversal, createUndoJournal, timeLeft } from "./undo-journal.js";
 import { prepareFileUndo, restoreFile, describeFileChange } from "./undo-files.js";
 import { resolveStateDir } from "../../shared-types/src/state-path.js";
@@ -721,6 +735,45 @@ export function wrongUrlNotice(title, url) {
     "browser, and do not guess another spelling: search for the thing by name and follow the result.";
 }
 
+// THE SITES THIS READER GENUINELY CANNOT SEE.
+//
+// Not a list of sites believed to be difficult — that kind of list is wrong the
+// week after it is written. One entry, measured, with the numbers in the comment
+// beside it, and a route that is known to work because the same transcript shows
+// it working.
+//
+// youtube.com over HTTP: 173 characters, all of it the footer ("About Press
+// Copyright Contact us Creators Advertise Developers…"), so `readable` is false
+// and web_open escalates to the controlled browser — which renders two entries
+// of a channel's video list and a wrong duration. Live on 24 Aug 2026 that cost
+// two runs, 31 steps and 153,747 billed tokens of web_open / web_read /
+// click "Popular", ending at the cost ceiling with a random video playing.
+//
+// A player is not a document, and this is the difference: the answer about a
+// video comes from a SEARCH, and the video itself is played by the user's own
+// browser, which is signed in and can actually render it.
+const UNREADABLE_SITES = [
+  {
+    host: /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i,
+    notice:
+      "NOTE: YouTube is a JavaScript application and this reader sees only a fragment of it — a channel's " +
+      "video list, its Popular/Latest sorting and the view counts are NOT reliably readable here, and " +
+      "re-reading or clicking again will not change that. To find a particular video (most viewed, newest, " +
+      "by name), use `search` — the result carries the title and the watch URL. To PLAY one, `open_url` it " +
+      "in the user's own browser, which is signed in and renders properly."
+  }
+];
+
+export function slowSiteNotice(url) {
+  let host;
+  try {
+    host = new URL(String(url ?? "")).hostname;
+  } catch {
+    return null;
+  }
+  return UNREADABLE_SITES.find((site) => site.host.test(host))?.notice ?? null;
+}
+
 // A path that ends where it started. Handed to a shape tool it is a zero-size
 // shape; that is the whole defect this pair of helpers exists for.
 function isClosedPath(path) {
@@ -923,6 +976,9 @@ export function buildToolset({
     // happens later, by which time nothing else remembers where the phone number
     // came from. Cleared by beginTurn — a new request is a new context.
     observedInstructions: [],
+    // The last page reading rendered, so a re-read that produced identical
+    // characters can say so. See web_read's render.
+    lastWebReading: null,
     // What the USER actually asked for, verbatim. A destination they named
     // themselves is theirs, however many times it also appears on screen.
     userRequest: ""
@@ -2101,12 +2157,21 @@ export function buildToolset({
     // The page said 404. Say 404, and say what that means about the URL.
     const missing = wrongUrlNotice(state.title, state.url);
     if (missing) return missing;
+    // THE NOTICE HAS TO REACH THE EMPTY BRANCH TOO — that is the branch that
+    // matters. A YouTube channel page renders as nothing here, so the advice
+    // about what to do instead was being computed below and never reached: the
+    // empty reading returned first, saying "try web_read once more", which is
+    // precisely the loop this exists to stop.
+    const unreadable = slowSiteNotice(state.url);
     if (!text && lines.length === 0) {
-      return `Page: ${state.title ? `"${state.title}" — ` : ""}${state.url}\n` +
+      return [
+        `Page: ${state.title ? `"${state.title}" — ` : ""}${state.url}`,
         "It loaded, but there is NOTHING readable on it — no text and no controls. Either it is still " +
-        "rendering, or it needs a sign-in, or it is blocking automated browsers. Try web_read once more; " +
-        "if it is still empty, this page cannot be read this way and the answer has to come from " +
-        "somewhere else.";
+          "rendering, or it needs a sign-in, or it is blocking automated browsers." +
+          (unreadable ? "" : " Try web_read once more; if it is still empty, this page cannot be read this " +
+            "way and the answer has to come from somewhere else."),
+        unreadable
+      ].filter(Boolean).join("\n");
     }
     // HOW MUCH OF THE PAGE THIS IS.
     //
@@ -2122,6 +2187,20 @@ export function buildToolset({
     return [
       `Page: ${state.title ? `"${state.title}" — ` : ""}${state.url}`,
       window,
+      // THE SITE THIS READER CANNOT SEE, SAID ONCE, WHERE IT MATTERS.
+      //
+      // Measured 24 Aug 2026: youtube.com over HTTP returns 173 characters of
+      // footer boilerplate — "About Press Copyright Contact us…" — so `readable`
+      // is false and web_open escalates to the controlled browser, which renders
+      // two videos of a channel's list and a wrong duration. Nothing said so, so
+      // the model rediscovered it the expensive way: two live runs, 31 steps,
+      // 153,747 billed tokens, alternating web_open and web_read and clicking
+      // "Popular" five times before the cost ceiling stopped it.
+      //
+      // The route that DID work in the same transcript, twice, in three calls:
+      // search for the video, then open_url it in the user's own browser. That
+      // is what this says, and it costs nothing on any other site.
+      unreadable,
       // A WEB PAGE IS THE LEAST TRUSTWORTHY THING THIS AGENT READS. Anyone can
       // put words on one, and the agent arrives at it because it was asked to
       // look something up.
@@ -2954,10 +3033,37 @@ export function buildToolset({
         // times over a message that never went. The application saying focus
         // moved to the thing clicked is the cheap half of the answer; when it
         // says anything else, saying so costs six words and is the truth.
+        // A BROWSER DOES NOT MOVE FOCUS WHEN YOU CLICK ITS PAGE.
+        //
+        // Live, 24 Aug 2026: asked for a channel's most-viewed video, the agent
+        // clicked YouTube's "Popular" tab and was told "nothing confirms it
+        // acted: focus is on 'Angry Prash - YouTube'" — the window's own title,
+        // because a Chromium page keeps focus on the document. It read that as a
+        // click that had failed and clicked again, then by element index, then
+        // by coordinate, then focused the window and clicked once more. Four
+        // attempts at a click that had most likely worked the first time.
+        //
+        // UNCONFIRMED IS NOT FAILED, and inside a browser it is the ORDINARY
+        // answer rather than a warning sign. Saying which one this is costs a
+        // sentence, and only on the window type where it is true.
+        // FROM THE WORKING WINDOW, NOT FROM THE CLICK RESULT. The click returns
+        // the pointer's own record — `{performed, x, y, label, focusedName}` —
+        // and carries no window at all, so a first version of this test read
+        // three fields that are never there and could not have fired once. The
+        // window that was read last is where the click landed, and it is the
+        // thing that knows whether this is a browser.
+        const clickedWindow = state.lastWindow ?? {};
+        const inBrowser = /chrome|msedge|firefox|brave|opera|vivaldi|avast|browser/i.test(
+          `${clickedWindow.application ?? ""} ${clickedWindow.title ?? ""} ${result.focusedName ?? ""}`
+        );
         return verdictOf(result) === CONFIRMED
           ? confirmed(result, `Clicked ${where}${stale}.`)
           : unconfirmed(result, `Clicked ${where}${stale} — but nothing confirms it acted: ` +
-            `${result.evidence?.observed}. Read the screen if it matters.`);
+            `${result.evidence?.observed}. ` +
+            (inBrowser
+              ? "That is normal in a browser: clicking a page does not move focus, so this is very likely to " +
+                "have worked. READ THE SCREEN to see what changed — do not click it again."
+              : "Read the screen if it matters."));
       }
     },
     {
@@ -4164,7 +4270,23 @@ export function buildToolset({
       acts: true,
       execute: async (args) => {
         const url = String(args.url);
-        if (!/^https?:\/\//i.test(url)) throw new Error("Only http(s) URLs can be opened.");
+        if (!/^https?:\/\//i.test(url)) {
+          // THE REFUSAL SAYS WHAT TO DO INSTEAD, OR IT COSTS FOUR MORE CALLS.
+          //
+          // Live, 25 Aug 2026: given a PDF it had just written, the model tried
+          // `open_url` on the local path, read "Only http(s) URLs can be
+          // opened", and went looking for another way — Start-Process, then the
+          // window list, then Start-Process again, then an OCR of Edge. Four
+          // calls and most of the run's tokens, to look at a file it had already
+          // verified. A file it produced is already in front of the user with an
+          // Open button on it, and there is nothing left for this tool to do.
+          throw new Error(
+            `Only http(s) URLs can be opened. ${JSON.stringify(url)} looks like a local path.\n` +
+            "A file you created with create_document is ALREADY on screen as a card the user can open — " +
+            "you do not need to open it, and opening it tells you nothing the read-back has not already " +
+            "told you. If they specifically asked you to open an existing file, use `launch` with the path."
+          );
+        }
         const launch = await adapter.executeCommand(state.cwd, `Start-Process ${JSON.stringify(url)}`, [], { timeoutMs: 15000 });
         if (launch.exitCode !== 0) {
           return {
@@ -4600,6 +4722,193 @@ export function buildToolset({
         return confirmed(result, result.appended
           ? `Added to the end of ${result.filePath}, keeping what was already in it.`
           : `Wrote ${result.filePath}${result.existed ? " (replacing what was there)" : ""}.`);
+      }
+    },
+    {
+      name: "create_document",
+      // MAKING A DOCUMENT HAD NO VERB, AND COST THIRTEEN TOOL CALLS.
+      //
+      // Measured live, 25 Aug 2026. "create a pdf file properly formatted, write
+      // an essay about how to make an aircraft from scratch": 219.7 seconds, 14
+      // steps, 13 tool calls, 227,584 tokens. Not one of those steps was about
+      // the essay. It probed for Python, probed for reportlab and fpdf, ran
+      // `pip install reportlab`, wrote a Python SCRIPT with the whole essay
+      // inside it, ran the script, stat'd the output, failed to read the PDF
+      // back, dumped its header bytes to prove it was a PDF, tried `open_url` on
+      // a local path, fell back to Start-Process, listed the windows, launched
+      // it again, and OCR'd Microsoft Edge to confirm the words were there.
+      //
+      // Every one of those is a sensible move for a model with no tool for the
+      // job. The defect is the missing tool, and it is missing for .docx and
+      // .xlsx in exactly the same way. See make-document.js.
+      //
+      // WHY THE DESCRIPTION SAYS "DOWNLOADS". The user's complaint was that a
+      // file they asked for should behave like a download does: it lands
+      // somewhere they already know to look, and there is something to click.
+      // Every word here is re-sent on every step of every task, and almost none
+      // of them make a document — so this says only the things that change what
+      // the model DOES, and the rest waits in the result. See the render below.
+      description:
+        "Write a finished PDF, Word, Excel, HTML, CSV, Markdown or text file from markdown you write here. " +
+        "Use for ANY 'make me a file' request — never a script, an install or an app. Saves to Downloads " +
+        "unless a folder is named, reads it back, and puts a card on screen with an Open button.",
+      parameters: {
+        type: "object",
+        properties: {
+          filename: { type: "string", description: "Name only; the extension is added." },
+          format: { type: "string", enum: DOCUMENT_FORMATS },
+          title: { type: "string", description: "Optional heading at the top." },
+          content: {
+            type: "string",
+            description: "The whole document as markdown. For a spreadsheet, a markdown table or CSV."
+          },
+          folder: { type: "string", description: "Only if the user named one." }
+        },
+        required: ["filename", "format", "content"]
+      },
+      preview: (args) => `${args.filename ?? "document"}.${String(args.format ?? "").replace(/^\./, "")}`,
+      acts: true,
+      execute: async (args) => {
+        const format = String(args.format ?? "").replace(/^\./, "").toLowerCase();
+        const raw = String(args.filename ?? "").trim() || "document";
+        // A model that has been told "filename" still writes a path into it
+        // about a third of the time, and a path is a perfectly clear answer to
+        // "where should this go" — so an absolute one is honoured rather than
+        // being flattened into a filename with slashes in it.
+        const absolute = path.isAbsolute(raw) || /^[a-z]:[\\/]/i.test(raw);
+        const stem = path.basename(raw).replace(/\.[a-z0-9]{1,5}$/i, "")
+          // Windows will not create any of these, and the failure is a raw
+          // ENOENT that says nothing about which character was the problem.
+          .replace(/[<>:"/\\|?*]/g, " ").replace(/\s+/g, " ").trim() || "document";
+
+        // WHERE A FILE GOES WHEN NOBODY SAID.
+        //
+        // It went to whatever directory the model happened to name, which in the
+        // measured run was the repository the agent was started from. Downloads
+        // is where every other program on this machine puts a file it made for
+        // you, it is one click from the taskbar, and it is the answer the user
+        // gave when asked.
+        // Two independent sources, then a guess. The machine profile is the good
+        // one — it is read from Windows itself and knows about redirection — but
+        // it resolves asynchronously on the first turn and a request that beat
+        // its deadline must still put the file somewhere sensible rather than in
+        // whatever directory the daemon happens to have been started from.
+        const profile = state.machineProfile;
+        const directory = absolute ? path.dirname(raw)
+          : String(args.folder ?? "").trim()
+          || profile?.folders?.Downloads
+          || adapter?.getDownloadsPath?.()
+          || (profile?.home ? path.join(profile.home, "Downloads") : null)
+          || path.join(os.homedir(), "Downloads");
+
+        await fs.mkdir(directory, { recursive: true }).catch(() => {});
+
+        // NOT OVER SOMEBODY ELSE'S FILE. `write_file` stops and asks, which is
+        // right for a path the model chose deliberately. This tool is naming
+        // the file itself, so the question has an obvious answer and asking it
+        // costs a whole round trip: it does what a browser download does.
+        let filePath = path.join(directory, `${stem}.${format}`);
+        for (let attempt = 2; attempt < 100; attempt += 1) {
+          try {
+            await fs.access(filePath);
+            filePath = path.join(directory, `${stem} (${attempt}).${format}`);
+          } catch { break; }
+        }
+
+        const built = makeDocument({ format, title: String(args.title ?? ""), content: String(args.content ?? "") });
+        const undo = await prepareFileUndo(state.stateDir, filePath);
+        const entryId = state.journal.record({
+          tool: "create_document",
+          summary: describeFileChange(filePath, undo.reversal),
+          reversal: undo.reversal,
+          why: undo.why
+        });
+        await fs.writeFile(filePath, built.buffer);
+
+        // READ BACK DOWN A PATH THAT KNOWS NOTHING ABOUT THE WRITER.
+        //
+        // documents.js was written to parse other people's Word files, PDFs and
+        // spreadsheets; it has never heard of make-document.js. So a document
+        // this tool believes it produced and that extractor cannot read is not a
+        // document, and that is the whole verification — no screen reading, no
+        // opening it in a viewer, no OCR. Exactly the rule in CLAUDE.md:
+        // verification must not share a code path with the thing it verifies.
+        const bytes = (await fs.stat(filePath).catch(() => null))?.size ?? 0;
+        let extracted = null;
+        if (isDocumentPath(filePath)) {
+          try { extracted = extractDocumentText(filePath, await fs.readFile(filePath)); } catch { extracted = null; }
+        } else {
+          const text = await fs.readFile(filePath, "utf8").catch(() => null);
+          extracted = text == null ? null : { text, format };
+        }
+        const words = extracted?.text ? (extracted.text.match(/\S+/g) ?? []).length : 0;
+
+        const card = {
+          kind: "file",
+          path: filePath,
+          name: path.basename(filePath),
+          format,
+          bytes,
+          pages: built.pages ?? null,
+          words
+        };
+        const result = {
+          filePath,
+          format,
+          bytes,
+          pages: built.pages ?? null,
+          words,
+          directory,
+          uiCard: card,
+          evidence: bytes === 0
+            ? evidence({
+                observed: `${filePath} was written and is 0 bytes`,
+                method: "filesystem.stat", actedVia: "create_document", verdict: REFUTED
+              })
+            : extracted?.text
+              ? evidence({
+                  observed: `${filePath} is ${bytes} bytes and reads back as ${words} words of ${format}` +
+                    `${built.pages ? ` across ${built.pages} pages` : ""}`,
+                  // Named for what actually did the reading, not for this tool.
+                  method: isDocumentPath(filePath) ? "document.extract" : "filesystem.read",
+                  actedVia: "create_document",
+                  verdict: CONFIRMED
+                })
+              : evidence({
+                  observed: `${filePath} is ${bytes} bytes but nothing could read its text back`,
+                  method: NOTHING_READ_IT_BACK, actedVia: "create_document", verdict: UNCONFIRMED
+                })
+        };
+        state.journal.settle(entryId, result.evidence);
+        state.ownedPaths.add(filePath.toLowerCase());
+        return result;
+      },
+      failed: (result) => verdictOf(result) === REFUTED,
+      // THE LESSON GOES IN THE RESULT, WHERE IT IS READ AT THE MOMENT IT MATTERS
+      // and costs nothing on the steps that never make a document. Every
+      // sentence below is aimed at one move the measured run actually made
+      // after the file already existed: it opened it, it listed the windows, it
+      // launched it a second time, and it read a browser's screen to check the
+      // words were there — five tool calls and most of the tokens, spent
+      // proving something the read-back had already settled.
+      render: (result) => {
+        if (verdictOf(result) === REFUTED) {
+          return refuted(result, `${result.filePath} was created and is empty. Nothing here can say why — ` +
+            "write it again, and if it is empty a second time use a different format.");
+        }
+        const where = `${result.filePath} (${(result.bytes / 1024).toFixed(1)} KB` +
+          `${result.pages ? `, ${result.pages} page${result.pages === 1 ? "" : "s"}` : ""}` +
+          `${result.words ? `, ${result.words} words` : ""})`;
+        if (verdictOf(result) === UNCONFIRMED) {
+          return unconfirmed(result, `Wrote ${where}, but its text could not be read back to check it. ` +
+            "UNCONFIRMED — say so rather than claiming the document is right.");
+        }
+        return confirmed(result,
+          `Wrote ${where}, and reading it back confirms the text is in it.\n` +
+          "THIS STEP IS FINISHED. The user has the file on screen as a card with Open and Show in folder " +
+          "buttons — do NOT open it, do NOT launch a viewer, and do NOT read the screen to check it. " +
+          "The read-back above is the evidence, and it is better evidence than a screenshot of a reader.\n" +
+          "Tell them the file name and where it is, and stop.");
       }
     },
     {
@@ -5137,7 +5446,27 @@ export function buildToolset({
         const page = await readWebPage({ selector: args.selector, settle: true });
         return { ...page, evidence: pageEvidence(page) };
       },
-      render: (page) => reported(page, renderWebPage(page))
+      // THE SAME PAGE, READ AGAIN, IS NOT NEW INFORMATION.
+      //
+      // Live, 24 Aug 2026: web_read returned the identical reading five times in
+      // one request while the model waited for a list to appear that this reader
+      // cannot see. The repeat guard in index.js counts a call's ARGUMENTS, and
+      // these were legitimately different each time — a different URL had been
+      // opened in between — so nothing ever said the obvious thing: you already
+      // have this, and reading it again produced the same characters.
+      //
+      // Compared on the text itself rather than on a call count, so it is a
+      // statement about the PAGE and cannot be wrong.
+      render: (page) => {
+        const rendered = renderWebPage(page);
+        const same = rendered === state.lastWebReading;
+        state.lastWebReading = rendered;
+        return reported(page, same
+          ? `${rendered}\n\nThis is CHARACTER-FOR-CHARACTER the reading you already have — nothing on the ` +
+            "page changed. Reading it again will return this again: either act on what is here, get the " +
+            "answer another way, or tell the user what you can and cannot see."
+          : rendered);
+      }
     },
     {
       name: "web_click",
@@ -5414,6 +5743,301 @@ export function buildToolset({
         return result.moved
           ? confirmed(result, `Scrolled to ${result.scrollAfter?.y ?? "?"}. Call web_read to see what is there now.`)
           : refuted(result, "The page did not move — you are already at the end of it.");
+      }
+    },
+    {
+      name: "github",
+      // ONE CALL ANSWERS "WHAT IS THIS REPOSITORY", AND THAT IS THE POINT.
+      //
+      // Live, 24 Aug 2026: given a GitHub URL the agent ran `git clone` and read
+      // the files off disk, because both machine-readable doors were shut — the
+      // API is application/json and web-page.js refuses that, and the HTML page
+      // is 583 KB that renders as GitHub's own furniture with no file contents
+      // in it. See github.js for the measurements.
+      //
+      // With no `path` this returns the overview, the filtered file tree AND the
+      // README together, because that is what a person means by "look at this
+      // repo" and three round trips through the model is three times the cost of
+      // one. The description is deliberately short: every word here is re-sent on
+      // every step of every future request (~163 tokens per tool, measured).
+      description:
+        "Read a GitHub repository directly: overview, file list and README, or one file's exact contents when " +
+        "`path` is given. Use this for any github.com URL instead of cloning it or opening the page.",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "A github.com URL, or owner/repo" },
+          path: { type: "string", description: "A file to read. A /blob/ URL already names one." },
+          ref: { type: "string", description: "Branch or tag. Defaults to the repository's own." }
+        },
+        required: ["repo"]
+      },
+      preview: (args) => String(args.repo ?? ""),
+      acts: true,
+      execute: async (args) => {
+        const reference = parseRepoReference(args.repo);
+        if (!reference) {
+          throw new Error(
+            `"${String(args.repo ?? "")}" is not a GitHub repository. Use a github.com URL or owner/repo — ` +
+            "for any other site, use web_open."
+          );
+        }
+        // An explicit argument beats what was parsed out of the URL; a /blob/
+        // URL carries both and the caller may be narrowing it.
+        if (args.path) reference.path = String(args.path);
+        if (args.ref) reference.ref = String(args.ref);
+
+        if (reference.path && reference.kind !== "tree") {
+          const file = await readFile(reference);
+          if (!file.ok) {
+            return {
+              github: true, kind: "file", reference, failed: true, reason: file.reason,
+              evidence: evidence({
+                observed: `raw.githubusercontent.com could not give ${reference.path}: ${file.reason}`,
+                method: "raw.githubusercontent.com",
+                actedVia: "github",
+                verdict: file.status === 404 ? REFUTED : UNCONFIRMED
+              })
+            };
+          }
+          return {
+            github: true, kind: "file", reference, ...file,
+            evidence: evidence({
+              observed: `raw.githubusercontent.com returned ${file.bytes} bytes of ` +
+                `${reference.owner}/${reference.repo}/${reference.path} at ${file.ref}`,
+              method: "raw.githubusercontent.com",
+              actedVia: "github",
+              verdict: CONFIRMED
+            })
+          };
+        }
+
+        const overview = await readRepository(reference);
+        if (!overview.ok) {
+          return {
+            github: true, kind: "repo", reference, failed: true, reason: overview.reason,
+            evidence: evidence({
+              observed: `api.github.com could not describe ${reference.owner}/${reference.repo}: ${overview.reason}`,
+              method: "api.github.com",
+              actedVia: "github",
+              verdict: overview.status === 404 ? REFUTED : UNCONFIRMED
+            })
+          };
+        }
+        const defaultBranch = overview.repository.defaultBranch;
+        // Both at once: neither depends on the other's answer, and a repository
+        // read is two round trips rather than one only because GitHub splits it.
+        const [tree, readme] = await Promise.all([
+          readTree(reference, { defaultBranch }),
+          readReadme(reference)
+        ]);
+        return {
+          github: true,
+          kind: "repo",
+          reference,
+          repository: overview.repository,
+          tree: tree.ok ? tree : null,
+          treeReason: tree.ok ? null : tree.reason,
+          readme: readme.ok ? readme.text : null,
+          readmeTruncated: Boolean(readme.truncated),
+          remaining: Number.isFinite(overview.remaining) ? overview.remaining : null,
+          evidence: evidence({
+            observed: `api.github.com returned ${overview.repository.fullName}` +
+              (tree.ok ? `, ${tree.fileCount} files on ${tree.ref}` : ", and no file tree") +
+              (readme.ok ? `, README ${readme.text.length} characters` : ", no README"),
+            method: "api.github.com",
+            actedVia: "github",
+            verdict: CONFIRMED
+          })
+        };
+      },
+      render: (result) => {
+        if (result.failed) {
+          return verdictOf(result) === REFUTED
+            ? refuted(result, result.reason)
+            : unconfirmed(result, `${result.reason} Nothing was read.`);
+        }
+
+        // A REPOSITORY IS SOMEBODY ELSE'S WORDS. A README is exactly the kind of
+        // document an instruction aimed at an agent hides in, and it arrives in
+        // the same conversation as the user's request. Same boundary as a file,
+        // a page and the clipboard — see content-boundary.js.
+        if (result.kind === "file") {
+          const where = `${result.reference.owner}/${result.reference.repo}/${result.path} @ ${result.ref}`;
+          const notice = screenObservedContent(result.text ?? "", `the file ${where}`);
+          return confirmed(result, [
+            notice,
+            `${where} (${result.bytes.toLocaleString()} bytes` +
+              `${result.truncated ? `, showing the first ${MAX_FILE_CHARS.toLocaleString()} characters` : ""}):`,
+            result.text
+          ].filter(Boolean).join("\n\n"));
+        }
+
+        const repo = result.repository;
+        const lines = [`${repo.fullName}${repo.archived ? " (ARCHIVED)" : ""} — ${repo.description ?? "no description"}`];
+        lines.push([
+          repo.language && `language ${repo.language}`,
+          repo.license && `licence ${repo.license}`,
+          Number.isFinite(repo.stars) && `${repo.stars.toLocaleString()} stars`,
+          `default branch ${repo.defaultBranch}`,
+          repo.updatedAt && `last pushed ${String(repo.updatedAt).slice(0, 10)}`
+        ].filter(Boolean).join(" · "));
+        if (repo.homepage) lines.push(repo.homepage);
+
+        if (result.tree) {
+          const tree = result.tree;
+          lines.push("", `${tree.fileCount.toLocaleString()} files on ${tree.ref}` +
+            (tree.mostly.length ? ` — mostly ${tree.mostly.map((k) => `.${k.extension} × ${k.count}`).join(", ")}` : "") + ".");
+          // Said out loud, for the same reason the composer says it: the model
+          // must be able to tell "there is no test folder" from "the test folder
+          // was not shown to you".
+          if (tree.machinery) {
+            lines.push(`${tree.machinery.toLocaleString()} generated or vendored files are not listed.`);
+          }
+          if (tree.truncated) lines.push("GitHub truncated this tree — the repository is larger than one request.");
+          lines.push(...tree.entries.map((entry) => `  ${entry.path}`));
+          if (tree.omitted) lines.push(`  … and ${tree.omitted} more files not listed here.`);
+        } else if (result.treeReason) {
+          lines.push("", `The file list could not be read: ${result.treeReason}`);
+        }
+
+        const notice = screenObservedContent(result.readme ?? "", `the README of ${repo.fullName}`);
+        if (result.readme) {
+          lines.push("", "README:", result.readme + (result.readmeTruncated ? "\n[… README clipped]" : ""));
+        }
+        // Below ten, because at 60 an hour the next few calls are the ones that
+        // matter and finding out by failing is worse than being told.
+        if (Number.isFinite(result.remaining) && result.remaining < 10) {
+          lines.push("", `(${result.remaining} GitHub API requests left this hour. Reading files is unaffected.)`);
+        }
+        return confirmed(result, [notice, lines.join("\n")].filter(Boolean).join("\n\n"));
+      }
+    },
+    {
+      name: "capability",
+      // TEACHING IT SOMETHING IT DID NOT SHIP WITH.
+      //
+      // One tool, not one per capability: 33 tools are 5,397 tokens of schema
+      // re-sent every step (measured), so a tool per saved capability would tax
+      // every future request forever. This description never grows; the saved
+      // ones are advertised as one line each in the system prompt, and only once
+      // any exist. See capabilities.js.
+      description:
+        "Save a reusable way to fetch something from an https API, then call it by name later. Use when a request " +
+        "needs a source there is no tool for. save: {id, title, when, url with {placeholders}, parameters, render}.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["save", "run", "list"] },
+          id: { type: "string" },
+          arguments: { type: "object", description: "For run: a value per parameter." },
+          definition: { type: "object", description: "For save: the capability." }
+        },
+        required: ["action"]
+      },
+      preview: (args) => `${args.action ?? "?"} ${args.id ?? args.definition?.id ?? ""}`.trim(),
+      acts: true,
+      execute: async (args) => {
+        const action = String(args.action ?? "");
+
+        if (action === "list") {
+          const saved = await listCapabilities(basePath);
+          return {
+            capabilityList: saved.map((entry) => ({
+              id: entry.id, when: entry.when, host: entry.host, runs: entry.runs ?? 0, failures: entry.failures ?? 0
+            })),
+            evidence: evidence({
+              observed: `${saved.length} saved capabilit${saved.length === 1 ? "y" : "ies"} on disk`,
+              method: "capabilities.directory",
+              verdict: CONFIRMED
+            })
+          };
+        }
+
+        if (action === "save") {
+          const definition = args.definition ?? {};
+          const saved = await saveCapability(basePath, definition);
+          if (!saved.ok) {
+            return {
+              capabilitySaved: false, problems: saved.problems,
+              evidence: evidence({
+                observed: `refused to save: ${saved.problems.join("; ")}`,
+                method: "capabilities.validate",
+                actedVia: "capability",
+                verdict: REFUTED
+              })
+            };
+          }
+          // Read back from disk through the same loader a later run uses. A
+          // capability that "saved" and cannot be loaded again is this project's
+          // oldest failure shape, one layer up.
+          const readBack = await readCapability(basePath, saved.capability.id);
+          return {
+            capabilitySaved: Boolean(readBack),
+            capability: saved.capability,
+            replaced: saved.replaced,
+            evidence: evidence({
+              observed: readBack
+                ? `${saved.capability.id} is on disk and loads back, for ${saved.capability.host}`
+                : `${saved.capability.id} was written and could not be loaded back`,
+              method: "capabilities.readBack",
+              actedVia: "capability",
+              verdict: readBack ? CONFIRMED : REFUTED
+            })
+          };
+        }
+
+        if (action === "run") {
+          const result = await runSavedCapability(basePath, String(args.id ?? ""), args.arguments ?? {});
+          if (!result.ok) {
+            return {
+              capabilityRun: false, id: args.id, reason: result.reason,
+              evidence: evidence({
+                observed: `${args.id} did not return anything usable: ${result.reason}`,
+                method: result.capability?.host ?? "capabilities.run",
+                actedVia: "capability",
+                verdict: UNCONFIRMED
+              })
+            };
+          }
+          return {
+            capabilityRun: true, id: args.id, url: result.url, text: result.text, bytes: result.bytes,
+            evidence: evidence({
+              observed: `${result.capability.host} answered HTTP ${result.status} with ${result.bytes} bytes`,
+              method: result.capability.host,
+              actedVia: "capability",
+              verdict: CONFIRMED
+            })
+          };
+        }
+
+        throw new Error('action must be "save", "run" or "list".');
+      },
+      render: (result) => {
+        if (result.capabilityList) {
+          if (!result.capabilityList.length) {
+            return reported(result, "Nothing has been saved yet. Save one with action:\"save\" when a request needs a source there is no tool for.");
+          }
+          return reported(result, result.capabilityList
+            .map((entry) => `${entry.id} (${entry.host}) — ${entry.when} · ${entry.runs} runs, ${entry.failures} failed`)
+            .join("\n"));
+        }
+        if (result.capabilitySaved === false) {
+          return refuted(result, `That capability was not saved:\n- ${result.problems.join("\n- ")}`);
+        }
+        if (result.capabilitySaved) {
+          return confirmed(result, `Saved ${result.capability.id} for ${result.capability.host}` +
+            `${result.replaced ? " (replacing the previous one)" : ""}. ` +
+            "It is a plain JSON file in .syscora/capabilities and will be offered on every future request.");
+        }
+        if (result.capabilityRun === false) {
+          return unconfirmed(result, `${result.reason}. Nothing was read — do it another way, or fix the capability and save it again.`);
+        }
+        // WHAT CAME BACK IS SOMEBODY ELSE'S WORDS. A capability fetches from the
+        // open internet, so its answer is content and goes through the same
+        // boundary a page, a file and a repository do.
+        const notice = screenObservedContent(result.text ?? "", `the capability ${result.id}`);
+        return confirmed(result, [notice, `${result.url}:`, result.text].filter(Boolean).join("\n\n"));
       }
     },
     {
@@ -5853,6 +6477,113 @@ export function buildToolset({
       }
     },
     {
+      name: "email_draft",
+      // THIS TOOL CANNOT SEND. IT PUTS A CARD IN FRONT OF A PERSON.
+      //
+      // Everything a mail-sending agent gets wrong lives in the gap between
+      // "the model decided to send this" and "a human saw who it was going to".
+      // This product reads other people's web pages, documents and messages,
+      // and the rule it is built on is that an instruction found inside one is
+      // never an action — enforced on DESTINATIONS, at the tool boundary. An
+      // email address is the sharpest destination there is.
+      //
+      // So the outcome of this tool is a DRAFT: recipients, subject and body,
+      // rendered in the chat as an editable card with a Send button. The user
+      // can change every field, including who it goes to, and nothing leaves
+      // the machine until they press it. The daemon route that actually sends
+      // is reachable only from that card, behind the API token, and no tool
+      // here can call it. See apps/daemon/src/gmail.js.
+      // Every word here is re-sent on every step, so it says the two things
+      // that change what the model DOES and leaves the rest to the result.
+      description:
+        "Compose an email and put it in front of the user as an editable draft with a Send button they " +
+        "press. This is the ONLY way to email from here and it does not send: never say you sent it, " +
+        "and never open a mail client to send it yourself.",
+      parameters: {
+        type: "object",
+        properties: {
+          to: { type: "string", description: "Recipient address, or several separated by commas" },
+          cc: { type: "string", description: "Optional copies, comma separated" },
+          // Two words, because the whole schema is re-sent on every step of
+          // every task and almost none of them send mail. "blind" is the one
+          // fact a model could get wrong here, and it is the one word that
+          // stops it putting a private list in `cc`.
+          bcc: { type: "string", description: "Optional blind copies, comma separated" },
+          subject: { type: "string" },
+          body: { type: "string", description: "Plain text. Blank lines separate paragraphs." }
+        },
+        required: ["to", "subject", "body"]
+      },
+      preview: (args) => String(args.to ?? ""),
+      // It changes nothing about the machine and nothing about the world: it
+      // draws a card. `acts: false` is the honest answer, and it is what keeps
+      // the evidence contract from demanding a reading of a change that this
+      // tool is specifically designed not to make.
+      acts: false,
+      execute: async (args) => {
+        const addresses = (value) => String(value ?? "")
+          .split(/[,;]/).map((entry) => entry.trim()).filter(Boolean);
+        const to = addresses(args.to);
+        const cc = addresses(args.cc);
+        const bcc = addresses(args.bcc);
+        // A refusal the model can act on, rather than a card with an empty To
+        // field that the user has to work out how to fill in.
+        if (to.length === 0) {
+          throw new Error("An email draft needs at least one recipient address in `to`.");
+        }
+        const subject = String(args.subject ?? "").trim();
+        const body = String(args.body ?? "").trim();
+        const draft = { kind: "email-draft", to, cc, bcc, subject, body };
+        return {
+          drafted: true,
+          draft,
+          // The surface renders this; the model only ever sees `render` below.
+          // Any tool can carry one of these — it is the general channel for
+          // "the client has something to draw that is not a line of output".
+          uiCard: draft,
+          evidence: evidence({
+            observed: `a draft to ${to.join(", ")} was put in the conversation for the user to review`,
+            // The card is the observation: it exists on the surface, which is
+            // the only thing this tool claims to have done.
+            method: "compose card",
+            verdict: CONFIRMED
+          })
+        };
+      },
+      // THE LESSON GOES IN THE RESULT, WHERE IT IS READ AT THE MOMENT IT MATTERS.
+      //
+      // A live run on 25 Aug 2026 is why every sentence below is here. Asked to
+      // email someone and then message a contact "once the message is sent",
+      // the model drafted correctly, read "NOTHING HAS BEEN SENT", concluded
+      // the job was unfinished, and went looking for another way to send it: it
+      // launched Outlook, walked through Outlook's first-run wizard, granted
+      // Microsoft access to the user's Google account, gave up, opened Gmail in
+      // the user's browser, and started filling in a compose window — 27 steps
+      // and 170,000 tokens, ending in a token ceiling with a half-typed email
+      // in a browser and the draft card still sitting untouched above it.
+      //
+      // Every clause is aimed at one wrong turn that run actually took:
+      // "you cannot send it" (it believed it could), "do not open Outlook,
+      // Gmail or any other mail client" (it opened both), "this step is
+      // finished" (it thought it was mid-task), and the last sentence, which is
+      // the one that would have stopped it — the request chained a WhatsApp
+      // message to the email having been sent, and the agent cannot observe
+      // that, so the honest move is to stop and say what it is waiting on.
+      render: (result) => confirmed(
+        result,
+        `Draft ready for ${result.draft.to.join(", ")} — subject "${result.draft.subject}". ` +
+        "It is on screen with a Send button the user presses themselves.\n" +
+        "NOTHING HAS BEEN SENT, AND YOU CANNOT SEND IT. There is no tool here that sends mail. " +
+        "Do NOT open Outlook, Gmail, a browser or any other mail client to send it yourself: the " +
+        "draft is already in front of the user, and a second copy typed into some other client " +
+        "would go from the wrong account and arrive twice.\n" +
+        "THIS STEP IS FINISHED. Say the draft is ready and stop.\n" +
+        "If something else you were asked to do was to happen AFTER the mail was sent, you cannot " +
+        "know whether it has been — the user has not pressed Send yet. Do not do that part, and do " +
+        "not pretend it happened: name it, say it is waiting on them pressing Send, and stop there."
+      )
+    },
+    {
       name: "wait",
       description: "Wait a moment for something to finish loading or appearing.",
       parameters: { type: "object", properties: { ms: { type: "number" } }, required: ["ms"] },
@@ -6180,6 +6911,18 @@ export function buildToolset({
     async notes() {
       try {
         return describeNotes(await readNotes(basePath));
+      } catch {
+        return "";
+      }
+    },
+
+    // WHAT THIS MACHINE HAS BEEN TAUGHT. One line per saved capability, in front
+    // of the model for the first decision — the same argument as the machine
+    // profile and the notes. Empty until the user has actually saved one, which
+    // is what keeps this free for everybody who never does.
+    async capabilities() {
+      try {
+        return describeCapabilities(await listCapabilities(basePath));
       } catch {
         return "";
       }

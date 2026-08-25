@@ -601,10 +601,16 @@ test("narrating the next step instead of taking it is not finishing", async () =
 // would also offer the stall to the recorder as a route worth saving.
 test("a run that stalls and stays stalled is reported as unfinished", async () => {
   const toolset = stubToolset({ click: async () => ({ ok: true, text: "Clicked." }) });
+  // FOUR TURNS, NOT THREE, SINCE 24 AUG 2026. A run that narrates twice is now
+  // asked once for the ANSWER instead of another step — a real audit was losing
+  // ten files of work to a "Partly done" card carrying nothing but the
+  // narration (see unfinished-wrapup.test.js). "Stays stalled" therefore means
+  // it keeps narrating through that ask too, which is what the fourth turn is.
   const turns = [
     { text: "Opening it.", toolCalls: [{ name: "click", args: { text: "Amma" } }] },
     { text: "I've clicked the search box. Now I'll type the name." },
-    { text: "Next, I'll press enter to send it." }
+    { text: "Next, I'll press enter to send it." },
+    { text: "Now I'll press enter to send it." }
   ];
 
   const agent = new FastAgent({ provider: scriptedProvider(turns), toolset, maxSteps: 20 });

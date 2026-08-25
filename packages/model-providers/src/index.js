@@ -126,6 +126,21 @@ export async function openAiCompatibleChat({
   signal = null,
   onTextDelta = null,
   onReasoningDelta = null,
+  // A TOOL CALL IS ALSO A STREAM, AND IT WAS THE ONLY ONE NOBODY WATCHED.
+  //
+  // Prose and reasoning each had a channel to the screen; the third thing a turn
+  // can be doing — composing a tool call — had none, because the call is only
+  // handed to the caller once the whole turn has finished arriving. Asking for a
+  // file of any size means the model spends that whole turn writing the file's
+  // CONTENTS into an argument, and for all of it the surface showed nothing
+  // moving at all. Measured live on 25 Aug 2026: 59 seconds of a turning sphere
+  // labelled "Thinking…" with no row on screen, for a `write_file` that was
+  // streaming the entire time.
+  //
+  // Called with { index, id, name, argumentsBytes } — never the argument text
+  // itself. Half-written JSON is not something any consumer should be tempted to
+  // parse, and the byte count is the part that says "still going".
+  onToolCallDelta = null,
   stream = true,
   // BEING RATE-LIMITED IS A WAIT, NOT A FAILURE.
   //
@@ -193,7 +208,8 @@ export async function openAiCompatibleChat({
   const deadline = Date.now() + timeoutMs;
   const attemptOptions = {
     baseUrl, apiKey, model, headers, wireMessages, tools,
-    temperature, maxTokens, stream, onTextDelta, onReasoningDelta, signal, deadline, idleTimeoutMs
+    temperature, maxTokens, stream, onTextDelta, onReasoningDelta, onToolCallDelta,
+    signal, deadline, idleTimeoutMs
   };
 
   let attempt = 0;
@@ -237,7 +253,8 @@ export async function openAiCompatibleChat({
  */
 async function sendChatOnce({
   baseUrl, apiKey, model, headers, wireMessages, tools,
-  temperature, maxTokens, stream, onTextDelta, onReasoningDelta, signal, deadline, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS
+  temperature, maxTokens, stream, onTextDelta, onReasoningDelta, onToolCallDelta = null,
+  signal, deadline, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS
 }) {
   const controller = new AbortController();
   // A TOTAL-DURATION TIMEOUT CANNOT TELL THINKING FROM A DEAD SOCKET.
@@ -379,6 +396,16 @@ async function sendChatOnce({
           if (call.function?.name) existing.name = call.function.name;
           if (call.function?.arguments) existing.arguments += call.function.arguments;
           pending.set(key, existing);
+          // Only once the name is known: a row that cannot say which tool it is
+          // has nothing to tell anyone. See onToolCallDelta.
+          if (existing.name) {
+            onToolCallDelta?.({
+              index: Number(key),
+              id: existing.id,
+              name: existing.name,
+              argumentsBytes: existing.arguments.length
+            });
+          }
         }
       }
     }

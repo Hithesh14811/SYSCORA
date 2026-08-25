@@ -29,7 +29,24 @@ export const MAX_FILE_BYTES = 20 * 1024 * 1024;
 export const MAX_EXTRACTED_CHARS = 200_000;
 // A folder is attached as a LISTING, not as its contents. Somebody's Downloads
 // folder has forty thousand files in it and none of them is the question.
-export const MAX_FOLDER_ENTRIES = 300;
+//
+// THREE HUNDRED WAS STILL FAR TOO MANY, AND THEY WERE THE WRONG THREE HUNDRED.
+// Live, 23 Aug 2026: a project folder was attached and "can you see the folder?"
+// cost 21,285 input tokens. The folder holds 9,142 files and the listing is
+// alphabetical, so what travelled was `.git` object hashes, `.pytest_cache`, and
+// two hundred lines of `.venv/Lib/site-packages/_pytest/__pycache__/*.pyc` —
+// and then it stopped, having never reached a single file the person wrote. The
+// agent's summary was accurate about pytest and knew nothing about the project.
+//
+// The listing is a MAP, and a map leaves out the scaffolding. What is skipped is
+// counted and named, because a listing that quietly omits things reads as
+// complete.
+export const MAX_FOLDER_ENTRIES = 120;
+
+// Directories that are machinery, not content: generated, vendored, or a cache.
+// Somebody's own file is never in one, and if the folder is nothing but these
+// they are listed anyway rather than answering "nothing here" (see below).
+const MACHINERY = /(^|\/)(\.git|node_modules|\.venv|venv|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.tox|site-packages|dist|build|target|coverage|\.next|\.nuxt|\.parcel-cache|\.gradle|\.idea|\.terraform|vendor|Pods)(\/|$)/i;
 
 const IMAGE_TYPES = /^image\/(png|jpeg|jpg|gif|webp|bmp|avif)$/i;
 const TEXTUAL_EXTENSIONS = /\.(txt|md|markdown|csv|tsv|json|ya?ml|xml|html?|css|js|mjs|cjs|ts|tsx|jsx|py|java|c|h|cpp|cs|go|rs|rb|php|sh|ps1|bat|sql|log|ini|toml|env|srt|vtt|rst|tex)$/i;
@@ -235,9 +252,22 @@ export function prepareFolder(files) {
     }
   }
 
-  const entries = list
+  const all = list
     .map((file) => ({ path: String(file.webkitRelativePath ?? file.name), bytes: file.size }))
     .sort((left, right) => left.path.localeCompare(right.path));
+
+  // What the person wrote, as opposed to what their tools generated. If that is
+  // empty the folder IS its machinery — somebody attached node_modules on
+  // purpose — and showing them an empty map would be a lie about their folder.
+  const skipped = all.filter((entry) => MACHINERY.test(entry.path));
+  const everythingIsMachinery = skipped.length === all.length;
+  const content = everythingIsMachinery ? all : all.filter((entry) => !MACHINERY.test(entry.path));
+
+  // Shallow first. A folder's own README, package.json and source directory say
+  // more about it than anything nested six levels down, and alphabetical order
+  // buries them under whatever begins with a dot.
+  const depth = (entry) => entry.path.split("/").length;
+  const ranked = [...content].sort((left, right) => depth(left) - depth(right) || left.path.localeCompare(right.path));
 
   return {
     kind: "folder",
@@ -245,12 +275,43 @@ export function prepareFolder(files) {
     path,
     fileCount: list.length,
     bytes: list.reduce((total, file) => total + file.size, 0),
-    entries: entries.slice(0, MAX_FOLDER_ENTRIES),
+    entries: ranked.slice(0, MAX_FOLDER_ENTRIES),
     // Named rather than silently dropped: a listing that stops without saying so
     // reads as a complete listing, and the model would answer "there is no
     // README in it" about a folder it was shown a third of.
-    omitted: Math.max(0, entries.length - MAX_FOLDER_ENTRIES)
+    omitted: Math.max(0, ranked.length - MAX_FOLDER_ENTRIES),
+    // The two summaries that replace two hundred lines of `.pyc`: which folders
+    // were left out, and what the folder is mostly made of.
+    machinery: summariseMachinery(everythingIsMachinery ? [] : skipped),
+    mostly: summariseKinds(content)
   };
+}
+
+/** The machinery directories that were left out, with their file counts. */
+function summariseMachinery(skipped) {
+  const counts = new Map();
+  for (const entry of skipped) {
+    const name = MACHINERY.exec(entry.path)?.[2];
+    if (name) counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 6)
+    .map(([name, count]) => ({ name, count }));
+}
+
+/** The extensions this folder is mostly made of — what kind of project it is. */
+function summariseKinds(entries) {
+  const counts = new Map();
+  for (const entry of entries) {
+    const extension = /\.([A-Za-z0-9]{1,8})$/.exec(entry.path)?.[1]?.toLowerCase();
+    if (!extension) continue;
+    counts.set(extension, (counts.get(extension) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 6)
+    .map(([extension, count]) => ({ extension, count }));
 }
 
 /**
@@ -266,11 +327,24 @@ export function describeAttachments(attachments) {
   for (const item of attachments) {
     if (item.kind === "document" && item.text) {
       const where = item.path ? ` at ${item.path}` : "";
+      // WHOLE OR CLIPPED, SAID EXPLICITLY.
+      //
+      // The header used to say only how the text was obtained, and a live
+      // transcript on 24 Aug 2026 shows what that cost: asked "did you read my
+      // resume before searching?", the agent answered "I should read the file
+      // itself rather than rely on the attachment summary" and spent a step
+      // reading the same PDF off disk. It was never a summary — it was the
+      // complete text — but nothing in front of it said so, and a model handed
+      // an unlabelled extract is right to wonder what was left out.
       const clipped = item.truncated
-        ? `\n[… the rest of ${item.name} was not sent — it is longer than ${MAX_EXTRACTED_CHARS.toLocaleString()} characters]`
+        ? `\n[… the rest of ${item.name} was not sent — it is longer than ${MAX_EXTRACTED_CHARS.toLocaleString()} characters` +
+          (item.path ? ", so read the file itself if you need the rest" : "") + "]"
         : "";
+      const completeness = item.truncated
+        ? "the first part of its text"
+        : "its COMPLETE text, not a summary — there is no need to open the file to read it";
       blocks.push(
-        `\n\n--- Attached file: ${item.name}${where} (${item.extractedBy}) ---\n` +
+        `\n\n--- Attached file: ${item.name}${where} — ${completeness} (${item.extractedBy}) ---\n` +
         `${item.text}${clipped}\n--- end of ${item.name} ---`
       );
     }
@@ -284,9 +358,26 @@ export function describeAttachments(attachments) {
           ? `Full path on this machine: ${item.path}\n` +
             "You can read, list and search inside it with the filesystem tools."
           : "This browser cannot give the folder's path, so only the listing below is available.",
-        `${item.fileCount} file${item.fileCount === 1 ? "" : "s"}, ${humanBytes(item.bytes)}.`,
-        ...item.entries.map((entry) => `  ${entry.path} (${humanBytes(entry.bytes)})`)
+        `${item.fileCount} file${item.fileCount === 1 ? "" : "s"}, ${humanBytes(item.bytes)}.`
       ];
+      // What kind of thing this is, in one line, before the map of it.
+      if (item.mostly?.length) {
+        lines.push(`Mostly: ${item.mostly.map((kind) => `.${kind.extension} × ${kind.count}`).join(", ")}.`);
+      }
+      // Said out loud. The agent must be able to tell "there is no .git here"
+      // from "the .git was not shown to you" — it can go and look either way,
+      // and only one of those is worth looking at.
+      if (item.machinery?.length) {
+        const total = item.machinery.reduce((sum, group) => sum + group.count, 0);
+        lines.push(
+          `Not listed: ${total.toLocaleString()} generated or vendored files in ` +
+          `${item.machinery.map((group) => group.name).join(", ")}. They are still on disk.`
+        );
+      }
+      // The sizes went with the per-file lines. A map does not need them — the
+      // total is above, and anything more precise is one `run` away — and they
+      // were a third of the characters.
+      lines.push(...item.entries.map((entry) => `  ${entry.path}`));
       if (item.omitted) lines.push(`  … and ${item.omitted} more files not listed here.`);
       lines.push(`--- end of ${item.name} ---`);
       blocks.push(lines.join("\n"));

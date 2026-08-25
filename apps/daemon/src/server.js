@@ -2,6 +2,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createRuntime, loadCapabilityPlugins } from "./runtime-factory.js";
 import { PROTOCOL_VERSION, ValidationError } from "../../../packages/shared-types/src/domain.js";
@@ -17,6 +18,9 @@ import { reportPreflight } from "./preflight.js";
 // a .docx is a ZIP of XML and a .pdf is a set of FlateDecode streams, both of
 // which Node can take apart without a dependency.
 import { extractDocumentText, isDocumentPath } from "../../../packages/fast-agent/src/documents.js";
+// Mail. Reachable only from the compose card, never from the agent loop — the
+// reason is the long note at the top of this module.
+import { connectGmail, disconnectGmail, gmailStatus, sendGmail, setDefaultGmailAddress } from "./gmail.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,6 +60,10 @@ function parseStaticPath(urlPathname) {
     // remains available at /console.html for debugging.
     return path.join(desktopDirectory, "demo.html");
   }
+  // Chromium asks for /favicon.ico regardless of the <link rel="icon"> in the
+  // markup, so every single page load logged a 404 in the console. Nothing was
+  // broken by it and it made the console useless for spotting things that are.
+  if (urlPathname === "/favicon.ico") return path.join(desktopDirectory, "icon.ico");
   const safePath = path.normalize(urlPathname).replace(/^(\.\.[/\\])+/, "");
   return path.join(desktopDirectory, safePath);
 }
@@ -64,6 +72,12 @@ function inferContentType(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
   if (filePath.endsWith(".js")) return "application/javascript; charset=utf-8";
+  // The brand mark is served from here too. Without this it goes out as
+  // octet-stream, which Chromium refuses to paint into an <img> — the top bar
+  // showed a broken-image box and nothing in the console said why.
+  if (filePath.endsWith(".png")) return "image/png";
+  if (filePath.endsWith(".svg")) return "image/svg+xml";
+  if (filePath.endsWith(".ico")) return "image/x-icon";
   return "application/octet-stream";
 }
 
@@ -88,10 +102,38 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
   const terminalStates = new Set(["COMPLETED", "COMPLETED_WITH_WARNINGS", "ANSWERED", "FAILED", "TIMED_OUT", "CANCELLED", "ROLLED_BACK", "DENIED", "PLAN_REJECTED"]);
 
   const writeSse = (response, event) => response.write(`data: ${JSON.stringify(event)}\n\n`);
+  // FILES THIS DAEMON ITSELF PRODUCED, AND NOTHING ELSE.
+  //
+  // The file card has Open and Show in folder buttons, and they need a route.
+  // A route that opens "the path in the request" is a route that opens any file
+  // on the machine — and the page it is called from renders text the agent read
+  // out of web pages, documents and messages, which is precisely the shape of
+  // thing this codebase refuses to let become an action.
+  //
+  // So the same boundary the Send button has: the daemon records the path of
+  // every file a tool reported creating, and the route can open one of those or
+  // nothing. A path the user never asked for was never in a card, so it is not
+  // in this set, whatever a request says.
+  const openableFiles = new Set();
+  const noteOpenableFile = (event) => {
+    const card = (event?.details ?? event)?.card;
+    if (card?.kind === "file" && typeof card.path === "string" && card.path) {
+      openableFiles.add(path.resolve(card.path).toLowerCase());
+    }
+  };
+
   const publish = (sessionId, event) => {
+    noteOpenableFile(event);
     const run = intentRuns.get(sessionId);
     if (!run) return;
-    run.events.push(event);
+    // `run.events` is the replay buffer a reconnecting client is caught up
+    // from, so it must hold the RECORD of the run and not its ticks.
+    // TOOL_STREAMING is emitted twice a second for as long as the model is
+    // composing a tool call — a single large `write_file` is a couple of
+    // hundred of them, each superseded by the next and all of them superseded
+    // by the TOOL_STARTED that follows. Sent to whoever is watching now,
+    // exactly like the runtime treats it (see the note there).
+    if ((event.eventType ?? event.type) !== "TOOL_STREAMING") run.events.push(event);
     for (const subscriber of run.subscribers) writeSse(subscriber, event);
   };
   const priorOnSessionEvent = runtime.onSessionEvent;
@@ -201,6 +243,9 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
     return crypto.timingSafeEqual(provided, apiTokenBuffer);
   }
 
+  // The last Google sign-in failure, if there was one. See /api/email/connect.
+  let signInError = null;
+
   const server = http.createServer(async (request, response) => {
     try {
       const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
@@ -225,6 +270,110 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
 
       if (requestUrl.pathname.startsWith("/api/") && !isAuthorized(request) && requestUrl.pathname !== "/api/health") {
         sendJson(response, 401, { error: "Unauthorized: missing or invalid x-syscora-token header." });
+        return;
+      }
+
+      // ---- Mail -------------------------------------------------------------
+      //
+      // THESE ROUTES ARE FOR THE COMPOSE CARD, NOT FOR THE AGENT. Nothing in
+      // the agent loop can reach them: they are POSTs behind the API token, and
+      // the token is injected into the CLIENT by the desktop shell, never given
+      // to a tool. `email_draft` produces a card; a person presses Send. See the
+      // long note at the top of gmail.js for why that boundary is where it is.
+      if (requestUrl.pathname === "/api/email/status" && request.method === "GET") {
+        // `signInError` is how a sign-in that failed after its response had
+        // already been sent gets back to the card. It clears when a new one
+        // starts, and when one succeeds.
+        sendJson(response, 200, { ...gmailStatus(basePath), signInError });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/email/connect" && request.method === "POST") {
+        // TWO EVENTS, ONE REQUEST. The consent URL is ready in milliseconds;
+        // the sign-in it starts finishes minutes later, in a browser window
+        // this process does not own. So the response carries the URL and the
+        // OUTCOME is collected by polling /api/email/status — which is also
+        // why a failure has to be remembered rather than thrown into a
+        // response that was sent long ago.
+        //
+        // The page is opened by the CLIENT. A daemon that can open browser
+        // windows by itself is a daemon that can be made to.
+        try {
+          const url = await new Promise((resolve, reject) => {
+            connectGmail(basePath, { onUrl: resolve })
+              .then(() => { signInError = null; })
+              .catch((error) => {
+                signInError = error?.message ?? String(error);
+                reject(error);
+              });
+          });
+          signInError = null;
+          sendJson(response, 200, { url });
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error) });
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/email/disconnect" && request.method === "POST") {
+        // An address disconnects one account; no address disconnects them all.
+        const payload = await readJsonBody(request).catch(() => ({}));
+        sendJson(response, 200, disconnectGmail(basePath, payload?.address ?? null));
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/email/default" && request.method === "POST") {
+        try {
+          const payload = await readJsonBody(request);
+          sendJson(response, 200, setDefaultGmailAddress(basePath, payload?.address));
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error) });
+        }
+        return;
+      }
+
+      // The file card's two buttons. `open` hands the file to whatever Windows
+      // has registered for it; `reveal` selects it in Explorer.
+      //
+      // Explorer rather than `start`: `start` is a cmd.exe builtin, so it needs
+      // a shell, and a shell needs the path quoted — which is how a path with a
+      // space or an ampersand in it becomes a command. `explorer.exe` takes the
+      // path as one argument with no shell anywhere near it. See the note on
+      // `openableFiles` for why an arbitrary path cannot reach here at all.
+      if (requestUrl.pathname === "/api/files/open" && request.method === "POST") {
+        try {
+          const payload = await readJsonBody(request);
+          const wanted = path.resolve(String(payload?.path ?? ""));
+          if (!openableFiles.has(wanted.toLowerCase())) {
+            sendJson(response, 403, { ok: false, error: "That file was not created here, so it cannot be opened from here." });
+            return;
+          }
+          // It has to still BE there. A card is a record of a moment, and the
+          // user may have moved or deleted the file since.
+          await fs.access(wanted);
+          const reveal = payload?.reveal === true;
+          const child = spawn("explorer.exe", reveal ? [`/select,${wanted}`] : [wanted], {
+            detached: true, stdio: "ignore", windowsVerbatimArguments: false
+          });
+          child.unref();
+          sendJson(response, 200, { ok: true, path: wanted, revealed: reveal });
+        } catch (error) {
+          sendJson(response, 400, { ok: false, error: error?.code === "ENOENT" ? "That file is no longer there." : (error?.message ?? String(error)) });
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/email/send" && request.method === "POST") {
+        try {
+          const draft = await readJsonBody(request);
+          const sent = await sendGmail(basePath, draft);
+          // Gmail's own id for the message it created. Reported back so the
+          // card can say "sent" on the strength of the server's answer rather
+          // than on the strength of the request having returned.
+          sendJson(response, 200, { ok: true, ...sent });
+        } catch (error) {
+          sendJson(response, 400, { ok: false, error: error?.message ?? String(error) });
+        }
         return;
       }
 
@@ -951,8 +1100,15 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
       // drive the mutating API. Clients obtain the token out-of-band: the Electron
       // shell injects it in-process via a contextBridge preload; a plain browser
       // reads it from the daemon stdout banner and enters it in the Connect panel.
-      const file = await fs.readFile(staticPath, "utf8");
-      response.writeHead(200, { "content-type": inferContentType(staticPath) });
+      // A BUFFER, NOT A STRING. This read "utf8" for every asset, which is
+      // lossless for HTML/CSS/JS and destroys anything else: every byte that is
+      // not valid UTF-8 comes back as U+FFFD and goes out re-encoded, so a PNG
+      // arrives corrupt with a 200 and a correct content-type. Text is decoded
+      // where it is decided that the file IS text.
+      const contentType = inferContentType(staticPath);
+      const binary = !contentType.startsWith("text/") && !contentType.startsWith("application/javascript");
+      const file = await fs.readFile(staticPath, binary ? null : "utf8");
+      response.writeHead(200, { "content-type": contentType });
       response.end(file);
     } catch (error) {
       if (error instanceof ValidationError) {

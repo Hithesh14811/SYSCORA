@@ -31,11 +31,27 @@ import { redactSensitiveData } from "./redaction.js";
 //   28 characters — `ChatListItemGridViewItem2` is 25, and identifiers of that
 //     shape are what UI Automation names its controls with.
 //
+// `_` AND `-` ARE SEPARATORS, AND LEAVING THEM INSIDE THE RUN COST A WHOLE
+// REQUEST. The class used to be `[A-Za-z0-9_-]`, which contradicted the rule
+// stated three paragraphs above and made every ordinary saved filename a
+// candidate. Live, 23 Aug 2026: the agent wrote
+// `J1_Internships_Software_Engineer.txt` to the Desktop, listed the folder to
+// find it again, and the listing came back reading `***REDACTED***.txt` — 32
+// characters, upper case and lower case and a digit, exactly the shape. It then
+// called `read_file` on the placeholder, got ENOENT, and spent five steps
+// working around its own redaction with PowerShell. The user saw an assistant
+// that could not open the file it had just written.
+//
+// Nothing in the first table below loses by this: a vendor prefix like `hf_` or
+// `sk-` is matched by the named rules above, and what follows one is an
+// unbroken alphanumeric run regardless.
+//
 // Known limits, stated rather than discovered later: a 32-character
 // single-case hex key (Azure) is indistinguishable from an MD5 by shape alone
-// and is NOT caught, and neither is a secret shorter than 28 characters that
-// carries no known prefix. tests/unit/secret-shapes.test.js pins both tables.
-const SECRET_RUN = /[A-Za-z0-9_-]{28,}/g;
+// and is NOT caught; neither is a secret shorter than 28 characters that
+// carries no known prefix, nor one whose only long run is broken up by
+// underscores. tests/unit/secret-shapes.test.js pins both tables.
+const SECRET_RUN = /[A-Za-z0-9]{28,}/g;
 const looksLikeCredential = (run) => /[a-z]/.test(run) && /[A-Z]/.test(run) && /\d/.test(run);
 
 function clipped(value, depth = 0, maxStringLength = 1200) {
