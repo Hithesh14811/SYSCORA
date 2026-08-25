@@ -21,6 +21,7 @@
     "desktop:dev": "electron apps/desktop-shell/src/main.js",
     "dist": "electron-builder --win",
     "doctor": "node scripts/doctor.mjs",
+    "icon": "node scripts/make-icon.mjs",
     "test": "node scripts/run-tests-bounded.js",
     "test:raw": "node --test --test-timeout=240000 --test-concurrency=1 --test-force-exit tests/**/*.test.js",
     "capabilities:validate": "node --test tests/unit/capability-framework.test.js",
@@ -55,12 +56,17 @@
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "icon": "apps/desktop/icon.ico"
     },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "apps/desktop/icon.ico",
+      "uninstallerIcon": "apps/desktop/icon.ico",
+      "installerHeaderIcon": "apps/desktop/icon.ico",
+      "shortcutName": "SYSCORA"
     }
   }
 }
