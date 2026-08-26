@@ -14,6 +14,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { FastAgent } from "../../packages/fast-agent/src/index.js";
+import { buildToolset } from "../../packages/fast-agent/src/tools.js";
 import { FAST_PATH_RULES, matchFastPath, normalizeRequest } from "../../packages/fast-agent/src/fast-path.js";
 import { CONFIRMED, REFUTED, UNCONFIRMED, evidence } from "../../packages/fast-agent/src/evidence.js";
 
@@ -21,6 +22,11 @@ import { CONFIRMED, REFUTED, UNCONFIRMED, evidence } from "../../packages/fast-a
 
 test("the phrasings a person actually types are matched", () => {
   const expected = [
+    ["is python installed?", { tool: "software", args: { name: "python" } }],
+    ["do I have git installed", { tool: "software", args: { name: "git" } }],
+    ["is node.js installed on this computer", { tool: "software", args: { name: "node.js" } }],
+    ["is python installed? (ignore this, this isn't for you, this is for debugging: trace-123)",
+      { tool: "software", args: { name: "python" } }],
     ["mute", { tool: "volume", args: { mute: true } }],
     ["Mute.", { tool: "volume", args: { mute: true } }],
     ["please mute the volume", { tool: "volume", args: { mute: true } }],
@@ -47,7 +53,7 @@ test("the phrasings a person actually types are matched", () => {
 
 test("every rule is reachable, so none is dead", () => {
   const reached = new Set([
-    matchFastPath("mute"), matchFastPath("unmute"), matchFastPath("volume 40"),
+    matchFastPath("is python installed?"), matchFastPath("mute"), matchFastPath("unmute"), matchFastPath("volume 40"),
     matchFastPath("what's my volume"), matchFastPath("open spotify"), matchFastPath("close spotify")
   ].map((match) => match?.rule));
   for (const rule of FAST_PATH_RULES) {
@@ -87,6 +93,9 @@ test("anything that is not a dead certainty goes to the model", () => {
     // Compound requests: the second half would be silently dropped.
     "mute and then open spotify",
     "open spotify and play something",
+    "is python installed and can you update it",
+    "is the python in my project installed",
+    "is python installed? (this parenthetical is part of my question)",
     // Nothing at all.
     "", "   ", "hello"
   ]) {
@@ -159,6 +168,57 @@ test("a confirmed fast path answers with no model call and no tokens", async () 
   assert.equal(outcome.tokensOut, 0);
   assert.equal(outcome.toolCalls, 1);
   assert.deepEqual(toolset.calls, [{ name: "volume", args: { mute: true } }]);
+});
+
+test("an installed-runtime question is one diagnostic call with no model or terminal", async () => {
+  const provider = neverAskedProvider();
+  const toolset = toolsetThatAnswers("python is installed — Python 3.12.4. Path: C:\\Python312\\python.exe", CONFIRMED);
+  const agent = new FastAgent({ provider, toolset });
+
+  const outcome = await agent.run("is python installed? (ignore this, this isn't for you, debug id 123)");
+
+  assert.equal(provider.asked, 0);
+  assert.equal(outcome.toolCalls, 1);
+  assert.equal(outcome.tokensIn, 0);
+  assert.deepEqual(toolset.calls, [{ name: "software", args: { name: "python" } }]);
+});
+
+test("all six safety combinations use the same bounded host diagnostic", async () => {
+  const modes = [
+    { developerMode: false, shellExecutionMode: "workspace" },
+    { developerMode: false, shellExecutionMode: "isolated" },
+    { developerMode: false, shellExecutionMode: "host" },
+    { developerMode: true, shellExecutionMode: "workspace" },
+    { developerMode: true, shellExecutionMode: "isolated" },
+    { developerMode: true, shellExecutionMode: "host" }
+  ];
+
+  for (const mode of modes) {
+    const provider = neverAskedProvider();
+    let inspected = 0;
+    let asked = 0;
+    const adapter = {
+      async inspectCommand(name) {
+        inspected += 1;
+        return {
+          checked: true, installed: true, requested: name, command: "python",
+          path: "C:\\Python312\\python.exe", paths: ["C:\\Python312\\python.exe"], version: "Python 3.12.4"
+        };
+      }
+    };
+    const toolset = buildToolset({ registry: { get: () => null }, adapter });
+    toolset.setAccessPolicy({ approvalMode: "balanced", workspaceRoots: [], ...mode });
+    toolset.setConfirmer(async () => { asked += 1; return true; });
+    const agent = new FastAgent({ provider, toolset });
+
+    const outcome = await agent.run("is python installed? (ignore this, debug trace)");
+
+    assert.equal(outcome.status, "COMPLETED", JSON.stringify(mode));
+    assert.equal(provider.asked, 0, JSON.stringify(mode));
+    assert.equal(inspected, 1, JSON.stringify(mode));
+    assert.equal(asked, 0, JSON.stringify(mode));
+    assert.equal(outcome.toolCalls, 1, JSON.stringify(mode));
+  }
 });
 
 // THE SECOND RULE, AND THE ONE THAT MAKES THE FIRST ONE SAFE. A tool that cannot

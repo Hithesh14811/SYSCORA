@@ -69,6 +69,11 @@ import {
 import { Reversal, createUndoJournal, timeLeft } from "./undo-journal.js";
 import { prepareFileUndo, restoreFile, describeFileChange } from "./undo-files.js";
 import { resolveStateDir } from "../../shared-types/src/state-path.js";
+import {
+  ApprovalMode,
+  ShellExecutionMode,
+  normalizeAccessPolicy
+} from "../../shared-types/src/access-policy.js";
 import { createWingetWatcher, isWingetInstall } from "./winget-progress.js";
 import { isWebviewHostProcess, normalizeWindow, pickWebviewWindow } from "../../../os-adapters/windows/src/webview-windows.js";
 // THE RECEIPT EVERY RESULT CARRIES. See evidence.js: a success sentence is only
@@ -94,6 +99,11 @@ const MAX_SCREEN_TEXT_CHARS = 2500;
 // renderElements). Sixty was too few for a real application: Paint's toolbar
 // alone exceeds it, and the rows that fell off were the tools.
 const MAX_ELEMENTS = 110;
+const NETWORK_TOOLS = new Set([
+  "search", "web_open", "web_read", "web_click", "web_type", "web_scroll",
+  "open_url", "github"
+]);
+const FILE_WRITE_TOOLS = new Set(["write_file", "create_document", "edit_file"]);
 
 // NEVER CUT AN EMOJI IN HALF.
 //
@@ -960,6 +970,18 @@ export function buildToolset({
     machineProfile: null,
     // Set per run by whoever can put a question in front of the user.
     confirm,
+    // Changed per request without rebuilding the toolset. Rebuilding would
+    // discard the current window, working directory and undo journal and make a
+    // safety switch noticeably slow.
+    // A toolset constructed directly is an internal/developer API and keeps its
+    // historical surface. Product requests always call setAccessPolicy before
+    // the model sees definitions, where terminal access defaults off.
+    accessPolicy: normalizeAccessPolicy({
+      approvalMode: ApprovalMode.BALANCED,
+      developerMode: true,
+      shellExecutionMode: ShellExecutionMode.HOST
+    }),
+    approvedThisTurn: new Set(),
     // The last thing typed, so a send confirmation can show it.
     lastTyped: null,
     // What the previous reading of a window looked like, so an identical one can
@@ -1010,6 +1032,85 @@ export function buildToolset({
       // Nobody answered, or the channel broke. Not approved.
       return { approved: false, asked: true };
     }
+  };
+
+  const isWithinRoot = (candidate, root) => {
+    try {
+      const resolvedCandidate = path.resolve(String(candidate));
+      const resolvedRoot = path.resolve(String(root));
+      const relative = path.relative(resolvedRoot, resolvedCandidate);
+      return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    } catch {
+      return false;
+    }
+  };
+
+  const externalWriteTarget = (name, args) => {
+    if (name === "write_file" || name === "edit_file") return String(args.path ?? "");
+    if (name !== "create_document") return "";
+    const filename = String(args.filename ?? "document");
+    if (path.isAbsolute(filename) || /^[a-z]:[\\/]/i.test(filename)) return filename;
+    if (String(args.folder ?? "").trim()) return path.join(String(args.folder), filename);
+    // The tool deliberately defaults finished documents to Downloads. It is
+    // outside an attached workspace unless the user explicitly attached it.
+    return path.join(os.homedir(), "Downloads", filename);
+  };
+
+  // Ask mode is deliberately broader than Balanced mode, but still pays no
+  // model or process cost. It asks once per category per turn, not once per web
+  // click or file write.
+  const confirmAskModeBoundary = async (name, args) => {
+    if (state.accessPolicy.approvalMode !== ApprovalMode.ASK) return true;
+    let category = null;
+    let request = null;
+    if (NETWORK_TOOLS.has(name)) {
+      category = "network";
+      request = {
+        kind: "network",
+        summary: "use the internet for this request",
+        reason: "Ask for approval is selected, so network access needs your permission.",
+        rule: "access.ask.network",
+        detail: name
+      };
+    } else if (FILE_WRITE_TOOLS.has(name)) {
+      const target = externalWriteTarget(name, args);
+      const inside = state.accessPolicy.workspaceRoots.some((root) => isWithinRoot(target, root));
+      if (!inside) {
+        category = "external-file-write";
+        request = {
+          kind: "external-file-write",
+          summary: "edit a file outside the attached workspace",
+          reason: "Ask for approval is selected, so external file changes need your permission.",
+          rule: "access.ask.external-file",
+          detail: target || name
+        };
+      }
+    }
+    if (!request || state.approvedThisTurn.has(category)) return true;
+    const { approved } = await askPermission(request);
+    if (approved) state.approvedThisTurn.add(category);
+    return approved;
+  };
+
+  const authorizeModelShell = async ({ command, verdict }) => {
+    const critical = requiresConfirmation(command);
+    const request = critical.confirm
+      ? {
+          kind: "command",
+          summary: critical.summary,
+          reason: critical.reason,
+          rule: critical.rule,
+          detail: command
+        }
+      : {
+          kind: "command",
+          summary: "run a command that can change this system",
+          reason: verdict?.reason || "This command is not on the read-only allow-list.",
+          rule: verdict?.rule || "shell.default-ask",
+          detail: command
+        };
+    const { approved } = await askPermission(request);
+    return approved;
   };
 
   // EVERYTHING READ GOES THROUGH HERE ON ITS WAY TO THE MODEL.
@@ -2263,31 +2364,21 @@ export function buildToolset({
             "the outer shell expand `$_` and your own variables to nothing before the inner one runs."
           );
         }
-        // Asked before anything is spawned, and only for the handful of command
-        // shapes that cannot be undone.
-        //
-        // NOT ASKED IF THE ANSWER CANNOT MATTER. The floor below refuses some
-        // commands outright, and it is checked where the process is spawned —
-        // so a command that was going to be refused anyway still put a card in
-        // front of the user, who clicked Allow and got "REFUSED" for their
-        // trouble. An approval that changes nothing teaches people to stop
-        // reading them.
-        const gate = classifyShellCommand(command).verdict === ShellVerdict.DENY
-          ? { confirm: false }
-          : requiresConfirmation(command);
-        if (gate.confirm) {
-          const { approved } = await askPermission({
-            kind: "command",
-            summary: gate.summary,
-            reason: gate.reason,
-            rule: gate.rule,
-            detail: command
-          });
-          if (!approved) {
+        // Ask once here so the transcript can display the decision before the
+        // command call, then carry that exact answer to the adapter. The adapter
+        // checks it again at the final spawn boundary and refuses callers that
+        // do not provide one.
+        const shellVerdict = classifyShellCommand(command);
+        let shellApproved = null;
+        let approvalGate = null;
+        if (shellVerdict.verdict === ShellVerdict.ASK) {
+          approvalGate = requiresConfirmation(command);
+          shellApproved = await authorizeModelShell({ command, verdict: shellVerdict });
+          if (!shellApproved) {
             return {
               refusedByUser: true,
               command,
-              gate,
+              gate: approvalGate.confirm ? approvalGate : shellVerdict,
               evidence: evidence({
                 observed: "the user answered NO to the approval card, so nothing was spawned",
                 method: "user.approval",
@@ -2296,6 +2387,15 @@ export function buildToolset({
             };
           }
         }
+        // A wrapper can itself become ASK at the adapter boundary even when the
+        // original command was read-only (for example Start-Process for a
+        // background server). In that case the final boundary owns the prompt;
+        // an answer already collected above is reused without asking twice.
+        const finalShellAuthorization = async ({ verdict } = {}) => {
+          if (shellApproved !== null) return shellApproved === true;
+          shellApproved = await authorizeModelShell({ command, verdict });
+          return shellApproved;
+        };
         const background = args.background === true || KEEPS_RUNNING.test(command);
         if (background) {
           // Started through Start-Process so it outlives this call and keeps its
@@ -2304,7 +2404,13 @@ export function buildToolset({
             state.cwd,
             `$p = Start-Process -PassThru -FilePath "powershell" -ArgumentList '-NoExit','-Command',${JSON.stringify(command)}; $p.Id`,
             [],
-            { timeoutMs: 20000 }
+            {
+              timeoutMs: 20000,
+              shellOrigin: "model",
+              authorizationCommand: command,
+              accessPolicy: state.accessPolicy,
+              authorizeShell: finalShellAuthorization
+            }
           );
           return {
             ...launched,
@@ -2339,6 +2445,10 @@ export function buildToolset({
         try {
           result = await adapter.executeCommand(state.cwd, command, [], {
             timeoutMs: Number(args.timeoutMs) || 90000,
+            shellOrigin: "model",
+            authorizationCommand: command,
+            accessPolicy: state.accessPolicy,
+            authorizeShell: finalShellAuthorization,
             // STOP HAS TO REACH THE CHILD PROCESS.
             //
             // The loop checks for a stop between tool calls, so pressing stop
@@ -2437,6 +2547,83 @@ export function buildToolset({
         // `reported`, not `confirmed`: this is a transcript of what the process
         // said, and it is true whatever the exit code turns out to mean.
         return reported(result, parts.join("\n"));
+      }
+    },
+    {
+      name: "software",
+      description:
+        "Check whether a command-line runtime or developer tool is installed on this host, and report its " +
+        "version and executable path. Use this for questions such as 'is Python installed?'. This is a bounded " +
+        "diagnostic, not terminal access, and never opens a terminal window.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Runtime or command name, for example python, node, git, java, go or dotnet" }
+        },
+        required: ["name"]
+      },
+      preview: (args) => `Check whether ${String(args.name ?? "software").trim()} is installed`,
+      acts: false,
+      execute: async (args) => {
+        const name = String(args.name ?? "").trim();
+        if (!name) throw new Error("software needs a runtime or command name.");
+        if (typeof adapter.inspectCommand !== "function") {
+          throw new Error("This system adapter cannot inspect installed commands safely.");
+        }
+        const commandResult = await adapter.inspectCommand(name);
+        if (commandResult.checked !== true) {
+          throw new Error(commandResult.reason || `Could not safely inspect ${name}.`);
+        }
+        let installedApplication = null;
+        let inventoryChecked = false;
+        if (!commandResult.installed) {
+          try {
+            const inventory = await runCapability("application.listInstalled", { nameContains: name, limit: 400 });
+            inventoryChecked = true;
+            const needle = name.toLowerCase();
+            installedApplication = (inventory.applications ?? []).find((application) => {
+              const candidate = String(application.name ?? "").toLowerCase();
+              return candidate === needle || candidate.startsWith(`${needle} `) ||
+                candidate.endsWith(` ${needle}`) || candidate.includes(` ${needle} `);
+            }) ?? null;
+          } catch {
+            // Some test/minimal registries expose only the command diagnostic.
+            // A CLI hit remains conclusive; for a miss the wording below stays
+            // scoped to PATH unless the installed-app inventory also completed.
+          }
+        }
+        const installed = commandResult.installed || Boolean(installedApplication);
+        const version = commandResult.version ?? installedApplication?.version ?? null;
+        const resolvedPath = commandResult.path ?? null;
+        return {
+          ...commandResult,
+          name,
+          installed,
+          version,
+          path: resolvedPath,
+          installedApplication,
+          inventoryChecked,
+          evidence: evidence({
+            observed: installed
+              ? (resolvedPath
+                  ? `${name} resolved to ${resolvedPath}${version ? ` and reported ${version}` : ""}`
+                  : `${installedApplication.name} appears in the host's installed-application inventory${version ? ` at version ${version}` : ""}`)
+              : `${name} did not resolve to a real executable on the host PATH` +
+                (inventoryChecked ? " and was not present in the installed-application inventory" : ""),
+            method: "host.command-inspection",
+            verdict: CONFIRMED
+          })
+        };
+      },
+      render: (result) => {
+        const label = String(result.name ?? result.command ?? "That software").trim();
+        if (!result.installed) {
+          return confirmed(result, result.inventoryChecked
+            ? `${label} is not installed on this machine.`
+            : `${label} is not available on this machine's PATH.`);
+        }
+        const details = [result.version, result.path ? `Path: ${result.path}` : null].filter(Boolean);
+        return confirmed(result, `${label} is installed${details.length ? ` — ${details.join(". ")}` : "."}`);
       }
     },
     {
@@ -6705,11 +6892,13 @@ export function buildToolset({
         const name = String(step?.tool ?? "").trim();
         if (name === "batch") throw new Error("A batch cannot contain another batch.");
         const tool = byName.get(name);
-        if (!tool) {
+        if (!tool || (name === "run" && state.accessPolicy.developerMode !== true)) {
           return {
             done,
             failedAt: index,
-            failure: `There is no tool called "${name}". Use one of: ${[...byName.keys()].join(", ")}.`,
+            failure: name === "run"
+              ? "The arbitrary terminal is off. The user can enable Developer terminal access in Safety settings."
+              : `There is no tool called "${name}".`,
             evidence: evidence({
               observed: `step ${index + 1} names a tool that does not exist`,
               method: "batch:step-results",
@@ -6718,6 +6907,18 @@ export function buildToolset({
           };
         }
         const { say: _s, saw: _w, ...inputs } = step?.args ?? {};
+        if (!(await confirmAskModeBoundary(name, inputs))) {
+          return {
+            done,
+            failedAt: index,
+            failure: "The user did not approve this access, so nothing was changed.",
+            evidence: evidence({
+              observed: `step ${index + 1} (${name}) was refused by the user before it started`,
+              method: "user.approval",
+              verdict: REFUTED
+            })
+          };
+        }
         try {
           // A long step inside a batch is as long as it is outside one, so its
           // progress belongs on the row just the same — an install run this way
@@ -6841,34 +7042,25 @@ export function buildToolset({
   const SAW_PARAMETER = { type: "string", description: "Quoted from the last result: backward-looking, never a plan." };
   const SAY_PARAMETER = { type: "string", description: "What you are doing, one short sentence." };
 
+  const toolIsVisible = (tool) => tool.name !== "run" || state.accessPolicy.developerMode === true;
+  const definitions = () => tools.filter(toolIsVisible).map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: {
+        ...tool.parameters,
+        properties: { saw: SAW_PARAMETER, say: SAY_PARAMETER, ...tool.parameters.properties },
+        required: [...new Set([...(tool.parameters.required ?? []), "saw", "say"])]
+      }
+    }
+  }));
+
   return {
     // The wire format the model is shown.
-    definitions: tools.map((tool) => ({
-      type: "function",
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: {
-          ...tool.parameters,
-          properties: { saw: SAW_PARAMETER, say: SAY_PARAMETER, ...tool.parameters.properties },
-          // REQUIRED, not merely asked for.
-          //
-          // As an optional property the model filled it most of the time and
-          // dropped it exactly when a step was routine — so the transcript went
-          // silent at the start of a task, which is the one moment the user is
-          // definitely watching. The prompt asked for it in three places and lost
-          // to the schema, as guidance always does here.
-          //
-          // `saw` is required for the same reason, and it was the harder lesson:
-          // left optional it was dropped on precisely the steps where it mattered
-          // most — the ones following a result it had not really read. Requiring
-          // it is what makes the transcript checkable rather than decorative.
-          required: [...new Set([...(tool.parameters.required ?? []), "saw", "say"])]
-        }
-      }
-    })),
+    get definitions() { return definitions(); },
 
-    has: (name) => byName.has(name),
+    has: (name) => Boolean(byName.get(name) && toolIsVisible(byName.get(name))),
 
     // The tool objects themselves — their names, their `acts` flag and their
     // renders. Exposed for the CI property test that walks every tool and proves
@@ -6949,6 +7141,19 @@ export function buildToolset({
       // the last turn must not gate this turn's actions — the user has spoken
       // since, and they may have asked for exactly that thing.
       state.observedInstructions = [];
+      state.approvedThisTurn.clear();
+    },
+
+    // The surface selects this per request. It is intentionally a setter on a
+    // long-lived toolset so changing modes does not rebuild machine state or
+    // slow the next turn.
+    setAccessPolicy(value) {
+      state.accessPolicy = normalizeAccessPolicy(value);
+      if (state.accessPolicy.shellExecutionMode === ShellExecutionMode.WORKSPACE &&
+          state.accessPolicy.workspaceRoots.length > 0 &&
+          !state.accessPolicy.workspaceRoots.some((root) => isWithinRoot(state.cwd, root))) {
+        state.cwd = state.accessPolicy.workspaceRoots[0];
+      }
     },
 
     // How the surface is told that something read was addressed to the agent.
@@ -7015,13 +7220,35 @@ export function buildToolset({
      */
     async execute(name, args = {}, { onProgress = null, signal = null } = {}) {
       const tool = byName.get(name);
-      if (!tool) {
-        return { ok: false, text: `There is no tool called "${name}". Use one of: ${[...byName.keys()].join(", ")}.` };
+      if (!tool || !toolIsVisible(tool)) {
+        return {
+          ok: false,
+          text: name === "run"
+            ? "The arbitrary terminal is off. The user can enable Developer terminal access in Safety settings."
+            : `There is no tool called "${name}".`
+        };
       }
       const startedAt = Date.now();
       try {
         // `say` is narration for the user, not an input to the operation.
         const { say, saw, ...inputs } = args;
+        if (name === "run" && state.accessPolicy.shellExecutionMode === ShellExecutionMode.WORKSPACE &&
+            state.accessPolicy.workspaceRoots.length === 0 &&
+            classifyShellCommand(String(inputs.command ?? "")).verdict !== ShellVerdict.ALLOW) {
+          return {
+            ok: false,
+            text: "This command can change the system, so Workspace terminal access needs an attached folder. " +
+              "Attach the project with + and try again. Read-only version and status checks do not need a folder.",
+            durationMs: Date.now() - startedAt
+          };
+        }
+        if (!(await confirmAskModeBoundary(name, inputs))) {
+          return {
+            ok: false,
+            text: "REFUSED — the user did not approve this access, so nothing was changed. Do not retry by another route.",
+            durationMs: Date.now() - startedAt
+          };
+        }
         // ACTING ON A DESTINATION THAT CAME OUT OF SOMETHING WE READ.
         //
         // Checked HERE, at the tool boundary, because that is the one place

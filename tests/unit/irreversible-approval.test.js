@@ -63,6 +63,7 @@ const recordingAdapter = (ran) => ({
   listWindows: async () => [],
   runPowerShell: async () => ({ stdout: "", stderr: "", exitCode: 1 })
 });
+const DEVELOPER_TERMINAL = { developerMode: true, shellExecutionMode: "host" };
 
 test("an irreversible command asks the user, and a yes lets it run", async () => {
   const ran = [];
@@ -81,7 +82,7 @@ test("an irreversible command asks the user, and a yes lets it run", async () =>
     }
   };
 
-  const session = await runtime.submitIntent("delete the build folder", { fast: true });
+  const session = await runtime.submitIntent("delete the build folder", { fast: true, ...DEVELOPER_TERMINAL });
 
   const asked = events.find((event) => event.eventType === "APPROVAL_REQUIRED");
   assert.ok(asked, "the user must be asked before an irreversible command");
@@ -109,7 +110,7 @@ test("a no means the command never runs, and the agent is told to stop trying", 
     if (event.eventType === "TOOL_FINISHED") toolResults.push(event.details);
   };
 
-  await runtime.submitIntent("delete my work folder", { fast: true });
+  await runtime.submitIntent("delete my work folder", { fast: true, ...DEVELOPER_TERMINAL });
 
   assert.deepEqual(ran, [], "a refused command must never be spawned");
   const refused = toolResults.find((result) => /said NO/.test(result.output ?? ""));
@@ -118,7 +119,7 @@ test("a no means the command never runs, and the agent is told to stop trying", 
   assert.match(refused.output, /Do not try it again/);
 });
 
-test("ordinary work is never interrupted to ask", async () => {
+test("a mutating terminal command asks at the spawn boundary", async () => {
   const ran = [];
   const provider = scriptedProvider([
     { text: "Installing.", toolCalls: [{ name: "run", args: { command: "winget install VideoLAN.VLC" } }] },
@@ -127,11 +128,16 @@ test("ordinary work is never interrupted to ask", async () => {
   const runtime = runtimeWith(provider, recordingAdapter(ran));
 
   const events = [];
-  runtime.onSessionEvent = (sessionId, event) => events.push(event);
+  runtime.onSessionEvent = (sessionId, event) => {
+    events.push(event);
+    if (event.eventType === "APPROVAL_REQUIRED") {
+      setImmediate(() => runtime.resolveApproval(event.details.approvalId, true));
+    }
+  };
 
-  await runtime.submitIntent("install vlc", { fast: true });
+  await runtime.submitIntent("install vlc", { fast: true, ...DEVELOPER_TERMINAL });
 
-  assert.equal(events.filter((event) => event.eventType === "APPROVAL_REQUIRED").length, 0);
+  assert.equal(events.filter((event) => event.eventType === "APPROVAL_REQUIRED").length, 1);
   assert.deepEqual(ran, ["winget install VideoLAN.VLC"]);
 });
 
@@ -156,7 +162,7 @@ test("stopping answers the question, and a late click authorizes nothing", async
     }
   };
 
-  await runtime.submitIntent("delete notes.txt", { fast: true, signal: controller.signal });
+  await runtime.submitIntent("delete notes.txt", { fast: true, signal: controller.signal, ...DEVELOPER_TERMINAL });
 
   assert.ok(approvalId, "it did ask");
   assert.deepEqual(ran, [], "silence, and then a stop, is not consent");
@@ -358,7 +364,9 @@ test("a caller that passed autoApprove is not asked to click its own card", asyn
   runtime.onSessionEvent = (sessionId, event) => events.push(event);
 
   const startedAt = Date.now();
-  const session = await runtime.submitIntent("delete the build folder", { fast: true, autoApprove: true });
+  const session = await runtime.submitIntent("delete the build folder", {
+    fast: true, autoApprove: true, ...DEVELOPER_TERMINAL
+  });
 
   assert.deepEqual(ran, ["Remove-Item -Recurse .\\build"], "the authorized command must actually run");
   assert.equal(session.finalResponse.status, "COMPLETED");
@@ -395,7 +403,7 @@ test("a human clicking Allow is not recorded as an automatic approval", async ()
     }
   };
 
-  await runtime.submitIntent("delete the build folder", { fast: true });
+  await runtime.submitIntent("delete the build folder", { fast: true, ...DEVELOPER_TERMINAL });
 
   const resolved = events.find((event) => event.eventType === "APPROVAL_RESOLVED");
   assert.equal(resolved.details.approved, true);
@@ -426,7 +434,9 @@ test("autoApprove does not put a card up for something the floor will refuse any
   const events = [];
   runtime.onSessionEvent = (sessionId, event) => events.push(event);
 
-  await runtime.submitIntent("delete all the shadow copies", { fast: true, autoApprove: true });
+  await runtime.submitIntent("delete all the shadow copies", {
+    fast: true, autoApprove: true, ...DEVELOPER_TERMINAL
+  });
 
   assert.equal(events.filter((event) => event.eventType === "APPROVAL_REQUIRED").length, 0,
     "an approval that changes nothing teaches people to stop reading them");

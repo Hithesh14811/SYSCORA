@@ -6,6 +6,30 @@ import { getWindowsAutomationHost } from "../../windows-host/src/client.js";
 import { CdpBrowserAdapter } from "../../browser/src/cdp-browser-adapter.js";
 import { classifyShellCommand, ShellVerdict } from "../../../packages/policy-engine/src/shell-rules.js";
 import { accessibilityLaunchArgs } from "./webview-windows.js";
+import { executeInWindowsSandbox } from "./windows-sandbox.js";
+
+function pathIsInside(candidate, root) {
+  try {
+    const relative = path.relative(path.resolve(String(root)), path.resolve(String(candidate)));
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  } catch {
+    return false;
+  }
+}
+
+function blockedCommand(command, args, reason, rule) {
+  return {
+    command,
+    args,
+    exitCode: -1,
+    timedOut: false,
+    cancelled: false,
+    blocked: true,
+    blockedRule: rule,
+    stdout: "",
+    stderr: reason
+  };
+}
 
 function parseEnvContents(rawContents) {
   const pairs = new Map();
@@ -31,6 +55,33 @@ function serializeEnvContents(pairs) {
 function escapePowerShellSingleQuoted(value) {
   return String(value).replace(/'/g, "''");
 }
+
+const COMMAND_PROBE_ALIASES = Object.freeze({
+  "node.js": "node",
+  nodejs: "node",
+  python3: "python",
+  powershell: "powershell"
+});
+
+const SAFE_VERSION_ARGUMENTS = Object.freeze({
+  python: ["--version"],
+  py: ["--version"],
+  node: ["--version"],
+  npm: ["--version"],
+  git: ["--version"],
+  java: ["--version"],
+  javac: ["--version"],
+  dotnet: ["--version"],
+  go: ["version"],
+  rustc: ["--version"],
+  cargo: ["--version"],
+  docker: ["--version"],
+  kubectl: ["version", "--client"],
+  winget: ["--version"],
+  code: ["--version"],
+  gh: ["--version"],
+  powershell: ["-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"]
+});
 
 // Parse `winget search` output into structured candidates.
 //
@@ -461,19 +512,95 @@ export class WindowsAdapter {
     // The refusal is a RESULT, not a throw: the caller's verify() reads a
     // nonzero exit and reports the reason to the user, which is the same shape
     // as any other command that did not succeed.
-    const verdict = classifyShellCommand(command, args);
-    if (verdict.verdict === ShellVerdict.DENY) {
-      return {
-        command,
-        args,
-        exitCode: -1,
-        timedOut: false,
-        cancelled: false,
-        blocked: true,
-        blockedRule: verdict.rule,
-        stdout: "",
-        stderr: verdict.reason
-      };
+    const spawnVerdict = classifyShellCommand(command, args);
+    // Background execution wraps the model's line in Start-Process. Judge both
+    // the bytes that will be spawned and the original line they carry: a hard
+    // DENY must not become an approvable wrapper merely because it is detached.
+    const sourceVerdict = options.shellOrigin === "model" && options.authorizationCommand != null
+      ? classifyShellCommand(String(options.authorizationCommand))
+      : spawnVerdict;
+    const denied = sourceVerdict.verdict === ShellVerdict.DENY ? sourceVerdict
+      : (spawnVerdict.verdict === ShellVerdict.DENY ? spawnVerdict : null);
+    if (denied) {
+      return blockedCommand(command, args, denied.reason, denied.rule);
+    }
+    const verdict = sourceVerdict.verdict === ShellVerdict.ASK ? sourceVerdict : spawnVerdict;
+
+    // MODEL SHELL POLICY AT THE FINAL SPAWN BOUNDARY.
+    //
+    // Internal typed commands (for example the registry's own `git --version`)
+    // keep their existing path. A free-form command written by the model must
+    // explicitly identify itself, and is refused closed if the caller forgot
+    // either the developer opt-in or the final ASK callback.
+    if (options.shellOrigin === "model") {
+      const policy = options.accessPolicy ?? {};
+      if (policy.developerMode !== true || policy.shellExecutionMode === "none") {
+        return blockedCommand(
+          command,
+          args,
+          "Arbitrary terminal access is disabled. Enable Developer terminal access to use it.",
+          "shell.developer-mode-required"
+        );
+      }
+      if (policy.shellExecutionMode === "workspace") {
+        const roots = Array.isArray(policy.workspaceRoots) ? policy.workspaceRoots : [];
+        // A version/status query has no filesystem write target to confine. Let
+        // it run without forcing the user to attach an unrelated folder; any
+        // command that can mutate remains refused until it has a real root.
+        const readOnlyWithoutRoot = roots.length === 0 && verdict.verdict === ShellVerdict.ALLOW;
+        if (!readOnlyWithoutRoot && (roots.length === 0 || !roots.some((root) => pathIsInside(workingDirectory, root)))) {
+          return blockedCommand(
+            command,
+            args,
+            "Workspace terminal access can only spawn inside an attached folder.",
+            "shell.workspace-boundary"
+          );
+        }
+      }
+      if (verdict.verdict === ShellVerdict.ASK) {
+        if (typeof options.authorizeShell !== "function") {
+          return blockedCommand(
+            command,
+            args,
+            "This command can change the system and no approval channel reached the spawn boundary.",
+            "shell.ask-without-authorizer"
+          );
+        }
+        let approved = false;
+        try {
+          approved = await options.authorizeShell({
+            command: String(options.authorizationCommand ?? command),
+            args,
+            verdict
+          });
+        } catch {
+          approved = false;
+        }
+        if (approved !== true) {
+          return blockedCommand(
+            command,
+            args,
+            "The command was not approved, so no process was spawned.",
+            verdict.rule || "shell.default-ask"
+          );
+        }
+      }
+      if (policy.shellExecutionMode === "isolated") {
+        if (args.length > 0) {
+          return blockedCommand(
+            command,
+            args,
+            "Disposable execution accepts a command line, not an internal typed command.",
+            "shell.isolation-command-shape"
+          );
+        }
+        return executeInWindowsSandbox({
+          command: commandLine,
+          workspaceRoots: policy.workspaceRoots,
+          timeoutMs: options.timeoutMs,
+          signal: options.signal ?? null
+        });
+      }
     }
     const usesShell = args.length === 0 && /[\s|&<>^"']/.test(commandLine.trim());
     const [spawnCommand, spawnArgs] = usesShell
@@ -561,6 +688,73 @@ export class WindowsAdapter {
         });
       });
     });
+  }
+
+  // A bounded host diagnostic for "is X installed?". This is deliberately not
+  // arbitrary shell access: where.exe receives one validated command token,
+  // and only a small reviewed set of executables may be launched with fixed
+  // version arguments. It therefore remains available when the model terminal
+  // is hidden or configured to use Windows Sandbox, while still describing the
+  // actual host machine the user asked about.
+  async inspectCommand(commandName) {
+    const requested = String(commandName ?? "").trim().toLowerCase();
+    const canonical = COMMAND_PROBE_ALIASES[requested] ?? requested.replace(/\.exe$/i, "");
+    if (!/^[a-z0-9][a-z0-9.+_-]{0,63}$/i.test(canonical)) {
+      return { checked: false, installed: false, requested, command: canonical, paths: [], reason: "not-a-command-name" };
+    }
+
+    const candidates = canonical === "python" ? ["python", "py"] : [canonical];
+    const paths = [];
+    for (const candidate of candidates) {
+      const located = await this.executeCommand(process.cwd(), "where.exe", [candidate], { timeoutMs: 4000 });
+      if (located.exitCode !== 0) continue;
+      for (const line of String(located.stdout ?? "").split(/\r?\n/)) {
+        const found = line.trim();
+        if (found && !paths.some((entry) => entry.toLowerCase() === found.toLowerCase())) paths.push(found);
+      }
+    }
+
+    // WindowsApps entries are app-execution aliases which may only open the
+    // Store. They are not evidence that a runtime is installed. Prefer a real
+    // executable and report no CLI installation when aliases are all we found.
+    const realPaths = paths.filter((entry) => !/[\\/]Microsoft[\\/]WindowsApps[\\/]/i.test(entry));
+    const executablePath = realPaths[0] ?? null;
+    if (!executablePath) {
+      return {
+        checked: true,
+        installed: false,
+        requested,
+        command: canonical,
+        path: null,
+        paths,
+        aliasesOnly: paths.length > 0,
+        version: null
+      };
+    }
+
+    let version = null;
+    let versionResult = null;
+    const versionArgs = SAFE_VERSION_ARGUMENTS[canonical] ??
+      (canonical === "python" && /[\\/]py\.exe$/i.test(executablePath) ? SAFE_VERSION_ARGUMENTS.py : null);
+    if (versionArgs) {
+      versionResult = await this.executeCommand(path.dirname(executablePath), executablePath, versionArgs, { timeoutMs: 6000 });
+      if (versionResult.exitCode === 0) {
+        version = `${String(versionResult.stdout ?? "").trim()}\n${String(versionResult.stderr ?? "").trim()}`
+          .trim().split(/\r?\n/).find(Boolean) ?? null;
+      }
+    }
+
+    return {
+      checked: true,
+      installed: true,
+      requested,
+      command: canonical,
+      path: executablePath,
+      paths,
+      aliasesOnly: false,
+      version,
+      versionResult
+    };
   }
 
   async runPowerShell(script, options = {}) {

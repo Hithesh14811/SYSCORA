@@ -29,7 +29,7 @@
     "eval:mock": "node tests/eval/runner.mjs --mock"
   },
   "devDependencies": {
-    "electron": "^35.0.0",
+    "electron": "43.4.1",
     "electron-builder": "^26.15.3"
   },
   "build": {

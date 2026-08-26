@@ -38,6 +38,10 @@ function recordingAdapter() {
   };
   const RESPONSES = {
     executeCommand: { stdout: "ok", stderr: "", exitCode: 0 },
+    inspectCommand: {
+      checked: true, installed: true, requested: "python", command: "python",
+      path: "C:\\Python312\\python.exe", paths: ["C:\\Python312\\python.exe"], version: "Python 3.12.4"
+    },
     clipboardAction: { text: "clip" },
     launchApplication: { application: "notepad", windowIdentity: { windowId: "42" } },
     listWindows: [{ WindowHandle: 42, ProcessName: "notepad", MainWindowTitle: "Untitled", Bounds: { x: 0, y: 0, width: 800, height: 600 }, Foreground: true }],
@@ -49,6 +53,7 @@ function recordingAdapter() {
   return {
     calls,
     executeCommand: record("executeCommand"),
+    inspectCommand: record("inspectCommand"),
     readTextFile: record("readTextFile"),
     writeTextFile: record("writeTextFile"),
     clipboardAction: record("clipboardAction"),
@@ -568,9 +573,9 @@ test("a batch stops when a step reports it did not happen, not only when one thr
 // The loop enforces only the DENY floor — formatting a disk, wiping shadow
 // copies — and everything between that and reading a file ran unattended,
 // including deleting the user's documents and uninstalling their applications.
-// The gate has to be narrow enough that ordinary work never meets it: an
-// assistant that asks permission to do what it was just told to do is useless.
-test("work that can be undone is never interrupted to ask", async () => {
+// Every mutating command reaches ASK at the final shell boundary. Read-only
+// commands keep the fast path; a new or misspelled verb never silently mutates.
+test("mutating shell work asks while read-only work keeps the fast path", async () => {
   const ran = [];
   const asked = [];
   const toolset = buildToolset({
@@ -590,8 +595,8 @@ test("work that can be undone is never interrupted to ask", async () => {
     await toolset.execute("run", { command });
   }
 
-  assert.deepEqual(asked, [], "nothing here is irreversible, so nothing may stop to ask");
-  assert.equal(ran.length, 6, "and all of it ran");
+  assert.equal(asked.length, 5, "every mutation must stop at ASK");
+  assert.deepEqual(ran, ["Get-Process | Sort-Object WS -Descending"], "only the read-only command runs");
 });
 
 test("deleting, uninstalling and the like stop and ask, and a no means it does not run", async () => {

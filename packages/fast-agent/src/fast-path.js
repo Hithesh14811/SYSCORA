@@ -39,7 +39,7 @@ export function normalizeRequest(text) {
     .trim()
     .replace(/^(?:please|pls|hey|ok|okay)[,\s]+/, "")
     .replace(/[\s,]*(?:please|pls|thanks|thank you)$/, "")
-    .replace(/[.!\s]+$/, "")
+    .replace(/[.?!\s]+$/, "")
     .trim();
 }
 
@@ -73,6 +73,16 @@ function looksLikeAnApplicationName(value) {
 }
 
 const RULES = [
+  {
+    id: "software-installed",
+    // A factual host question with exactly one bounded interpretation. The
+    // typed tool performs the observation; this route merely avoids asking a
+    // remote model to rediscover which tool to call.
+    pattern: /^(?:is|do i have)\s+(?:the\s+)?([a-z0-9][a-z0-9 .+_-]{0,38})\s+(?:installed|available)(?:\s+(?:on|in)\s+(?:this|my)\s+(?:computer|pc|system|machine))?$/,
+    call: (match) => (looksLikeAnApplicationName(match[1])
+      ? { tool: "software", args: { name: match[1].trim() } }
+      : null)
+  },
   {
     id: "mute",
     // "mute the volume", "mute my sound", "mute the system", "mute"
@@ -136,10 +146,23 @@ const NOT_AN_INSTRUCTION = /\b(?:how|why|should|would|could|can|whether|if|expla
  * did before.
  */
 export function matchFastPath(userText) {
-  const said = normalizeRequest(userText);
+  // The transcript/debug harness appends an explicit "ignore this" note to
+  // ordinary prompts. It is user-declared metadata, not part of the request;
+  // strip only that exact trailing marker and leave every other aside alone.
+  const routedText = String(userText ?? "").replace(/\s*\(\s*ignore this\b[\s\S]*$/i, "");
+  const said = normalizeRequest(routedText);
   if (!said || said.length > 60) return null;
+  // This rule answers a question rather than performing an action, so the
+  // instruction-only guard below does not apply to its "do I have" phrasing.
+  const diagnosticRule = RULES.find((rule) => rule.id === "software-installed");
+  const diagnosticMatch = diagnosticRule.pattern.exec(said);
+  if (diagnosticMatch) {
+    const call = diagnosticRule.call(diagnosticMatch);
+    if (call) return { ...call, rule: diagnosticRule.id };
+  }
   if (NOT_AN_INSTRUCTION.test(said)) return null;
   for (const rule of RULES) {
+    if (rule === diagnosticRule) continue;
     const match = rule.pattern.exec(said);
     if (!match) continue;
     const call = rule.call(match);

@@ -59,6 +59,46 @@ const suggestions = document.getElementById("suggestions");
 const healthDot = document.getElementById("healthDot");
 const healthLabel = document.getElementById("healthLabel");
 const healthPill = document.getElementById("healthPill");
+const onboardingPanel = document.getElementById("onboardingPanel");
+const onboardingForm = document.getElementById("onboardingForm");
+const onboardingCancel = document.getElementById("onboardingCancel");
+const onboardingError = document.getElementById("onboardingError");
+const privacyConsent = document.getElementById("privacyConsent");
+const developerTerminalToggle = document.getElementById("developerTerminalToggle");
+const shellExecutionMode = document.getElementById("shellExecutionMode");
+const shellModeRow = document.getElementById("shellModeRow");
+const safetySettingsButton = document.getElementById("safetySettingsButton");
+
+const ACCESS_STORAGE_KEY = "syscora_approval_mode";
+const TERMINAL_STORAGE_KEY = "syscora_developer_terminal";
+const SHELL_MODE_STORAGE_KEY = "syscora_shell_execution_mode";
+const ONBOARDING_STORAGE_KEY = "syscora_onboarding_complete_v1";
+const ACCESS_MODES = Object.freeze({
+  ask: {
+    label: "Ask for approval",
+    description: "Always ask to edit external files and use the internet",
+    icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M8.2 11.6V5.8a1.5 1.5 0 0 1 3 0v4.1-5.2a1.5 1.5 0 0 1 3 0v5.2-4.1a1.5 1.5 0 0 1 3 0v5.1-2.6a1.5 1.5 0 0 1 3 0v5.6c0 4.2-3 7.1-7 7.1h-1.1c-2.3 0-4.4-1.1-5.7-3l-2.5-3.7a1.6 1.6 0 0 1 2.5-2l1.8 1.8"/></svg>'
+  },
+  balanced: {
+    label: "Approve for me",
+    description: "Only ask for actions detected as potentially unsafe",
+    icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M12 2.8l8 3.4v5.2c0 5-3.3 8.3-8 10-4.7-1.7-8-5-8-10V6.2z"/><path d="M10.2 8.3l-2.4 3.6 2.4 3.7M13.8 8.3l2.4 3.6-2.4 3.7"/></svg>'
+  },
+  full: {
+    label: "Full access",
+    description: "Unrestricted app access; catastrophic commands remain blocked",
+    icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M12 2.8l8 3.4v5.2c0 5-3.3 8.3-8 10-4.7-1.7-8-5-8-10V6.2z"/><path d="M12 7.4v5.8M12 16.6h.01"/></svg>'
+  }
+});
+
+function storedValue(key, fallback) {
+  try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+}
+let approvalMode = ACCESS_MODES[storedValue(ACCESS_STORAGE_KEY, "balanced")]
+  ? storedValue(ACCESS_STORAGE_KEY, "balanced") : "balanced";
+let developerTerminal = storedValue(TERMINAL_STORAGE_KEY, "0") === "1";
+let selectedShellMode = ["workspace", "isolated", "host"].includes(storedValue(SHELL_MODE_STORAGE_KEY, "workspace"))
+  ? storedValue(SHELL_MODE_STORAGE_KEY, "workspace") : "workspace";
 
 function showConnect(message) {
   if (message) { connectError.textContent = message; connectError.hidden = false; }
@@ -84,6 +124,7 @@ connectForm.addEventListener("submit", (e) => {
   sessionStorage.setItem(TOKEN_STORAGE_KEY, v);
   connectToken.value = "";
   hideConnect();
+  if (storedValue(ONBOARDING_STORAGE_KEY, "0") !== "1") openSafetySettings({ firstRun: true });
 });
 
 const nativeFetch = window.fetch.bind(window);
@@ -101,6 +142,98 @@ debugToggle.addEventListener("change", () => {
   debug = debugToggle.checked;
   document.body.classList.toggle("debug", debug);
 });
+
+let safetySettingsFirstRun = false;
+const providerName = document.getElementById("providerName");
+const providerModel = document.getElementById("providerModel");
+const providerBaseUrl = document.getElementById("providerBaseUrl");
+const providerApiKey = document.getElementById("providerApiKey");
+const providerStatus = document.getElementById("providerStatus");
+
+function syncTerminalSettings() {
+  developerTerminal = developerTerminalToggle?.checked === true;
+  if (shellModeRow) shellModeRow.hidden = !developerTerminal;
+}
+
+async function openSafetySettings({ firstRun = false } = {}) {
+  safetySettingsFirstRun = firstRun;
+  if (!onboardingPanel) return;
+  onboardingPanel.hidden = false;
+  document.body.classList.add("settings-open");
+  if (privacyConsent) privacyConsent.checked = storedValue(ONBOARDING_STORAGE_KEY, "0") === "1";
+  if (developerTerminalToggle) developerTerminalToggle.checked = developerTerminal;
+  if (shellExecutionMode) shellExecutionMode.value = selectedShellMode;
+  // The privacy acknowledgement is a real first-run gate. Once it has been
+  // completed this panel is ordinary settings and remains freely cancellable.
+  if (onboardingCancel) {
+    onboardingCancel.textContent = "Cancel";
+    onboardingCancel.hidden = firstRun;
+  }
+  syncTerminalSettings();
+  renderAccessMode();
+  onboardingError.hidden = true;
+  try {
+    const response = await fetch("/api/settings/model");
+    if (!response.ok) return;
+    const status = await response.json();
+    if (providerStatus) {
+      providerStatus.textContent = status.configured
+        ? `${status.provider || "Current provider"} · ${status.model || "current model"}. The protected key is never shown.`
+        : "No provider key is configured yet. The key is never shown after saving.";
+    }
+  } catch { /* daemon status already appears elsewhere */ }
+}
+
+function closeSafetySettings() {
+  if (onboardingPanel) onboardingPanel.hidden = true;
+  if (onboardingCancel) onboardingCancel.hidden = false;
+  document.body.classList.remove("settings-open");
+  if (providerApiKey) providerApiKey.value = "";
+}
+
+developerTerminalToggle?.addEventListener("change", syncTerminalSettings);
+safetySettingsButton?.addEventListener("click", () => {
+  openMoreMenu(false);
+  openSafetySettings({ firstRun: false });
+});
+onboardingCancel?.addEventListener("click", closeSafetySettings);
+
+onboardingForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  onboardingError.hidden = true;
+  const providerUpdate = {
+    provider: providerName?.value || undefined,
+    model: providerModel?.value.trim() || undefined,
+    baseUrl: providerBaseUrl?.value.trim() || undefined,
+    apiKey: providerApiKey?.value.trim() || undefined
+  };
+  if (Object.values(providerUpdate).some(Boolean)) {
+    try {
+      const response = await fetch("/api/settings/model", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(providerUpdate)
+      });
+      if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `HTTP ${response.status}`);
+    } catch (error) {
+      onboardingError.textContent = `The provider settings were not saved: ${error.message}`;
+      onboardingError.hidden = false;
+      return;
+    }
+  }
+  developerTerminal = developerTerminalToggle?.checked === true;
+  selectedShellMode = shellExecutionMode?.value || "workspace";
+  try {
+    localStorage.setItem(TERMINAL_STORAGE_KEY, developerTerminal ? "1" : "0");
+    localStorage.setItem(SHELL_MODE_STORAGE_KEY, selectedShellMode);
+    localStorage.setItem(ONBOARDING_STORAGE_KEY, "1");
+  } catch {}
+  closeSafetySettings();
+});
+
+if (apiToken && storedValue(ONBOARDING_STORAGE_KEY, "0") !== "1") {
+  queueMicrotask(() => openSafetySettings({ firstRun: true }));
+}
 
 // ---- Is the daemon actually there? ------------------------------------------
 
@@ -2707,6 +2840,15 @@ async function submit(text, { attachments = [], routing = null, display = null }
   // events are skipped: a percentage that finished an hour ago is noise, and
   // they are by far the most numerous thing on the wire.
   const streamed = [];
+  const workspaceRoots = [...new Set(attachments
+    .filter((attachment) => attachment?.kind === "folder" && attachment.path)
+    .map((attachment) => attachment.path))];
+  const accessPolicy = {
+    approvalMode,
+    developerMode: developerTerminal,
+    shellExecutionMode: developerTerminal ? selectedShellMode : "none",
+    workspaceRoots
+  };
 
   try {
     const res = await fetch("/api/intents", {
@@ -2717,14 +2859,11 @@ async function submit(text, { attachments = [], routing = null, display = null }
           protocolVersion: "1.0.0",
           type: "intent_request",
           requestId: `demo-${reqId++}`,
-          // A request is an instruction. The agent loop has no approval gate;
-          // this only matters on the offline route, where it stops that route
-          // asking a question the user has already answered by asking.
-          payload: { text, history, autoApprove: true }
+          payload: { text, history, ...accessPolicy }
         },
         text,
         history,
-        autoApprove: true
+        ...accessPolicy
       })
     });
     const session = await readIntentSession(res, {
@@ -2825,6 +2964,11 @@ const attachMenu = document.getElementById("attachMenu");
 const attachmentStrip = document.getElementById("attachmentStrip");
 const modelSelect = document.getElementById("modelSelect");
 const modelHint = document.getElementById("modelHint");
+const accessButton = document.getElementById("accessButton");
+const accessButtonIcon = document.getElementById("accessButtonIcon");
+const accessButtonLabel = document.getElementById("accessButtonLabel");
+const accessMenu = document.getElementById("accessMenu");
+const onboardingModes = document.getElementById("onboardingModes");
 
 let attachedFiles = [];
 
@@ -2845,8 +2989,71 @@ const PICKERS = { file: fileInput, image: imageInput, folder: folderInput };
 // with `typeof` rather than depending on the order they are evaluated in.
 function closeOtherComposerMenus(except) {
   if (except !== "attach" && typeof openAttachMenu === "function") openAttachMenu(false);
+  if (except !== "access" && typeof openAccessMenu === "function") openAccessMenu(false);
   if (except !== "model" && typeof openModelMenu === "function") openModelMenu(false);
 }
+
+function accessModeButton(mode, { compact = false } = {}) {
+  const definition = ACCESS_MODES[mode];
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.accessMode = mode;
+  button.className = compact
+    ? `onboarding-mode${mode === "full" ? " full" : ""}`
+    : `access-menu-item${mode === "full" ? " full" : ""}`;
+  if (compact) {
+    button.append(el("strong", null, definition.label), document.createTextNode(definition.description));
+  } else {
+    const icon = el("span", "access-menu-icon");
+    icon.innerHTML = definition.icon;
+    const copy = el("span", "access-menu-copy");
+    copy.append(el("strong", null, definition.label), el("em", null, definition.description));
+    button.append(icon, copy, el("span", "access-menu-tick", "✓"));
+  }
+  button.addEventListener("click", () => setApprovalMode(mode));
+  return button;
+}
+
+function renderAccessMode() {
+  const definition = ACCESS_MODES[approvalMode];
+  if (accessButtonIcon) accessButtonIcon.innerHTML = definition.icon;
+  if (accessButtonLabel) accessButtonLabel.textContent = definition.label;
+  accessButton?.setAttribute("aria-label", `Access mode: ${definition.label}`);
+  accessButton?.classList.toggle("full", approvalMode === "full");
+  for (const item of document.querySelectorAll("[data-access-mode]")) {
+    item.classList.toggle("chosen", item.dataset.accessMode === approvalMode);
+    item.setAttribute("aria-checked", String(item.dataset.accessMode === approvalMode));
+  }
+}
+
+function setApprovalMode(mode) {
+  if (!ACCESS_MODES[mode]) return;
+  approvalMode = mode;
+  try { localStorage.setItem(ACCESS_STORAGE_KEY, mode); } catch {}
+  renderAccessMode();
+  openAccessMenu(false);
+}
+
+function openAccessMenu(open) {
+  if (!accessMenu || !accessButton) return;
+  if (open) closeOtherComposerMenus("access");
+  accessMenu.hidden = !open;
+  accessButton.setAttribute("aria-expanded", String(open));
+  accessButton.classList.toggle("open", open);
+}
+
+if (accessMenu) {
+  for (const mode of Object.keys(ACCESS_MODES)) accessMenu.appendChild(accessModeButton(mode));
+}
+if (onboardingModes) {
+  for (const mode of Object.keys(ACCESS_MODES)) onboardingModes.appendChild(accessModeButton(mode, { compact: true }));
+}
+accessButton?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  openAccessMenu(accessMenu.hidden);
+});
+accessMenu?.addEventListener("click", (event) => event.stopPropagation());
+renderAccessMode();
 
 function openAttachMenu(open) {
   if (!attachMenu || !attachButton) return;
@@ -2960,10 +3167,13 @@ moreMenu?.addEventListener("click", (event) => event.stopPropagation());
 
 // Anywhere else, and Escape. A menu that only closes by choosing something is a
 // menu you cannot back out of.
-document.addEventListener("click", () => { openAttachMenu(false); openMoreMenu(false); openModelMenu(false); });
+document.addEventListener("click", () => {
+  openAttachMenu(false); openAccessMenu(false); openMoreMenu(false); openModelMenu(false);
+});
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   if (attachMenu && !attachMenu.hidden) openAttachMenu(false);
+  if (accessMenu && !accessMenu.hidden) openAccessMenu(false);
   if (moreMenu && !moreMenu.hidden) openMoreMenu(false);
   if (modelMenu && !modelMenu.hidden) openModelMenu(false);
 });

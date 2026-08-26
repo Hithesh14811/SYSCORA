@@ -1962,6 +1962,17 @@ function Flush-ClipboardRestore {
   } catch {}
 }
 
+function Get-VisibleCaptureBounds($bounds) {
+  if(-not $bounds){ return $null }
+  $virtual=[System.Windows.Forms.SystemInformation]::VirtualScreen
+  $left=[Math]::Max([int64]$bounds.x,[int64]$virtual.Left)
+  $top=[Math]::Max([int64]$bounds.y,[int64]$virtual.Top)
+  $right=[Math]::Min(([int64]$bounds.x+[int64]$bounds.width),[int64]$virtual.Right)
+  $bottom=[Math]::Min(([int64]$bounds.y+[int64]$bounds.height),[int64]$virtual.Bottom)
+  if($right -le $left -or $bottom -le $top){ return $null }
+  return @{x=[int]$left;y=[int]$top;width=[int]($right-$left);height=[int]($bottom-$top)}
+}
+
 function Invoke-Operation($operation, $params) {
   Flush-ClipboardRestore
   switch ($operation) {
@@ -2300,8 +2311,20 @@ function Invoke-Operation($operation, $params) {
       if ($w) { $r=$w.bounds } elseif ($params.region) { $r=$params.region } else { $b=[System.Windows.Forms.SystemInformation]::VirtualScreen;$r=@{x=$b.X;y=$b.Y;width=$b.Width;height=$b.Height} }
       $target=[IO.Path]::GetFullPath([string]$params.path);[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))|Out-Null
       $method="screen-region"
-      if($w -and [M4Native]::CaptureWindow([IntPtr][Int64]$w.windowId,$target)){$method="PrintWindow"}
-      else{[M4Native]::Capture([int]$r.x,[int]$r.y,[int]$r.width,[int]$r.height,$target)|Out-Null}
+      $direct=$false
+      if($w){$direct=[M4Native]::CaptureWindow([IntPtr][Int64]$w.windowId,$target)}
+      if($direct){$method="PrintWindow"}
+      else{
+        # A just-launched terminal can replace its bootstrap HWND. UIA may
+        # briefly return the old window's off-screen sentinel rectangle; do not
+        # hand those coordinates to CopyFromScreen, which throws and collapses
+        # the entire observation. Capture only the visible intersection.
+        $visible=Get-VisibleCaptureBounds $r
+        if(-not $visible){return @{captured=$false;reason="window-outside-visible-desktop";windowId=$(if($w){$w.windowId}else{$null})}}
+        $r=$visible
+        try{[M4Native]::Capture([int]$r.x,[int]$r.y,[int]$r.width,[int]$r.height,$target)|Out-Null}
+        catch{return @{captured=$false;reason="screen-capture-failed";detail=$_.Exception.Message;windowId=$(if($w){$w.windowId}else{$null})}}
+      }
       $capturedWindowId = if($w){$w.windowId}else{$null}
       return @{captured=$true;path=$target;bounds=$r;windowId=$capturedWindowId;method=$method;timestamp=[DateTime]::UtcNow.ToString("o")}
     }
@@ -2314,10 +2337,16 @@ function Invoke-Operation($operation, $params) {
       $capturePath = if($params.path){[IO.Path]::GetFullPath([string]$params.path)}else{[IO.Path]::Combine([IO.Path]::GetTempPath(),"syscora-m4","vision-"+[guid]::NewGuid().ToString()+".png")}
       if(-not $params.path){
         [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($capturePath))|Out-Null
-        $r=if($w){$w.bounds}else{@{x=0;y=0;width=[System.Windows.Forms.SystemInformation]::VirtualScreen.Width;height=[System.Windows.Forms.SystemInformation]::VirtualScreen.Height}}
+        $r=if($w){$w.bounds}else{$b=[System.Windows.Forms.SystemInformation]::VirtualScreen;@{x=$b.X;y=$b.Y;width=$b.Width;height=$b.Height}}
         $direct=$false
         if($w){$direct=[M4Native]::CaptureWindow([IntPtr][Int64]$w.windowId,$capturePath)}
-        if(-not $direct){[M4Native]::Capture([int]$r.x,[int]$r.y,[int]$r.width,[int]$r.height,$capturePath)|Out-Null}
+        if(-not $direct){
+          $visible=Get-VisibleCaptureBounds $r
+          if(-not $visible){return @{found=$false;reason="window-outside-visible-desktop";target=$null;matches=@()}}
+          $r=$visible
+          try{[M4Native]::Capture([int]$r.x,[int]$r.y,[int]$r.width,[int]$r.height,$capturePath)|Out-Null}
+          catch{return @{found=$false;reason="screen-capture-failed";detail=$_.Exception.Message;target=$null;matches=@()}}
+        }
       } else { $r=@{x=[int]$params.originX;y=[int]$params.originY} }
       $ocr=Read-OcrImage $capturePath $(if($w){$w.windowId}else{$params.windowId}) ([int]$r.x) ([int]$r.y)
       $query=[string]$params.query

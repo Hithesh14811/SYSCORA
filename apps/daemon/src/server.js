@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createRuntime, loadCapabilityPlugins } from "./runtime-factory.js";
+import { createRuntime, loadCapabilityPlugins, reloadRuntimeModelProvider } from "./runtime-factory.js";
 import { PROTOCOL_VERSION, ValidationError } from "../../../packages/shared-types/src/domain.js";
 import { AgentRuntime } from "../../../packages/agent-runtime/src/index.js";
 import { buildEnvelope, parseRequestBodyWithEnvelope } from "../../../packages/protocol/src/envelope.js";
@@ -12,6 +12,8 @@ import { buildSessionResponse } from "../../../packages/protocol/src/session-pro
 import { projectSessionLifecycle } from "../../../packages/shared-types/src/session-lifecycle.js";
 import { closeWindowsAutomationHost } from "../../../os-adapters/windows-host/src/client.js";
 import { resolveStateDir } from "../../../packages/shared-types/src/state-path.js";
+import { normalizeAccessPolicy } from "../../../packages/shared-types/src/access-policy.js";
+import { isProtectedReference, protectToFile } from "../../../packages/secrets/src/protected-value.js";
 import { installCrashGuards, reportInterruptedRun } from "./crash-guard.js";
 import { reportPreflight } from "./preflight.js";
 // The same extractor the agent uses on files it finds on disk. See documents.js:
@@ -26,8 +28,34 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const desktopDirectory = path.resolve(__dirname, "../../desktop");
 
+const BASE_SECURITY_HEADERS = Object.freeze({
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "cross-origin-resource-policy": "same-origin",
+  "x-frame-options": "DENY"
+});
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "base-uri 'none'",
+  "object-src 'none'",
+  "frame-src 'none'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+  "script-src 'self'",
+  // The renderer has legacy style attributes and runtime-set CSS variables.
+  // This is narrower than allowing inline scripts and preserves the current UI.
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "font-src 'self' data:",
+  "connect-src 'self'"
+].join("; ");
+
 function sendJson(response, statusCode, payload) {
-  response.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
+  response.writeHead(statusCode, {
+    ...BASE_SECURITY_HEADERS,
+    "content-security-policy": CONTENT_SECURITY_POLICY,
+    "content-type": "application/json; charset=utf-8"
+  });
   response.end(JSON.stringify(payload, null, 2));
 }
 
@@ -273,6 +301,81 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         return;
       }
 
+      // ---- Provider settings ------------------------------------------------
+      // Never return a credential. A newly supplied key is protected with the
+      // current Windows user's DPAPI key before config.json is changed, and the
+      // provider is swapped in-process so saving does not add a restart delay.
+      if (requestUrl.pathname === "/api/settings/model" && request.method === "GET") {
+        const stateDirectory = resolveStateDir(basePath);
+        let parsed = {};
+        try { parsed = JSON.parse(await fs.readFile(path.join(stateDirectory, "config.json"), "utf8")); } catch {}
+        const model = parsed?.model ?? parsed ?? {};
+        sendJson(response, 200, {
+          provider: model.provider ?? process.env.SYSCORA_MODEL_PROVIDER ?? null,
+          model: model.model ?? process.env.SYSCORA_MODEL_NAME ?? null,
+          configured: Boolean(
+            process.env.SYSCORA_MODEL_API_KEY || model.primaryApiKey || model.apiKey ||
+            (Array.isArray(model.apiKeys) && model.apiKeys.length > 0)
+          ),
+          protected: isProtectedReference(model.primaryApiKey) || isProtectedReference(model.apiKey)
+        });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/settings/model" && request.method === "POST") {
+        try {
+          const payload = await readJsonBody(request);
+          const allowedProviders = new Set(["openai", "anthropic", "mistral", "gemini", "google", "agentrouter", "deepseek"]);
+          const provider = payload.provider == null ? null : String(payload.provider).trim().toLowerCase();
+          if (provider && !allowedProviders.has(provider)) throw new Error("That model provider is not supported.");
+          const modelName = payload.model == null ? null : String(payload.model).trim().slice(0, 160);
+          const baseUrl = payload.baseUrl == null ? null : String(payload.baseUrl).trim();
+          if (baseUrl) {
+            const endpoint = new URL(baseUrl);
+            if (endpoint.protocol !== "https:" && endpoint.hostname !== "127.0.0.1" && endpoint.hostname !== "localhost") {
+              throw new Error("A provider URL must use HTTPS (localhost is allowed for local models). ");
+            }
+          }
+          const apiKey = payload.apiKey == null ? "" : String(payload.apiKey).trim();
+          if (apiKey && (apiKey.length < 8 || apiKey.length > 4096)) throw new Error("The API key length is invalid.");
+
+          const stateDirectory = resolveStateDir(basePath);
+          const configPath = path.join(stateDirectory, "config.json");
+          let config = {};
+          try { config = JSON.parse(await fs.readFile(configPath, "utf8")); } catch {}
+          if (!config || Array.isArray(config) || typeof config !== "object") config = {};
+          const existingModel = config.model && typeof config.model === "object" ? config.model : {};
+          const nextModel = { ...existingModel };
+          if (provider) nextModel.provider = provider;
+          if (modelName) nextModel.model = modelName;
+          if (baseUrl) nextModel.baseUrl = baseUrl.replace(/\/$/, "");
+          if (apiKey) {
+            const secretName = "model-primary.bin";
+            await protectToFile(path.join(stateDirectory, "secrets", secretName), apiKey);
+            nextModel.primaryApiKey = `dpapi:${secretName}`;
+            delete nextModel.apiKey;
+            delete nextModel.apiKeys;
+          }
+          const next = {
+            ...config,
+            model: nextModel,
+            externalAIConsent: {
+              ...(config.externalAIConsent ?? {}),
+              scopes: ["EXTERNAL_AI_SANITIZED_REASONING", "EXTERNAL_AI_STRUCTURED_UI_CONTEXT"]
+            }
+          };
+          await fs.mkdir(stateDirectory, { recursive: true });
+          const temporary = `${configPath}.${process.pid}.tmp`;
+          await fs.writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+          await fs.rename(temporary, configPath);
+          const status = reloadRuntimeModelProvider(runtime, basePath);
+          sendJson(response, 200, { ...status, protected: Boolean(apiKey) || isProtectedReference(nextModel.primaryApiKey) });
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error) });
+        }
+        return;
+      }
+
       // ---- Mail -------------------------------------------------------------
       //
       // THESE ROUTES ARE FOR THE COMPOSE CARD, NOT FOR THE AGENT. Nothing in
@@ -464,6 +567,8 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           return;
         }
         response.writeHead(200, {
+          ...BASE_SECURITY_HEADERS,
+          "content-security-policy": CONTENT_SECURITY_POLICY,
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-cache, no-transform",
           connection: "keep-alive"
@@ -526,9 +631,13 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         }
         const held = { at: Date.now(), sessionId: null };
         activeIntent = held;
+        const accessPolicy = normalizeAccessPolicy(payload);
         const runOptions = {
           workspacePath: basePath,
-          autoApprove: payload.autoApprove === true,
+          ...accessPolicy,
+          // Kept for the staged/legacy pipeline while the explicit mode owns
+          // the fast path. Older API clients still receive their old semantics.
+          autoApprove: accessPolicy.approvalMode === "full",
           // The prior turns of this conversation, oldest first. The client owns
           // the transcript; the daemon stays stateless about it and simply
           // forwards what was sent, bounded here so a client cannot grow the
@@ -1108,7 +1217,11 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
       const contentType = inferContentType(staticPath);
       const binary = !contentType.startsWith("text/") && !contentType.startsWith("application/javascript");
       const file = await fs.readFile(staticPath, binary ? null : "utf8");
-      response.writeHead(200, { "content-type": contentType });
+      response.writeHead(200, {
+        ...BASE_SECURITY_HEADERS,
+        "content-security-policy": CONTENT_SECURITY_POLICY,
+        "content-type": contentType
+      });
       response.end(file);
     } catch (error) {
       if (error instanceof ValidationError) {

@@ -201,7 +201,7 @@ const READ_ONLY_VERBS = new Set([
   "route", "getmac", "driverquery", "assoc", "ftype", "set", "path",
   "wc", "head", "tail", "sort", "more", "less",
   // developer tooling, read-only invocations only (subcommands checked below)
-  "git", "npm", "node", "python", "python3", "pip", "dotnet", "java", "javac",
+  "git", "npm", "node", "python", "python3", "py", "pip", "dotnet", "java", "javac",
   "go", "cargo", "rustc", "docker", "kubectl", "winget", "code", "gh", "curl", "wget"
 ]);
 
@@ -232,11 +232,20 @@ const READ_ONLY_SUBCOMMANDS = Object.freeze({
   node: null,
   python: null,
   python3: null,
+  py: null,
   java: null,
   javac: null,
   rustc: null,
   code: null
 });
+
+// These executables only become read-only when they are asked for help or a
+// version. Running a script is arbitrary code execution; previously the `null`
+// entry above accidentally allowed `python cleanup.py` and `node task.js` while
+// still prompting for the harmless Windows `py --version` launcher.
+const VERSION_ONLY_VERBS = new Set([
+  "node", "python", "python3", "py", "java", "javac", "rustc", "code"
+]);
 
 // Flags that turn an otherwise-reading command into one that writes.
 const WRITE_FLAGS = /(?:^|\s)(?:-o|--output|-O|--remote-name|>>?|--write|--in-place|-i\b)/i;
@@ -378,7 +387,14 @@ export function classifyShellCommand(command, args = []) {
     // `dotnet --info`). Enumerating that per tool is how `git --version` — the
     // single most common way to check whether something is installed — ended up
     // needing approval.
-    if (allowedSubcommands && isVersionOrHelpOnly(segment)) continue;
+    if (isVersionOrHelpOnly(segment)) continue;
+    if (VERSION_ONLY_VERBS.has(verb)) {
+      return {
+        verdict: ShellVerdict.ASK,
+        rule: "interpreter-execution",
+        reason: `\`${verb}\` is being asked to run code rather than only report its version, so it needs your approval.`
+      };
+    }
     if (allowedSubcommands) {
       const subcommand = subcommandOf(segment);
       if (!allowedSubcommands.has(subcommand)) {

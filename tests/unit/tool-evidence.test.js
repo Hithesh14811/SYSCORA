@@ -67,6 +67,15 @@ function harness({ files = new Map(), overrides = {}, basePath } = {}) {
 
   const adapter = {
     executeCommand: async (cwd, command) => record("executeCommand", { stdout: "", stderr: "", exitCode: 0, command }),
+    inspectCommand: async (name) => record("inspectCommand", {
+      checked: true,
+      installed: true,
+      requested: name,
+      command: String(name).toLowerCase(),
+      path: "C:\\Python312\\python.exe",
+      paths: ["C:\\Python312\\python.exe"],
+      version: "Python 3.12.4"
+    }),
     listWindows: async () => record("listWindows", [{
       WindowHandle: 9, ProcessName: "app", MainWindowTitle: "The app",
       Bounds: { x: 0, y: 0, width: 1200, height: 800 }, Foreground: true
@@ -170,6 +179,7 @@ function harness({ files = new Map(), overrides = {}, basePath } = {}) {
 
 const SUCCESS_CALLS = [
   { tool: "run", args: { command: "git --version" } },
+  { tool: "software", args: { name: "python" }, readOnly: true },
   { tool: "screen", args: { application: "app" } },
   { tool: "click", args: { text: "Send" }, needsReading: true },
   { tool: "type", args: { text: "hello" }, needsReading: true },

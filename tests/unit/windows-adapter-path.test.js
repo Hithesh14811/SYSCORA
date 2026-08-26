@@ -5,6 +5,58 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { WindowsAdapter } from "../../os-adapters/windows/src/windows-adapter.js";
 
+test("WindowsAdapter - inspectCommand ignores Store aliases and reports a real runtime", async () => {
+  const adapter = new WindowsAdapter();
+  const calls = [];
+  adapter.executeCommand = async (_cwd, command, args) => {
+    calls.push({ command, args });
+    if (command === "where.exe" && args[0] === "python") {
+      return { exitCode: 0, stdout: "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe\n", stderr: "" };
+    }
+    if (command === "where.exe" && args[0] === "py") {
+      return { exitCode: 0, stdout: "C:\\Windows\\py.exe\n", stderr: "" };
+    }
+    return { exitCode: 0, stdout: "Python 3.12.4\n", stderr: "" };
+  };
+
+  const result = await adapter.inspectCommand("python");
+
+  assert.equal(result.checked, true);
+  assert.equal(result.installed, true);
+  assert.equal(result.path, "C:\\Windows\\py.exe");
+  assert.equal(result.version, "Python 3.12.4");
+  assert.deepEqual(calls.at(-1), { command: "C:\\Windows\\py.exe", args: ["--version"] });
+});
+
+test("WindowsAdapter - inspectCommand does not count a Store execution alias as installed", async () => {
+  const adapter = new WindowsAdapter();
+  let versionSpawned = false;
+  adapter.executeCommand = async (_cwd, command, args) => {
+    if (command !== "where.exe") versionSpawned = true;
+    return args[0] === "python"
+      ? { exitCode: 0, stdout: "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe\n", stderr: "" }
+      : { exitCode: 1, stdout: "", stderr: "" };
+  };
+
+  const result = await adapter.inspectCommand("python");
+
+  assert.equal(result.checked, true);
+  assert.equal(result.installed, false);
+  assert.equal(result.aliasesOnly, true);
+  assert.equal(versionSpawned, false);
+});
+
+test("WindowsAdapter - inspectCommand refuses anything shaped like arguments", async () => {
+  const adapter = new WindowsAdapter();
+  let spawned = false;
+  adapter.executeCommand = async () => { spawned = true; return { exitCode: 0, stdout: "", stderr: "" }; };
+
+  const result = await adapter.inspectCommand("python --version");
+
+  assert.equal(result.checked, false);
+  assert.equal(spawned, false);
+});
+
 test("WindowsAdapter - verifyUserPathEntry and rollbackUserPath", async (t) => {
   const adapter = new WindowsAdapter();
   // First get current user path to restore later

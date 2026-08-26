@@ -52,6 +52,10 @@ import { PrerequisiteResolver } from "./prerequisite-resolver.js";
 import { EnvironmentModel } from "../../context-engine/src/environment-model.js";
 import { FailureReason, FastAgent, buildToolset } from "../../fast-agent/src/index.js";
 import { deleteSkill, readSkills, recordSkillRun, writeSkill } from "../../fast-agent/src/skills.js";
+import {
+  canAutoApprove,
+  normalizeAccessPolicy
+} from "../../shared-types/src/access-policy.js";
 
 export {
   InteractiveAgentController,
@@ -530,6 +534,8 @@ export class AgentRuntime {
     // The state is about the MACHINE, and there is one machine. Conversations
     // are the client's to keep; where the pointer and the focus are is not.
     const toolset = this._ensureToolset(options.workspacePath);
+    const accessPolicy = normalizeAccessPolicy(options);
+    toolset.setAccessPolicy?.(accessPolicy);
     // ASKING, WITHOUT A PIPELINE BEHIND IT.
     //
     // The staged route had a whole approval apparatus — risk assessment, policy
@@ -568,8 +574,8 @@ export class AgentRuntime {
     // This answers CONFIRM cards only. The DENY floor is checked where the
     // process is actually spawned (see the gate in tools.js), so nothing here
     // can talk it round.
-    const autoApprove = options.autoApprove === true;
     const askUser = (request) => new Promise((resolve) => {
+      const automatic = canAutoApprove(request, accessPolicy);
       const approvalId = createId("approval");
       const settle = (approved, automatic = false) => {
         if (!this._approvals.delete(approvalId)) return;
@@ -592,10 +598,11 @@ export class AgentRuntime {
           rule: request.rule,
           detail: request.detail,
           timeoutMs: APPROVAL_TIMEOUT_MS,
-          autoApproved: autoApprove
+          autoApproved: automatic,
+          approvalMode: accessPolicy.approvalMode
         }
       });
-      if (autoApprove) settle(true, true);
+      if (automatic) settle(true, true);
     });
     // A stop press is an answer too: refuse anything still waiting rather than
     // leaving the run stuck behind a card nobody is going to click.

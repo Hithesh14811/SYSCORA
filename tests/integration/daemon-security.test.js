@@ -25,7 +25,7 @@ async function request(port, method, pathname, { token, body, headers = {} } = {
     body: body === undefined ? undefined : (typeof body === "string" ? body : JSON.stringify(body))
   });
   const text = await res.text();
-  return { status: res.status, text };
+  return { status: res.status, text, headers: res.headers };
 }
 
 describe("Daemon HTTP security surface", () => {
@@ -37,7 +37,7 @@ describe("Daemon HTTP security surface", () => {
   before(async () => {
     basePath = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-daemon-"));
     process.env.SYSCORA_API_TOKEN = token;
-    server = startServer({ port: 0, basePath });
+    server = startServer({ port: 0, basePath, warmHost: false });
     await new Promise((resolve) => server.on("listening", resolve));
     port = server.address().port;
   });
@@ -67,6 +67,19 @@ describe("Daemon HTTP security surface", () => {
   it("accepts the correct token", async () => {
     const res = await request(port, "GET", "/api/sessions", { token });
     assert.equal(res.status, 200);
+  });
+
+  it("protects the provider-settings surface and never returns a key", async () => {
+    const unauthorized = await request(port, "GET", "/api/settings/model");
+    assert.equal(unauthorized.status, 401);
+
+    const authorized = await request(port, "GET", "/api/settings/model", { token });
+    assert.equal(authorized.status, 200);
+    const body = JSON.parse(authorized.text);
+    assert.equal(Object.hasOwn(body, "apiKey"), false);
+    assert.equal(Object.hasOwn(body, "primaryApiKey"), false);
+    assert.match(authorized.headers.get("content-security-policy") || "", /default-src 'self'/);
+    assert.equal(authorized.headers.get("x-content-type-options"), "nosniff");
   });
 
   it("rejects an oversized request body (413)", async () => {

@@ -58,6 +58,7 @@ function startDaemon() {
 }
 
 function createWindow({ port, apiToken }) {
+  const developerToolsAllowed = !app.isPackaged || process.env.SYSCORA_ENABLE_DEVTOOLS === "1";
   const window = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -75,6 +76,10 @@ function createWindow({ port, apiToken }) {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      devTools: developerToolsAllowed,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
       preload: path.join(__dirname, "preload.js"),
       // The token is handed to the preload as a launch argument, delivered
       // in-process to the renderer via contextBridge. It is never embedded in
@@ -84,6 +89,12 @@ function createWindow({ port, apiToken }) {
   });
 
   window.once("ready-to-show", () => window.show());
+  // The chat renderer needs no camera, microphone, geolocation, notifications,
+  // MIDI, USB, serial or clipboard permission from Chromium. Agent capabilities
+  // live behind the authenticated daemon instead of browser permission prompts.
+  window.webContents.session.setPermissionCheckHandler(() => false);
+  window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  window.webContents.on("will-attach-webview", (event) => event.preventDefault());
   sendLinksToTheRealBrowser(window, port);
   window.loadURL(`http://127.0.0.1:${port}`);
   return window;
@@ -141,16 +152,17 @@ function sendLinksToTheRealBrowser(window, port) {
 // explicitly: losing Ctrl+R while developing is a bad trade for a tidy window,
 // and a user who presses F12 by accident gets nothing, which is correct.
 function removeMenuBarKeepingItsShortcuts(window) {
+  const developerToolsAllowed = !app.isPackaged || process.env.SYSCORA_ENABLE_DEVTOOLS === "1";
   Menu.setApplicationMenu(null);
   window.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown") return;
     const key = String(input.key ?? "").toLowerCase();
-    if ((input.control || input.meta) && key === "r") {
+    if (developerToolsAllowed && (input.control || input.meta) && key === "r") {
       window.webContents.reload();
       event.preventDefault();
     }
     if (key === "f12" || ((input.control || input.meta) && input.shift && key === "i")) {
-      window.webContents.toggleDevTools();
+      if (developerToolsAllowed) window.webContents.toggleDevTools();
       event.preventDefault();
     }
   });

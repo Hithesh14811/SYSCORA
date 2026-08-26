@@ -210,6 +210,28 @@ export function createRuntime(basePath = process.cwd()) {
   return runtime;
 }
 
+/** Apply provider settings without restarting or rebuilding the runtime. */
+export function reloadRuntimeModelProvider(runtime, basePath = process.cwd()) {
+  const modelConfig = loadModelConfig(basePath);
+  const modelProvider = new ConsentAwareModelProvider({
+    provider: createModelProviderChain(modelConfig),
+    consentScopes: modelConfig.externalAIConsent.scopes,
+    onProvenance: (record) => {
+      runtime?.auditRepository?.append?.("external-ai", "EXTERNAL_AI_REQUEST", record).catch?.(() => {});
+    }
+  });
+  if (!runtime?.reasoningEngine) throw new Error("The runtime has no reasoning engine to reconfigure.");
+  runtime.reasoningEngine.modelProvider = modelProvider;
+  runtime.reasoningEngine.minTimeoutMs = Math.max(0, Number(modelConfig.requestTimeoutMs) || 0);
+  runtime.reasoningEngine._liveFailures = 0;
+  return {
+    provider: modelConfig.provider,
+    model: modelConfig.model ?? null,
+    configured: Boolean(modelConfig.apiKey),
+    remote: String(modelConfig.provider).toLowerCase() !== "mock"
+  };
+}
+
 // Opt-in capability plugin loading. Construction stays synchronous; a caller
 // (daemon/CLI) invokes this explicitly after createRuntime(). Loading is fully
 // wired end-to-end: discovery -> manifest validation -> runtime-version check ->
