@@ -442,6 +442,12 @@ export function isReadOnlyShellCommand(command, args = []) {
 // stays exactly as fast as it is now.
 const CONFIRM_RULES = Object.freeze([
   {
+    id: "persistent-user-environment",
+    pattern: /\[Environment\]::SetEnvironmentVariable\s*\([^)]*,\s*['"]User['"]\s*\)|\bsetx(?:\.exe)?\s+\S/i,
+    summary: "change your persistent user environment",
+    reason: "user environment changes such as PATH affect future applications and remain after SYSCORA closes"
+  },
+  {
     id: "delete-files",
     // A delete of a drive root is already DENIED. This is the ordinary delete: a
     // file, a folder, a wildcard. Reversible only if the recycle bin happens to
@@ -563,7 +569,10 @@ const IRREVERSIBLE_CONTROLS = Object.freeze([
     id: "send-outward",
     // The button forms. Enter-to-send is handled separately, by the app it is
     // being pressed in — see requiresSendConfirmation.
-    pattern: /^\s*(?:send|send message|send now|post|publish|tweet|reply all|send invite|share)\s*$/i,
+    // A bare Share control opens a chooser/submenu; it has not sent anything
+    // yet. Gating that intermediate menu added a user round trip in Spotify
+    // while the actual WhatsApp Send/Enter remained the irreversible boundary.
+    pattern: /^\s*(?:send|send message|send now|post|publish|tweet|reply all|send invite)\s*$/i,
     summary: "send this",
     reason: "once it has gone to somebody else it cannot be taken back"
   }

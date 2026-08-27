@@ -18,6 +18,7 @@ import { ApprovalTokenStore } from "../../../packages/permission-broker/src/appr
 import { CapabilityGrantStore } from "../../../packages/permission-broker/src/capability-grant-store.js";
 import { DeveloperIntelligenceEngine } from "../../../packages/developer-intelligence/src/index.js";
 import { WindowsAdapter } from "../../../os-adapters/windows/src/windows-adapter.js";
+import { AndroidAdapter } from "../../../os-adapters/android/src/android-adapter.js";
 import { SemanticState } from "../../../packages/semantic-state/src/index.js";
 import { Memory } from "../../../packages/memory/src/index.js";
 import { WindowsSecretBroker } from "../../../packages/secrets/src/index.js";
@@ -99,6 +100,10 @@ export function createRuntime(basePath = process.cwd()) {
   const semanticState = new SemanticState(path.join(stateDirectory, "semantic-state"));
   const memory = new Memory(path.join(stateDirectory, "memory"));
   const adapter = new WindowsAdapter();
+  // A separate, bounded ADB transport. It is only reached by `android.*`
+  // capabilities; constructing it starts no process and changes no desktop
+  // behavior. SYSCORA_ADB_PATH can point at a bundled Platform Tools binary.
+  const androidAdapter = new AndroidAdapter();
   // The PermissionBroker is shared between the runtime (grant enforcement,
   // approval-token issuance) and the privileged helper (single-use token
   // consumption), so a token issued via /api/privileged/approve is the exact
@@ -150,7 +155,7 @@ export function createRuntime(basePath = process.cwd()) {
     // that cannot be recorded does not run.
     auditRepository
   });
-  const capabilityRegistry = createDefaultCapabilityRegistry(adapter, { privilegedHelper });
+  const capabilityRegistry = createDefaultCapabilityRegistry(adapter, { privilegedHelper, androidAdapter });
   const recoveryEngine = new RecoveryEngine();
   const troubleshootingEngine = new TroubleshootingEngine();
   const secretBroker = new WindowsSecretBroker(path.join(stateDirectory, "secrets"));

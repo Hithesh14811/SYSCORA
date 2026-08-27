@@ -217,7 +217,7 @@ export function requiresInjectionConfirmation({ tool, args } = {}, observed = []
 // The tools that push something out of this machine or change it irreversibly.
 // A `screen` or a `read_file` cannot carry out an instruction, so a run that
 // only looks is never gated.
-const ACTS_OUTWARD = /^(?:type|key|run|web_type|web_click|open_url|web_open|write_file|edit_file|clipboard|launch|batch)$/;
+const ACTS_OUTWARD = /^(?:type|key|run|web_type|web_click|open_url|web_open|write_file|edit_file|clipboard|launch|batch|android_devices|android_tap|android_type|android_act|android_many)$/;
 
 /**
  * The line put in front of content that was found to contain an instruction.

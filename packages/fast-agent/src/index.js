@@ -292,6 +292,31 @@ function coarse(args) {
   return rounded;
 }
 
+// UI semantics live here instead of in one-off regular expressions at each
+// guard. Reads are repeatable observations; actions are attempts. Android's
+// single- and multi-device read tools are aliases for the same observation and
+// cannot be used to route around a no-progress guard.
+function isUiObservation(name, args = {}) {
+  return name === "screen" || name === "android_screen"
+    || (name === "android_many" && args.operation === "read_ui");
+}
+
+function mayRepeatCall(name, args = {}) {
+  if (isUiObservation(name, args)) return true;
+  if (/^(scroll|key|wait|windows|run|run_jobs|draw|drag)$/.test(name)) return true;
+  return name === "android_act" && /^(?:scroll|key)$/.test(String(args.operation ?? ""));
+}
+
+function canonicalAttemptSignature(name, args = {}) {
+  if (name === "android_screen") return `android_ui_read:${String(args.serial ?? "")}`;
+  if (name === "android_many" && args.operation === "read_ui") {
+    return `android_ui_read:${[...(args.serials ?? [])].map(String).sort().join(",")}`;
+  }
+  return /^(click|move_mouse)$/.test(name)
+    ? `${name}:${JSON.stringify(coarse(args))}`
+    : `${name}:${JSON.stringify(args)}`;
+}
+
 // A reply that ends in a question mark is asking the user something, which is a
 // legitimate reason to stop and never a false claim about the machine.
 const ASKS_THE_USER = /\?\s*$|\?["')\]]*\s*$/;
@@ -543,6 +568,8 @@ HOW YOU WORK
 CHOOSING A TOOL
 - WHETHER SOFTWARE IS INSTALLED is \`software\`, not \`run\`, \`launch\` or the screen tools. It checks the actual host and reports the version and path even when Developer terminal access is off. Never open a terminal window merely to answer an installed/version question.
 - When \`run\` is available, the terminal is usually fastest for installing software, files, processes, services, network, registry and settings. A GUI is for what genuinely has no typed tool or command.
+- ANDROID NEVER GOES THROUGH \`run\` OR \`software\`. \`android_devices\` already knows the exact adb executable even when it is not on PATH. Its list operation absorbs the brief reconnect after USB authorization; use wait next and refresh only after wait. Never search a drive for adb.exe, restart adb in PowerShell, or ask approval for a raw adb command.
+- A FINITE COMMAND THAT MAY WAIT ON A PERSON, DEVICE, NETWORK OR DIALOG uses \`run {defer:true}\`. That returns a managed job immediately, so continue any independent work and use \`run_jobs\` in a later turn to read live output or the final exit. Do not hold the whole conversation open on a command whose completion is not required for the next independent step.
 - MAKING A DOCUMENT IS \`create_document\`, NOT THE TERMINAL. A PDF, Word file, spreadsheet, CSV, web page or text file is ONE call: you write the content as markdown and it writes the file, to Downloads unless the user named a folder. Do not check for Python, install a library, write a script that writes a file, or open an app to type into. It reads the file back for you, so nothing is left to verify — do not open it, launch a viewer or read the screen afterwards. Measured, 25 Aug 2026: one PDF essay cost 13 tool calls and 227,584 tokens the other way, eleven of them about the toolchain rather than the essay.
 - To OPEN AN APPLICATION, use \`launch\`, not \`run\`. It already knows how to resolve a name to whatever the machine actually has — a Start menu entry, a packaged app, a registered path, a shortcut — and it hands you back the window it opened. \`Start-Process "WhatsApp"\` fails because that is not a file; working out the packaged app's identity by hand costs five commands and half a minute, and \`launch WhatsApp\` does it in one.
 - For anything on the WEB, there are two routes and they are not interchangeable. \`web_open\` drives a controlled browser through the page's own structure: a page arrives in a fraction of a second as its real text and its actual links, and \`web_click\`/\`web_type\` act on them by name. Use it for looking things up, reading, searching, prices, documentation, research — anything where you need to know what a page SAYS.
@@ -1451,9 +1478,7 @@ export class FastAgent {
         // same PLACE is one attempt however many pixels apart the guesses are.
         // Only for the pointer-hunting tools: a drawing is made of strokes that
         // are deliberately near each other, and must not be mistaken for a loop.
-        const attemptSignature = /^(click|move_mouse)$/.test(call.name)
-          ? `${call.name}:${JSON.stringify(coarse(shown))}`
-          : signature;
+        const attemptSignature = canonicalAttemptSignature(call.name, shown);
         // "IT HAS NOT GOT YOU ANYWHERE" HAS TO BE TRUE.
         //
         // The count was never cleared, so an action that DID something still
@@ -1474,7 +1499,7 @@ export class FastAgent {
         callCounts.set(attemptSignature, attempts);
         // Repetition is normal and correct for these: scrolling a long list,
         // pressing a key, waiting for something to appear, drawing a picture.
-        const mayRepeat = /^(scroll|key|wait|screen|windows|run|draw|drag)$/.test(call.name);
+        const mayRepeat = mayRepeatCall(call.name, shown);
         if (!mayRepeat && attempts >= 3) {
           const refusal =
             `This is the ${attempts}${attempts === 3 ? "rd" : "th"} time you have run exactly this in one ` +
@@ -1487,6 +1512,22 @@ export class FastAgent {
             details: { callId: call.id, tool: call.name, ok: false, output: refusal, durationMs: 0, repeated: true }
           });
           messages.push({ role: "tool", tool_call_id: call.id, content: refusal });
+          // One refusal is a chance to change strategy. If the model ignores
+          // it and submits the same action again, enforcement—not another
+          // paragraph—ends the loop. Screen changes clear the count above, so
+          // a legitimately repeated control remains unaffected.
+          if (attempts >= 4) {
+            const visuallyStuck = unchangedReadings >= 2;
+            return this._settle(
+              "PARTIALLY_COMPLETED",
+              `${lastText ? `${lastText}\n\n` : ""}I stopped after the same UI action made no progress three times.` +
+                (visuallyStuck
+                  ? " The screen has not changed through those attempts; the target is likely a visually hidden or unlabelled icon/control."
+                  : " No observed state change made another identical attempt safe or useful.") +
+                " Nothing was changed by these attempts. Tell me what is visually blocking the target, or take over that one control and I will continue.",
+              { steps, toolCalls, startedAt }
+            );
+          }
           continue;
         }
 
@@ -1527,8 +1568,10 @@ export class FastAgent {
         // to know a run was refused rather than finished. See the DECLINED
         // settle.
         if (result.raw?.refusedByUser === true) declinedActions += 1;
-        if (result.ok) failedCalls.clear();
-        else failedCalls.set(signature, result.text);
+        const unconfirmed = result.raw?.evidence?.verdict === "UNCONFIRMED";
+        const unchanged = result.raw?.screenUnchanged === true;
+        if (result.ok && !unconfirmed && !unchanged) failedCalls.clear();
+        else if (!result.ok || unconfirmed) failedCalls.set(signature, result.text);
         performed.push({ tool: call.name, args: shown, ok: result.ok === true, verified: null });
         await this._emit({
           type: "TOOL_FINISHED",
@@ -1562,7 +1605,7 @@ export class FastAgent {
         // different, because moving the pointer four pixels makes a new
         // signature. What was identical was the OUTCOME — nothing. So that is
         // what gets counted.
-        if (call.name === "screen") {
+        if (isUiObservation(call.name, shown)) {
           unchangedReadings = result.raw?.screenUnchanged ? unchangedReadings + 1 : 0;
           // A reading that came back DIFFERENT is proof the screen moved, which
           // is what clears the repeat guard. See its call site above.

@@ -548,6 +548,11 @@ export function repairCmdIsms(command) {
 // it does not need to be — it is a default for the obvious cases, and
 // `background: true` states it explicitly for everything else.
 const KEEPS_RUNNING = /(^|[\s;&|])(jupyter(\s+(notebook|lab|console))?|npm\s+(run\s+)?(dev|start|serve|watch)|yarn\s+(dev|start)|pnpm\s+(dev|start)|vite|next\s+dev|ng\s+serve|flask\s+run|streamlit\s+run|uvicorn|gunicorn|rails\s+s(erver)?|php\s+-S|http-server|serve\b|ngrok|docker\s+compose\s+up(?!\s+-d)|tensorboard)\b/i;
+// Android is a typed capability boundary. Falling out of it into PowerShell is
+// slower (PATH search alone took 39 seconds in the reported run), loses device
+// state, and bypasses the adapter's timeouts/cancellation. Detect both direct
+// adb invocations and filesystem searches for adb.exe before shell approval.
+const ANDROID_SHELL_ESCAPE = /(?:^|[\s;&|])(?:&\s*)?(?:"[^"]*[\\/])?adb(?:\.exe)?(?:"|\s|$)|\b(?:Get-ChildItem|gci|dir)\b[^\r\n;|]*\badb\.exe\b/i;
 
 // IS THERE ANYTHING IN THIS READING BUT THE WINDOW FRAME?
 //
@@ -1003,7 +1008,20 @@ export function buildToolset({
     lastWebReading: null,
     // What the USER actually asked for, verbatim. A destination they named
     // themselves is theirs, however many times it also appears on screen.
-    userRequest: ""
+    userRequest: "",
+    // Android adds six schemas to the model request. Keep them out of ordinary
+    // desktop turns entirely; once a phone task activates them they remain
+    // available for natural follow-ups such as "now send it".
+    androidActive: false,
+    // Per-device hierarchy identity. Android UI reads use this to return a
+    // compact delta on unchanged screens instead of feeding the same hundred
+    // controls back into every model turn.
+    androidSignatures: new Map(),
+    // Finite commands deliberately detached from the model loop. Unlike a
+    // Start-Process server, these keep their output and final exit status so a
+    // later tool call—or the user's next message—can check what happened.
+    commandJobs: new Map(),
+    nextCommandJob: 1
   };
 
   // ONE CLICK IN FRONT OF THE THINGS THAT CANNOT BE TAKEN BACK.
@@ -1063,7 +1081,10 @@ export function buildToolset({
     if (state.accessPolicy.approvalMode !== ApprovalMode.ASK) return true;
     let category = null;
     let request = null;
-    if (NETWORK_TOOLS.has(name)) {
+    const androidNetwork = (name === "android_devices" && ["connect", "pair", "disconnect"].includes(args.operation))
+      || (name === "android_act" && args.operation === "open_uri")
+      || (name === "android_many" && args.operation === "open_uri");
+    if (NETWORK_TOOLS.has(name) || androidNetwork) {
       category = "network";
       request = {
         kind: "network",
@@ -1936,17 +1957,44 @@ export function buildToolset({
     const wanted = String(args.text ?? "").trim();
     if (wanted) {
       const needle = normalizeLabel(wanted);
-      const score = (element) => {
-        const candidate = normalizeLabel(element.text);
+      const nearNeedle = normalizeLabel(args.near ?? "");
+      const wantedRole = normalizeLabel(String(args.role ?? "").replace(/^ControlType\./i, ""));
+      const labelScore = (value, expected) => {
+        const candidate = normalizeLabel(value);
         if (!candidate) return 0;
-        if (candidate === needle) return 4;
-        if (candidate.startsWith(needle) || candidate.endsWith(needle)) return 3;
-        if (candidate.includes(needle)) return 2;
+        if (candidate === expected) return 4;
+        if (candidate.startsWith(expected) || candidate.endsWith(expected)) return 3;
+        if (candidate.includes(expected)) return 2;
         return 0;
       };
+      const roleOf = (element) => normalizeLabel(
+        String(element.role ?? element.controlType ?? "").replace(/^ControlType\./i, "")
+      );
+      const nearScore = (element) => {
+        if (!nearNeedle) return 0;
+        return state.elements
+          .filter((other) => other !== element
+            && Math.abs(other.center.y - element.center.y) <= 60
+            && Math.abs(other.center.x - element.center.x) <= 1000)
+          .reduce((best, other) => Math.max(best, labelScore(other.text, nearNeedle)), 0);
+      };
       const ranked = state.elements
-        .map((element, index) => ({ element, index, score: score(element) + (element.clickable ? 0.5 : 0) }))
-        .filter((entry) => entry.score >= 2)
+        .map((element, index) => {
+          const direct = labelScore(element.text, needle);
+          const relation = nearScore(element);
+          const roleMatches = !wantedRole || roleOf(element) === wantedRole;
+          return {
+            element,
+            index,
+            score: direct * 100 + relation * 10 + (element.clickable ? 1 : 0),
+            direct,
+            relation,
+            roleMatches
+          };
+        })
+        .filter((entry) => entry.direct >= 2
+          && entry.roleMatches
+          && (!nearNeedle || entry.relation >= 2))
         .sort((left, right) => right.score - left.score);
       if (ranked.length === 0) {
         // A bare "nothing is labelled that" is a dead end: told it three times,
@@ -1969,7 +2017,9 @@ export function buildToolset({
           .slice(0, 10)
           .map(({ element }) => `  "${element.text}" @${element.center.x},${element.center.y}`);
         throw new Error(
-          `Nothing on screen is labelled "${wanted}".` +
+          `Nothing on screen is labelled "${wanted}"` +
+          (args.near ? ` beside "${args.near}"` : "") +
+          (args.role ? ` with role "${args.role}"` : "") + "." +
           (scored.length ? `\nThe closest labels actually present are:\n${scored.join("\n")}` : "") +
           "\nUse one of those, or read the screen again. Do not click a coordinate you have not read."
         );
@@ -2029,7 +2079,8 @@ export function buildToolset({
         x: element.center.x, y: element.center.y,
         windowId: element.windowId ?? state.lastWindow?.windowId,
         label: element.text ?? null,
-        role: String(element.role ?? element.controlType ?? "").replace(/^ControlType\./, "")
+        role: String(element.role ?? element.controlType ?? "").replace(/^ControlType\./, ""),
+        near: args.near ?? null
       };
     }
     if (Number.isFinite(Number(args.element))) {
@@ -2311,7 +2362,321 @@ export function buildToolset({
     ].filter(Boolean).join("\n\n");
   };
 
+  const androidSelectorSchema = {
+    type: "object",
+    description: "Semantic selector from android_screen. Add fields until it identifies one element; never invent coordinates.",
+    properties: {
+      id: { type: "string" }, text: { type: "string" }, textContains: { type: "string" },
+      description: { type: "string" }, resourceId: { type: "string" }, className: { type: "string" },
+      occurrence: { type: "number" }, clickable: { type: "boolean" }
+    }
+  };
+  const androidEvidence = (observed, verdict = CONFIRMED) => evidence({
+    observed, method: "adb:device-scoped-observation", verdict
+  });
+  const rememberAndroidUi = (serial, ui) => {
+    if (!ui?.nodes) return;
+    state.androidElements ??= new Map();
+    state.androidElements.set(String(serial), new Map(ui.nodes.map((node) => [String(node.id), node])));
+  };
+  const androidNodeLabel = (node) => node.text || node.description || node.semanticLabel || node.resourceId || "unlabelled";
+  const markAndroidReading = (serial, result) => {
+    const key = String(serial);
+    const previous = state.androidSignatures.get(key) ?? null;
+    const current = String(result?.signature ?? "") || null;
+    if (current) state.androidSignatures.set(key, current);
+    return {
+      ...result,
+      screenUnchanged: previous && current ? previous === current : null,
+      screenChanged: previous && current ? previous !== current : null
+    };
+  };
+  const renderAndroidUi = (result) => {
+    rememberAndroidUi(result.serial, result);
+    if (result.screenUnchanged === true) {
+      return `Android ${result.serial}: IDENTICAL to the last hierarchy — nothing accessible changed. ` +
+        "Do not read it again without taking a different action or asking the user about a visually hidden control.";
+    }
+    const content = (result.nodes ?? []).map((node) => [node.text, node.description].filter(Boolean).join(" ")).join("\n");
+    const injection = screenObservedContent(content, `Android device ${result.serial}`);
+    const visible = (result.nodes ?? []).filter((node) =>
+      node.text || node.description || node.semanticLabel || node.resourceId || node.clickable || node.editable
+    ).map((node, order) => ({
+      node,
+      order,
+      rank: (node.focused ? 40 : 0) + (node.editable ? 32 : 0) + (node.clickable ? 24 : 0)
+        + (node.selected ? 12 : 0) + (node.checked ? 8 : 0) + (node.semanticLabel ? 6 : 0)
+        + (node.resourceId ? 3 : 0) + ((node.text || node.description) ? 2 : 0)
+    })).sort((left, right) => right.rank - left.rank || left.order - right.order)
+      .slice(0, 120).map((entry) => entry.node);
+    const lines = visible.map((node, index) => {
+      const label = androidNodeLabel(node);
+      const flags = [node.clickable && "clickable", node.editable && "editable", node.scrollable && "scrollable", node.focused && "focused"].filter(Boolean);
+      return `${index}| ${node.role || "element"} ${JSON.stringify(clip(label, 180))} id=${node.id}` +
+        `${node.resourceId ? ` resourceId=${JSON.stringify(node.resourceId)}` : ""}${flags.length ? ` [${flags.join(", ")}]` : ""}`;
+    });
+    return [
+      `Android ${result.serial}: ${result.nodes?.length ?? 0} accessible elements (no screenshot used).`,
+      injection,
+      lines.join("\n") || "No labelled accessible elements were published by this screen.",
+      (result.nodes?.length ?? 0) > visible.length ? `… ${result.nodes.length - visible.length} additional structural or lower-ranked elements omitted.` : null
+    ].filter(Boolean).join("\n");
+  };
+
+  // A small model surface over the richer android.* capability family. Keeping
+  // these conditional means runtimes without the Android adapter retain the
+  // exact tool catalog they had before this feature.
+  const androidTools = registry?.has?.("android.device.list") ? [
+    {
+      name: "android_devices",
+      description:
+        "Set up Google's official Platform Tools; or list, wait for, refresh, connect, pair, disconnect, inspect, list apps, install an APK, or dismiss a NON-SECURE keyguard on Android. List automatically absorbs the brief USB reset after an authorization dialog. If no device returns, use wait; use refresh only after wait. NEVER invoke adb or search for adb.exe with run/software—the Android adapter already owns its exact executable, cancellation, and recovery. Pair/connect use exact wireless ADB host:port endpoints. Secure PIN/password/pattern/biometric locks are never bypassed.",
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["setup", "list", "wait", "refresh", "connect", "pair", "disconnect", "inspect", "apps", "install", "dismiss_keyguard"] },
+          serial: { type: "string" }, endpoint: { type: "string" },
+          pairingCode: { type: "string", description: "Temporary six-digit Android pairing code. Passed to adb on stdin." },
+          apkPath: { type: "string" }, replace: { type: "boolean" }, includeSystem: { type: "boolean" }, query: { type: "string" },
+          timeoutMs: { type: "number", description: "For wait/refresh only; bounded to the Android capability deadline." }
+        }, required: ["operation"]
+      },
+      preview: (args) => `${args.operation}${args.serial ? ` ${args.serial}` : args.endpoint ? ` ${args.endpoint}` : ""}`,
+      acts: true,
+      execute: async (args, { onProgress = null, signal = null } = {}) => {
+        if (["setup", "pair", "install"].includes(args.operation)) {
+          const installing = args.operation === "install";
+          const settingUp = args.operation === "setup";
+          const { approved } = await askPermission({
+            kind: settingUp ? "android-platform-tools-setup" : (installing ? "android-install" : "android-pair"),
+            summary: settingUp
+              ? "install Google's Android Platform Tools for SYSCORA"
+              : (installing ? `install ${path.basename(String(args.apkPath ?? "an APK"))} on Android ${args.serial ?? ""}` : `pair with Android ${args.endpoint ?? ""}`),
+            reason: settingUp
+              ? "This downloads and installs Google's adb executable into SYSCORA's private tools folder; it does not change PATH and needs no restart."
+              : installing
+              ? "Installing an APK adds executable software and may replace an existing application."
+              : "Pairing grants this computer persistent developer control until it is revoked on the phone.",
+            rule: settingUp ? "android.platform.setup" : (installing ? "android.install" : "android.pair"),
+            detail: settingUp
+              ? "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+              : (installing ? String(args.apkPath ?? "") : String(args.endpoint ?? ""))
+          });
+          if (!approved) return { performed: false, reason: "The user did not approve this Android operation.", evidence: androidEvidence("the user refused the Android operation", REFUTED) };
+        }
+        const execution = { onProgress, signal };
+        const result = args.operation === "setup" ? await runCapability("android.platform.setup", {}, execution)
+          : args.operation === "list" ? await runCapability("android.device.list", {}, execution)
+            : args.operation === "wait" ? await runCapability("android.device.wait", { timeoutMs: args.timeoutMs }, execution)
+              : args.operation === "refresh" ? await runCapability("android.device.refresh", { timeoutMs: args.timeoutMs }, execution)
+          : args.operation === "connect" ? await runCapability("android.connection.connect", { endpoint: args.endpoint })
+            : args.operation === "pair" ? await runCapability("android.connection.pair", { endpoint: args.endpoint, pairingCode: args.pairingCode })
+              : args.operation === "disconnect" ? await runCapability("android.connection.disconnect", { endpoint: args.endpoint })
+                : args.operation === "inspect" ? await runCapability("android.device.inspect", { serial: args.serial })
+                  : args.operation === "apps" ? await runCapability("android.app.list", { serial: args.serial, includeSystem: args.includeSystem, query: args.query })
+                    : args.operation === "install" ? await runCapability("android.app.install", { serial: args.serial, apkPath: args.apkPath, replace: args.replace })
+                      : await runCapability("android.device.dismissKeyguard", { serial: args.serial });
+        return { ...result, operation: args.operation, evidence: androidEvidence(`Android ${args.operation} returned device-scoped state`) };
+      },
+      failed: (result) => result.performed === false || result.connected === false || result.paired === false || result.installed === false,
+      render: (result) => result.performed === false
+        ? refuted(result, result.reason ?? "The Android operation was not performed.")
+        : reported(result, clip(JSON.stringify(Object.fromEntries(Object.entries(result).filter(([key]) => !["evidence", "message", "pairingCode"].includes(key))), null, 2), 5000))
+    },
+    {
+      name: "android_screen",
+      description: "Read one Android device's live accessibility hierarchy as semantic text and controls. Uses no screenshot. Password values are always hidden. Call before tapping or typing.",
+      parameters: { type: "object", properties: { serial: { type: "string" }, maxNodes: { type: "number" } }, required: ["serial"] },
+      preview: (args) => args.serial,
+      acts: false,
+      execute: async (args) => {
+        const result = await runCapability("android.ui.read", args);
+        return { ...markAndroidReading(args.serial, result), evidence: androidEvidence(`Android ${args.serial} published ${result.nodes?.length ?? 0} accessible elements`) };
+      },
+      render: renderAndroidUi
+    },
+    {
+      name: "android_tap",
+      description: "Tap exactly one semantic element from android_screen. Refuses ambiguous selectors and accepts no coordinates. It waits internally for a UI change, so do not add a fixed wait afterward.",
+      parameters: { type: "object", properties: { serial: { type: "string" }, selector: androidSelectorSchema, waitForChangeMs: { type: "number" } }, required: ["serial", "selector"] },
+      preview: (args) => `${args.serial} ${args.selector?.text ?? args.selector?.description ?? args.selector?.resourceId ?? args.selector?.id ?? "element"}`,
+      acts: true,
+      execute: async (args) => {
+        const remembered = args.selector?.id ? state.androidElements?.get(String(args.serial))?.get(String(args.selector.id)) : null;
+        const label = args.selector?.text || args.selector?.description || remembered?.text || remembered?.description || remembered?.resourceId || args.selector?.resourceId;
+        const critical = requiresClickConfirmation(label);
+        if (critical.confirm) {
+          const { approved } = await askPermission({ kind: "android-click", summary: critical.summary, reason: critical.reason, rule: critical.rule, detail: `${args.serial}: ${label}` });
+          if (!approved) return { performed: false, reason: "The user did not approve this irreversible Android action.", evidence: androidEvidence("the user refused the Android tap", REFUTED) };
+        }
+        const result = await runCapability("android.ui.tap", args);
+        rememberAndroidUi(args.serial, result.ui);
+        if (result.ui?.signature) state.androidSignatures.set(String(args.serial), String(result.ui.signature));
+        return {
+          ...result,
+          evidence: evidence({
+            observed: result.changed
+              ? `a fresh Android hierarchy read changed after tapping ${result.target?.id ?? "the selected element"}`
+              : `a fresh Android hierarchy read did not change after tapping ${result.target?.id ?? "the selected element"}`,
+            method: "android.ui.read",
+            actedVia: "android.ui.tap",
+            verdict: result.changed ? CONFIRMED : UNCONFIRMED
+          })
+        };
+      },
+      failed: (result) => result.performed === false,
+      render: (result) => result.performed === false ? refuted(result, result.reason) : result.changed
+        ? confirmed(result, `Tapped ${JSON.stringify(androidNodeLabel(result.target ?? {}))} on Android ${result.serial}; the accessibility hierarchy changed.`)
+        : unconfirmed(result, `The tap was delivered to ${JSON.stringify(androidNodeLabel(result.target ?? {}))} on Android ${result.serial}, but the accessibility hierarchy did not change. Do not tap it again; verify the intended result through a different observation.`)
+    },
+    {
+      name: "android_type",
+      description: "Type safe text into one semantic Android edit field. Password fields are refused. Unsupported text fails instead of being silently changed; full Unicode needs the optional companion.",
+      parameters: { type: "object", properties: { serial: { type: "string" }, selector: androidSelectorSchema, text: { type: "string" }, clear: { type: "boolean" } }, required: ["serial", "selector", "text"] },
+      preview: (args) => `${args.serial} ${String(args.text ?? "").length} characters`,
+      acts: true,
+      execute: async (args) => {
+        const result = await runCapability("android.ui.type", args);
+        rememberAndroidUi(args.serial, result.ui);
+        return { ...result, evidence: androidEvidence(`Android ${args.serial} accepted ${result.characters ?? 0} characters through its input service`) };
+      },
+      failed: (result) => result.performed === false,
+      render: (result) => confirmed(result, `Typed ${result.characters} characters into the selected Android field.${result.changed ? " The hierarchy changed." : " The field did not publish a changed hierarchy, so its value is unconfirmed."}`)
+    },
+    {
+      name: "android_act",
+      description: "Perform one bounded Android action: allow-listed key, semantic scroll, exact-package launch, or allow-listed URI open. No arbitrary shell or raw coordinates.",
+      parameters: {
+        type: "object", properties: {
+          operation: { type: "string", enum: ["key", "scroll", "launch", "open_uri"] }, serial: { type: "string" },
+          key: { type: "string" }, direction: { type: "string", enum: ["up", "down", "left", "right"] }, selector: androidSelectorSchema,
+          packageName: { type: "string" }, uri: { type: "string" }
+        }, required: ["operation", "serial"]
+      },
+      preview: (args) => `${args.operation} ${args.serial}`,
+      acts: true,
+      execute: async (args) => {
+        if (args.operation === "key" && /^(?:enter|return)$/i.test(String(args.key ?? ""))) {
+          const device = await runCapability("android.device.inspect", { serial: args.serial });
+          const critical = requiresSendConfirmation("enter", device.foregroundApp?.packageName ?? "");
+          if (critical.confirm) {
+            const { approved } = await askPermission({ kind: "android-send", summary: critical.summary, reason: critical.reason, rule: critical.rule, detail: `${args.serial}: ${device.foregroundApp?.packageName ?? "messaging app"}` });
+            if (!approved) return { performed: false, reason: "The user did not approve sending from Android.", evidence: androidEvidence("the user refused the Android send key", REFUTED) };
+          }
+        }
+        const result = args.operation === "key" ? await runCapability("android.ui.key", { serial: args.serial, key: args.key })
+          : args.operation === "scroll" ? await runCapability("android.ui.scroll", { serial: args.serial, direction: args.direction, selector: args.selector })
+            : args.operation === "launch" ? await runCapability("android.app.launch", { serial: args.serial, packageName: args.packageName })
+              : await runCapability("android.uri.open", { serial: args.serial, uri: args.uri });
+        rememberAndroidUi(args.serial, result.ui);
+        return { ...result, operation: args.operation, evidence: androidEvidence(`Android ${args.serial} completed bounded ${args.operation}`) };
+      },
+      failed: (result) => result.performed === false,
+      render: (result) => result.performed === false ? refuted(result, result.reason) : confirmed(result,
+        `Android ${result.serial} completed ${result.operation}.${result.changed === false ? " No accessibility-tree change was observed." : ""}`)
+    },
+    {
+      name: "android_many",
+      description: "Run one bounded operation concurrently on 1-32 exact Android serials. Supports inspect, read_ui, semantic tap/type/scroll, launch, open_uri, key, install, and non-secure dismiss_keyguard. Devices have independent queues and failures.",
+      parameters: { type: "object", properties: { serials: { type: "array", items: { type: "string" } }, operation: { type: "string", enum: ["inspect", "read_ui", "tap", "type", "scroll", "launch", "open_uri", "key", "install", "dismiss_keyguard"] }, input: { type: "object", description: "Operation arguments: selector/text/direction/packageName/uri/key/apkPath/replace as applicable." } }, required: ["serials", "operation"] },
+      preview: (args) => `${args.operation} on ${args.serials?.length ?? 0} Android devices`,
+      acts: true,
+      execute: async (args) => {
+        if (args.operation === "install") {
+          const { approved } = await askPermission({ kind: "android-multi-install", summary: `install ${path.basename(String(args.input?.apkPath ?? "an APK"))} on ${args.serials?.length ?? 0} Android devices`, reason: "Installing an APK adds executable software to every selected device and may replace an existing application.", rule: "android.multi.install", detail: (args.serials ?? []).join(", ") });
+          if (!approved) return { performed: false, reason: "The user did not approve this multi-device install.", evidence: androidEvidence("the user refused the multi-device install", REFUTED) };
+        }
+        if (args.operation === "tap") {
+          const label = args.input?.selector?.text || args.input?.selector?.description || args.input?.selector?.resourceId;
+          const critical = requiresClickConfirmation(label);
+          if (critical.confirm) {
+            const { approved } = await askPermission({ kind: "android-multi-click", summary: `${critical.summary} on ${args.serials?.length ?? 0} Android devices`, reason: critical.reason, rule: critical.rule, detail: (args.serials ?? []).join(", ") });
+            if (!approved) return { performed: false, reason: "The user did not approve this irreversible multi-device tap.", evidence: androidEvidence("the user refused the multi-device tap", REFUTED) };
+          }
+        }
+        if (args.operation === "key" && /^(?:enter|return)$/i.test(String(args.input?.key ?? ""))) {
+          const { approved } = await askPermission({ kind: "android-multi-send", summary: `press Enter on ${args.serials?.length ?? 0} Android devices`, reason: "Enter can send messages in whichever conversations are open, and each send may be irreversible.", rule: "android.multi.send", detail: (args.serials ?? []).join(", ") });
+          if (!approved) return { performed: false, reason: "The user did not approve this multi-device action.", evidence: androidEvidence("the user refused the multi-device action", REFUTED) };
+        }
+        const result = await runCapability("android.devices.run", args);
+        if (args.operation === "read_ui") {
+          const devices = (result.devices ?? []).map((device) => device.ok && device.value
+            ? { ...device, value: markAndroidReading(device.serial, device.value) }
+            : device);
+          const readable = devices.filter((device) => device.ok && device.value);
+          const screenUnchanged = readable.length > 0 && readable.every((device) => device.value.screenUnchanged === true);
+          return {
+            ...result,
+            devices,
+            screenUnchanged,
+            performed: true,
+            evidence: androidEvidence(`${result.succeeded}/${result.devices?.length ?? 0} Android devices published accessibility state`)
+          };
+        }
+        return { ...result, performed: true, evidence: androidEvidence(`${result.succeeded}/${result.devices?.length ?? 0} Android devices completed ${args.operation}`) };
+      },
+      failed: (result) => result.performed === false || (result.failed > 0 && result.succeeded === 0),
+      render: (result) => result.performed === false ? refuted(result, result.reason) : reported(result,
+        result.operation === "read_ui" && result.screenUnchanged === true
+          ? `All ${result.succeeded} Android accessibility hierarchies are IDENTICAL to their last readings. Do not switch read tools or node limits; take a different action.`
+          : clip(JSON.stringify({ operation: result.operation, succeeded: result.succeeded, failed: result.failed, devices: result.devices }, null, 2), 5000))
+    }
+  ] : [];
+
+  const publicJob = (job) => ({
+    jobId: job.id,
+    state: job.state,
+    command: job.command,
+    cwd: job.cwd,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    elapsedMs: (job.finishedAt ?? Date.now()) - job.startedAt,
+    exitCode: job.result?.exitCode ?? null,
+    timedOut: job.result?.timedOut === true,
+    cancelled: job.result?.cancelled === true,
+    stdout: clip(job.result?.stdout ?? job.stdout ?? "", 3000),
+    stderr: clip(job.result?.stderr ?? job.stderr ?? "", 1500)
+  });
+
+  const startCommandJob = ({ command, cwd, timeoutMs, accessPolicy, authorizeShell }) => {
+    const id = `job-${state.nextCommandJob++}`;
+    const controller = new AbortController();
+    const job = {
+      id, command, cwd, state: "RUNNING", startedAt: Date.now(), finishedAt: null,
+      stdout: "", stderr: "", result: null, controller, promise: null
+    };
+    state.commandJobs.set(id, job);
+    for (const candidate of state.commandJobs.values()) {
+      if (state.commandJobs.size <= 32) break;
+      if (candidate.state !== "RUNNING") state.commandJobs.delete(candidate.id);
+    }
+    job.promise = adapter.executeCommand(cwd, command, [], {
+      timeoutMs,
+      shellOrigin: "model",
+      authorizationCommand: command,
+      accessPolicy,
+      authorizeShell,
+      signal: controller.signal,
+      onOutput: ({ text, stream }) => {
+        const key = stream === "stderr" ? "stderr" : "stdout";
+        job[key] = clip(`${job[key]}${text}`, key === "stderr" ? 1500 : 3000);
+      }
+    }).then((result) => {
+      job.result = result;
+      job.finishedAt = Date.now();
+      job.state = result.cancelled ? "CANCELLED" : (result.timedOut ? "TIMED_OUT" : "COMPLETED");
+      return result;
+    }).catch((error) => {
+      job.result = { exitCode: -1, stdout: job.stdout, stderr: error?.message ?? String(error) };
+      job.finishedAt = Date.now();
+      job.state = "FAILED";
+      return job.result;
+    });
+    return job;
+  };
+
   const tools = [
+    ...androidTools,
     {
       name: "run",
       description:
@@ -2327,6 +2692,11 @@ export function buildToolset({
             description:
               "For anything that stays running — a server, a notebook, a watcher, a tunnel. Starts it and " +
               "returns immediately instead of waiting for an exit that never comes."
+          },
+          defer: {
+            type: "boolean",
+            description:
+              "For a finite command that may wait on a device, network, GUI prompt or slow program. Runs it as a managed background job, returns a job id immediately, and preserves output/exit status for run_jobs. For Android, always use android_devices instead."
           },
           timeoutMs: { type: "number", description: "Kill the command after this long (default 90000)" }
         },
@@ -2387,6 +2757,21 @@ export function buildToolset({
             };
           }
         }
+        if (ANDROID_SHELL_ESCAPE.test(command)) {
+          return {
+            blocked: true,
+            command,
+            stderr:
+              "Android recovery is not allowed through arbitrary shell. Use android_devices list/wait/refresh; " +
+              "it already knows the exact adb.exe path and is bounded and cancellable. Do not search the drive or run adb another way.",
+            rule: "android.typed-boundary",
+            evidence: evidence({
+              observed: "the raw Android shell fallback was refused before approval or process spawn",
+              method: "android.typed-boundary",
+              verdict: REFUTED
+            })
+          };
+        }
         // A wrapper can itself become ASK at the adapter boundary even when the
         // original command was read-only (for example Start-Process for a
         // background server). In that case the final boundary owns the prompt;
@@ -2397,6 +2782,27 @@ export function buildToolset({
           return shellApproved;
         };
         const background = args.background === true || KEEPS_RUNNING.test(command);
+        if (args.defer === true && !background) {
+          const job = startCommandJob({
+            command,
+            cwd: state.cwd,
+            timeoutMs: Number(args.timeoutMs) || 90_000,
+            accessPolicy: { ...state.accessPolicy },
+            authorizeShell: finalShellAuthorization
+          });
+          return {
+            managed: true,
+            background: true,
+            jobId: job.id,
+            command,
+            state: job.state,
+            evidence: evidence({
+              observed: `${job.id} was registered and handed to the Windows command adapter`,
+              method: "command.run:managed-job",
+              verdict: CONFIRMED
+            })
+          };
+        }
         if (background) {
           // Started through Start-Process so it outlives this call and keeps its
           // own console; the shell returns as soon as Windows accepts it.
@@ -2442,6 +2848,19 @@ export function buildToolset({
           ? createWingetWatcher({ onProgress })
           : null;
         let result;
+        const commandStartedAt = Date.now();
+        let lastOutput = "";
+        let lastOutputAt = 0;
+        let measuredProgress = false;
+        const liveHeartbeat = onProgress ? setInterval(() => {
+          if (measuredProgress) return;
+          const seconds = Math.max(1, Math.round((Date.now() - commandStartedAt) / 1000));
+          onProgress({
+            percent: null,
+            phase: "Running command",
+            label: lastOutput || `No output yet — ${seconds}s elapsed`
+          });
+        }, 3000) : null;
         try {
           result = await adapter.executeCommand(state.cwd, command, [], {
             timeoutMs: Number(args.timeoutMs) || 90000,
@@ -2456,12 +2875,22 @@ export function buildToolset({
             // left the install running with nobody watching it. The adapter has
             // supported cancellation all along; nothing was passing it one.
             ...(signal ? { signal } : {}),
-            ...(watch || winget
+            ...(onProgress
               ? {
                   onOutput: ({ text }) => {
                     winget?.note(text);
                     const progress = watch?.(text);
-                    if (progress) onProgress(progress);
+                    if (progress) {
+                      measuredProgress = true;
+                      onProgress(progress);
+                      return;
+                    }
+                    if (measuredProgress) return;
+                    const line = String(text ?? "").split(/[\r\n]+/).map((part) => part.trim()).filter(Boolean).at(-1);
+                    if (!line || Date.now() - lastOutputAt < 500) return;
+                    lastOutputAt = Date.now();
+                    lastOutput = clip(line, 120);
+                    onProgress({ percent: null, phase: "Running command", label: lastOutput });
                   }
                 }
               : {})
@@ -2469,6 +2898,7 @@ export function buildToolset({
         } finally {
           // The poll must not outlive the command, whatever ended it.
           winget?.stop();
+          if (liveHeartbeat) clearInterval(liveHeartbeat);
         }
         const stopped = result.blocked === true || result.timedOut === true;
         return {
@@ -2512,6 +2942,11 @@ export function buildToolset({
             "not a different command, not a pipe, not an elevated process, not a different API. " +
             "Carry on with the rest of the task, and tell the user plainly what you did not do.");
         }
+        if (result.managed) {
+          return confirmed(result,
+            `Started managed background job ${result.jobId} for \`${result.command}\`. ` +
+            `It is running without blocking this task. Use run_jobs with jobId ${result.jobId} to read its live output or final exit status.`);
+        }
         if (result.background) {
           const pid = String(result.stdout ?? "").trim().split(/\s+/).pop();
           return result.exitCode === 0
@@ -2548,6 +2983,62 @@ export function buildToolset({
         // said, and it is true whatever the exit code turns out to mean.
         return reported(result, parts.join("\n"));
       }
+    },
+    {
+      name: "run_jobs",
+      description:
+        "List or inspect managed finite command jobs started by run with defer:true. Waiting is bounded and does not call the model repeatedly. Cancelling stops the exact job and requires confirmation.",
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["list", "status", "wait", "cancel"] },
+          jobId: { type: "string" },
+          waitMs: { type: "number", description: "For wait: at most 10000ms." }
+        },
+        required: ["operation"]
+      },
+      preview: (args) => `${args.operation}${args.jobId ? ` ${args.jobId}` : ""}`,
+      acts: false,
+      execute: async (args) => {
+        if (args.operation === "list") {
+          return {
+            jobs: [...state.commandJobs.values()].map(publicJob),
+            evidence: evidence({ observed: `${state.commandJobs.size} managed command jobs are registered`, method: "command.jobs", verdict: CONFIRMED })
+          };
+        }
+        const job = state.commandJobs.get(String(args.jobId ?? ""));
+        if (!job) throw new Error(`There is no managed command job ${JSON.stringify(args.jobId ?? "")}.`);
+        if (args.operation === "wait" && job.state === "RUNNING") {
+          const waitMs = Math.max(0, Math.min(10_000, Number(args.waitMs) || 3_000));
+          await Promise.race([job.promise, new Promise((resolve) => setTimeout(resolve, waitMs))]);
+        }
+        if (args.operation === "cancel" && job.state === "RUNNING") {
+          const { approved } = await askPermission({
+            kind: "command-job-cancel",
+            summary: `stop background command ${job.id}`,
+            reason: "Stopping a process can leave partial work or incomplete files behind.",
+            rule: "command.job.cancel",
+            detail: job.command
+          });
+          if (!approved) {
+            return {
+              performed: false,
+              reason: "The user did not approve stopping the background command.",
+              evidence: evidence({ observed: `${job.id} was not cancelled`, method: "user.approval", verdict: REFUTED })
+            };
+          }
+          job.controller.abort();
+          await Promise.race([job.promise, new Promise((resolve) => setTimeout(resolve, 3_000))]);
+        }
+        return {
+          ...publicJob(job),
+          evidence: evidence({ observed: `${job.id} is ${job.state}`, method: "command.jobs", verdict: CONFIRMED })
+        };
+      },
+      failed: (result) => result.performed === false,
+      render: (result) => result.performed === false
+        ? refuted(result, result.reason)
+        : reported(result, clip(JSON.stringify(Object.fromEntries(Object.entries(result).filter(([key]) => key !== "evidence")), null, 2), 5000))
     },
     {
       name: "software",
@@ -3068,12 +3559,15 @@ export function buildToolset({
       name: "click",
       description:
         "Click something from the last screen reading. Prefer `text` (its exact label) over `element` (its " +
-        "index); use x,y only for a place with no label. button:\"right\" opens a context menu. The window " +
+        "index). When labels repeat, add `near` for text on the same row and/or `role` to resolve it in one " +
+        "call; use x,y only for a place with no label. button:\"right\" opens a context menu. The window " +
         "is brought to the front first.",
       parameters: {
         type: "object",
         properties: {
           text: { type: "string", description: "The element's label, copied from the last screen reading" },
+          near: { type: "string", description: "Visible text beside the intended control, such as a song or chat name" },
+          role: { type: "string", description: "Optional role from the reading, such as button or dataitem" },
           element: { type: "number", description: "Its index in the last screen reading" },
           x: { type: "number" },
           y: { type: "number" },
@@ -4440,8 +4934,15 @@ export function buildToolset({
     },
     {
       name: "open_url",
-      description: "Open a URL in the default browser.",
-      parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+      description: "Open a URL. Omit application for the default browser; name an installed browser when the user specifies one.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string" },
+          application: { type: "string", description: "Optional installed browser, such as Brave or Chrome" }
+        },
+        required: ["url"]
+      },
       preview: (args) => args.url,
       // WHICH WINDOW DID IT OPEN IN?
       //
@@ -4474,7 +4975,11 @@ export function buildToolset({
             "told you. If they specifically asked you to open an existing file, use `launch` with the path."
           );
         }
-        const launch = await adapter.executeCommand(state.cwd, `Start-Process ${JSON.stringify(url)}`, [], { timeoutMs: 15000 });
+        const before = await foregroundNow().catch(() => null);
+        const requestedApplication = String(args.application ?? "").trim();
+        const launch = requestedApplication && typeof adapter.openUrlInApplication === "function"
+          ? await adapter.openUrlInApplication(url, requestedApplication)
+          : await adapter.executeCommand(state.cwd, `Start-Process ${JSON.stringify(url)}`, [], { timeoutMs: 15000 });
         if (launch.exitCode !== 0) {
           return {
             ...launch,
@@ -4487,8 +4992,10 @@ export function buildToolset({
             })
           };
         }
-        await new Promise((resolve) => setTimeout(resolve, 1800));
-        const window = await foregroundNow();
+        const foreground = typeof adapter.waitForForegroundChange === "function"
+          ? await adapter.waitForForegroundChange(before, 2500).catch(() => null)
+          : null;
+        const window = foreground?.window ?? await foregroundNow();
         if (window?.windowId) {
           state.lastWindow = { windowId: String(window.windowId), application: window.processName, title: window.title };
         }
@@ -4500,13 +5007,13 @@ export function buildToolset({
                 observed: `the window in front is ${window.processName} ${JSON.stringify(String(window.title ?? ""))} ` +
                   `(windowId ${window.windowId})`,
                 method: "window.foreground",
-                actedVia: "command.run:Start-Process",
+                actedVia: requestedApplication ? "application.openUrl" : "command.run:Start-Process",
                 verdict: CONFIRMED
               })
             : evidence({
                 observed: "Start-Process was accepted; nothing could say which window the page landed in",
                 method: NOTHING_READ_IT_BACK,
-                actedVia: "command.run:Start-Process",
+                actedVia: requestedApplication ? "application.openUrl" : "command.run:Start-Process",
                 verdict: UNCONFIRMED
               })
         };
@@ -5702,9 +6209,17 @@ export function buildToolset({
         }
         const before = await runCapability("browser.currentState", {}).catch(() => null);
         const clicked = await runCapability("browser.click", { target: found.target });
-        // A click that navigates needs a moment before the new page is readable.
-        await new Promise((resolve) => setTimeout(resolve, 900));
-        const after = await runCapability("browser.currentState", {}).catch(() => null);
+        // Wait for an actual navigation or DOM mutation, returning immediately
+        // when it happens instead of paying a fixed delay on every click.
+        const readiness = before
+          ? await runCapability("browser.wait", {
+              condition: "state.change",
+              value: JSON.stringify(before),
+              timeoutMs: 1200
+            }).catch(() => null)
+          : null;
+        const after = readiness?.state
+          ?? await runCapability("browser.currentState", {}).catch(() => null);
         const moved = Boolean(before && after && before.url !== after.url);
         return {
           ...clicked,
@@ -5794,9 +6309,17 @@ export function buildToolset({
         let submitted = null;
         let after = null;
         if (args.submit === true) {
+          const beforeSubmit = await runCapability("browser.currentState", {}).catch(() => null);
           submitted = await runCapability("browser.key", { key: "Enter", target: field.target });
-          await new Promise((resolve) => setTimeout(resolve, 1200));
-          after = await runCapability("browser.currentState", {}).catch(() => null);
+          const readiness = beforeSubmit
+            ? await runCapability("browser.wait", {
+                condition: "state.change",
+                value: JSON.stringify(beforeSubmit),
+                timeoutMs: 1600
+              }).catch(() => null)
+            : null;
+          after = readiness?.state
+            ?? await runCapability("browser.currentState", {}).catch(() => null);
         }
         const wanted = String(args.text ?? "");
         return {
@@ -6892,11 +7415,11 @@ export function buildToolset({
         const name = String(step?.tool ?? "").trim();
         if (name === "batch") throw new Error("A batch cannot contain another batch.");
         const tool = byName.get(name);
-        if (!tool || (name === "run" && state.accessPolicy.developerMode !== true)) {
+        if (!tool || (/^(?:run|run_jobs)$/.test(name) && state.accessPolicy.developerMode !== true)) {
           return {
             done,
             failedAt: index,
-            failure: name === "run"
+            failure: /^(?:run|run_jobs)$/.test(name)
               ? "The arbitrary terminal is off. The user can enable Developer terminal access in Safety settings."
               : `There is no tool called "${name}".`,
             evidence: evidence({
@@ -7042,7 +7565,9 @@ export function buildToolset({
   const SAW_PARAMETER = { type: "string", description: "Quoted from the last result: backward-looking, never a plan." };
   const SAY_PARAMETER = { type: "string", description: "What you are doing, one short sentence." };
 
-  const toolIsVisible = (tool) => tool.name !== "run" || state.accessPolicy.developerMode === true;
+  const toolIsVisible = (tool) =>
+    (!/^(?:run|run_jobs)$/.test(tool.name) || state.accessPolicy.developerMode === true) &&
+    (!tool.name.startsWith("android_") || state.androidActive === true);
   const definitions = () => tools.filter(toolIsVisible).map((tool) => ({
     type: "function",
     function: {
@@ -7133,10 +7658,18 @@ export function buildToolset({
       state.elements = [];
       state.lastCanvas = null;
       state.lastTool = null;
+      // Screen deltas are only meaningful inside one request. A first read in
+      // a new turn must include the controls even when the user left the phone
+      // untouched, and no id from a previous hierarchy may be treated as fresh.
+      state.androidElements?.clear();
+      state.androidSignatures.clear();
       // WHAT THE USER ACTUALLY ASKED FOR, kept verbatim so a destination they
       // named themselves is never mistaken for one an injection supplied. See
       // requiresInjectionConfirmation.
       state.userRequest = String(userText ?? "");
+      if (/\b(?:android|phone|mobile|tablet|adb|pixel|galaxy|device|wireless debugging)\b/i.test(state.userRequest)) {
+        state.androidActive = true;
+      }
       // A new request is a new context. An instruction found in a chat during
       // the last turn must not gate this turn's actions — the user has spoken
       // since, and they may have asked for exactly that thing.
@@ -7223,7 +7756,7 @@ export function buildToolset({
       if (!tool || !toolIsVisible(tool)) {
         return {
           ok: false,
-          text: name === "run"
+          text: /^(?:run|run_jobs)$/.test(name)
             ? "The arbitrary terminal is off. The user can enable Developer terminal access in Safety settings."
             : `There is no tool called "${name}".`
         };

@@ -493,7 +493,22 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           return;
         }
         run.canceller?.abort(new Error("STOPPED_BY_USER"));
-        sendJson(response, 202, { sessionId, stopping: true, settled: run.settled });
+        // Give cooperative cancellation a short window to reach the active
+        // adapter and let the same response report whether Stop actually
+        // settled. This is bounded: the button remains clickable and a broken
+        // tool cannot pin this HTTP request too.
+        if (!run.settled && run.completion) {
+          await Promise.race([
+            run.completion.catch(() => {}),
+            new Promise((resolve) => setTimeout(resolve, 3_000))
+          ]);
+        }
+        sendJson(response, run.settled ? 200 : 202, {
+          sessionId,
+          stopping: !run.settled,
+          settled: run.settled,
+          status: run.status
+        });
         return;
       }
 
@@ -695,7 +710,7 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
             resolveStarted(sessionId);
           }
         }))();
-        runPromise.then((session) => settleRun(session.sessionId, session)).catch((error) => {
+        const completion = runPromise.then((session) => settleRun(session.sessionId, session)).catch((error) => {
           if (submittedSessionId) settleRun(submittedSessionId, null, error);
           rejectStarted(error);
         // Released when the RUN ends, not when this handler returns — the
@@ -703,6 +718,7 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         // being driven long after that.
         }).finally(() => releaseIntentClaim(held));
         const sessionId = await started;
+        ensureRun(sessionId).completion = completion;
         sendJson(response, 202, {
           status: "RUNNING",
           sessionId,

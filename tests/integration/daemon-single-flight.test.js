@@ -165,4 +165,46 @@ describe("the daemon runs one request at a time on every route", () => {
       await new Promise((resolve) => localServer.close(resolve));
     }
   });
+
+  test("Stop waits for cooperative cancellation and releases the next request", async () => {
+    let calls = 0;
+    const cancellable = {
+      onSessionEvent: null,
+      sessionStore: { list: async () => [] },
+      async submitIntent(rawText, options = {}) {
+        calls += 1;
+        const sessionId = `session_stop_${calls}`;
+        options.onSessionStarted?.(sessionId);
+        if (calls === 1) {
+          await new Promise((resolve) => options.signal.addEventListener("abort", resolve, { once: true }));
+        }
+        return {
+          sessionId,
+          createdAt: new Date().toISOString(),
+          currentState: calls === 1 ? "CANCELLED" : "COMPLETED",
+          intent: null, plan: null, taskResults: [], observations: [], verifications: [], events: [],
+          finalResponse: {
+            status: calls === 1 ? "CANCELLED" : "COMPLETED",
+            message: calls === 1 ? "Stopped." : `handled: ${rawText}`
+          }
+        };
+      }
+    };
+    const localServer = startServer({ port: 0, basePath, warmHost: false, runtime: cancellable });
+    await new Promise((resolve) => localServer.on("listening", resolve));
+    const localPort = localServer.address().port;
+    try {
+      const first = await api(localPort, "POST", "/api/intents", { body: { text: "wait for a phone" } });
+      assert.equal(first.status, 202);
+      const stopped = await api(localPort, "POST", `/api/intents/${first.json.sessionId}/stop`, {});
+      assert.equal(stopped.status, 200);
+      assert.equal(stopped.json.settled, true);
+
+      const next = await api(localPort, "POST", "/api/intents?sync=true", { body: { text: "new task" } });
+      assert.equal(next.status, 200, "a cancelled request left the global single-flight claim held");
+      assert.equal(calls, 2);
+    } finally {
+      await new Promise((resolve) => localServer.close(resolve));
+    }
+  });
 });

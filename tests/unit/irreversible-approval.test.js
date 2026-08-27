@@ -65,6 +65,16 @@ const recordingAdapter = (ran) => ({
 });
 const DEVELOPER_TERMINAL = { developerMode: true, shellExecutionMode: "host" };
 
+test("persistent PATH changes get a meaningful approval reason", () => {
+  const command = "$ErrorActionPreference='Stop'; $dir='C:\\Tools'; " +
+    "[Environment]::SetEnvironmentVariable('Path', $dir, 'User')";
+  const gate = requiresConfirmation(command);
+  assert.equal(gate.confirm, true);
+  assert.equal(gate.rule, "persistent-user-environment");
+  assert.match(gate.summary, /persistent user environment/i);
+  assert.doesNotMatch(gate.reason, /erroractionpreference/i);
+});
+
 test("an irreversible command asks the user, and a yes lets it run", async () => {
   const ran = [];
   const provider = scriptedProvider([

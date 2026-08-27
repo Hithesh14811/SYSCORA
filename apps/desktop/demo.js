@@ -548,6 +548,7 @@ const VERB = [
 // Every entry the loop adds needs a line here.
 const TOOL_VERB = {
   run: "Ran",
+  run_jobs: "Checked a background command",
   screen: "Looked at the screen",
   click: "Clicked",
   type: "Typed",
@@ -602,6 +603,7 @@ const TOOL_VERB_RUNNING = {
   web_open: "Reading the page",
   web_read: "Reading the page",
   run: "Running",
+  run_jobs: "Checking a background command",
   screen: "Looking at the screen",
   read_file: "Reading the file",
   write_file: "Writing the file",
@@ -664,7 +666,7 @@ const ICON_PATHS = {
 // and the older dotted capability ids. A tool with no entry gets the cog, which
 // is honest — it says "a step ran" without pretending to describe it.
 const TOOL_ICON = {
-  run: "terminal", batch: "layers", wait: "clock",
+  run: "terminal", run_jobs: "terminal", batch: "layers", wait: "clock",
   search: "search",
   web_open: "globe", web_read: "globe", web_click: "globe", web_type: "globe",
   web_scroll: "globe", open_url: "globe",
@@ -1245,6 +1247,12 @@ class Turn {
   // finishes. `key` is whatever the runtime will quote back on completion.
   startStep({ key, capability, inputs, subgoal, arg: explicitArg }) {
     this.clearStatus();
+    // TOOL_STREAMING says the model is composing the call. TOOL_STARTED is the
+    // exact boundary where that stops being true. Without changing the live
+    // label here, a command could be executing for ten minutes beside the words
+    // "Composing the command", which is precisely what a hung command looks
+    // like to somebody watching it.
+    this.setStatus(runningVerbFor(capability));
     this.throttleNode = null;
     this._closeStream(null);
     // Whatever is still pending belongs to the round now executing; the next
@@ -1278,6 +1286,11 @@ class Turn {
     head.appendChild(el("code", "step-tool", capability));
     const arg = explicitArg || argSummary(capability, inputs);
     if (arg) head.appendChild(el("code", "step-arg", arg));
+    // A heartbeat belongs to the exact step, not only to the whole request. It
+    // moves without a model call and makes a silent process distinguishable
+    // from a frozen interface even when the process has no progress percentage.
+    const liveTime = el("span", "step-time step-live-time", "running");
+    head.appendChild(liveTime);
     // Drawn by CSS from the open/closed state, so it can never disagree with it.
     head.appendChild(el("span", "step-chevron", ""));
     step.appendChild(head);
@@ -1296,7 +1309,12 @@ class Turn {
     const placeholder = this._claimPendingRow(capability);
     if (placeholder) placeholder.replaceWith(step); else this.root.appendChild(step);
     this.keepWorkingLast();
-    this.pendingSteps.push({ key, capability, node: step, head });
+    const stepStartedAt = Date.now();
+    const liveTimer = setInterval(() => {
+      const seconds = Math.max(1, Math.round((Date.now() - stepStartedAt) / 1000));
+      liveTime.textContent = `running · ${seconds}s`;
+    }, 1000);
+    this.pendingSteps.push({ key, capability, node: step, head, liveTime, liveTimer });
     scrollToEnd();
     return step;
   }
@@ -1352,6 +1370,8 @@ class Turn {
 
   finishStep({ key, capability, ok, message, preview, durationMs }) {
     const pending = this._takeStep(key, capability);
+    if (pending?.liveTimer) clearInterval(pending.liveTimer);
+    pending?.liveTime?.remove();
     // The command's own output is a better answer than the bar that was
     // standing in for it, so the bar goes when the output arrives.
     pending?.progress?.wrap?.remove();
@@ -1418,6 +1438,8 @@ class Turn {
     // so the row goes rather than being marked.
     this._dropPendingRows();
     for (const pending of this.pendingSteps) {
+      if (pending.liveTimer) clearInterval(pending.liveTimer);
+      pending.liveTime?.remove();
       pending.node.classList.remove("running");
       pending.node.classList.add("unknown");
       setStepState(pending.head, "unknown");
@@ -1434,6 +1456,7 @@ class Turn {
   // `Remove-Item -Recurse C:\Users\me\Documents` are not the same sentence.
   askApproval(details) {
     this.clearStatus();
+    this.setStatus("Waiting for your approval…");
     this._closeStream(null);
     const card = el("div", "approval-card");
     card.appendChild(el("h3", null, `Can I ${details.summary ?? "do this"}?`));
@@ -1468,6 +1491,8 @@ class Turn {
     card.querySelector(".actions")?.remove();
     card.classList.add(approved ? "approved" : "rejected");
     card.appendChild(el("p", "agent-detail", approved ? "You allowed this." : "You said no — it was not run."));
+    const current = this.pendingSteps.at(-1);
+    this.setStatus(approved && current ? runningVerbFor(current.capability) : "Continuing…");
     scrollToEnd();
   }
 
@@ -1985,6 +2010,29 @@ function remember(role, text, shown = null) {
   renderChatList();
 }
 
+// A request belongs to the chat it started in, even if the user opens another
+// chat while it is running. The old code blocked navigation to avoid this
+// bookkeeping problem; that made the whole application feel frozen. Persist to
+// the captured chat instead, and only mirror into the live `conversation` array
+// when that chat is still on screen.
+function rememberInChat(chatId, role, text, shown = null) {
+  const trimmed = String(text ?? "").trim();
+  const chat = chats.find((candidate) => candidate.id === chatId);
+  if (!trimmed || !chat) return;
+  chat.conversation ??= [];
+  chat.conversation.push({ role, text: trimmed });
+  if (chat.conversation.length > 24) chat.conversation.splice(0, chat.conversation.length - 24);
+  const naming = String(shown ?? trimmed).trim() || trimmed;
+  if (role === "user" && (!chat.title || chat.title === "New chat")) chat.title = titleFrom(naming);
+  chat.updatedAt = Date.now();
+  chats.sort((left, right) => right.updatedAt - left.updatedAt);
+  saveChats(chats);
+  if (chat.id === activeChatId) {
+    conversation.splice(0, conversation.length, ...chat.conversation.slice(-24));
+  }
+  renderChatList();
+}
+
 /**
  * The agent could not tell whether the user had pressed Send.
  *
@@ -2032,8 +2080,8 @@ const clipStored = (value, limit) => {
   return text.length > limit ? `${text.slice(0, limit)}\n… [clipped when this chat was saved]` : text;
 };
 
-function recordTurn(userText, events, session, attachments = [], sent = null, reply = null, id = null) {
-  const chat = activeChat();
+function recordTurn(userText, events, session, attachments = [], sent = null, reply = null, id = null, chatId = activeChatId) {
+  const chat = chats.find((candidate) => candidate.id === chatId) ?? activeChat();
   chat.turns.push({
     // Stable across the splice that trims a chat to MAX_TURNS_PER_CHAT, which a
     // positional index would not be — and an edit that rewinds to the wrong
@@ -2061,7 +2109,10 @@ function recordTurn(userText, events, session, attachments = [], sent = null, re
   if (chat.turns.length > MAX_TURNS_PER_CHAT) {
     chat.turns.splice(0, chat.turns.length - MAX_TURNS_PER_CHAT);
   }
-  touchActiveChat();
+  chat.updatedAt = Date.now();
+  chats.sort((left, right) => right.updatedAt - left.updatedAt);
+  saveChats(chats);
+  renderChatList();
   return chat.turns[chat.turns.length - 1];
 }
 
@@ -2493,7 +2544,6 @@ function renderStoredChat(chat, { resumed = true } = {}) {
 }
 
 function switchToChat(id) {
-  if (busyWithRun()) return;
   const target = chats.find((chat) => chat.id === id);
   if (!target || id === activeChatId) {
     dismissRailOverlay();
@@ -2509,7 +2559,6 @@ function switchToChat(id) {
 }
 
 function startNewChat() {
-  if (busyWithRun()) return;
   // An untouched "New chat" is not worth a second one.
   const current = activeChat();
   if (current && current.turns.length === 0) {
@@ -2773,6 +2822,8 @@ function replyTextOf(session) {
 // it is working, "send another" is never what you want and "stop" always is.
 const sendButton = document.getElementById("sendButton");
 let runningSessionId = null;
+let stoppingSessionId = null;
+let runningTurn = null;
 
 // Both states are drawn, not typed. `textContent = "↑"` rendered whatever glyph
 // the system font happened to have for an arrow — a different weight and a
@@ -2782,11 +2833,21 @@ const SEND_GLYPH = `<svg class="icon" viewBox="0 0 24 24" width="17" height="17"
   <path d="M12 19V5.6M5.8 11.8L12 5.4l6.2 6.4" /></svg>`;
 const STOP_GLYPH = `<svg class="icon" viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="currentColor">
   <rect x="6.5" y="6.5" width="11" height="11" rx="2.4" /></svg>`;
+const STOPPING_GLYPH = `<svg class="icon stop-spinner" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"
+  fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+  <circle cx="12" cy="12" r="8" opacity=".28" />
+  <path d="M12 4a8 8 0 0 1 8 8" /></svg>`;
 
 function setRunning(sessionId) {
   runningSessionId = sessionId;
+  if (sessionId === null) {
+    stoppingSessionId = null;
+    runningTurn = null;
+  }
   const running = sessionId !== null;
   sendButton.classList.toggle("stopping", running);
+  sendButton.classList.remove("stop-pending");
+  sendButton.disabled = false;
   sendButton.innerHTML = running ? STOP_GLYPH : SEND_GLYPH;
   sendButton.setAttribute("aria-label", running ? "Stop" : "Send message");
   sendButton.title = running ? "Stop" : "Send (Enter)";
@@ -2795,17 +2856,40 @@ function setRunning(sessionId) {
 async function stopRunning() {
   if (!runningSessionId) return;
   const sessionId = runningSessionId;
-  // Optimistic: the button must respond to the press, not to the round trip.
-  // The run settles on its own and renders whatever it had actually done.
-  setRunning(null);
+  // Do not pretend the machine is idle before the process has actually exited.
+  // That race let a follow-up through while the daemon still held its single
+  // physical-pointer claim, producing the useless "already working" error.
+  stoppingSessionId = sessionId;
+  // This is not a dead disabled button. It visibly changes state and remains
+  // clickable: a second click repeats the idempotent stop request/status nudge
+  // if a transport response was lost.
+  sendButton.disabled = false;
+  sendButton.classList.add("stop-pending");
+  sendButton.innerHTML = STOPPING_GLYPH;
+  sendButton.setAttribute("aria-label", "Stopping");
+  sendButton.title = "Stopping the current task…";
+  runningTurn?.setStatus("Stopping the current step…");
   try {
-    await fetch(`/api/intents/${encodeURIComponent(sessionId)}/stop`, { method: "POST" });
-  } catch { /* the run settles regardless; nothing here is worth surfacing */ }
+    const response = await fetch(`/api/intents/${encodeURIComponent(sessionId)}/stop`, { method: "POST" });
+    if (!response.ok) throw new Error(`Stop request failed (${response.status}).`);
+  } catch {
+    // Do not leave a failed network request masquerading as an accepted stop.
+    // The original task may still be running, so restore the live Stop control.
+    if (runningSessionId === sessionId) {
+      stoppingSessionId = null;
+      sendButton.classList.remove("stop-pending");
+      sendButton.innerHTML = STOP_GLYPH;
+      sendButton.setAttribute("aria-label", "Stop");
+      sendButton.title = "Stop";
+      runningTurn?.setStatus("Still running — Stop could not reach the daemon. Try again.");
+    }
+  }
 }
 
 let reqId = 0;
 async function submit(text, { attachments = [], routing = null, display = null } = {}) {
   if (runningSessionId) return;
+  const submittedChatId = activeChatId;
   document.querySelector(".welcome")?.remove();
   // WHAT IS SENT AND WHAT IS SHOWN ARE NOT THE SAME THING.
   //
@@ -2836,6 +2920,7 @@ async function submit(text, { attachments = [], routing = null, display = null }
   // or, when they typed none and simply dropped a folder in, its name.
   remember("user", text, shown || attachments.map((file) => file.name).join(", "));
   const turn = new Turn();
+  runningTurn = turn;
   // Kept so this turn can be drawn again when the chat is re-opened. Progress
   // events are skipped: a percentage that finished an hour ago is noise, and
   // they are by far the most numerous thing on the wire.
@@ -2885,8 +2970,8 @@ async function submit(text, { attachments = [], routing = null, display = null }
       }
     });
     renderFinal(turn, session);
-    remember("assistant", replyTextOf(session));
-    recordTurn(shown, streamed, session, attachments, text, replyTextOf(session), turnId);
+    rememberInChat(submittedChatId, "assistant", replyTextOf(session));
+    recordTurn(shown, streamed, session, attachments, text, replyTextOf(session), turnId, submittedChatId);
   } catch (err) {
     turn.settle();
     // "Worth trying again" was the whole diagnosis, and the real reason — the
@@ -2905,7 +2990,7 @@ async function submit(text, { attachments = [], routing = null, display = null }
     }
     // A turn that failed is still part of the conversation — "why did that not
     // work?" is an ordinary next message, and it needs the turn to be there.
-    recordTurn(shown, streamed, null, attachments, text, null, turnId);
+    recordTurn(shown, streamed, null, attachments, text, null, turnId, submittedChatId);
   } finally {
     setRunning(null);
   }

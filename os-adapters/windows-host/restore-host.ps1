@@ -7,7 +7,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
-Add-Type -ReferencedAssemblies @("System.Drawing","Accessibility") -TypeDefinition @'
+Add-Type -ReferencedAssemblies @("System.Drawing","Accessibility","UIAutomationClient","UIAutomationTypes") -TypeDefinition @'
 using System;
 using Accessibility;
 using System.Collections.Generic;
@@ -17,6 +17,7 @@ using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Windows.Automation;
 
 public sealed class M4Window {
   public long windowId;
@@ -50,6 +51,44 @@ public sealed class M4StrokeResult {
   public bool pressed;
   public bool released;
   public double durationMs;
+}
+
+// Wake a bounded local wait as soon as an application's accessibility tree
+// changes. The caller still re-evaluates its typed predicate after every wake:
+// an event is a hint that useful state may be ready, never proof that it is.
+// A short timeout is intentionally retained as a fallback because Chromium and
+// WebView2 occasionally omit UIA notifications while replacing whole subtrees.
+public static class M4UiChangeSignal {
+  public static bool Wait(AutomationElement root, int timeoutMs) {
+    if (root == null || timeoutMs <= 0) return false;
+    using (var signal = new AutoResetEvent(false)) {
+      StructureChangedEventHandler structure = (sender, args) => signal.Set();
+      AutomationPropertyChangedEventHandler property = (sender, args) => signal.Set();
+      var properties = new AutomationProperty[] {
+        AutomationElement.NameProperty,
+        AutomationElement.IsEnabledProperty,
+        AutomationElement.IsOffscreenProperty,
+        AutomationElement.HasKeyboardFocusProperty,
+        ValuePattern.ValueProperty,
+        TogglePattern.ToggleStateProperty,
+        ExpandCollapsePattern.ExpandCollapseStateProperty
+      };
+      var structureAdded = false;
+      var propertyAdded = false;
+      try {
+        Automation.AddStructureChangedEventHandler(root, TreeScope.Subtree, structure);
+        structureAdded = true;
+        Automation.AddAutomationPropertyChangedEventHandler(root, TreeScope.Subtree, property, properties);
+        propertyAdded = true;
+        return signal.WaitOne(timeoutMs);
+      } catch {
+        return false;
+      } finally {
+        if (propertyAdded) try { Automation.RemoveAutomationPropertyChangedEventHandler(root, property); } catch {}
+        if (structureAdded) try { Automation.RemoveStructureChangedEventHandler(root, structure); } catch {}
+      }
+    }
+  }
 }
 
 public static class M4Native {
@@ -1686,26 +1725,48 @@ function Find-UiElement($params) {
   if (-not $window) { return @{ found=$false; reason="window-not-found" } }
   $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][Int64]$window.windowId)
   $selector = if ($params.selector) { $params.selector } elseif ($params.target) { $params.target } else { $params }
-  $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  # Fetch the tree properties in one provider crossing. Reading `.Current` for
+  # every node (and then doing it again for every relational candidate) made a
+  # Spotify lookup slower than the model-visible screen fallback it replaced.
+  $cache = New-UiCacheRequest
+  $activation = $cache.Activate()
+  try {
+    $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+  } finally {
+    $activation.Dispose()
+  }
+  $expectedControlTypes = @()
+  if ($selector.controlTypes) { $expectedControlTypes = @($selector.controlTypes) }
+  elseif ($selector.controlType) { $expectedControlTypes = @($selector.controlType) }
+  $expectedControlTypes = @($expectedControlTypes | ForEach-Object {
+    $value = [string]$_
+    if ($value.StartsWith("ControlType.", [StringComparison]::OrdinalIgnoreCase)) { $value } else { "ControlType." + $value }
+  })
   $hits = @()
+  $visibleRows = @()
   foreach ($element in $all) {
     try {
-      $name = $element.Current.Name
-      $r = $element.Current.BoundingRectangle
+      $name = $element.Cached.Name
+      $r = $element.Cached.BoundingRectangle
       $finite = -not [double]::IsInfinity($r.X) -and -not [double]::IsNaN($r.X) -and -not [double]::IsInfinity($r.Y) -and -not [double]::IsNaN($r.Y)
-      $ok = -not $element.Current.IsOffscreen -and $element.Current.IsEnabled -and $finite
-      if ($selector.automationId -and $element.Current.AutomationId -ne [string]$selector.automationId) { $ok=$false }
+      $visible = -not $element.Cached.IsOffscreen -and $finite -and $r.Width -gt 0 -and $r.Height -gt 0
+      if ($visible -and $name) {
+        $visibleRows += [pscustomobject]@{
+          name=[string]$name
+          x=[double]($r.X + $r.Width / 2)
+          y=[double]($r.Y + $r.Height / 2)
+        }
+      }
+      $ok = $visible -and $element.Cached.IsEnabled
+      if ($selector.automationId -and $element.Cached.AutomationId -ne [string]$selector.automationId) { $ok=$false }
       if ($selector.name -and $name -ne [string]$selector.name) { $ok=$false }
       if ($selector.nameStartsWith -and -not $name.StartsWith([string]$selector.nameStartsWith, [StringComparison]::OrdinalIgnoreCase)) { $ok=$false }
       if ($selector.nameContains -and $name.IndexOf([string]$selector.nameContains, [StringComparison]::OrdinalIgnoreCase) -lt 0) { $ok=$false }
-      if ($selector.controlType) {
-        $expectedControlType = [string]$selector.controlType
-        if (-not $expectedControlType.StartsWith("ControlType.", [StringComparison]::OrdinalIgnoreCase)) {
-          $expectedControlType = "ControlType." + $expectedControlType
-        }
-        if (-not $element.Current.ControlType.ProgrammaticName.Equals($expectedControlType, [StringComparison]::OrdinalIgnoreCase)) { $ok=$false }
+      if ($expectedControlTypes.Count -gt 0) {
+        $actualControlType = $element.Cached.ControlType.ProgrammaticName
+        if (-not ($expectedControlTypes | Where-Object { $actualControlType.Equals($_, [StringComparison]::OrdinalIgnoreCase) })) { $ok=$false }
       }
-      if ($selector.className -and $element.Current.ClassName -ne [string]$selector.className) { $ok=$false }
+      if ($selector.className -and $element.Cached.ClassName -ne [string]$selector.className) { $ok=$false }
       if ($ok -and ($selector.withinName -or $selector.parentName)) {
         $ancestor = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($element)
         $inside = $false
@@ -1731,10 +1792,127 @@ function Find-UiElement($params) {
       if ($ok) { $hits += ,$element }
     } catch {}
   }
+  # RELATIONAL TARGETING: THE ACTION BELONGING TO A ROW, NOT THE FIRST ACTION
+  # WITH THAT NAME. Chromium commonly publishes a result row as separate sibling
+  # nodes: text "Baby", text "Justin Bieber", and a bare control named "Play".
+  # A name-only selector cannot distinguish that from the player's global Play
+  # button. `nearText` scores each candidate against the visible labels on the
+  # same row, allowing one grounded request to express "Play beside Baby".
+  if ($hits.Count -gt 0 -and $selector.nearText) {
+    $wantedTokens = @([regex]::Matches(([string]$selector.nearText).ToLowerInvariant(), '[a-z0-9]+') |
+      ForEach-Object { $_.Value } | Where-Object { $_.Length -ge 2 } | Select-Object -Unique)
+    $sameRowTolerance = if ($null -ne $selector.sameRowTolerance) {
+      [Math]::Min(250, [Math]::Max(20, [int]$selector.sameRowTolerance))
+    } else { 90 }
+    $maxDistance = if ($null -ne $selector.maxDistance) {
+      [Math]::Min(2000, [Math]::Max(100, [int]$selector.maxDistance))
+    } else { 900 }
+    $ranked = @()
+    foreach ($candidate in $hits) {
+      try {
+        $cr = $candidate.Cached.BoundingRectangle
+        $cx = $cr.X + $cr.Width / 2
+        $cy = $cr.Y + $cr.Height / 2
+        $nearbyText = New-Object System.Collections.Generic.List[string]
+        $nearbyText.Add([string]$candidate.Cached.Name)
+        $closest = [double]::MaxValue
+        foreach ($other in $visibleRows) {
+          try {
+            $name = [string]$other.name
+            $dx = [Math]::Abs($other.x - $cx)
+            $dy = [Math]::Abs($other.y - $cy)
+            if ($dy -le $sameRowTolerance -and $dx -le $maxDistance) {
+              $nearbyText.Add($name)
+              $nameLower = $name.ToLowerInvariant()
+              $matchesWanted = $false
+              foreach ($token in $wantedTokens) {
+                if ($nameLower.Contains($token)) { $matchesWanted = $true; break }
+              }
+              if ($matchesWanted) {
+                $distance = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+                if ($distance -lt $closest) { $closest = $distance }
+              }
+            }
+          } catch {}
+        }
+        $words = ([string]::Join(' ', $nearbyText)).ToLowerInvariant()
+        $tokenHits = 0
+        foreach ($token in $wantedTokens) { if ($words.Contains($token)) { $tokenHits++ } }
+        $coverage = if ($wantedTokens.Count -gt 0) { $tokenHits / [double]$wantedTokens.Count } else { 0 }
+        $minimumCoverage = if ($null -ne $selector.minimumCoverage) {
+          [Math]::Min(1.0, [Math]::Max(0.0, [double]$selector.minimumCoverage))
+        } else { 0.0 }
+        if ($tokenHits -gt 0 -and $coverage -ge $minimumCoverage) {
+          $ranked += [pscustomobject]@{
+            element=$candidate
+            score=($tokenHits * 1000) + [int]($coverage * 500) - [Math]::Min(499, [int]$closest)
+            tokenHits=$tokenHits
+            coverage=$coverage
+          }
+        }
+      } catch {}
+    }
+    if ($ranked.Count -eq 0) { $hits = @() }
+    else {
+      $ranked = @($ranked | Sort-Object score -Descending)
+      $bestScore = $ranked[0].score
+      $hits = @($ranked | Where-Object { $_.score -eq $bestScore } | ForEach-Object { $_.element })
+    }
+  }
   if ($hits.Count -eq 0) { return @{ found=$false; reason="target-not-found"; matchCount=0; window=$window } }
   $index = if ($null -ne $selector.occurrence) { [Math]::Max(0,[int]$selector.occurrence) } else { 0 }
   if ($index -ge $hits.Count) { return @{ found=$false; reason="occurrence-not-found"; matchCount=$hits.Count; window=$window } }
-  return @{ found=$true; matchCount=$hits.Count; ambiguous=($hits.Count -gt 1 -and $null -eq $selector.occurrence); target=(Convert-Element $hits[$index] $window.windowId $window); window=$window }
+  return @{ found=$true; matchCount=$hits.Count; ambiguous=($hits.Count -gt 1 -and $null -eq $selector.occurrence); relational=[bool]$selector.nearText; target=(Convert-Element $hits[$index] $window.windowId $window); window=$window }
+}
+
+function Wait-UiCondition($params) {
+  $timeout = if ($null -ne $params.timeoutMs) {
+    [Math]::Min(20000, [Math]::Max(50, [int]$params.timeoutMs))
+  } else { 5000 }
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  $polls = 0
+  $eventWakeups = 0
+  $last = $null
+  while ($watch.ElapsedMilliseconds -lt $timeout) {
+    $polls++
+    $last = Find-UiElement $params
+    $matched = if ([string]$params.condition -eq 'absent') { -not $last.found } else { $last.found }
+    if ($matched) {
+      return @{
+        matched=$true
+        elapsedMs=$watch.ElapsedMilliseconds
+        polls=$polls
+        eventWakeups=$eventWakeups
+        found=$last.found
+        target=$last.target
+        window=$last.window
+        relational=$last.relational
+      }
+    }
+    $remaining = $timeout - [int]$watch.ElapsedMilliseconds
+    if ($remaining -le 0) { break }
+    $slice = [Math]::Min(250, [Math]::Max(1, $remaining))
+    $window = $last.window
+    if (-not $window) { $window = Select-Window $params }
+    if ($window) {
+      try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][Int64]$window.windowId)
+        if ([M4UiChangeSignal]::Wait($root, $slice)) { $eventWakeups++ }
+      } catch { Start-Sleep -Milliseconds ([Math]::Min(75, $slice)) }
+    } else {
+      Start-Sleep -Milliseconds ([Math]::Min(75, $slice))
+    }
+  }
+  return @{
+    matched=$false
+    reason='ui-wait-timeout'
+    elapsedMs=$watch.ElapsedMilliseconds
+    polls=$polls
+    eventWakeups=$eventWakeups
+    found=[bool]$last.found
+    target=$last.target
+    window=$last.window
+  }
 }
 
 function Invoke-UiAction($params) {
@@ -1973,6 +2151,31 @@ function Get-VisibleCaptureBounds($bounds) {
   return @{x=[int]$left;y=[int]$top;width=[int]($right-$left);height=[int]($bottom-$top)}
 }
 
+# The Windows clipboard is a shared lock, not a durable RPC endpoint. Another
+# application can own it for a few milliseconds while rendering a preview or
+# processing a copy. That is ordinary contention and should be absorbed here,
+# where no model call or duplicate-tool guard is involved.
+function Invoke-ClipboardWithRetry($operation, $text=$null) {
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  $attempts = 0
+  $lastError = $null
+  for ($attempt=0; $attempt -lt 6; $attempt++) {
+    $attempts++
+    try {
+      if ($operation -eq 'read') {
+        return @{ text=[System.Windows.Forms.Clipboard]::GetText(); attempts=$attempts; elapsedMs=$watch.ElapsedMilliseconds }
+      }
+      $previous = [System.Windows.Forms.Clipboard]::GetText()
+      [System.Windows.Forms.Clipboard]::SetText([string]$text)
+      return @{ written=$true; previousText=$previous; attempts=$attempts; elapsedMs=$watch.ElapsedMilliseconds }
+    } catch {
+      $lastError = $_.Exception.Message
+      if ($attempt -lt 5) { Start-Sleep -Milliseconds (15 * ($attempt + 1)) }
+    }
+  }
+  throw "Clipboard $operation failed after $attempts attempts: $lastError"
+}
+
 function Invoke-Operation($operation, $params) {
   Flush-ClipboardRestore
   switch ($operation) {
@@ -2020,6 +2223,7 @@ function Invoke-Operation($operation, $params) {
     "ui.focused" { return Get-FocusedElement $params }
     "ui.invoke" { return Invoke-NamedControl $params }
     "ui.find" { return Find-UiElement $params }
+    "ui.wait" { return Wait-UiCondition $params }
     "ui.action" { return Invoke-UiAction $params }
     "pointer.move" {
       $moved=[M4Native]::MoveExact([int]$params.x,[int]$params.y,[ref]$script:AchievedX,[ref]$script:AchievedY)
@@ -2303,8 +2507,8 @@ function Invoke-Operation($operation, $params) {
       }
       return (New-InputResult $chord @{method="chord";keys=$keys;chord=[string]$params.chord;windowId=$inputWindowId;foreground=$focus})
     }
-    "clipboard.read" { return @{text=[System.Windows.Forms.Clipboard]::GetText()} }
-    "clipboard.write" { $previous=[System.Windows.Forms.Clipboard]::GetText();[System.Windows.Forms.Clipboard]::SetText([string]$params.text);return @{written=$true;previousText=$previous} }
+    "clipboard.read" { return Invoke-ClipboardWithRetry 'read' }
+    "clipboard.write" { return Invoke-ClipboardWithRetry 'write' ([string]$params.text) }
     "screen.capture" {
       $w = if ($params.windowId -or $params.application) { Select-Window $params } else { $null }
       if(($params.windowId -or $params.application) -and -not $w){return @{captured=$false;reason="window-not-found"}}

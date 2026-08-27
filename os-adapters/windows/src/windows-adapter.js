@@ -618,16 +618,45 @@ export class WindowsAdapter {
       let stderr = "";
       let timedOut = false;
       let cancelled = false;
+      let terminating = false;
+      let settled = false;
+      let exitCode = null;
+      let exitFlush = null;
+      // On Windows, killing the PowerShell wrapper alone can orphan the real
+      // command it launched. That leaves the daemon waiting on one process
+      // while adb/installers/servers continue invisibly in another. Stop the
+      // exact process tree owned by this command; the user pressed Stop on the
+      // whole step, not on its wrapper.
+      const terminate = () => {
+        if (terminating) return;
+        terminating = true;
+        if (process.platform === "win32" && child.pid) {
+          try {
+            const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+              stdio: "ignore", windowsHide: true, shell: false
+            });
+            killer.unref();
+            // taskkill is the tree-aware route. The direct kill is a bounded
+            // fallback if policy or antivirus prevents taskkill itself.
+            const fallback = setTimeout(() => {
+              try { child.kill(); } catch { /* already gone */ }
+            }, 500);
+            fallback.unref?.();
+            return;
+          } catch { /* fall through to the direct child */ }
+        }
+        try { child.kill(); } catch { /* already gone */ }
+      };
       const timeout = setTimeout(() => {
         timedOut = true;
-        child.kill();
+        terminate();
       }, timeoutMs);
       // Cooperative cancellation: an aborted signal kills the child promptly and
       // the result carries `cancelled: true` so callers can distinguish it from a
       // timeout or a normal non-zero exit.
       const onAbort = () => {
         cancelled = true;
-        child.kill();
+        terminate();
       };
       if (signal) {
         if (signal.aborted) onAbort();
@@ -635,7 +664,30 @@ export class WindowsAdapter {
       }
       const cleanup = () => {
         clearTimeout(timeout);
+        if (exitFlush) clearTimeout(exitFlush);
         if (signal) signal.removeEventListener?.("abort", onAbort);
+      };
+      const settle = (code = exitCode, error = null) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // A daemon started by the command can inherit these handles after the
+        // command process itself has exited (adb start-server does exactly
+        // this). Waiting for ChildProcess "close" then waits for the daemon,
+        // not the command, and can pin the whole agent forever. The process
+        // "exit" event is the authoritative completion boundary. Give its own
+        // buffered output one turn to drain, then detach inherited handles.
+        child.stdout?.destroy?.();
+        child.stderr?.destroy?.();
+        resolve({
+          command,
+          args,
+          exitCode: Number.isInteger(code) ? code : -1,
+          timedOut,
+          cancelled,
+          stdout,
+          stderr: error ? `${stderr}\n${error.message}`.trim() : stderr
+        });
       };
       // OUTPUT AS IT ARRIVES, NOT ONLY WHEN IT IS OVER.
       //
@@ -663,29 +715,18 @@ export class WindowsAdapter {
         stderr += text;
         publish(text, "stderr");
       });
+      child.on("exit", (code) => {
+        exitCode = code;
+        // Usually "close" follows immediately and preserves every last byte.
+        // This fallback is what prevents an inherited pipe from becoming a
+        // ten-minute request after the actual command has already finished.
+        exitFlush = setTimeout(() => settle(code), 100);
+      });
       child.on("close", (code) => {
-        cleanup();
-        resolve({
-          command,
-          args,
-          exitCode: code ?? -1,
-          timedOut,
-          cancelled,
-          stdout,
-          stderr
-        });
+        settle(Number.isInteger(code) ? code : exitCode);
       });
       child.on("error", (error) => {
-        cleanup();
-        resolve({
-          command,
-          args,
-          exitCode: -1,
-          timedOut,
-          cancelled,
-          stdout,
-          stderr: `${stderr}\n${error.message}`.trim()
-        });
+        settle(-1, error);
       });
     });
   }
@@ -1764,6 +1805,56 @@ export class WindowsAdapter {
     );
   }
 
+  // Open an http(s) URL with a specifically named installed application. This
+  // is a typed runtime operation: the application is resolved to an installed
+  // identity first and the URL is passed as one literal argument, never parsed
+  // as model-authored shell. Executable-backed browsers support this directly;
+  // opaque Start-menu identities deliberately return unsupported rather than
+  // handing the URL to the machine's unrelated default browser.
+  async openUrlInApplication(url, application) {
+    const targetUrl = String(url ?? "").trim();
+    const app = String(application ?? "").trim();
+    if (!/^https?:\/\//i.test(targetUrl)) throw new Error("Only http(s) URLs can be opened");
+    if (!app) throw new Error("An application name is required");
+    const resolution = await this.resolveApplicationTarget(app, app);
+    if (!resolution.resolved) {
+      return {
+        exitCode: -1,
+        stderr: `${app} is not installed or could not be resolved.`,
+        application: app,
+        resolution,
+        opened: false
+      };
+    }
+    if (resolution.kind === "start-menu") {
+      return {
+        exitCode: -1,
+        stderr: `${app} has only an opaque Start-menu identity, which cannot safely receive a URL argument.`,
+        application: app,
+        resolution,
+        opened: false,
+        reason: "APPLICATION_ARGUMENTS_UNSUPPORTED"
+      };
+    }
+    const executable = escapePowerShellSingleQuoted(String(resolution.target));
+    const literalUrl = escapePowerShellSingleQuoted(targetUrl);
+    const commandResult = await this.runPowerShell(
+      `$ErrorActionPreference = 'Stop'; ` +
+      `$process = Start-Process -FilePath '${executable}' -ArgumentList @('${literalUrl}') -PassThru; ` +
+      `[pscustomobject]@{ opened = $true; processId = $process.Id } | ConvertTo-Json -Compress`,
+      { timeoutMs: 8000 }
+    );
+    let opened = null;
+    try { opened = JSON.parse(commandResult.stdout || "null"); } catch { opened = null; }
+    return {
+      ...commandResult,
+      application: app,
+      resolution,
+      opened: opened?.opened === true,
+      processId: opened?.processId ?? null
+    };
+  }
+
   async launchApplication(application) {
     const launchStartedAt = Date.now();
     const map = {
@@ -2270,7 +2361,6 @@ public static class SyscoraAudio {
     const text = String(query ?? "").trim();
     if (!text) throw new Error("A Spotify track query is required");
     const readyTimeoutMs = clampInt(options.readyTimeoutMs, 500, 20000, 8000);
-    const searchSettleMs = clampInt(options.searchSettleMs, 200, 6000, 1500);
     const playDeadlineMs = clampInt(options.playDeadlineMs, 500, 15000, 6000);
     const steps = [];
 
@@ -2301,7 +2391,6 @@ public static class SyscoraAudio {
     //    (reliable) rather than blindly typing into a located search box.
     const search = await this.openSpotifySearch(text);
     steps.push({ step: "search", ok: Boolean(search?.launch?.opened) });
-    await new Promise((r) => setTimeout(r, searchSettleMs));
 
     // 4. Bounded UI Automation: locate a result whose accessible text matches
     //    the requested track, then invoke that result's Play button. There is no
@@ -2319,7 +2408,34 @@ public static class SyscoraAudio {
     // wait before falling back to reading the screen and clicking, which worked
     // every time. The search results are populated by now either way, so that
     // fallback is one click away.
-    if (uia.invoked) await new Promise((r) => setTimeout(r, 1200));
+    if (uia.invoked && this.automationHost) {
+      // Arm a local readiness predicate and return the instant Spotify exposes
+      // the requested Now-playing label. This replaces a blind 1.2-second sleep
+      // without asking the model to inspect the screen between polls.
+      const playbackReady = await this.waitForUiTarget({
+        application: "spotify",
+        windowId: ready.window?.WindowHandle,
+        selector: {
+          nameStartsWith: "Now playing:",
+          nearText: spotifyQueryTokens(text).join(" "),
+          minimumCoverage: 0.5,
+          maxDistance: 1200,
+          sameRowTolerance: 140
+        },
+        timeoutMs: 1800
+      }).catch(() => null);
+      steps.push({
+        step: "playback-ready",
+        ok: playbackReady?.matched === true,
+        elapsedMs: playbackReady?.elapsedMs ?? null,
+        eventWakeups: playbackReady?.eventWakeups ?? 0
+      });
+    } else if (uia.invoked) {
+      // Compatibility only: production Windows sessions use the persistent
+      // host above, while degraded/non-Windows environments retain the former
+      // bounded settle before the legacy playback read.
+      await new Promise((r) => setTimeout(r, 1200));
+    }
     const playback = await this.readSpotifyPlayback();
 
     return {
@@ -2346,6 +2462,7 @@ public static class SyscoraAudio {
   // never toggles, playback. Returns { found, invoked, name, reason }.
   async _invokeSpotifyPlayButton(query, deadlineMs, windowHandle = null) {
     const limit = clampInt(deadlineMs, 500, 15000, 6000);
+    const startedAt = Date.now();
     const tokens = spotifyQueryTokens(query);
     if (tokens.length === 0) return { found: false, invoked: false, name: null, reason: "invalid-track-query", commandResult: null };
     // Modern Chromium accessibility trees often expose a result as one button
@@ -2382,7 +2499,94 @@ public static class SyscoraAudio {
           // corrections and keeps compatibility when the host is unavailable.
         }
       }
+
+      // Spotify's top result often publishes the title/artist and the action as
+      // separate siblings: a bare DataItem named "Play" beside text naming the
+      // song. Wait for that relationship locally, waking on UIA changes and
+      // polling only as a fallback. This is the general primitive the screen
+      // tool already teaches the model manually as "beside it".
+      const remainingMs = Math.min(2500, Math.max(0, limit - (Date.now() - startedAt)));
+      if (remainingMs >= 50) {
+        try {
+          const selector = {
+            nameStartsWith: "Play",
+            controlTypes: ["Button", "DataItem", "ListItem", "Hyperlink"],
+            nearText: spotifyQueryTokens(query).join(" "),
+            minimumCoverage: 0.5,
+            maxDistance: 1100,
+            sameRowTolerance: 140
+          };
+          const nearby = await this.waitForUiTarget({
+            application: "spotify",
+            windowId: windowHandle,
+            selector,
+            timeoutMs: remainingMs
+          });
+          if (nearby?.matched && nearby.target) {
+            const bounds = uiBounds(nearby.target);
+            const invoked = await this.invokeControl({
+              windowId: nearby.target.windowId ?? windowHandle,
+              name: nearby.target.name,
+              x: Number(bounds.x) + Number(bounds.width) / 2,
+              y: Number(bounds.y) + Number(bounds.height) / 2
+            });
+            if (invoked?.performed === true) {
+              return {
+                found: true,
+                invoked: true,
+                name: nearby.target.name ?? null,
+                matchedLabel: String(query).trim(),
+                matchedBounds: bounds,
+                reason: null,
+                readiness: nearby,
+                semantic: invoked
+              };
+            }
+            // Spotify exposes its row action as a DataItem without
+            // InvokePattern. The target is already grounded to the requested
+            // row and exact window, so deliver one ordinary click locally rather
+            // than throwing the result away and starting a new PowerShell scan.
+            const clicked = await this.pointerAction("click", {
+              windowId: String(nearby.target.windowId ?? windowHandle),
+              x: Number(bounds.x) + Number(bounds.width) / 2,
+              y: Number(bounds.y) + Number(bounds.height) / 2,
+              button: "left",
+              clicks: 1
+            }).catch(() => null);
+            if (clicked?.performed === true) {
+              return {
+                found: true,
+                invoked: true,
+                name: nearby.target.name ?? null,
+                matchedLabel: String(query).trim(),
+                matchedBounds: bounds,
+                reason: null,
+                readiness: nearby,
+                semantic: clicked
+              };
+            }
+          }
+        } catch {
+          // A bounded miss returns below so the model-visible screen fallback
+          // can act; only sessions without the persistent host use the legacy
+          // process-isolated matcher.
+        }
+      }
+      // The persistent host already performed every bounded semantic route. Do
+      // not buy a second process startup and another tree walk after it misses;
+      // returning now lets the existing screen fallback act immediately.
+      return {
+        found: false,
+        invoked: false,
+        name: null,
+        reason: "matching-track-not-found",
+        commandResult: null
+      };
     }
+    // Keep host readiness plus compatibility matching inside the caller's one
+    // deadline. A failed readiness predicate must not silently buy a second
+    // full six-second wait.
+    const legacyLimit = Math.max(100, limit - (Date.now() - startedAt));
     const encodedTokens = Buffer.from(JSON.stringify(tokens), "utf8").toString("base64");
     const queryText = String(query).trim();
     const displayQuery = queryText.toLowerCase().replace(/\b[a-z0-9]/g, (character) => character.toUpperCase());
@@ -2453,7 +2657,7 @@ public static class SyscoraAudio {
       "$matchedLabel=$null;",
       "$matchedBounds=$null;",
       "$episodePlay=$null;$episodeLabel=$null;$episodeBounds=$null;$pickedEpisode=$false;",
-      "while($sw.ElapsedMilliseconds -lt " + limit + " -and -not $play){",
+      "while($sw.ElapsedMilliseconds -lt " + legacyLimit + " -and -not $play){",
       "  $best=$null;$bestScore=-100000;",
       // Ask UIA for exact-name elements first. Spotify exposes the requested top
       // result under that exact Name, so this avoids a full 800+ element walk.
@@ -2465,7 +2669,7 @@ public static class SyscoraAudio {
       // over bounded single-edit title variants. Then search only the matching
       // title's few ancestors for the generic Play button. This is substantially
       // faster than walking every descendant in Spotify's Chromium tree.
-      "  if($labels.Count -eq 0){try{foreach($variant in @($queryVariants)){if($sw.ElapsedMilliseconds -ge (" + limit + "/2)){break};$variantCondition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,[string]$variant);$variantLabel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$variantCondition);if($variantLabel){$labels=@($variantLabel);break}}}catch{$labels=@()}};",
+      "  if($labels.Count -eq 0){try{foreach($variant in @($queryVariants)){if($sw.ElapsedMilliseconds -ge (" + legacyLimit + "/2)){break};$variantCondition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,[string]$variant);$variantLabel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$variantCondition);if($variantLabel){$labels=@($variantLabel);break}}}catch{$labels=@()}};",
       "  $playNameCond=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Play');$genericPlayCond=New-Object System.Windows.Automation.AndCondition($buttonCond,$playNameCond);",
       "  foreach($labelEl in $labels){try{$label=$labelEl.Current.Name;$rr=$labelEl.Current.BoundingRectangle;if($labelEl.Current.IsOffscreen -or -not (& $matches $label) -or $rr.Width -le 0 -or $rr.Height -le 0 -or $rr.Height -gt 260){continue};$ancestor=$labelEl;for($depth=0;$depth-lt 5;$depth++){$ancestor=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($ancestor);if(-not $ancestor){break};$candidate=$ancestor.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$genericPlayCond);if($candidate -and -not $candidate.Current.IsOffscreen -and $candidate.Current.IsEnabled){if(& $isEpisode $ancestor){if(-not $episodePlay){$episodePlay=$candidate;$episodeLabel=$label;$episodeBounds=$rr}}else{$best=$candidate;$matchedLabel=$label;$matchedBounds=$rr};break}}}catch{};if($best){break}};",
       // Some Chromium apps expose the action and object as one accessibility
@@ -2473,7 +2677,7 @@ public static class SyscoraAudio {
       // controls, not the entire raw tree, and bind the action to the requested
       // object tokens before invoking it. This is the same general semantic
       // action+object shape used by the persistent host selector above.
-      "  if(-not $best -and $sw.ElapsedMilliseconds -lt " + limit + "){try{$actionButtons=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$buttonCond);foreach($candidate in $actionButtons){if($sw.ElapsedMilliseconds -ge " + limit + "){break};$candidateName=$candidate.Current.Name;$candidateBounds=$candidate.Current.BoundingRectangle;if(-not $candidate.Current.IsOffscreen -and $candidate.Current.IsEnabled -and $candidateName.StartsWith('Play ',[StringComparison]::OrdinalIgnoreCase) -and (& $matches $candidateName) -and $candidateBounds.Width -gt 0 -and $candidateBounds.Height -gt 0){$best=$candidate;$matchedLabel=$candidateName;$matchedBounds=$candidateBounds;break}}}catch{}};",
+      "  if(-not $best -and $sw.ElapsedMilliseconds -lt " + legacyLimit + "){try{$actionButtons=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$buttonCond);foreach($candidate in $actionButtons){if($sw.ElapsedMilliseconds -ge " + legacyLimit + "){break};$candidateName=$candidate.Current.Name;$candidateBounds=$candidate.Current.BoundingRectangle;if(-not $candidate.Current.IsOffscreen -and $candidate.Current.IsEnabled -and $candidateName.StartsWith('Play ',[StringComparison]::OrdinalIgnoreCase) -and (& $matches $candidateName) -and $candidateBounds.Width -gt 0 -and $candidateBounds.Height -gt 0){$best=$candidate;$matchedLabel=$candidateName;$matchedBounds=$candidateBounds;break}}}catch{}};",
       "  if($best){$play=$best;break};",
       "  if(-not $play){ Start-Sleep -Milliseconds 400 }",
       "};",
@@ -2487,7 +2691,7 @@ public static class SyscoraAudio {
       "try{ $ip=$play.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $ip.Invoke(); $invoked=$true }catch{ $invoked=$false };",
       "[pscustomobject]@{found=$true;invoked=$invoked;name=$name;matchedLabel=$matchedLabel;matchedBounds=$matchedBounds;pickedEpisode=$pickedEpisode} | ConvertTo-Json -Compress"
     ].join(" ");
-    const ps = await this.runPowerShell(script, { timeoutMs: limit + 4000 });
+    const ps = await this.runPowerShell(script, { timeoutMs: legacyLimit + 4000 });
     let parsed = null;
     try { parsed = JSON.parse(ps.stdout || "null"); } catch { parsed = null; }
     return {
@@ -2955,6 +3159,31 @@ public static class SyscoraAudio {
   }
 
   /**
+   * Wait locally for the foreground window to become observably different.
+   * This is used after fire-and-forget OS hand-offs such as opening a URL. It
+   * returns as soon as Windows exposes the new handle/title, with a short
+   * adaptive poll because there is no model decision inside this loop.
+   */
+  async waitForForegroundChange(before = null, timeoutMs = 2500) {
+    const deadline = Date.now() + clampInt(timeoutMs, 50, 10000, 2500);
+    const beforeId = String(before?.windowId ?? before?.WindowHandle ?? "");
+    const beforeTitle = String(before?.title ?? before?.MainWindowTitle ?? "");
+    let polls = 0;
+    let current = null;
+    while (Date.now() < deadline) {
+      polls += 1;
+      current = await this.getForegroundWindow();
+      const currentId = String(current?.windowId ?? current?.WindowHandle ?? "");
+      const currentTitle = String(current?.title ?? current?.MainWindowTitle ?? "");
+      if (current && (currentId !== beforeId || currentTitle !== beforeTitle)) {
+        return { changed: true, window: current, polls };
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(125, 40 + polls * 10)));
+    }
+    return { changed: false, window: current ?? await this.getForegroundWindow(), polls, reason: "foreground-wait-timeout" };
+  }
+
+  /**
    * Every live process as processId -> parentProcessId.
    *
    * Exists for one question: which window really belongs to an application. An
@@ -3065,6 +3294,26 @@ public static class SyscoraWindowEnumerator {
 
   async findUiTarget({ application = null, windowId = null, selector = {} } = {}) {
     return this.hostRequest("ui.find", { application, windowId, selector }, { timeoutMs: 8000 });
+  }
+
+  /**
+   * A typed, bounded UI readiness predicate executed wholly inside the local
+   * automation runtime. The persistent host wakes on UIA structure/property
+   * events and rechecks the selector, with an adaptive poll fallback for sparse
+   * Chromium providers. No screen frames or model calls are involved.
+   */
+  async waitForUiTarget({ application = null, windowId = null, selector = {}, condition = "present", timeoutMs = 5000 } = {}) {
+    const bounded = clampInt(timeoutMs, 50, 20000, 5000);
+    if (this.automationHost) {
+      return this.hostRequest("ui.wait", {
+        application,
+        windowId,
+        selector,
+        condition,
+        timeoutMs: bounded
+      }, { timeoutMs: bounded + 2000 });
+    }
+    return { matched: false, reason: "automation-host-unavailable", polls: 0 };
   }
 
   // Reusable semantic UI primitive for controls whose accessible name combines

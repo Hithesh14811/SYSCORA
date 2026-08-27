@@ -2,7 +2,7 @@ const REDACTED = "***REDACTED***";
 
 // Names that mean "credential" and nothing else. A match here is redacted
 // whatever the value looks like.
-const UNAMBIGUOUS = /(secret|password|credential|apiKey|accessKey|privateKey)/i;
+const UNAMBIGUOUS = /(secret|password|credential|apiKey|accessKey|privateKey|pairingCode|oneTimeCode|unlockCode|otp)/i;
 // Names that mean a credential SOMETIMES. "token" is an auth token and it is
 // also a unit of text; "value" is a form field's contents and it is also the
 // generic name for anything at all.

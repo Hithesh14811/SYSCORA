@@ -355,18 +355,33 @@ export class CdpBrowserAdapter {
   }
 
   async currentState() {
-    return this._evaluate(`(() => ({
-      url: location.href,
-      title: document.title,
-      readyState: document.readyState,
-      viewport: { width: innerWidth, height: innerHeight },
-      scroll: { x: scrollX, y: scrollY },
-      activeElement: document.activeElement ? {
-        tag: document.activeElement.tagName,
-        id: document.activeElement.id,
-        name: document.activeElement.getAttribute("name")
-      } : null
-    }))()`);
+    return this._evaluate(`(() => {
+      // Arm one lightweight observer before an action. A later wait can then
+      // notice an in-page render that happened between the click and the next
+      // protocol request, without streaming frames or polling through a model.
+      if (!globalThis.__syscoraUiChangeTracker) {
+        const tracker = { version: 0 };
+        const observer = new MutationObserver(() => { tracker.version += 1; });
+        const root = document.documentElement;
+        if (root) observer.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+        tracker.observer = observer;
+        globalThis.__syscoraUiChangeTracker = tracker;
+      }
+      const tracker = globalThis.__syscoraUiChangeTracker;
+      return {
+        url: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        uiVersion: tracker?.version ?? 0,
+        viewport: { width: innerWidth, height: innerHeight },
+        scroll: { x: scrollX, y: scrollY },
+        activeElement: document.activeElement ? {
+          tag: document.activeElement.tagName,
+          id: document.activeElement.id,
+          name: document.activeElement.getAttribute("name")
+        } : null
+      };
+    })()`);
   }
 
   async mediaState({ selector = "video, audio", blockedStateSelector = null } = {}) {
@@ -1032,13 +1047,33 @@ export class CdpBrowserAdapter {
 
   async wait({ condition = "selector", selector = null, value = null, timeoutMs = 10000, signal = null } = {}) {
     const deadline = Date.now() + Math.min(30000, Math.max(100, Number(timeoutMs) || 10000));
+    let baseline = value;
+    if (condition === "state.change" && typeof value === "string") {
+      try { baseline = JSON.parse(value); } catch { baseline = {}; }
+    }
     while (Date.now() < deadline) {
       throwIfAborted(signal);
-      const matched = condition === "document.readyState"
-        ? await this._evaluate(`document.readyState === ${JSON.stringify(value ?? "complete")}`)
-        : await this._evaluate(`Boolean(document.querySelector(${JSON.stringify(selector)}))`);
-      if (matched) return { matched: true, condition, selector, value };
-      await delay(100);
+      if (condition === "state.change") {
+        let state = null;
+        try { state = await this.currentState(); } catch {
+          // Navigation can destroy the old execution context between requests.
+          // The new context is itself the change; retry immediately against it.
+          await delay(25);
+          continue;
+        }
+        const matched = !baseline
+          || state.url !== baseline.url
+          || state.title !== baseline.title
+          || state.readyState !== baseline.readyState
+          || Number(state.uiVersion ?? 0) !== Number(baseline.uiVersion ?? 0);
+        if (matched) return { matched: true, condition, state };
+      } else {
+        const matched = condition === "document.readyState"
+          ? await this._evaluate(`document.readyState === ${JSON.stringify(value ?? "complete")}`)
+          : await this._evaluate(`Boolean(document.querySelector(${JSON.stringify(selector)}))`);
+        if (matched) return { matched: true, condition, selector, value };
+      }
+      await delay(condition === "state.change" ? 50 : 100);
     }
     return { matched: false, reason: "browser-wait-timeout", condition, selector, value };
   }

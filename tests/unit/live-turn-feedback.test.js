@@ -55,6 +55,44 @@ test("a tool call ends the round of thinking that produced it", () => {
     "without this, reasoning that resumes after a tool call is written into a box that is still marked live");
 });
 
+test("TOOL_STARTED replaces composing with a live per-step heartbeat", () => {
+  const body = /startStep\(\{[\s\S]*?\n  \}\n/.exec(demo)?.[0] ?? "";
+  assert.match(body, /this\.setStatus\(runningVerbFor\(capability\)\)/,
+    "the sphere can remain on 'Composing the command' after the command has actually started");
+  assert.match(body, /setInterval/,
+    "a silent command has no per-step elapsed heartbeat, so running and frozen look identical");
+  assert.match(body, /running · \$\{seconds\}s/);
+});
+
+test("approval is visibly waiting and resumes the exact running label", () => {
+  const approval = /askApproval\(details\)\s*\{([\s\S]*?)\n  \}/.exec(demo)?.[1] ?? "";
+  assert.match(approval, /Waiting for your approval/,
+    "the command row claims it is running while the process has not yet crossed approval");
+  const resolved = /settleApproval\(approvalId, approved\)\s*\{([\s\S]*?)\n  \}/.exec(demo)?.[1] ?? "";
+  assert.match(resolved, /runningVerbFor\(current\.capability\)/,
+    "after approval the live label never returns to the operation that is now executing");
+});
+
+test("Stop visibly changes state, remains retryable, and is never a dead red button", () => {
+  const body = /async function stopRunning\(\)\s*\{([\s\S]*?)\n\}/.exec(demo)?.[1] ?? "";
+  assert.match(body, /STOPPING_GLYPH/);
+  assert.match(body, /sendButton\.disabled = false/,
+    "the first Stop click disables the only recovery control while the daemon may still be stuck");
+  assert.doesNotMatch(body, /stoppingSessionId === runningSessionId\) return/,
+    "a lost first stop request makes every later Stop click a no-op");
+  assert.match(css, /#sendButton\.stopping\.stop-pending/,
+    "stopping is visually indistinguishable from the still-running red Stop state");
+});
+
+test("a running request is persisted to its original chat without blocking navigation", () => {
+  assert.match(demo, /const submittedChatId = activeChatId/);
+  assert.match(demo, /rememberInChat\(submittedChatId, "assistant"/);
+  const switchBody = /function switchToChat\(id\)\s*\{([\s\S]*?)\n\}/.exec(demo)?.[1] ?? "";
+  const newBody = /function startNewChat\(\)\s*\{([\s\S]*?)\n\}/.exec(demo)?.[1] ?? "";
+  assert.doesNotMatch(switchBody, /busyWithRun/);
+  assert.doesNotMatch(newBody, /busyWithRun/);
+});
+
 // ---- 2. the call being written ---------------------------------------------
 
 test("the transport reports a tool call while its arguments are still arriving", async (t) => {

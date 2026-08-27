@@ -694,6 +694,77 @@ test("something that stays running is started, not waited on", async () => {
   assert.match(ran[2].command, /Start-Process/);
 });
 
+test("a finite slow command can continue as a managed job and be checked later", async () => {
+  let finish;
+  const held = new Promise((resolve) => { finish = resolve; });
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: {
+      executeCommand: async (_cwd, _command, _args, options) => {
+        options.onOutput?.({ stream: "stdout", text: "device authorization requested\n" });
+        await held;
+        return { stdout: "device connected\n", stderr: "", exitCode: 0 };
+      }
+    }
+  });
+
+  const started = await toolset.execute("run", { command: "Get-Date", defer: true });
+  assert.equal(started.ok, true);
+  assert.match(started.text, /managed background job job-1/i);
+
+  const running = await toolset.execute("run_jobs", { operation: "status", jobId: "job-1" });
+  assert.match(running.text, /"state": "RUNNING"/);
+  assert.match(running.text, /device authorization requested/);
+
+  finish();
+  await new Promise((resolve) => setImmediate(resolve));
+  const completed = await toolset.execute("run_jobs", { operation: "status", jobId: "job-1" });
+  assert.match(completed.text, /"state": "COMPLETED"/);
+  assert.match(completed.text, /device connected/);
+  assert.match(completed.text, /"exitCode": 0/);
+});
+
+test("Android recovery cannot escape into raw adb or a recursive drive search", async () => {
+  const spawned = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: {
+      executeCommand: async (_cwd, command) => {
+        spawned.push(command);
+        return { stdout: "should not run", stderr: "", exitCode: 0 };
+      }
+    }
+  });
+
+  for (const command of [
+    "adb kill-server; adb start-server; adb devices -l",
+    '& "C:\\Users\\me\\platform-tools\\adb.exe" devices -l',
+    "Get-ChildItem -Path C:\\ -Filter adb.exe -Recurse"
+  ]) {
+    const result = await toolset.execute("run", { command });
+    assert.equal(result.ok, false);
+    assert.match(result.text, /android_devices list\/wait\/refresh/i);
+  }
+  assert.deepEqual(spawned, [], "no Android fallback may reach PowerShell or approval");
+});
+
+test("ordinary command output is streamed as indeterminate progress", async () => {
+  const progress = [];
+  const toolset = buildToolset({
+    registry: stubRegistry({}),
+    adapter: {
+      executeCommand: async (_cwd, _command, _args, options) => {
+        options.onOutput?.({ stream: "stdout", text: "waiting for device authorization\n" });
+        return { stdout: "done", stderr: "", exitCode: 0 };
+      }
+    }
+  });
+  await toolset.execute("run", { command: "Get-Date" }, { onProgress: (event) => progress.push(event) });
+  assert.equal(progress.length, 1);
+  assert.equal(progress[0].percent, null);
+  assert.match(progress[0].label, /waiting for device authorization/);
+});
+
 // The loop reads a timeout as "that did not work", and for a server it is the
 // opposite — so the result has to say which one it was.
 test("a command that timed out is told it may simply never have been going to exit", async () => {

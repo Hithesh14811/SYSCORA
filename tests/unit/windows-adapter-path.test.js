@@ -5,6 +5,24 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { WindowsAdapter } from "../../os-adapters/windows/src/windows-adapter.js";
 
+test("executeCommand settles on process exit when a daemon inherits its output pipe", async () => {
+  const adapter = new WindowsAdapter();
+  const childCode = [
+    "const { spawn } = require('node:child_process');",
+    "const daemon = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 2000)'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });",
+    "daemon.unref();",
+    "process.stdout.write('launcher exited\\n');"
+  ].join(" ");
+  const startedAt = Date.now();
+  const result = await adapter.executeCommand(process.cwd(), process.execPath, ["-e", childCode], { timeoutMs: 5_000 });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /launcher exited/);
+  assert.ok(elapsedMs < 1_500,
+    `the command process exited but its inherited pipe pinned the adapter for ${elapsedMs}ms`);
+});
+
 test("WindowsAdapter - inspectCommand ignores Store aliases and reports a real runtime", async () => {
   const adapter = new WindowsAdapter();
   const calls = [];

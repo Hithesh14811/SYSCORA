@@ -2792,6 +2792,13 @@ body.sidebar-open .sidebar-toggle:hover .panel-fill { opacity: .7; }
   background: linear-gradient(150deg, #ff8079, #e0544c);
   box-shadow: 0 4px 16px rgba(255, 107, 98, .35), inset 0 1px 0 rgba(255, 255, 255, .28);
 }
+#sendButton.stopping.stop-pending {
+  background: #46505e;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .22), inset 0 1px 0 rgba(255, 255, 255, .12);
+  cursor: pointer;
+}
+.stop-spinner { animation: stop-spinner-turn .75s linear infinite; }
+@keyframes stop-spinner-turn { to { transform: rotate(360deg); } }
 
 /* --- the two menus -------------------------------------------------------- */
 

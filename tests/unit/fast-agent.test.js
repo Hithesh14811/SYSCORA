@@ -549,6 +549,51 @@ test("a screen that never changes ends the run instead of being hunted forever",
   assert.match(outcome.message, /Nothing was changed/);
 });
 
+test("Android screen reads are repeatable observations, not repeated actions", async () => {
+  let reads = 0;
+  const turns = [200, 400, 700, 300].map((maxNodes) => ({
+    text: "checking",
+    toolCalls: [{ name: "android_screen", args: { serial: "phone-1", maxNodes } }]
+  }));
+  turns.push({ text: "The accessible screen stayed unchanged, so I need a different route." });
+  const events = [];
+  const agent = new FastAgent({
+    provider: scriptedProvider(turns),
+    toolset: stubToolset({
+      android_screen: async () => {
+        reads += 1;
+        return {
+          ok: true,
+          text: reads === 1 ? "Android controls." : "IDENTICAL to the last hierarchy.",
+          raw: { screenUnchanged: reads > 1, evidence: { verdict: "CONFIRMED" } }
+        };
+      }
+    }),
+    onEvent: (event) => events.push(event)
+  });
+  const outcome = await agent.run("inspect my Android phone");
+  assert.equal(outcome.status, "COMPLETED");
+  assert.equal(reads, 4);
+  assert.equal(events.some((event) => event.details?.repeated === true), false,
+    "changing a read limit or using repeated observation must not trip the action-repeat guard");
+});
+
+test("ignoring the repeated-action warning is enforced by the controller", async () => {
+  let clicks = 0;
+  const repeated = Array.from({ length: 6 }, () => ({
+    text: "trying",
+    toolCalls: [{ name: "click", args: { text: "Search" } }]
+  }));
+  const agent = new FastAgent({
+    provider: scriptedProvider(repeated),
+    toolset: stubToolset({ click: async () => { clicks += 1; return { ok: true, text: "Clicked." }; } })
+  });
+  const outcome = await agent.run("open search");
+  assert.equal(outcome.status, "PARTIALLY_COMPLETED");
+  assert.equal(clicks, 2, "the third call is refused and a fourth ignored warning ends the run");
+  assert.ok(outcome.steps <= 4, `controller enforcement should stop promptly, took ${outcome.steps}`);
+});
+
 // Repetition is how a long list gets scrolled and how a picture gets drawn, so
 // the guards above must not mistake either for going in circles.
 test("scrolling and drawing may repeat as much as they need to", async () => {

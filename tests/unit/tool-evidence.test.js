@@ -179,6 +179,7 @@ function harness({ files = new Map(), overrides = {}, basePath } = {}) {
 
 const SUCCESS_CALLS = [
   { tool: "run", args: { command: "git --version" } },
+  { tool: "run_jobs", args: { operation: "list" }, readOnly: true },
   { tool: "software", args: { name: "python" }, readOnly: true },
   { tool: "screen", args: { application: "app" } },
   { tool: "click", args: { text: "Send" }, needsReading: true },

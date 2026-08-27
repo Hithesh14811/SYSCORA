@@ -4674,6 +4674,204 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
+  // Android is deliberately a second adapter, not an extension of the Windows
+  // one. No Android capability exists in lightweight/test runtimes unless the
+  // caller explicitly supplies this adapter, so desktop planning and execution
+  // keep exactly their previous surface and timing.
+  const androidAdapter = options.androidAdapter ?? null;
+  if (androidAdapter) {
+    const registerAndroid = ({
+      name, description, inputSchema, execute, permissionType = "READ",
+      risk = RiskLevel.LOW, network = false, timeout = 20_000,
+      reversibility = "NOT_REQUIRED", requiresAdb = true
+    }) => registry.register({
+      name,
+      version: "1.0.0",
+      description,
+      inputSchema,
+      outputSchema: { type: "object" },
+      requiredContext: [],
+      riskMetadata: { level: risk },
+      permissions: network ? ["network:android-device"] : ["session:android-device"],
+      permissionModel: {
+        scope: network ? ["SESSION", "NETWORK"] : ["SESSION"],
+        type: permissionType
+      },
+      execution: {
+        modalities: [modalityProfile(ExecutionModality.OS_API)],
+        preferredModality: ExecutionModality.OS_API,
+        resources: ["android-device", "adb"]
+      },
+      security: {
+        filesystem: name === "android.app.install" ? "READ" : "NONE",
+        registry: "NONE",
+        network: network ? "CONTROLLED" : "NONE",
+        browser: "NONE",
+        clipboard: "NONE",
+        windowAutomation: name.startsWith("android.ui.") ? (permissionType === "READ" ? "READ" : "CONTROLLED") : "NONE",
+        // ADB is a bounded transport here: capability callers cannot supply a
+        // command or shell fragment. The adapter owns every exact argument.
+        externalProcesses: "CONTROLLED"
+      },
+      reversibility,
+      preconditions: (args = {}) => name === "android.platform.setup" || ["android.device.list", "android.device.wait", "android.device.refresh"].includes(name) || name.startsWith("android.connection.")
+        ? true
+        : Boolean(args.serial || (Array.isArray(args.serials) && args.serials.length)),
+      execute,
+      observe: async (result, args) => ({
+        observationId: createId(),
+        source: name,
+        timestamp: new Date().toISOString(),
+        structuredState: result,
+        relatedActionId: args?.actionId,
+        detectedChanges: permissionType === "READ" || result?.performed === false ? [] : ["android.device"],
+        confidence: result?.performed === false ? 0.4 : 0.95,
+        trustLevel: "SYSTEM_TRUSTED"
+      }),
+      verify: async (observation) => {
+        const result = observation?.structuredState ?? {};
+        const failed = result.performed === false || result.connected === false || result.paired === false || result.installed === false;
+        return {
+          status: failed ? "FAILED" : "VERIFIED",
+          message: failed ? (result.reason ?? `${name} did not complete`) : `${name} completed`,
+          evidence: result,
+          confidence: 1
+        };
+      },
+      timeout,
+      retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+      recoveryHints: ["REFRESH_STATE", "ABORT_ON_FAILURE"],
+      lifecycleStatus: LifecycleStatus.VERIFIED,
+      availability: requiresAdb
+        ? { check: () => androidAdapter.isAvailable() }
+        : { available: true, reason: null }
+    });
+
+    registerAndroid({
+      name: "android.platform.setup",
+      description: "Download, verify, and activate Google's official Android Platform Tools inside SYSCORA without changing PATH or requiring a restart",
+      inputSchema: { type: "object", properties: {}, required: [] },
+      execute: (_args, options) => androidAdapter.setupPlatformTools(options),
+      permissionType: "EXECUTE",
+      risk: RiskLevel.HIGH,
+      network: true,
+      timeout: 180_000,
+      requiresAdb: false
+    });
+    registerAndroid({
+      name: "android.device.list",
+      description: "List every Android device visible to ADB, including wireless, offline, and unauthorized devices; an expected USB reset immediately after authorization is stabilized internally",
+      inputSchema: { type: "object", properties: {}, required: [] },
+      execute: (_args, options) => androidAdapter.listDevices(options)
+    });
+    registerAndroid({
+      name: "android.device.wait",
+      description: "Wait locally and return on the first Android device reconnect without another model call or a fixed full delay",
+      inputSchema: { type: "object", properties: { timeoutMs: { type: "number" } }, required: [] },
+      execute: (args, options) => androidAdapter.waitForDevices({ ...options, timeoutMs: args.timeoutMs }),
+      timeout: 30_000
+    });
+    registerAndroid({
+      name: "android.device.refresh",
+      description: "Restart SYSCORA's known ADB server directly and wait for Android devices without PATH lookup or arbitrary shell access",
+      inputSchema: { type: "object", properties: { timeoutMs: { type: "number" } }, required: [] },
+      execute: (args, options) => androidAdapter.refreshDevices({ ...options, timeoutMs: args.timeoutMs }),
+      permissionType: "EXECUTE",
+      risk: RiskLevel.LOW,
+      timeout: 45_000
+    });
+    registerAndroid({
+      name: "android.connection.connect",
+      description: "Connect to an already-paired Android device at an exact wireless ADB host:port endpoint",
+      inputSchema: { type: "object", properties: { endpoint: { type: "string" } }, required: ["endpoint"] },
+      execute: (args) => androidAdapter.connect(args.endpoint), permissionType: "NETWORK", risk: RiskLevel.MEDIUM, network: true
+    });
+    registerAndroid({
+      name: "android.connection.pair",
+      description: "Pair an Android 11+ device wirelessly using its temporary six-digit pairing code; the code is never persisted or put on a command line",
+      inputSchema: { type: "object", properties: { endpoint: { type: "string" }, pairingCode: { type: "string" } }, required: ["endpoint", "pairingCode"] },
+      execute: (args) => androidAdapter.pair(args.endpoint, args.pairingCode), permissionType: "NETWORK", risk: RiskLevel.HIGH, network: true
+    });
+    registerAndroid({
+      name: "android.connection.disconnect",
+      description: "Disconnect one exact wireless Android ADB endpoint",
+      inputSchema: { type: "object", properties: { endpoint: { type: "string" } }, required: ["endpoint"] },
+      execute: (args) => androidAdapter.disconnect(args.endpoint), permissionType: "NETWORK", risk: RiskLevel.MEDIUM, network: true
+    });
+    registerAndroid({
+      name: "android.device.inspect",
+      description: "Read structured Android device identity, OS, security patch, battery, display, storage, foreground app, connection, and lock state without screenshots",
+      inputSchema: { type: "object", properties: { serial: { type: "string" } }, required: ["serial"] },
+      execute: (args) => androidAdapter.inspectDevice(args.serial)
+    });
+    registerAndroid({
+      name: "android.app.list",
+      description: "List installed Android packages on one exact device",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, includeSystem: { type: "boolean" }, query: { type: "string" }, limit: { type: "number" } }, required: ["serial"] },
+      execute: (args) => androidAdapter.listPackages(args.serial, args)
+    });
+    registerAndroid({
+      name: "android.ui.read",
+      description: "Read the current Android accessibility hierarchy as semantic elements without capturing or sending a screenshot; password contents are always redacted",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, maxNodes: { type: "number" } }, required: ["serial"] },
+      execute: (args) => androidAdapter.readUi(args.serial, args)
+    });
+    registerAndroid({
+      name: "android.ui.tap",
+      description: "Tap one unambiguous Android accessibility element selected by text, description, resource id, class, stable id, and optional occurrence; invented coordinates are not accepted",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, selector: { type: "object" }, waitForChangeMs: { type: "number" } }, required: ["serial", "selector"] },
+      execute: (args) => androidAdapter.tap(args.serial, args.selector, args), permissionType: "EXECUTE", risk: RiskLevel.MEDIUM
+    });
+    registerAndroid({
+      name: "android.ui.type",
+      description: "Type safe text into one unambiguous accessible Android edit field without reading or entering passwords",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, selector: { type: "object" }, text: { type: "string" }, clear: { type: "boolean" }, waitForChangeMs: { type: "number" } }, required: ["serial", "selector", "text"] },
+      execute: (args) => androidAdapter.typeText(args.serial, args.selector, args.text, args), permissionType: "EXECUTE", risk: RiskLevel.MEDIUM
+    });
+    registerAndroid({
+      name: "android.ui.key",
+      description: "Press one allow-listed Android navigation, volume, power, or media key on one exact device",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, key: { type: "string" } }, required: ["serial", "key"] },
+      execute: (args) => androidAdapter.pressKey(args.serial, args.key), permissionType: "EXECUTE", risk: RiskLevel.MEDIUM
+    });
+    registerAndroid({
+      name: "android.ui.scroll",
+      description: "Scroll an accessible Android scroll container in a named direction without screenshots or guessed coordinates",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, direction: { type: "string" }, selector: { type: "object" } }, required: ["serial", "direction"] },
+      execute: (args) => androidAdapter.scroll(args.serial, args), permissionType: "EXECUTE", risk: RiskLevel.MEDIUM
+    });
+    registerAndroid({
+      name: "android.app.launch",
+      description: "Launch an installed Android application by exact package name on one exact device",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, packageName: { type: "string" } }, required: ["serial", "packageName"] },
+      execute: (args) => androidAdapter.launchApp(args.serial, args.packageName), permissionType: "EXECUTE", risk: RiskLevel.MEDIUM
+    });
+    registerAndroid({
+      name: "android.uri.open",
+      description: "Open an allow-listed web, Spotify, map, mail, or telephone URI through Android's intent resolver",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, uri: { type: "string" } }, required: ["serial", "uri"] },
+      execute: (args) => androidAdapter.openUri(args.serial, args.uri), permissionType: "NETWORK", risk: RiskLevel.MEDIUM, network: true
+    });
+    registerAndroid({
+      name: "android.app.install",
+      description: "Install one exact local APK on one exact Android device through ADB without exposing an arbitrary shell",
+      inputSchema: { type: "object", properties: { serial: { type: "string" }, apkPath: { type: "string" }, replace: { type: "boolean" } }, required: ["serial", "apkPath"] },
+      execute: (args) => androidAdapter.installApk(args.serial, args.apkPath, args), permissionType: "EXECUTE", risk: RiskLevel.HIGH, timeout: 180_000
+    });
+    registerAndroid({
+      name: "android.device.dismissKeyguard",
+      description: "Wake a device and dismiss only a non-secure Android keyguard; never bypass PIN, password, pattern, biometric, encryption, or device policy",
+      inputSchema: { type: "object", properties: { serial: { type: "string" } }, required: ["serial"] },
+      execute: (args) => androidAdapter.dismissKeyguard(args.serial), permissionType: "EXECUTE", risk: RiskLevel.MEDIUM
+    });
+    registerAndroid({
+      name: "android.devices.run",
+      description: "Run one bounded inspect, UI-read, launch, URI-open, or allow-listed key operation concurrently across up to 32 exact Android device serials",
+      inputSchema: { type: "object", properties: { serials: { type: "array", items: { type: "string" } }, operation: { type: "string" }, input: { type: "object" } }, required: ["serials", "operation"] },
+      execute: (args) => androidAdapter.runOnDevices(args.serials, args.operation, args.input), permissionType: "EXECUTE", risk: RiskLevel.MEDIUM
+    });
+  }
+
   // Provider-neutral media contract. Planning targets `media.*`; Spotify is the
   // first provider behind it. The `spotify.*` capabilities above stay registered
   // so existing typed routes keep working while planning migrates.
