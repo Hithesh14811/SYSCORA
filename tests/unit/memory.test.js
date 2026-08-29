@@ -133,3 +133,33 @@ test("Memory - recordSuccessfulWorkflow and recordFailurePattern", async () => {
 
   await memory.close();
 });
+
+test("Memory - adaptive outcomes aggregate without retaining task content", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-test-"));
+  const memory = new Memory(tempDir);
+
+  await memory.recordAdaptivePattern({
+    tool: "play_music",
+    application: "Spotify",
+    failureClass: "matching-track-not-found",
+    recoverySequence: ["screen", "click"],
+    recovered: true
+  });
+  await memory.recordAdaptivePattern({
+    tool: "play_music",
+    application: "Spotify",
+    failureClass: "matching-track-not-found",
+    recoverySequence: ["screen", "click"],
+    recovered: true
+  });
+
+  const records = (await memory.list({ type: "FAILURE_PATTERN" }))
+    .filter((record) => record.provenance === "outcome_learning");
+  assert.equal(records.length, 1, "the same generalized pattern is evidence, not duplicate memories");
+  assert.deepEqual(records[0].content.counts, { observations: 2, recoveries: 2, unresolved: 0 });
+  assert.equal(JSON.stringify(records[0]).includes("Justin Bieber"), false);
+
+  const relevant = await memory.retrieveAdaptiveGuidance("play music on spotify");
+  assert.equal(relevant.length, 1);
+  assert.equal((await memory.retrieveAdaptiveGuidance("write a document")).length, 0);
+});

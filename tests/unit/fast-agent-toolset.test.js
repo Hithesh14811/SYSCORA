@@ -9,8 +9,17 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildToolset, repairCmdIsms } from "../../packages/fast-agent/src/tools.js";
+import { buildToolset as buildRawToolset, repairCmdIsms } from "../../packages/fast-agent/src/tools.js";
 import { createDefaultCapabilityRegistry } from "../../packages/capability-registry/src/index.js";
+
+// Shell-focused tests opt in explicitly. Production and raw callers now start
+// with the arbitrary terminal hidden.
+function buildToolset(options) {
+  const toolset = buildRawToolset(options);
+  toolset.setAccessPolicy({ developerMode: true, shellExecutionMode: "host" });
+  toolset.setConfirmer(async () => true);
+  return toolset;
+}
 
 // Records what the adapter was asked to do and answers plausibly.
 function recordingAdapter() {
@@ -77,7 +86,9 @@ function recordingAdapter() {
 function realToolset() {
   const adapter = recordingAdapter();
   const registry = createDefaultCapabilityRegistry(adapter);
-  return { toolset: buildToolset({ registry, adapter, basePath: "C:\\work" }), adapter, registry };
+  const toolset = buildToolset({ registry, adapter, basePath: "C:\\work" });
+  toolset.setAccessPolicy({ developerMode: true, shellExecutionMode: "host" });
+  return { toolset, adapter, registry };
 }
 
 test("every tool the model is offered maps to a capability the registry has", () => {
@@ -638,16 +649,18 @@ test("a yes runs it, once, without asking again for the same run", async () => {
 // A surface with no way to ask must not refuse everything: the CLI and the tests
 // have no user to put a card in front of, and a gate that cannot ask would turn
 // into a gate that always says no.
-test("with no confirmer wired the gate proceeds, exactly as before", async () => {
+test("with no confirmer wired an irreversible operation fails closed", async () => {
   const ran = [];
-  const toolset = buildToolset({
+  const toolset = buildRawToolset({
     registry: stubRegistry({}),
     adapter: { executeCommand: async (cwd, command) => { ran.push(command); return { stdout: "", stderr: "", exitCode: 0 }; } }
   });
 
-  await toolset.execute("run", { command: "Remove-Item notes.txt" });
+  toolset.setAccessPolicy({ developerMode: true, shellExecutionMode: "host" });
+  const result = await toolset.execute("run", { command: "Remove-Item notes.txt" });
 
-  assert.deepEqual(ran, ["Remove-Item notes.txt"]);
+  assert.deepEqual(ran, []);
+  assert.equal(result.ok, false);
 });
 
 test("a batch cannot contain a batch, and an unknown tool in one is named", async () => {
@@ -965,7 +978,15 @@ test("a label matching several different things asks which one, instead of guess
   // The candidates are named with their indices so the next call can be exact.
   assert.match(click.text, /@310,248/);
   assert.match(click.text, /@370,528/);
-  assert.match(click.text, /by its index/);
+  // AND THE CALL ITSELF IS SPELLED OUT, NOT DESCRIBED.
+  //
+  // This used to assert on the sentence "Pick the one you mean by its index".
+  // Measured live on Spotify, 28 Aug 2026, that sentence was not enough: the
+  // model answered an ambiguity refusal with the identical call, twice. The
+  // message now carries the exact arguments to copy, which is the same
+  // information in a form that cannot be paraphrased into another guess.
+  assert.match(click.text, /click \{element: \d+\}/);
+  assert.match(click.text, /Call ONE of these exactly/);
 });
 
 test("an unambiguous label still clicks without ceremony", async () => {
@@ -1469,6 +1490,7 @@ function editorToolset({
   windows = [],
   elements = [],
   launched = { WindowHandle: 42, title: "Untitled - Notepad" },
+  focused = null,
   keyboard = () => ({ performed: true }),
   pointer = () => ({ performed: true, x: 1, y: 1 })
 } = {}) {
@@ -1502,6 +1524,7 @@ function editorToolset({
       inspections.push(next);
       return { windows: [{ MainWindowTitle: launched.title }], elements: next };
     },
+    focusedElement: async () => focused,
     listWindows: async () => [
       ...windows,
       ...(launchedYet
@@ -1611,6 +1634,38 @@ test("an empty document and a search box are never gated", async () => {
   });
   await browser.toolset.execute("launch", { application: "chrome" });
   assert.equal((await browser.toolset.execute("type", { text: "cats" })).ok, true);
+});
+
+test("a compact focused field is not blocked by an unrelated rendered Document", async () => {
+  const spotifyPage = [
+    { name: "Spotify", controlType: "ControlType.Pane", boundingRect: { x: 0, y: 0, width: 1200, height: 900 } },
+    {
+      name: "Spotify Free", controlType: "ControlType.Document", value: "Top result Songs Artists Play",
+      boundingRect: { x: 0, y: 80, width: 1200, height: 820 }
+    },
+    {
+      name: "What do you want to play?", controlType: "ControlType.Edit", value: "",
+      boundingRect: { x: 260, y: 30, width: 620, height: 42 }
+    }
+  ];
+  const spotify = editorToolset({
+    windows: [{ WindowHandle: 42 }],
+    launched: { WindowHandle: 42, title: "Spotify Free" },
+    elements: [spotifyPage],
+    focused: {
+      found: true,
+      name: "What do you want to play?",
+      publishesValue: false,
+      controlType: "ControlType.Edit",
+      boundingRect: { x: 260, y: 30, width: 620, height: 42 }
+    }
+  });
+  await spotify.toolset.execute("launch", { application: "spotify" });
+
+  const typed = await spotify.toolset.execute("type", { text: "Senorita" });
+
+  assert.equal(typed.ok, true, "the caret destination is the search field, not the page Document");
+  assert.equal(spotify.calls.filter((call) => call.name === "keyboard.type").length, 1);
 });
 
 // A REAL EDITOR MAY NOT SAY WHAT IS IN IT.
@@ -2095,4 +2150,55 @@ test("enter outside a messaging app is not put through any of that", async () =>
   // it says.
   assert.equal(result.text, "Pressed enter. Nothing here says what it did.");
   assert.equal(inspected, 0, "a newline in Notepad must not cost an accessibility read");
+});
+
+
+// A COMMA IS NOT A CONTROL.
+//
+// Applications publish their punctuation as separate accessibility nodes -- the
+// comma between two artist names, the bullet between "Song" and an album.
+// Every element here is marked source UIA on purpose: isReadingNoise gives UIA
+// a free pass (it was deleting the timestamps a send needs as evidence), so an
+// unmarked fixture is caught by the OLD OCR rule and this test would pass with
+// the new filter deleted -- which it did, until this line.
+//
+// Measured on one real Spotify reading, 29 Aug 2026: of ~130 listed elements,
+// TWELVE were a lone "," or "•". They cannot be clicked, cannot be told apart,
+// and nothing can ever be found by asking for them -- and the whole reading is
+// re-sent on every later step, so each is paid for again for the rest of the task.
+test("punctuation-only labels are left out of the reading", async () => {
+  const toolset = buildToolset({
+    registry: {
+      get: () => ({
+        execute: async () => ({
+          read: true, windowId: "9", application: "Spotify", title: "Spotify", visibleText: "",
+          elements: [
+            { source: "UIA", role: "dataitem", text: "We Don't Talk Anymore", bounds: { x: 600, y: 390, width: 300, height: 20 }, clickable: true },
+            { source: "UIA", role: "text", text: ",", bounds: { x: 681, y: 487, width: 4, height: 12 } },
+            { source: "UIA", role: "text", text: "•", bounds: { x: 511, y: 487, width: 4, height: 12 } },
+            { source: "UIA", role: "text", text: "•", bounds: { x: 134, y: 679, width: 4, height: 12 } },
+            // Survivors: these carry information even though they are short.
+            // NOT a bare clock face: BARE_TIMESTAMP already strips those on
+            // purpose, and asserting on one would be testing that older rule.
+            { source: "UIA", role: "text", text: "1080p", bounds: { x: 1060, y: 1226, width: 40, height: 14 } },
+            { source: "UIA", role: "text", text: "99+", bounds: { x: 512, y: 350, width: 30, height: 14 } },
+            // A one-character CONTROL is a real thing and must stay.
+            { source: "UIA", role: "button", text: "+", bounds: { x: 90, y: 293, width: 20, height: 20 }, clickable: true }
+          ]
+        })
+      })
+    },
+    adapter: {}
+  });
+
+  const reading = await toolset.execute("screen", { application: "Spotify", saw: "asked", say: "reading" });
+
+  assert.doesNotMatch(reading.text, /\|\s*text\s*","/, "a bare comma must not be listed");
+  assert.doesNotMatch(reading.text, /\|\s*text\s*"•"/, "a bare bullet must not be listed");
+  // The counter-cases matter more than the removal: dropping a real label would
+  // be a far worse bug than listing a comma.
+  assert.match(reading.text, /1080p/, "a short alphanumeric label is information");
+  assert.match(reading.text, /99\+/, "a badge count is information");
+  assert.match(reading.text, /"\+"/, "a one-character BUTTON is a real control");
+  assert.match(reading.text, /We Don't Talk Anymore/, "and the actual rows are untouched");
 });

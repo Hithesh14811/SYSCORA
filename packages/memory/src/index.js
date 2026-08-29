@@ -252,6 +252,19 @@ export class Memory {
     }
   }
 
+  async pruneBefore(cutoff, { vacuum = false } = {}) {
+    const iso = new Date(cutoff).toISOString();
+    await this.ensureSchema();
+    const db = new DatabaseSync(this.dbPath);
+    try {
+      const result = db.prepare("DELETE FROM memory_records WHERE datetime(updated_at) < datetime(?)").run(iso);
+      if (vacuum && result.changes > 0) db.exec("VACUUM");
+      return { removed: Number(result.changes), cutoff: iso, vacuumed: Boolean(vacuum && result.changes > 0) };
+    } finally {
+      db.close();
+    }
+  }
+
   async recordSuccessfulWorkflow(workflow, verified = true) {
     return this.store({
       id: `memory_${crypto.randomUUID()}`,
@@ -282,6 +295,73 @@ export class Memory {
       expiresAt: null,
       verifiedSuccess: false
     });
+  }
+
+  /**
+   * Learn a generalized local recovery without retaining the user's content.
+   * The stable id turns repeated observations into evidence counts rather than
+   * thousands of one-off memories. Only tool/app/failure taxonomy and tool
+   * names in the recovery are stored; queries, messages and file names never
+   * enter this record.
+   */
+  async recordAdaptivePattern({ tool, application = "general", failureClass, recoverySequence = [], recovered = false }) {
+    const clean = (value, fallback) => String(value ?? "").toLowerCase()
+      .replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || fallback;
+    const normalized = {
+      tool: clean(tool, "unknown-tool"),
+      application: clean(application, "general"),
+      failureClass: clean(failureClass, "tool-failed"),
+      recoverySequence: [...new Set((recoverySequence ?? []).map((item) => clean(item, "")).filter(Boolean))].slice(0, 6)
+    };
+    const key = JSON.stringify(normalized);
+    const id = `adaptive_${crypto.createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
+    await this.ensureSchema();
+    const db = new DatabaseSync(this.dbPath);
+    let prior = null;
+    try {
+      prior = db.prepare("SELECT content, created_at FROM memory_records WHERE id = ?").get(id) ?? null;
+    } finally {
+      db.close();
+    }
+    let counts = { observations: 0, recoveries: 0, unresolved: 0 };
+    try { counts = { ...counts, ...(JSON.parse(prior?.content ?? "{}")?.counts ?? {}) }; } catch { /* start clean */ }
+    counts.observations += 1;
+    if (recovered) counts.recoveries += 1;
+    else counts.unresolved += 1;
+    const confidence = Math.min(0.98, 0.45 + counts.observations * 0.08 + (counts.recoveries / counts.observations) * 0.25);
+    const recovery = normalized.recoverySequence.length ? normalized.recoverySequence.join(" -> ") : "none verified";
+    return this.store({
+      id,
+      type: "FAILURE_PATTERN",
+      content: { ...normalized, counts },
+      summary: `${normalized.application}: ${normalized.tool} / ${normalized.failureClass}; recovery ${recovery}`,
+      provenance: "outcome_learning",
+      confidence,
+      sensitivity: "LOW",
+      createdAt: prior?.created_at ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      expiresAt: null,
+      relatedEntities: [],
+      verifiedSuccess: recovered
+    });
+  }
+
+  async retrieveAdaptiveGuidance(rawText, maxResults = 4) {
+    const requestTokens = new Set(String(rawText ?? "").toLowerCase().match(/[a-z0-9]+/g) ?? []);
+    const records = (await this.list({ type: "FAILURE_PATTERN" }))
+      .filter((record) => record.provenance === "outcome_learning")
+      .map((record) => {
+        const content = record.content ?? {};
+        const contextTokens = `${content.application ?? ""} ${content.tool ?? ""}`.split(/[^a-z0-9]+/).filter(Boolean);
+        const relevance = contextTokens.filter((token) => requestTokens.has(token)).length;
+        const counts = content.counts ?? {};
+        const evidence = Number(counts.recoveries ?? 0) + Number(counts.unresolved ?? 0);
+        return { ...record, relevance, evidence };
+      })
+      .filter((record) => record.relevance > 0)
+      .sort((left, right) => right.relevance - left.relevance || right.evidence - left.evidence ||
+        new Date(right.updatedAt) - new Date(left.updatedAt));
+    return records.slice(0, Math.max(0, Math.min(10, Number(maxResults) || 4)));
   }
 
   async storeWorkingMemory(sessionId, key, value, expiresAt = null) {

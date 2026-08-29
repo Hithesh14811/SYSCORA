@@ -22,6 +22,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isCanonicalPathInside } from "../../shared-types/src/canonical-path.js";
 import {
   classifyShellCommand,
   requiresClickConfirmation,
@@ -50,10 +51,14 @@ import { DOCUMENT_FORMATS, makeDocument } from "./make-document.js";
 import { createProgressReader, reportsProgress } from "./command-progress.js";
 // Searching the web without driving a browser. See web-search.js: a search is a
 // LIST, and a list is one HTTP round trip rather than six page loads.
-import { renderResults, searchWeb } from "./web-search.js";
+import { MAX_BATCH_QUERIES, renderBatch, searchMany } from "./web-search.js";
 // And READING one without driving a browser either — the same argument one step
 // on. See web-page.js: the browser is kept for the pages that genuinely need it.
 import { fetchPage } from "./web-page.js";
+// Scoring a page's own lines against the question it was opened for. Written for
+// exactly this and then left unwired for six days; see the `find` argument on
+// web_open, which is what finally calls it.
+import { bestPassages, inverseFrequencies, queryTerms, relevanceOf } from "./search-rank.js";
 // And reading a REPOSITORY without cloning it. See github.js: the API is JSON,
 // which web-page.js refuses by design, and the HTML page is 583 KB of furniture.
 import { MAX_FILE_CHARS, parseRepoReference, readFile, readReadme, readRepository, readTree } from "./github.js";
@@ -103,6 +108,53 @@ const NETWORK_TOOLS = new Set([
   "search", "web_open", "web_read", "web_click", "web_type", "web_scroll",
   "open_url", "github"
 ]);
+
+// EVERY SHAPE A MODEL WRITES A LIST IN.
+//
+// `search` and `web_open` both take one-or-many, and a schema saying so is not
+// enough — the same model that is given `queries: string[]` will send a single
+// string, a JSON-encoded array as a string, or both fields at once. Each of
+// those was a thrown error and a wasted step until this existed, and a step is
+// the expensive unit here (see the batching note in web-search.js).
+//
+// Accepting the shape and getting on with it is right precisely BECAUSE it is
+// unambiguous: there is exactly one sensible reading of each of these, so
+// refusing them buys nothing and costs a round trip.
+const asList = (...candidates) => {
+  const out = [];
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    if (Array.isArray(candidate)) {
+      out.push(...candidate.map((entry) => String(entry ?? "").trim()));
+      continue;
+    }
+    const text = String(candidate).trim();
+    if (!text) continue;
+    // A model that has been told the field is an array sometimes sends the array
+    // as text. `["a","b"]` is not a query and never will be.
+    if (/^\[[\s\S]*\]$/.test(text)) {
+      try {
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) {
+          out.push(...parsed.map((entry) => String(entry ?? "").trim()));
+          continue;
+        }
+      } catch { /* not JSON after all; treat it as the literal string */ }
+    }
+    out.push(text);
+  }
+  // Order preserved, blanks and repeats dropped: the caller numbers these and a
+  // duplicate would be two numbers for one thing.
+  return [...new Set(out.filter(Boolean))];
+};
+
+const asQueryList = (args) => asList(args?.queries, args?.query);
+
+// Pages, unlike searches, are fetched from unrelated hosts and nobody is
+// counting — so this is a cap on how much can go wrong in one call rather than a
+// rate limit. Six is about where the slowest page in a batch stops being hidden
+// by the others.
+const MAX_BATCH_PAGES = 6;
 const FILE_WRITE_TOOLS = new Set(["write_file", "create_document", "edit_file"]);
 
 // NEVER CUT AN EMOJI IN HALF.
@@ -246,6 +298,21 @@ function renderElements(elements, table) {
       y: Math.round(bounds.y + bounds.height / 2)
     };
     if (!text && element.clickable !== true) continue;
+    // A COMMA IS NOT A CONTROL.
+    //
+    // Applications publish their punctuation as separate accessibility nodes —
+    // the comma between two artist names, the bullet between "Song" and an
+    // album. Measured on one real Spotify reading, 29 Aug 2026: of ~130 listed
+    // elements, TWELVE were a lone "," or "•". They cannot be clicked, they
+    // cannot be told apart from each other, and nothing can ever be found by
+    // asking for them — and the whole reading is re-sent on every later step, so
+    // each one is paid for again and again for the rest of the task.
+    //
+    // Dropped only when NOT clickable, because a one-character button is a real
+    // thing (a "+" or a "×" on a chip), and only when there is not a single
+    // letter or digit in it — so "3:37", "99+" and "x2" all survive. A label
+    // made entirely of separators is the only thing this removes.
+    if (element.clickable !== true && text && !/[\p{L}\p{N}]/u.test(text)) continue;
     // SCROLLED OUT OF SIGHT IS NOT ON SCREEN.
     //
     // A WhatsApp reading listed `group "You:" @1564,-788` and seven more like it
@@ -900,7 +967,12 @@ export function buildToolset({
   // reach the real internet — one of them opens `https://example.com/`, which
   // exists — and a suite that quietly depends on a network is a suite that fails
   // on an aeroplane and passes on review.
-  readPageOverHttp = fetchPage
+  readPageOverHttp = fetchPage,
+  // The same seam, for the same reason, on the other half of the web path.
+  // `search` fans out to three indexes per query and a batch multiplies that by
+  // eight, so a suite without this both depends on a network and spends somebody
+  // else's rate limit every time it runs.
+  searchTheWeb = searchMany
 } = {}) {
   // What the last look at the screen found, so a click can name an element
   // rather than a coordinate. Reset by every fresh observation.
@@ -978,13 +1050,13 @@ export function buildToolset({
     // Changed per request without rebuilding the toolset. Rebuilding would
     // discard the current window, working directory and undo journal and make a
     // safety switch noticeably slow.
-    // A toolset constructed directly is an internal/developer API and keeps its
-    // historical surface. Product requests always call setAccessPolicy before
-    // the model sees definitions, where terminal access defaults off.
+    // Internal APIs must be at least as safe as the product surface. A missed
+    // setAccessPolicy call must hide arbitrary shell rather than exposing the
+    // signed-in Windows account.
     accessPolicy: normalizeAccessPolicy({
       approvalMode: ApprovalMode.BALANCED,
-      developerMode: true,
-      shellExecutionMode: ShellExecutionMode.HOST
+      developerMode: false,
+      shellExecutionMode: ShellExecutionMode.NONE
     }),
     approvedThisTurn: new Set(),
     // The last thing typed, so a send confirmation can show it.
@@ -1010,9 +1082,32 @@ export function buildToolset({
     // themselves is theirs, however many times it also appears on screen.
     userRequest: "",
     // Android adds six schemas to the model request. Keep them out of ordinary
-    // desktop turns entirely; once a phone task activates them they remain
-    // available for natural follow-ups such as "now send it".
+    // desktop turns entirely.
+    //
+    // RECOMPUTED EVERY TURN. It used to be a one-way switch — set true here and
+    // assigned `false` in exactly zero places in the file — on a toolset that is
+    // built ONCE PER PROCESS and shared by every chat. So one request months ago
+    // containing the word "device" left six Android tools in the schema of every
+    // request afterwards, in every conversation, until the daemon restarted.
+    //
+    // Measured live, 28 Aug 2026, on "search 10 internships … and send them to
+    // amma on whatsapp" — a request with no phone in it at all. The chat list
+    // above it held "can you see my device?" and "can you control my phone?".
+    // The agent opened with `android_devices list`, then `wait` (20.0s), then
+    // `refresh` (22.4s): three tool calls and 42 seconds of a desktop task spent
+    // looking for a phone nobody mentioned. And it was not being stupid — it had
+    // been handed six Android tools and a system-prompt paragraph telling it how
+    // to use them, so checking was the reasonable reading of its own toolbox.
     androidActive: false,
+    // A DEVICE WAS ACTUALLY THERE, which is a different claim from someone
+    // having said the word "phone".
+    //
+    // This is what makes the follow-up case work without the leak: after a real
+    // phone task, "now send it" still finds the tools, because a device was
+    // SEEN. A request that merely mentioned a device and found none turns
+    // nothing on for the next conversation. Evidence, not intent — the same rule
+    // the whole tool layer runs on.
+    androidProven: false,
     // Per-device hierarchy identity. Android UI reads use this to return a
     // compact delta on unchanged screens instead of feeding the same hundred
     // controls back into every model turn.
@@ -1038,11 +1133,9 @@ export function buildToolset({
   // installing, writing, launching, clicking, typing, changing settings they
   // asked to change — is untouched and just as fast.
   //
-  // With no confirmer wired, the surface has no way to ask, and a gate that
-  // cannot ask must not refuse: it proceeds, exactly as it did before. Every
-  // surface a person is actually watching wires one.
+  // Missing approval UI is a broken safety channel, not consent. Fail closed.
   const askPermission = async (request) => {
-    if (typeof state.confirm !== "function") return { approved: true, asked: false };
+    if (typeof state.confirm !== "function") return { approved: false, asked: false };
     try {
       const approved = await state.confirm(request);
       return { approved: approved === true, asked: true };
@@ -1053,14 +1146,7 @@ export function buildToolset({
   };
 
   const isWithinRoot = (candidate, root) => {
-    try {
-      const resolvedCandidate = path.resolve(String(candidate));
-      const resolvedRoot = path.resolve(String(root));
-      const relative = path.relative(resolvedRoot, resolvedCandidate);
-      return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-    } catch {
-      return false;
-    }
+    return isCanonicalPathInside(candidate, root, { allowMissingCandidate: true });
   };
 
   const externalWriteTarget = (name, args) => {
@@ -1582,6 +1668,8 @@ export function buildToolset({
           return {
             name: String(focused.name ?? "").trim() || null,
             value: focused.publishesValue === false || focused.value == null ? null : String(focused.value),
+            controlType: String(focused.controlType ?? focused.role ?? "").trim() || null,
+            boundingRect: rect,
             // Where to click to give it the caret back. See the type retry.
             center: rect && rect.width > 0 && rect.height > 0
               ? { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }
@@ -1593,7 +1681,7 @@ export function buildToolset({
       }
     }
     const value = await focusedValueByWalking();
-    return { name: null, value, center: null };
+    return { name: null, value, controlType: null, boundingRect: null, center: null };
   };
 
   const focusedValue = async () => (await focusedControl()).value;
@@ -1875,6 +1963,23 @@ export function buildToolset({
     if (intent) { state.ownedWindows.add(key); return; }
     if (state.emptySurfaces.has(key) || state.ownedWindows.has(key)) return;
 
+    // The window may contain a large rendered Document while the caret is in a
+    // small search, login or message field. Spotify is one such Chromium app:
+    // treating the page's 39 characters as an unsaved file blocked the search
+    // box three times. Protect the actual input destination, not unrelated page
+    // text. A large Edit or a Document control still goes through the guard.
+    const focused = await focusedControl();
+    const focusedBounds = focused?.boundingRect;
+    const focusedRole = String(focused?.controlType ?? "");
+    const compactFocusedEdit = /(^|\.)Edit$/i.test(focusedRole) && focusedBounds &&
+      Number(focusedBounds.width) > 0 && Number(focusedBounds.height) > 0 &&
+      Number(focusedBounds.height) <= 160 &&
+      Number(focusedBounds.width) >= Number(focusedBounds.height) * 1.5;
+    // This exemption belongs only to the control that is focused right now.
+    // Do not mark the whole window as owned: a later action in the same turn
+    // may focus a real editor/document and must be checked again.
+    if (compactFocusedEdit) return;
+
     // A look at the screen that has just happened already answered this. Paying
     // for a second accessibility read a second later is the kind of tax that
     // turns "type a line" into three seconds, and the reading is the same one.
@@ -2064,14 +2169,33 @@ export function buildToolset({
       };
       const tied = ranked.filter((entry) => entry.score === ranked[0].score);
       if (tied.length > 1) {
+        // GIVE IT THE CALL, NOT THE INSTRUCTION.
+        //
+        // This used to end "Pick the one you mean by its index" — which names
+        // the fix and leaves the caller to compose it. Measured live, 28 Aug
+        // 2026, on Spotify: `click {text:"Play"}` was refused for ambiguity and
+        // the model answered with the IDENTICAL call, twice, before finding its
+        // way. Three attempts and two screen reads for one button.
+        //
+        // A refusal that carries the exact arguments to copy cannot be misread
+        // the way a sentence can. The row context is what decides WHICH, so it
+        // stays beside each one.
         const options = tied
-          .map((entry) => `  ${entry.index}| ${entry.element.role ?? ""} "${entry.element.text}" @${entry.element.center.x},${entry.element.center.y}${rowContext(entry.element)}`)
+          .map((entry) => {
+            const near = rowContext(entry.element);
+            // The coordinates stay. They are how a reader of the transcript can
+            // tell two identically-labelled rows apart afterwards, and a test
+            // asserts on them for exactly that reason.
+            return `  click {element: ${entry.index}}   → ${entry.element.role ?? ""} `
+              + `"${entry.element.text}" @${entry.element.center.x},${entry.element.center.y}${near}`;
+          })
           .join("\n");
         throw new Error(
-          `"${wanted}" matches ${tied.length} things on screen, and they are not the same thing:\n${options}\n` +
-          "Pick the one you mean by its index. If what is beside it tells you which row you want, prefer that " +
-          "row's own action — a Play or Open control acts, whereas a title is often just text and clicking it " +
-          "does nothing."
+          `"${wanted}" matches ${tied.length} things on screen, and they are not the same thing. ` +
+          `Call ONE of these exactly:\n${options}\n` +
+          "Do not send the same call again — it will be refused the same way. If what is beside a row tells " +
+          "you it is the one you want, prefer that row's own action: a Play or Open control acts, whereas a " +
+          "title is often just text and clicking it does nothing."
         );
       }
       const { element } = ranked[0];
@@ -2284,6 +2408,108 @@ export function buildToolset({
     return pending.url;
   };
 
+  // DRIVING A SEARCH ENGINE IS WHAT `search` IS FOR.
+  //
+  // Observed live on 23 Aug 2026: handed a lookup, the model called `search`,
+  // disliked the results, and then opened google.com/search?q=… in the
+  // controlled browser — which answered with "our systems have detected unusual
+  // traffic", so it tried duckduckgo.com/?q=… , which was blocked too. Three
+  // navigations and eight seconds to arrive back where it started, and every one
+  // of them looked to the user like the product failing to search.
+  //
+  // The lesson goes in the RESULT rather than in the tool description, where it
+  // is read at the moment it matters and costs nothing the rest of the time.
+  // Thrown, not returned, because there is no page here to report and a sentence
+  // about what to do instead is the whole content.
+  //
+  // The path is pinned to a SEARCH path — `/search`, `/html/`, `/lite/` or the
+  // bare root — rather than to the domain. Matching the domain alone would
+  // refuse google.com/maps?q=… and news.google.com/rss/search as well, which are
+  // ordinary pages this tool is exactly right for.
+  const refuseSearchEngine = (url) => {
+    const engine = /^https?:\/\/(?:[a-z0-9-]+\.)*(google|bing|duckduckgo|yahoo|baidu|yandex|ecosia|brave)\.[a-z.]+\/(?:search|html\/?|lite\/?)?(?:[?#]|$)/i.exec(url);
+    if (!engine || !/[?&](q|query|p|wd|text)=/i.test(url)) return;
+    const terms = decodeURIComponent(/[?&](?:q|query|p|wd|text)=([^&]*)/i.exec(url)?.[1] ?? "").replace(/\+/g, " ");
+    throw new Error(
+      `Do not drive ${engine[1]} through the browser — it blocks automated browsers and this will keep failing. ` +
+      `Call the search tool instead: search({ queries: [${JSON.stringify(terms)}] }). ` +
+      "It takes several questions at once and returns titles, URLs and snippets for all of them in one step, " +
+      "then use web_open on the results you want to read."
+    );
+  };
+
+  // READING THE PART OF A PAGE THAT ANSWERS THE QUESTION.
+  //
+  // `bestPassages` was written on 23 Aug 2026 for exactly this, with a comment
+  // explaining that a price comparison had cost five tool calls and 59,980
+  // tokens because each page arrived as 15,000 tokens of navigation wrapped
+  // around two sentences. It was then never called by anything. Six days later
+  // the same shape cost a request for fifteen internships its whole budget.
+  //
+  // WHAT A PAGE IS FOR DECIDES WHAT TO SEND. Opened blind, a page is 2,500
+  // characters from the top plus sixty links in document order — which on
+  // amazon.jobs is the cookie notice, the country picker and the footer, and on
+  // any careers site puts the one link that matters somewhere past thirty.
+  // Opened WITH a question, the same page is four lines that mention it and the
+  // dozen links whose labels or addresses do.
+  //
+  // Scored with the page's own lines as the corpus, so a word on every line
+  // counts for nothing and the rare one carries the passage — the same local-IDF
+  // argument as search-rank.js, applied inside one document instead of across a
+  // result set.
+  const focusPage = (fetched, find) => {
+    const terms = queryTerms(find);
+    if (terms.length === 0) return null;
+    const lines = String(fetched.text ?? "").split("\n").filter((line) => line.trim().length > 0);
+    const idf = inverseFrequencies(terms, lines.map((line) => line.toLowerCase()));
+    const passages = bestPassages(fetched.text, terms, idf, { count: 4, chars: 320 });
+    const links = (fetched.links ?? [])
+      .map((link) => ({ ...link, relevance: relevanceOf({ title: link.label, url: link.href }, terms, idf) }))
+      .filter((link) => link.relevance > 0)
+      .sort((left, right) => right.relevance - left.relevance)
+      .slice(0, 12);
+    return { terms, passages, links };
+  };
+
+  // NOTHING MATCHED IS A FINDING, NOT AN EMPTY RESULT.
+  //
+  // A focused read that quietly returns nothing looks identical to a page that
+  // failed to load, and the recovery is opposite: one means look somewhere else,
+  // the other means look again. So a page that does not mention what was asked
+  // for says so and hands back its opening anyway — the model can still see what
+  // it landed on, which is usually how it works out that the URL was wrong.
+  const renderFocusedPage = (fetched, find, focus) => {
+    const head = `Page: ${fetched.title ? `"${fetched.title}" — ` : ""}${fetched.url}`;
+    const nothing = focus.passages.length === 0 && focus.links.length === 0;
+    if (nothing) {
+      return [
+        head,
+        `Nothing on this page mentions ${JSON.stringify(find)} — searched all ` +
+          `${String(fetched.text ?? "").length.toLocaleString()} characters of it. The opening, so you can see ` +
+          "what this page actually is:",
+        clip(String(fetched.text ?? ""), 600),
+        "If this is the wrong page, that is what the text above will tell you. Call web_open without `find` to " +
+          "read the whole thing, or search for a better URL."
+      ].filter(Boolean).join("\n\n");
+    }
+    return [
+      head,
+      `Searched all ${String(fetched.text ?? "").length.toLocaleString()} characters for ${JSON.stringify(find)}.`,
+      // A WEB PAGE IS THE LEAST TRUSTWORTHY THING THIS AGENT READS — the same
+      // boundary a full reading gets, applied to the part that was selected.
+      screenObservedContent(
+        [...focus.passages, ...focus.links.map((link) => link.label)].join("\n"),
+        `the page ${fetched.url}`
+      ),
+      focus.passages.length ? `What it says about that:\n${focus.passages.map((line) => `  ${line}`).join("\n")}` : null,
+      focus.links.length
+        ? `Links that match:\n${focus.links.map((link) => `  ${link.label}\n    ${link.href}`).join("\n")}`
+        : "No link on the page matches those words.",
+      // The whole text is held, so this is a promise the next call can keep.
+      "Call web_open again on this URL without `find` if you need the rest of the page."
+    ].filter(Boolean).join("\n\n");
+  };
+
   const renderWebPage = (page) => {
     const state = page?.state ?? {};
     if (!state.url) return "The controlled browser has no page open. Call web_open with a URL.";
@@ -2476,6 +2702,15 @@ export function buildToolset({
                   : args.operation === "apps" ? await runCapability("android.app.list", { serial: args.serial, includeSystem: args.includeSystem, query: args.query })
                     : args.operation === "install" ? await runCapability("android.app.install", { serial: args.serial, apkPath: args.apkPath, replace: args.replace })
                       : await runCapability("android.device.dismissKeyguard", { serial: args.serial });
+        // A PHONE WAS ACTUALLY THERE. See androidProven: this is the only thing
+        // that keeps the Android tools available into a later turn, so that
+        // "now send it" works after a real phone task while a fruitless look for
+        // a device that does not exist leaves nothing behind. Keyed on the
+        // count the adapter reports, and cleared by a list that comes back
+        // empty — a phone that has been unplugged is not still connected.
+        if (Array.isArray(result?.devices)) {
+          state.androidProven = result.devices.some((device) => device?.state !== "offline");
+        }
         return { ...result, operation: args.operation, evidence: androidEvidence(`Android ${args.operation} returned device-scoped state`) };
       },
       failed: (result) => result.performed === false || result.connected === false || result.paired === false || result.installed === false,
@@ -3359,6 +3594,15 @@ export function buildToolset({
             : summarizeWorkspace(result.elements ?? [], String(result.title ?? ""))
         };
         const lines = renderElements(result.elements ?? [], state.elements);
+        const screenText = [result.visibleText ?? "", ...lines].join("\n");
+        const recipientMismatch = /\bmessage yourself\b/i.test(screenText) &&
+          /\b(?:send|share|message|forward)\b/i.test(state.userRequest) &&
+          !/\b(?:myself|to me|message me|send me|my own|self[- ]?chat|yourself)\b/i.test(state.userRequest)
+          ? "RECIPIENT SAFETY: This is the application's Message yourself conversation, but the user " +
+            "asked for someone else. Do not send here, do not search guessed variants, and do not keep " +
+            "deliberating. Ask one direct question: whether they meant this self-chat or a different contact, " +
+            "then end the turn."
+          : null;
 
         // THE SAME HUNDRED AND TWENTY LINES, AGAIN.
         //
@@ -3476,6 +3720,7 @@ export function buildToolset({
 
         return reported(result, [
           `Window: ${result.application ?? "?"} — ${result.title ?? "?"} (windowId ${result.windowId})`,
+          recipientMismatch,
           // FIRST, above everything, because it changes how the rest is read.
           // The text on screen is other people's words — a chat, a page, a
           // document — and this is where the agent finds out whether some of it
@@ -3577,7 +3822,26 @@ export function buildToolset({
         },
         required: []
       },
-      preview: (args) => (args.text ? `"${args.text}"` : args.element != null ? `element ${args.element}` : `(${args.x}, ${args.y})`),
+      // THE TRANSCRIPT HAS TO SAY WHAT WAS ACTUALLY CALLED.
+      //
+      // This printed `args.text` and nothing else, so `click {text:"Play"}` and
+      // `click {text:"Play", near:"Peaches…"}` were the SAME LINE on screen.
+      // Reading a live transcript on 28 Aug 2026 it was impossible to tell
+      // whether a repeated-looking click had in fact been disambiguated — which
+      // decides whether the defect is the model ignoring an error or `near`
+      // failing to separate two rows. Two different bugs, one indistinguishable
+      // line, and no way to tell them apart after the fact.
+      preview: (args) => {
+        const base = args.text ? `"${args.text}"`
+          : args.element != null ? `element ${args.element}`
+            : `(${args.x}, ${args.y})`;
+        const qualifiers = [
+          args.near ? `near "${String(args.near).slice(0, 40)}"` : null,
+          args.role ? `role ${args.role}` : null,
+          args.button === "right" ? "right-click" : null
+        ].filter(Boolean);
+        return qualifiers.length ? `${base} (${qualifiers.join(", ")})` : base;
+      },
       acts: true,
       execute: async (args) => {
         const target = resolveTarget(args);
@@ -3779,6 +4043,34 @@ export function buildToolset({
       failed: (result) => result.performed === false
         || (result.landed === false && result.retried === true && !String(result.holds ?? "").trim()),
       execute: async (args) => {
+        // TYPING NOTHING IS NOT AN ACTION, AND IT WAS BEING USED AS ONE.
+        //
+        // Measured live, 28 Aug 2026: mid-way through deciding which of two
+        // playlists the user meant, the model called `type {text: ""}` — it had
+        // talked itself into "asking the user" and reached for a tool to do it.
+        // `documentGate` happened to refuse the call, but for an unrelated
+        // reason ("there is already work in this document"), so the model was
+        // told something true and useless about Spotify's window instead of the
+        // thing it actually did wrong.
+        //
+        // Refused here, ahead of every other check, and the refusal says what to
+        // do instead — asking is a REPLY, not a tool call. A lesson in the
+        // result costs nothing on the runs that never hit it.
+        if (String(args.text ?? "") === "") {
+          return {
+            // `performed: false` is what this tool's own `failed` predicate
+            // reads. Without it the refusal renders correctly and the RESULT is
+            // still reported as ok, which is precisely the shape of false
+            // success the evidence layer exists to prevent.
+            performed: false,
+            typed: false,
+            reason: "empty-text",
+            evidence: evidence({
+              observed: "the call carried no text to type, so nothing was sent to any control",
+              method: "toolset.arguments", actedVia: null, verdict: REFUTED
+            })
+          };
+        }
         await documentGate(args);
         if (args.into != null || args.element != null) {
           // `into` names the field; `text` is what to type into it, so the
@@ -3882,6 +4174,14 @@ export function buildToolset({
         };
       },
       render: (result) => {
+        // See the empty-text refusal in execute. The message is the correction,
+        // not the complaint.
+        if (result.reason === "empty-text") {
+          return refuted(result,
+            "There was no text to type, so nothing happened. If you were trying to ASK the user something, "
+            + "that is not a tool call — write the question as your reply and end the turn. If you meant to "
+            + "type something, call type again with the text.");
+        }
         if (result.performed === false) return refuted(result, `Typing did not complete: ${result.reason ?? "unknown"}`);
         // TEXT YOU CANNOT READ BACK IS NOT TEXT THAT FAILED.
         //
@@ -5826,6 +6126,33 @@ export function buildToolset({
         const playback = result?.playback ?? {};
         const nowPlaying = playback.nowPlaying ?? playback.title ?? result?.title ?? "";
         const right = playback.playing === true && matchesTrackQuery(nowPlaying, args.query);
+        // "THE WINDOW IS OPEN — READ THE SCREEN" WAS TRUE, AND POINTED SOMEWHERE
+        // ELSE.
+        //
+        // This tool opened and drove Spotify's window and never recorded it as
+        // the working window, which is what `screen` reads with no argument. So
+        // its own failure message sent the model to read whatever had been in
+        // front before — and the model did exactly as it was told.
+        //
+        // Measured live, 28 Aug 2026, twice in one session: `play_music` failed,
+        // the next `screen` returned "Window: WhatsApp.Root — WhatsApp", and the
+        // agent spent two further steps working out that it was looking at the
+        // wrong application and re-launching Spotify. Every failed play cost
+        // those two steps, and this tool fails often enough to matter — the
+        // `spotify:` URI hand-off is fire-and-forget and cannot report what
+        // actually started.
+        //
+        // Set on SUCCESS too: after a track starts, "skip it" or "add it to a
+        // playlist" is an ordinary follow-up and it should not have to hunt for
+        // the window either.
+        const spotifyWindow = playback.window?.WindowHandle ?? result?.window?.WindowHandle ?? null;
+        if (spotifyWindow) {
+          state.lastWindow = {
+            windowId: String(spotifyWindow),
+            application: "spotify",
+            title: String(nowPlaying || "Spotify")
+          };
+        }
         return {
           ...result,
           requested: args.query,
@@ -5940,62 +6267,112 @@ export function buildToolset({
     //
     // The description names WHEN NOT TO USE IT, because the choice between this
     // and the browser is real and the model has to make it every time.
+    // SEVERAL QUESTIONS ARE ONE CALL.
+    //
+    // See the batching note in web-search.js for the measurement. Short version:
+    // prefix caching on this endpoint is quantised into 8,192-token blocks, so a
+    // step costs roughly 4,000 billed tokens before it looks at anything, while
+    // a search result set costs about 700. Asking twenty independent questions
+    // one at a time spends 140,000 tokens on the ASKING and 14,000 on the
+    // answers — which is exactly how a request for fifteen internships hit its
+    // ceiling with nothing to show.
+    //
+    // `queries` is therefore the normal way to call this, and the description
+    // says so in its first sentence rather than leaving it as an option to be
+    // discovered.
     {
       name: "search",
       description:
-        "Search the web and get back a list of titles, URLs and snippets in one step. Use this FIRST for " +
-        "any lookup, question of fact, or finding pages worth reading. Use web_open instead when you must " +
-        "be ON a page — signing in, clicking, filling a form, or reading one page in full.",
+        "Search the web. Pass ALL the questions you have right now as `queries` — they run at once for the " +
+        "price of one step, and asking them one at a time is the most expensive mistake you can make here. " +
+        "Returns titles, URLs and snippets. Use this FIRST for any lookup. Use web_open when you must be ON " +
+        "a page — signing in, clicking, filling a form, or reading one in full.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "What to search for, as you would type it" },
-          limit: { type: "number", description: "How many results, 1-15. Default 8." }
+          queries: {
+            type: "array",
+            items: { type: "string" },
+            description: `Up to ${MAX_BATCH_QUERIES} independent searches, run in parallel. Prefer this.`
+          },
+          query: { type: "string", description: "A single search, when you genuinely only have one" },
+          limit: { type: "number", description: "Results per query, 1-15. Default 8." }
         },
-        required: ["query"]
+        required: []
       },
-      preview: (args) => args.query,
+      preview: (args) => {
+        const queries = asQueryList(args);
+        return queries.length > 1 ? `${queries.length} queries: ${queries.join(" · ").slice(0, 90)}` : (queries[0] ?? "");
+      },
       acts: false,
       execute: async (args) => {
+        const queries = asQueryList(args);
+        if (queries.length === 0) throw new Error("search needs a query, or a `queries` array of them.");
+        // REFUSED WITH THE FIX IN IT, rather than silently truncated. A batch cut
+        // to eight without saying so loses questions the model believes it asked,
+        // and it would then report on results it never got — which is the
+        // false-success shape this whole codebase is built to prevent.
+        if (queries.length > MAX_BATCH_QUERIES) {
+          throw new Error(
+            `${queries.length} queries is too many for one batch — the search engines start refusing at that ` +
+            `rate and the good ones drop out first. Send at most ${MAX_BATCH_QUERIES}, then send the rest.`
+          );
+        }
         const limit = Math.max(1, Math.min(15, Number(args.limit) || 8));
-        const found = await searchWeb(String(args.query ?? ""), { limit });
+        const found = await searchTheWeb(queries, { limit });
+        const answered = found.filter((one) => one.ok);
         // Results are somebody else's words. An instruction inside a search
         // snippet is content, not a command — same boundary as a page, a chat or
-        // a document. See content-boundary.js.
-        const injected = found.ok
+        // a document. See content-boundary.js. Screened across the WHOLE batch,
+        // because the boundary is about what was read and not about how many
+        // calls it arrived in.
+        const injected = answered.length > 0
           ? screenObservedContent(
-              found.results.map((result) => `${result.title} ${result.snippet}`).join("\n"),
-              `web search for "${found.query}"`
+              answered.flatMap((one) => one.results.map((result) => `${result.title} ${result.snippet}`)).join("\n"),
+              queries.length === 1 ? `web search for "${queries[0]}"` : `${queries.length} web searches`
             )
           : null;
+        const total = answered.reduce((count, one) => count + one.results.length, 0);
         return {
-          ...found,
+          batch: found,
+          queries,
+          ok: answered.length > 0,
+          // Kept for the single-query shape everything downstream already reads:
+          // one query in, one query's fields out, exactly as before.
+          ...(found.length === 1 ? found[0] : {}),
           injected,
           evidence: evidence({
-            observed: found.ok
+            observed: answered.length > 0
               // A REMEMBERED ANSWER SAYS SO. Search results are cached for ten
               // minutes so a burst of related queries does not get the good
               // indexes rate-limited — see web-search.js. But a ten-minute-old
               // price or score is still an old one, and a receipt that reports a
               // cached answer as a fresh observation is a receipt claiming
               // something was looked at when it was not.
-              ? `${found.results.length} results for ${JSON.stringify(found.query)} from ${found.provider}` +
-                (found.cached ? " (cached within the last ten minutes)" : "")
-              : `no results for ${JSON.stringify(found.query)}: ${found.reason}`,
+              ? `${total} results across ${answered.length} of ${found.length} ` +
+                `${found.length === 1 ? "query" : "queries"} ` +
+                `(${[...new Set(answered.flatMap((one) => String(one.provider).split("+")))].join("+")})` +
+                (answered.every((one) => one.cached) ? " (cached within the last ten minutes)" : "")
+              : `no results for ${found.map((one) => JSON.stringify(one.query)).join(", ")}: ` +
+                `${found.map((one) => one.reason).filter(Boolean).join("; ")}`,
             method: "web.search",
-            verdict: found.ok ? CONFIRMED : REFUTED
+            verdict: answered.length > 0 ? CONFIRMED : REFUTED
           })
         };
       },
       failed: (result) => result.ok === false,
       render: (result) => {
+        const batch = result.batch ?? [];
         if (!result.ok) {
           // The recovery depends on WHY, so the two cases say different things.
           // Being rate-limited and finding nothing lead opposite ways: one means
           // stop searching and open a page, the other means search differently.
-          const rateLimited = /rate-limiting|declined the request/.test(result.reason ?? "");
+          const reasons = batch.map((one) => one.reason).filter(Boolean).join("; ");
+          const rateLimited = /rate-limiting|declined the request/.test(reasons);
           return refuted(result, [
-            `The search for "${result.query}" returned nothing: ${result.reason}.`,
+            batch.length === 1
+              ? `The search for "${batch[0].query}" returned nothing: ${reasons}.`
+              : `None of the ${batch.length} searches returned anything: ${reasons}.`,
             rateLimited
               ? "The search engines are refusing requests from this machine right now, so searching again will " +
                 "not help. Use web_open on a site you already know, or the desktop browser."
@@ -6003,7 +6380,7 @@ export function buildToolset({
           ].join(" "));
         }
         return confirmed(result, [
-          renderResults(result),
+          renderBatch(batch),
           result.injected ? `\n\n${result.injected}` : ""
         ].join(""));
       }
@@ -6011,55 +6388,91 @@ export function buildToolset({
     {
       name: "web_open",
       description:
-        "Open a URL in a controlled browser and read the page back as text and links — far faster and more " +
-        "exact than reading a browser window on screen. Use it for looking things up, reading and " +
-        "research. It is a SEPARATE browser signed in to NOTHING: for the user's own accounts, use " +
-        "launch/open_url and the desktop tools.",
+        "Read web pages. Pass several `urls` to read them all in one step, and `find` to get back only the " +
+        "passages and links about it instead of the whole page — both are much cheaper than the alternative. " +
+        "Falls back to a controlled browser for pages that need one; that browser is signed in to NOTHING, so " +
+        "for the user's own accounts use launch/open_url and the desktop tools.",
       parameters: {
         type: "object",
         properties: {
           url: { type: "string" },
+          urls: {
+            type: "array",
+            items: { type: "string" },
+            description: `Up to ${MAX_BATCH_PAGES} pages, read at once. Read-only: to click or type, open one on its own.`
+          },
+          find: {
+            type: "string",
+            description: "What you want off the page, in words. Returns the lines and links that match it, not the whole page."
+          },
           rejectCookies: {
             type: "boolean",
             description: "Dismiss a consent banner first, always choosing the least-permissive option. Costs a few seconds."
           }
         },
-        required: ["url"]
+        required: []
       },
-      preview: (args) => args.url,
+      preview: (args) => {
+        const urls = asList(args?.urls, args?.url);
+        const where = urls.length > 1 ? `${urls.length} pages` : (urls[0] ?? "");
+        return args.find ? `${where} — "${String(args.find).slice(0, 50)}"` : where;
+      },
       acts: true,
       execute: async (args) => {
-        const url = String(args.url ?? "");
-        if (!/^https?:\/\//i.test(url)) throw new Error("Only http(s) URLs can be opened.");
+        const urls = asList(args?.urls, args?.url);
+        if (urls.length === 0) throw new Error("web_open needs a url, or a `urls` array of them.");
+        const bad = urls.find((one) => !/^https?:\/\//i.test(one));
+        if (bad) throw new Error(`Only http(s) URLs can be opened — ${JSON.stringify(bad.slice(0, 80))} is not one.`);
+        const find = String(args.find ?? "").trim() || null;
+        // Checked over EVERY url, before anything is fetched. When this lived
+        // inside the single-page path a batch was a way around it, and a refusal
+        // with a way around it teaches the model the way around rather than the
+        // rule. See refuseSearchEngine for what it is protecting.
+        for (const one of urls) refuseSearchEngine(one);
 
-        // DRIVING A SEARCH ENGINE IS WHAT `search` IS FOR.
+        // SEVERAL PAGES ARE ONE STEP, FOR THE SAME REASON SEVERAL SEARCHES ARE.
         //
-        // Observed live on 23 Aug 2026: handed a lookup, the model called
-        // `search`, disliked the results, and then opened
-        // google.com/search?q=… in the controlled browser — which answered with
-        // "our systems have detected unusual traffic", so it tried
-        // duckduckgo.com/?q=… , which was blocked too. Three navigations and
-        // eight seconds to arrive back where it started, and every one of them
-        // looked to the user like the product failing to search.
+        // See the batching note in web-search.js: a round trip costs about 4,000
+        // billed tokens before it reads anything, and an HTTP page read costs
+        // roughly 300. Four pages opened one at a time is 16,000 tokens of
+        // asking for 1,200 tokens of answer.
         //
-        // The lesson goes in the RESULT rather than in the tool description,
-        // where it is read at the moment it matters and costs nothing the rest
-        // of the time. Thrown, not returned, because there is no page here to
-        // report and a sentence about what to do instead is the whole content.
-        //
-        // The path is pinned to a SEARCH path — `/search`, `/html/`, `/lite/`
-        // or the bare root — rather than to the domain. Matching the domain
-        // alone would refuse google.com/maps?q=… and news.google.com/rss/search
-        // as well, which are ordinary pages this tool is exactly right for.
-        const engine = /^https?:\/\/(?:[a-z0-9-]+\.)*(google|bing|duckduckgo|yahoo|baidu|yandex|ecosia|brave)\.[a-z.]+\/(?:search|html\/?|lite\/?)?(?:[?#]|$)/i.exec(url);
-        if (engine && /[?&](q|query|p|wd|text)=/i.test(url)) {
-          const terms = decodeURIComponent(/[?&](?:q|query|p|wd|text)=([^&]*)/i.exec(url)?.[1] ?? "").replace(/\+/g, " ");
-          throw new Error(
-            `Do not drive ${engine[1]} through the browser — it blocks automated browsers and this will keep failing. ` +
-            `Call the search tool instead: search({ query: ${JSON.stringify(terms)} }). ` +
-            "It returns titles, URLs and snippets in one step, then use web_open on the result you want to read."
-          );
+        // READ-ONLY, AND SAID SO IN THE SCHEMA. A batch deliberately does not
+        // become "the page": `web_click`, `web_type` and `web_scroll` all act on
+        // ONE page, and quietly picking which of four that is would be the
+        // "whose window is this" defect with a browser in place of a window.
+        // Nothing is set, so those tools keep pointing where they did.
+        if (urls.length > 1) {
+          if (urls.length > MAX_BATCH_PAGES) {
+            throw new Error(
+              `${urls.length} pages is too many for one call. Read at most ${MAX_BATCH_PAGES}, then read the rest.`
+            );
+          }
+          const pages = await Promise.all(urls.map(async (one) => {
+            const fetched = await readPageOverHttp(one);
+            // Only a page that actually arrived has lines to search. An empty
+            // single-page-application shell scores nothing against anything, and
+            // "nothing on this page mentions it" would be a true sentence about
+            // the wrong thing — the page was never read, not read and found
+            // wanting.
+            const worthFocusing = fetched.ok && fetched.readable && find;
+            return { url: one, fetched, focus: worthFocusing ? focusPage(fetched, find) : null };
+          }));
+          const read = pages.filter((page) => page.fetched.ok && page.fetched.readable);
+          return {
+            pages,
+            find,
+            ok: read.length > 0,
+            evidence: evidence({
+              observed: `read ${read.length} of ${pages.length} pages over HTTP` +
+                (read.length ? `: ${read.map((page) => page.fetched.url).join(", ")}` : ""),
+              method: "http.get+extract",
+              verdict: read.length > 0 ? CONFIRMED : REFUTED
+            })
+          };
         }
+
+        const url = urls[0];
 
         // HTTP FIRST. Measured against nodejs.org and Wikipedia on 23 Aug 2026:
         // 490ms and 670ms respectively for the full text and every link, versus
@@ -6078,10 +6491,16 @@ export function buildToolset({
           if (fetched.ok && fetched.readable) {
             // The WHOLE page is kept, not just the part being shown. That is
             // what makes web_scroll free afterwards, and what stops web_read
-            // fetching the same article a second time.
+            // fetching the same article a second time — and it is what lets a
+            // focused read promise the rest of the page on request.
             state.httpPage = { ...fetched, at: Date.now(), offset: 0 };
             const page = asPageReading(fetched);
-            return { ...page, evidence: pageEvidence(page, "http.get") };
+            // A FOCUSED READ IS STILL THE SAME PAGE. `state.httpPage` is set
+            // either way, so web_scroll, web_read and web_click behave
+            // identically after one — `find` changes what is PRINTED, not what
+            // was read or where the tools that act think they are.
+            const focus = find ? focusPage(fetched, find) : null;
+            return { ...page, fetched, find, focus, evidence: pageEvidence(page, "http.get") };
           }
         }
 
@@ -6096,15 +6515,62 @@ export function buildToolset({
           await runCapability("browser.dismissCookieNotice", { timeoutMs: 6000 }).catch(() => null);
         }
         const page = await readWebPage({ settle: true });
-        return { ...page, evidence: pageEvidence(page, "browser.launch") };
+        // `find` travels even though this route cannot honour it, so the render
+        // can SAY it could not. A request that is silently ignored is one the
+        // model has no way to stop making.
+        return { ...page, find, evidence: pageEvidence(page, "browser.launch") };
       },
+      failed: (result) => result.pages !== undefined && result.ok === false,
       // WHERE THE BROWSER ACTUALLY IS, not where it was told to go. The address
       // comes back from browser.currentState rather than from the navigation
       // call, so a launch that silently landed nowhere cannot print a page.
-      render: (page) => (verdictOf(page) === CONFIRMED
-        ? confirmed(page, renderWebPage(page))
-        : unconfirmed(page, "The controlled browser was told to go there and has no page open — the " +
-          "navigation did not land. Try web_open again, or use open_url and the screen tools."))
+      render: (page) => {
+        // A BATCH REPORTS EVERY PAGE, INCLUDING THE ONES IT COULD NOT READ.
+        //
+        // Four URLs in and three pages out is the shape that produces a
+        // confident answer about a page nobody looked at. So each URL gets a
+        // line whatever happened to it, and a page that needs the real browser
+        // says which one it was and what to do about it — the batch is
+        // deliberately read-only, so that recovery is a second call and the
+        // model should not have to work that out.
+        if (page.pages) {
+          const sections = page.pages.map(({ url, fetched, focus }) => {
+            if (!fetched.ok) return `${url}\n  COULD NOT READ: ${fetched.reason}`;
+            if (!fetched.readable) {
+              return `${url}\n  Nothing readable came back over HTTP — this page writes itself with JavaScript. ` +
+                "Open it on its own with web_open to get the browser onto it.";
+            }
+            if (focus) return renderFocusedPage(fetched, page.find, focus);
+            return renderWebPage(asPageReading(fetched));
+          });
+          const read = page.pages.filter((one) => one.fetched.ok && one.fetched.readable).length;
+          const header = `Read ${read} of ${page.pages.length} pages.`;
+          if (read === 0) {
+            return refuted(page, [header, ...sections].join("\n\n"));
+          }
+          return confirmed(page, [header, ...sections].join("\n\n"));
+        }
+        if (verdictOf(page) !== CONFIRMED) {
+          return unconfirmed(page, "The controlled browser was told to go there and has no page open — the " +
+            "navigation did not land. Try web_open again, or use open_url and the screen tools.");
+        }
+        // A focus only exists when the page was read over HTTP, which is the
+        // only route that has the WHOLE text to search. A browsed page has been
+        // clipped by the renderer already, and searching a clip would report
+        // "nothing on this page mentions it" about words further down it.
+        if (page.focus) return confirmed(page, renderFocusedPage(page.fetched, page.find, page.focus));
+        return confirmed(page, [
+          renderWebPage(page),
+          // Only when it was asked for and could not be done. See the browser
+          // fallback in execute: this page came from the controlled browser,
+          // which hands back a reading that is already clipped, and searching a
+          // clip would report "nothing mentions it" about text further down.
+          page.find
+            ? `(\`find\` was not applied: this page needed the browser, which returns a clipped reading rather ` +
+              `than the whole document. What is above is the top of the page, not a search of it.)`
+            : null
+        ].filter(Boolean).join("\n\n"));
+      }
     },
     {
       name: "web_read",
@@ -6151,15 +6617,36 @@ export function buildToolset({
       //
       // Compared on the text itself rather than on a call count, so it is a
       // statement about the PAGE and cannot be wrong.
+      // AND AN UNCHANGED PAGE MUST NOT BE PAID FOR TWICE.
+      //
+      // The note above was appended AFTER the whole reading, so an identical
+      // re-read sent the entire page again and then said it was identical. That
+      // is the most expensive possible way to say "nothing changed": `screen`
+      // has always answered an unchanged window with one line, and this answered
+      // it with the page.
+      //
+      // It went from bad to much worse on 28 Aug 2026, when `web_read` was added
+      // to `isUiObservation` so that reading a form back would stop tripping the
+      // no-progress guard. That change is right — reading is not attempting —
+      // but the guard had been the only thing capping this at three, and
+      // removing it uncapped a full-price repeat. Measured on the live flight
+      // task the same day: six near-identical Google Flights readings inside one
+      // request, each ~2,500 characters of text plus sixty-odd footer links, and
+      // the run hit its 150,000-token ceiling having found no flight.
+      //
+      // A cheap fix for the repeat, not a re-armed guard: the model may look as
+      // often as it likes, and looking at something that has not moved now costs
+      // a sentence instead of a page.
       render: (page) => {
         const rendered = renderWebPage(page);
         const same = rendered === state.lastWebReading;
         state.lastWebReading = rendered;
-        return reported(page, same
-          ? `${rendered}\n\nThis is CHARACTER-FOR-CHARACTER the reading you already have — nothing on the ` +
-            "page changed. Reading it again will return this again: either act on what is here, get the " +
-            "answer another way, or tell the user what you can and cannot see."
-          : rendered);
+        if (!same) return reported(page, rendered);
+        return reported(page,
+          "IDENTICAL to your last reading of this page — not one character changed, so it is not repeated " +
+          "here. You already have it above. Either act on what is in it, get the answer another way, or " +
+          "tell the user what you can and cannot see. If you were waiting for something to appear, it has " +
+          "not appeared and reading again will not make it.");
       }
     },
     {
@@ -6207,6 +6694,36 @@ export function buildToolset({
                 "different link.")
           );
         }
+        // TWO PLAUSIBLE ROWS IS A QUESTION, NOT A COIN TOSS.
+        //
+        // The desktop `click` has refused an ambiguous label for months — it
+        // lists what matched and makes the caller pick. `web_click` did the
+        // opposite: it took the top score silently, and a wrong click on a web
+        // page NAVIGATES, so the mistake is not one wasted call, it moves the
+        // whole task somewhere else.
+        //
+        // Measured live, 28 Aug 2026, on Google Flights: asked for "New York,
+        // USA City in New York State" it clicked "Niagara Falls, New York, USA",
+        // twice. The second one navigated to a Mysuru→Hyderabad search and the
+        // run never recovered; it ended at 335,558 tokens having found no flight.
+        //
+        // Refused only when the runner-up is genuinely close — an exact match
+        // with a weak second place still goes straight through, which is almost
+        // every click.
+        const runnerUp = found.runnerUp ?? null;
+        const margin = Number(found.matchScore ?? 0) - Number(runnerUp?.score ?? 0);
+        if (runnerUp && margin < 0.15 && String(runnerUp.name).trim() !== String(found.target?.name ?? "").trim()) {
+          const rows = (found.alternatives ?? []).slice(0, 5)
+            .map((option, index) => `  ${index + 1}. ${JSON.stringify(option.name)} (match ${option.score})`)
+            .join("\n");
+          throw new Error(
+            `"${wanted}" is ambiguous on this page — two different things match it almost equally well, ` +
+            "and clicking the wrong one here navigates away from what you are doing.\n" +
+            `${rows}\n` +
+            "Ask for one of those labels EXACTLY as written above. If the one you want is not there, " +
+            "call web_read and use a label from the page itself."
+          );
+        }
         const before = await runCapability("browser.currentState", {}).catch(() => null);
         const clicked = await runCapability("browser.click", { target: found.target });
         // Wait for an actual navigation or DOM mutation, returning immediately
@@ -6248,8 +6765,37 @@ export function buildToolset({
         };
       },
       render: (result) => {
+        // A CONTROL THE DOM WILL NOT CLICK IS USUALLY A CONTROL THE ACCESSIBILITY
+        // TREE WILL, AND THE WAY OUT BELONGS IN THIS MESSAGE.
+        //
+        // "the element could not be clicked" was a dead end: it says what failed
+        // and nothing about what to do, so the model tries the same idea in a
+        // different shape until a guard stops it.
+        //
+        // Measured live, 29 Aug 2026, on Google Flights. Its trip-type and cabin
+        // controls are bare `div`s with no href and no handler CDP will fire, so
+        // `web_click` refused six times across "One way", "Round trip" and
+        // "Departure", and one call even reached for the desktop `click` tool
+        // with a browser element index. ELEVEN wasted calls.
+        //
+        // Then the agent worked out the answer by itself and it took four calls:
+        // `windows` → `screen chrome` → `click "Change ticket type. Round trip"`
+        // → `click "One way"`. Both landed first time, because the same div is
+        // published to UIA as a combobox WITH AN ACCESSIBLE NAME — Chromium
+        // builds an accessibility tree whether or not the DOM node looks
+        // clickable to a script.
+        //
+        // The run finished at 38 steps. Tokens SENT grow with the square of the
+        // steps, so those eleven calls are most of why it sent 1.2M: the same
+        // task in ~20 steps sends roughly a third of that.
         if (result.performed === false) {
-          return refuted(result, `The click did not land on "${result.label}": ${result.reason ?? "the element could not be clicked"}.`);
+          return refuted(result,
+            `The click did not land on "${result.label}": ${result.reason ?? "the element could not be clicked"}.\n` +
+            "This is usually a menu, tab or dropdown built as a plain div, which the page will not let a script " +
+            "click. Do NOT try another label or another wording — it will refuse the same way.\n" +
+            "GO ROUND IT THROUGH THE WINDOW: call `windows` to find the browser, `screen` it, and `click` the " +
+            "control by the name in that reading. The same control is almost always there as a real button or " +
+            "combobox, because the browser publishes an accessibility tree even for elements a script cannot press.");
         }
         const moved = result.before && result.after && result.before.url !== result.after.url;
         // WHAT IT CLICKED, NOT WHAT WAS ASKED FOR. A best match is a match, and
@@ -7587,11 +8133,23 @@ export function buildToolset({
 
     has: (name) => Boolean(byName.get(name) && toolIsVisible(byName.get(name))),
 
+    // Outcome learning needs to distinguish an observation that merely read
+    // successfully from an action that could actually recover a failed step.
+    // Expose only that boolean; tool implementations and arguments stay inside
+    // this boundary.
+    isActingTool: (name) => byName.get(name)?.acts === true,
+
     // The tool objects themselves — their names, their `acts` flag and their
     // renders. Exposed for the CI property test that walks every tool and proves
     // no render can produce a sentence from a result with no evidence. Nothing
     // in the product reads this; see tests/unit/tool-evidence.test.js.
     toolsForTest: tools,
+
+    // The window `screen` reads when it is given no argument. Exposed for the
+    // test that holds play_music to pointing at Spotify — its failure message
+    // tells the model to read the screen, and for two live sessions the screen
+    // was still showing WhatsApp. Nothing in the product reads this.
+    workingWindowForTest: () => (state.lastWindow ? { ...state.lastWindow } : null),
 
     // What the focused control holds RIGHT NOW, asked of the application rather
     // than inferred from pixels. Exposed because a replayed send has to prove
@@ -7645,6 +8203,23 @@ export function buildToolset({
       }
     },
 
+    // HOW TO DRIVE A PHONE — ONLY WHEN THERE IS ONE IN THE PICTURE.
+    //
+    // This paragraph used to sit in the fixed system prompt, so every desktop
+    // request in the product paid ~90 tokens to be told how to use adb, and,
+    // worse, was told it in the same breath as being handed six Android tools it
+    // should never have had (see androidActive). Instructions for a toolbox the
+    // model has not been given are not neutral — they are a suggestion.
+    //
+    // Empty on an ordinary turn, which is almost all of them.
+    androidGuidance() {
+      if (!state.androidActive) return "";
+      return "ANDROID: `android_devices` already knows the exact adb executable even when it is not on PATH — never go "
+        + "through `run` or `software` for it. Its list operation absorbs the brief reconnect after USB authorization; "
+        + "use wait next, and refresh only after wait. Never search a drive for adb.exe, restart adb in PowerShell, or "
+        + "ask approval for a raw adb command. If the user did not ask about a phone, do not touch these tools at all.";
+    },
+
     // A NEW TURN INVALIDATES WHAT IS ON SCREEN, AND NOTHING ELSE.
     //
     // The toolset outlives a single request so the agent keeps its place on the
@@ -7667,9 +8242,31 @@ export function buildToolset({
       // named themselves is never mistaken for one an injection supplied. See
       // requiresInjectionConfirmation.
       state.userRequest = String(userText ?? "");
-      if (/\b(?:android|phone|mobile|tablet|adb|pixel|galaxy|device|wireless debugging)\b/i.test(state.userRequest)) {
-        state.androidActive = true;
-      }
+      // ASSIGNED, NOT OR-ED. See androidActive: this line used to only ever set
+      // true, on a toolset shared by every conversation in the process.
+      //
+      // `device` ON ITS OWN IS GONE FROM THIS PATTERN. It is an ordinary English
+      // word — "audio device", "the device is unreadable", "how many devices are
+      // connected" about anything at all — and it was the term that actually
+      // fired on this machine. What is left either names a phone platform or
+      // says whose device it is.
+      // THREE TIERS, BECAUSE THE NOUNS ARE NOT EQUALLY AMBIGUOUS, AND THE COST
+      // OF BEING WRONG IS NOT SYMMETRIC.
+      //
+      // A false positive puts six tool schemas in front of the model and invites
+      // the 42-second detour this whole comment exists about. A false negative
+      // costs one turn in which the agent says it has no phone tools and the
+      // user rephrases. So `device` — the word that actually fired here, and the
+      // one that also means an audio endpoint, a monitor or a disk — is only a
+      // phone when something else in the sentence says whose it is.
+      state.androidActive = state.androidProven
+        // Names a phone platform outright. No ambiguity available.
+        || /\b(?:android|adb|pixel|galaxy|smartphone|wireless debugging)\b/i.test(state.userRequest)
+        // Nouns that only ever mean a handset on a desktop machine.
+        || /\b(?:phone|mobile|tablet)s?\b/i.test(state.userRequest)
+        // `device` needs a qualifier. "my device" and "connected device" are a
+        // phone; "the device is unreadable" is an error message.
+        || /\b(?:my|connected|paired|android)\s+devices?\b/i.test(state.userRequest);
       // A new request is a new context. An instruction found in a chat during
       // the last turn must not gate this turn's actions — the user has spoken
       // since, and they may have asked for exactly that thing.

@@ -614,6 +614,10 @@ export class AgentRuntime {
       onEvent: emit,
       signal: options.signal ?? null,
       skills: this._skillStore(),
+      memory: this.memory,
+      // The composer's Thinking control, per request. Null when the caller did
+      // not choose, which leaves the process default alone.
+      thinking: options.thinking ?? null,
       ...(Number.isFinite(Number(options.maxElapsedTime)) && Number(options.maxElapsedTime) > 0
         ? { maxElapsedMs: Number(options.maxElapsedTime) }
         : {})

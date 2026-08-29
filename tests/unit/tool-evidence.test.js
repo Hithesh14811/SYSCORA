@@ -165,8 +165,14 @@ function harness({ files = new Map(), overrides = {}, basePath } = {}) {
   };
 
   const registry = { get: (name) => (capabilities[name] ? { execute: capabilities[name] } : null) };
+  const toolset = buildToolset({ registry, adapter, basePath: basePath ?? "C:\\work" });
+  // This suite deliberately exercises every optional tool, including arbitrary
+  // shell and confirmation-gated actions. Production now fails closed when
+  // either capability is not explicitly enabled, so the fixture must opt in.
+  toolset.setAccessPolicy({ approvalMode: "balanced", developerMode: true, shellExecutionMode: "host" });
+  toolset.setConfirmer(async () => true);
   return {
-    toolset: buildToolset({ registry, adapter, basePath: basePath ?? "C:\\work" }),
+    toolset,
     calls,
     files,
     capabilities

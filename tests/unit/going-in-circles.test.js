@@ -121,9 +121,21 @@ test("reading the same page twice says so the second time, not the first", async
   });
   const first = await toolset.execute("web_read", {});
   const second = await toolset.execute("web_read", {});
-  assert.ok(!/CHARACTER-FOR-CHARACTER/.test(first.text), "a first reading is new information");
-  assert.match(second.text, /CHARACTER-FOR-CHARACTER/);
-  assert.match(second.text, /Reading it again will return this again/);
+  assert.ok(!/IDENTICAL/.test(first.text), "a first reading is new information");
+  assert.match(second.text, /IDENTICAL/);
+  // AND IT SAYS SO WITHOUT SAYING THE PAGE AGAIN.
+  //
+  // The notice used to be appended after the whole reading, so the repeat cost
+  // MORE than the original — the most expensive possible way to say "nothing
+  // changed". This test asserted only that the words appeared, so it passed
+  // throughout. Measured live 28 Aug 2026 on a flight search: six near-identical
+  // page readings, each carrying the full page, and the run hit its token
+  // ceiling. The wording is not the guarantee; the size is.
+  assert.ok(!second.text.includes("Latest Popular Oldest"), "the repeat must not carry the page body");
+  assert.ok(
+    second.text.length < first.text.length,
+    `a repeat must be cheaper than the reading it repeats (${second.text.length} vs ${first.text.length})`
+  );
 });
 
 // The notices must not follow the model onto every site it visits.

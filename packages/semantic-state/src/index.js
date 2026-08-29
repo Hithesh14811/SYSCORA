@@ -644,4 +644,34 @@ export class SemanticState {
   async close() {
     // Since we create a new DB connection per operation, no persistent handle to close
   }
+
+  async pruneBefore(cutoff, { vacuum = false } = {}) {
+    const iso = new Date(cutoff).toISOString();
+    await this.ensureSchema();
+    const db = new DatabaseSync(this.dbPath);
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const snapshots = db.prepare("DELETE FROM system_snapshots WHERE datetime(timestamp) < datetime(?)").run(iso);
+        const relationships = db.prepare("DELETE FROM semantic_relationships WHERE datetime(last_seen_at) < datetime(?)").run(iso);
+        const entities = db.prepare("DELETE FROM semantic_entities WHERE datetime(last_seen_at) < datetime(?)").run(iso);
+        db.exec("COMMIT");
+        if (vacuum && (snapshots.changes + relationships.changes + entities.changes) > 0) db.exec("VACUUM");
+        return {
+          removed: {
+            snapshots: Number(snapshots.changes),
+            relationships: Number(relationships.changes),
+            entities: Number(entities.changes)
+          },
+          cutoff: iso,
+          vacuumed: Boolean(vacuum)
+        };
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    } finally {
+      db.close();
+    }
+  }
 }

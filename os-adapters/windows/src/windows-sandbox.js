@@ -10,6 +10,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { canonicalizePath } from "../../../packages/shared-types/src/canonical-path.js";
 import { spawn } from "node:child_process";
 
 const escapeXml = (value) => String(value)
@@ -42,9 +43,20 @@ export async function executeInWindowsSandbox({ command, workspaceRoots, timeout
     );
   }
 
-  const workspace = String(workspaceRoots?.[0] ?? "").trim();
-  if (!workspace) {
+  const requestedWorkspace = String(workspaceRoots?.[0] ?? "").trim();
+  if (!requestedWorkspace) {
     return blocked(command, "Disposable execution needs an attached workspace.", "shell.isolation-workspace-required");
+  }
+  let workspace;
+  try {
+    workspace = canonicalizePath(requestedWorkspace, { allowMissing: false });
+    if (!(await fs.stat(workspace)).isDirectory()) throw new Error("the attached workspace is not a directory");
+  } catch (error) {
+    return blocked(
+      command,
+      `The attached workspace could not be resolved safely: ${error?.message ?? error}`,
+      "shell.isolation-workspace-invalid"
+    );
   }
 
   const jobDirectory = path.join(os.tmpdir(), `syscora-sandbox-${crypto.randomUUID()}`);

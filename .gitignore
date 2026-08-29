@@ -1,4 +1,5 @@
 node_modules/
+.npm-cache/
 .syscora/
 # Names where working state actually lives, per machine. See
 # packages/shared-types/src/state-path.js — it is a local fact, not a shared one.
@@ -10,6 +11,11 @@ dist/
 probe-*.json
 anaconda_projects/
 tests/eval/results/
+# bench-rank.mjs fetches one candidate pool and then A/Bs rankings against it
+# offline. That file is a local fixture — 100 KB of somebody else's titles and
+# snippets, regenerated in half a minute with --fresh — and committing it would
+# put a copy of the web in the history that nothing updates.
+tests/eval/search-baselines/candidate-pool.json
 
 # A LITERAL "%USERPROFILE%" DIRECTORY IS A BUG'S FOOTPRINT, NOT A SOURCE TREE.
 #
@@ -30,6 +36,8 @@ transcript.txt
 # and nothing about it belongs in a public repository.
 .claude/
 CLAUDE.md
+.agents/
+.kiro/
 .cursor/
 .windsurf/
 .aider*
@@ -37,3 +45,12 @@ CLAUDE.md
 
 # Internal engineering handoff notes. Working documents, not product docs.
 docs/next-session-brief.md
+
+# Generated release evidence and local signing material.
+artifacts/
+release/build-info.json
+*.pfx
+*.p12
+*.pem
+*.key
+logo syscora1.png

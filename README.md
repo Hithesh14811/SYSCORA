@@ -1,149 +1,158 @@
 # SYSCORA
 
-An agent that operates this Windows machine the way a person does — you say what
-you want in ordinary words, and it does it: opens the applications, reads what is
-on screen, clicks, types, runs commands, checks its own work, and tells you what
-is now true.
+SYSCORA is a supervised Windows agent that can inspect applications and files,
+operate graphical interfaces, use a controlled browser, run approved tools, and
+verify what happened before it reports success.
 
-It is the shape of an agentic coding assistant, pointed at the operating system
-instead of a repository. One conversation, held open for the whole task. The model talks
-while it works, calls tools by name, reads the results, and keeps going until the
-job is done.
+The product thesis is simple: **the Windows agent that proves what it changed**.
+It prefers structured accessibility and DOM state over pixels, separates
+untrusted content from user authority, shows tool activity in the conversation,
+and uses independent post-action evidence where a capability supports it.
 
-```
-you   ▸ install VLC and play the video on my desktop
-      ▸ winget shows VLC 3.0.21, 42 MB. Installing it.
-  ✓ run     winget install VideoLAN.VLC          ████████░░  78%
-      ▸ Installed. Desktop has one video, holiday.mp4. Opening it in VLC.
-  ✓ launch  vlc
-  ✓ screen  the working window
-      ▸ VLC is playing holiday.mp4, 4:31 long, at 0:03.
-```
+## Release status
+
+Version 0.1.x is a **developer preview candidate**, not a production or universal
+consumer release. The repository can build an x64 Windows installer, but public
+release is deliberately blocked until the signed candidate passes clean-machine
+validation, repeated live evaluation, independent security and prompt-injection
+review, provider-key revocation, lifecycle testing, and legal approval.
+
+See [supported platforms](docs/releases/supported-platforms.md), the
+[release process](docs/releases/release-process.md), [security policy](SECURITY.md),
+[privacy notice](PRIVACY.md), and [preview terms](TERMS.md).
 
 ## What it can do
 
-**See the screen without a screenshot.** Every look fuses the window's
-accessibility tree with OCR of its pixels and returns text: what the window is,
-what is written on it, and every control with the label you can click it by. It
-costs a fraction of what an image costs and it is exact — a button's name rather
-than a guess at one.
+- Fuse Windows accessibility data with OCR fallback to identify visible text and
+  controls; this is often more compact and deterministic than screenshot-only
+  perception, but it is not infallible.
+- Click, type, scroll, drag, launch and manage windows; read, create and edit
+  files; control volume; and use selected application-specific capabilities.
+- Drive a dedicated Chromium session through the DOM for supported browser work.
+- Draft Gmail messages while keeping Send as a human-operated action.
+- Run PowerShell only after Developer terminal access is enabled. Terminal is off
+  by default; disposable Windows Sandbox is the default execution mode, and no
+  host fallback occurs when isolation is unavailable.
+- Keep an audit trail, local memory, supported undo information, and separate
+  conversation histories.
+- Export local data, choose a retention period, reset provider credentials, and
+  delete local state.
 
-**Act.** `click`, `type`, `key`, `scroll`, `drag`, `draw`, `launch`,
-`new_document`, `focus`, `window_state`, `close_app`, `clipboard`, `volume`,
-`play_music`, `open_url`, files (`read_file`, `write_file`, `edit_file`), a
-PowerShell terminal (`run`), a controlled browser that reads pages through the
-DOM (`web_open`, `web_read`, `web_click`, `web_type`, `web_scroll`), and `batch`
-to run a decided sequence with no round trip between the steps.
+Experimental Android-over-ADB and third-party plugin paths exist for developers
+but are not consumer claims.
 
-**Check its own work.** A delivered keystroke is not evidence. After acting it
-reads the window back; after a drawing it asks the application whether it has
-anything to undo; after closing something it looks at the process list. When it
-cannot confirm, it says so rather than claiming success.
+## Developer setup
 
-**Keep more than one conversation.** New chat, and a list of previous ones to
-move between — each with its own history, so a long piece of work does not share
-a thread with "is python installed". Re-opening a chat replays its transcript,
-tool rows and all. There is no account system yet, so these live in this client's
-own storage: they belong to this machine, and clearing the browser's storage
-clears them.
+Requirements: a currently supported x64 Windows 11 release, Node.js 22.23.1 or a
+compatible pinned 22.x environment, and npm.
 
-**Know which machine it is on.** Your real Documents/Desktop/Pictures paths
-(including OneDrive redirection), which desktop applications are installed, and
-which browser handles links — read once at startup and put in front of the model
-before its first decision.
-
-## Running it
-
-```bash
-npm run mvp:ui
-```
-
-Then open <http://127.0.0.1:4317>. The daemon prints an API token on startup;
-paste it into the Connect panel the first time.
-
-As a desktop application (starts the daemon itself and injects the token, so
-there is nothing to paste):
-
-```bash
+```powershell
+npm ci
 npm run desktop:dev
 ```
 
-Tests:
+The desktop starts its authenticated loopback daemon and injects the random
+per-launch token through Electron's isolated preload. For browser-only debugging:
 
-```bash
+```powershell
+npm run mvp:ui
+```
+
+Then open `http://127.0.0.1:4317` and use the daemon token printed in the
+terminal. Do not expose that port or token to another machine.
+
+## Model setup and privacy
+
+The preview is bring-your-own-provider. Settings accepts supported
+OpenAI-compatible, Anthropic-compatible, Gemini, Mistral, DeepSeek, and
+AgentRouter configurations. A key entered through the app is protected with
+Windows DPAPI and is never read back into the renderer. Existing plaintext
+config can be migrated, unreadable protected state can be reset, and the active
+configuration can be health-tested.
+
+Environment configuration has precedence for the active provider:
+
+- `SYSCORA_MODEL_PROVIDER`
+- `SYSCORA_MODEL_API_KEY`
+- `SYSCORA_MODEL_NAME`
+- `SYSCORA_MODEL_BASE_URL`
+- `SYSCORA_EXTERNAL_AI_CONSENT_SCOPES` (must explicitly include the required
+  external-AI scopes for headless use)
+
+External AI requires explicit consent. Prompts and task-relevant file, screen,
+browser, email and tool context can be sent to the selected provider. Local-first
+does not mean that provider-bound context remains local. The preview has no
+analytics or advertising SDK and no managed SYSCORA model service.
+
+## Safety boundaries
+
+- Renderer navigation, child windows, Chromium permissions, Node integration,
+  production DevTools, and webviews are restricted.
+- The daemon binds to `127.0.0.1`, uses a random per-launch token, bounds request
+  bodies, compares credentials in constant time, and permits only one active
+  intent to own the physical pointer.
+- Model output is an untrusted proposal. Internal authorization, destination
+  binding, shell classification, and catastrophic-command denial are enforced at
+  the action boundary.
+- Missing or failed confirmation rejects the action.
+- Attached-workspace checks canonicalize existing path components through
+  symlinks, junctions and reparse points before testing containment.
+- “Full access” cannot enable the developer terminal, bypass catastrophic shell
+  denial, or turn instructions found in untrusted content into authority.
+
+These controls reduce risk; they cannot make arbitrary GUI automation or host
+execution risk-free. Malware already running as the same Windows user remains
+outside this product's isolation boundary.
+
+## Quality and release commands
+
+```powershell
+npm run check
 npm test
+npm run license:check
+npm run sbom
+npm run security:audit
+npm run dist -- --publish never
+npm run release:gate
 ```
 
-## Configuring the model
+`release:gate` is expected to fail during ordinary development. It requires a
+clean exactly tagged commit, a package made from that commit, valid Authenticode
+signatures, one exact installer, and complete external attestations. The tag
+workflow creates a draft GitHub release; publication remains a human decision.
 
-Provider settings come from the environment first, then a gitignored
-`.syscora/config.json`, then a deterministic offline Mock. Nothing about SYSCORA
-is tied to one vendor — any OpenAI-compatible endpoint that supports tool calling
-will do.
+## Architecture
 
-```json
-{
-  "model": {
-    "provider": "deepseek",
-    "baseUrl": "https://inference.baseten.co/v1",
-    "primaryApiKey": "…",
-    "model": "…",
-    "requestTimeoutMs": 30000,
-    "maxTokens": 4096
-  }
-}
+```text
+apps/desktop              conversation, onboarding, safety and privacy UI
+apps/desktop-shell        hardened Electron wrapper and signed updater
+apps/daemon               authenticated loopback API and runtime lifecycle
+packages/fast-agent       current model/tool loop
+packages/permission-broker authorization and approval state
+packages/policy-engine    content and shell policy
+packages/perception       accessibility/OCR perception
+packages/audit            append-only local audit trail
+os-adapters/windows       Windows actions and Sandbox execution
+os-adapters/browser       dedicated Chromium/CDP automation
 ```
 
-Or by environment: `SYSCORA_MODEL_PROVIDER`, `SYSCORA_MODEL_API_KEY`,
-`SYSCORA_MODEL_NAME`, `SYSCORA_MODEL_BASE_URL`.
-
-**Keys are secrets.** `.syscora/` is gitignored; treat anything in it the way you
-would treat a password, and rotate a key that has been shared or pasted anywhere.
-
-## How it is put together
-
-```
-apps/desktop          the chat surface — a live transcript, one row per tool call
-apps/desktop-shell    the Electron wrapper
-apps/daemon           HTTP + server-sent events, on 127.0.0.1 only
-packages/fast-agent   THE AGENT LOOP and the tools the model is given
-packages/perception   window capture, OCR and the accessibility tree, fused
-os-adapters/windows   the Windows adapter
-os-adapters/windows-host  a long-lived PowerShell host: UIA, SendInput, capture
-os-adapters/browser   the controlled Chromium, driven over CDP
-```
-
-A request goes: browser → `POST /api/intents` → `AgentRuntime.submitIntent` →
-the agent loop, which streams its events back over
-`GET /api/intents/:id/stream`. Every tool call appears in the transcript as it
-starts, with its arguments, and resolves in place with its real output.
-
-There is a second, older route underneath — a staged pipeline that plans from
-typed capabilities without a model at all. It is what answers when no model can
-be reached, and nothing but that reaches it.
-
-## What stops it doing something terrible
-
-- **A hard floor under the terminal.** Formatting a disk, deleting shadow copies,
-  disabling Defender or piping a download into a shell is refused outright, below
-  any approval, in the one place every command is spawned
-  (`packages/policy-engine/src/shell-rules.js`).
-- **Nothing destructive happens silently.** A file with something in it is not
-  overwritten, and a document that is already open is not typed into, without the
-  agent being told first and saying what it means to do.
-- **Local only.** The daemon binds 127.0.0.1 and every mutating route needs the
-  token.
-- **Stop means stop.** The button aborts the model call, the loop settles on what
-  it had already done, and a running command is killed.
-
-Credentials are stripped from anything sent to the model. Email addresses and
-file paths are not — they are usually the point of the request, and hiding them
-broke more than it protected.
+A request goes from the renderer to the authenticated daemon, through the agent
+loop and visible tools, then through policy and the OS adapter. Results stream
+back into the same conversation. A legacy typed pipeline remains for offline
+fallback and migration work; it should not be confused with the primary path.
 
 ## Known limits
 
-- Windows only.
-- One task at a time: there is one screen, one pointer, one focused window.
-- A task is bounded at 80 steps or six minutes, whichever comes first.
-- It cannot see pictures. It reads text and controls, so it judges a drawing by
-  the application's undo state, never by looking at it.
+- Windows 11 x64 only; see the precise support matrix.
+- One active task, screen, pointer and focused window at a time.
+- Tasks are bounded at 80 steps or six minutes.
+- Accessibility, OCR and DOM representations can be incomplete, stale, or
+  adversarial.
+- Many GUI actions cannot be transactionally rolled back.
+- The current preview requires model-provider knowledge and is therefore not a
+  casual-user product.
+- Product-market fit, common-benchmark leadership, and comparative accuracy are
+  not established by this repository's private test suite.
+
+Support is best effort through GitHub Issues. Report vulnerabilities privately
+as described in [SECURITY.md](SECURITY.md).

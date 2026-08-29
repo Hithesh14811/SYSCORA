@@ -74,6 +74,30 @@ const MAX_CONVERSATION_CHARS = 60000;
 // before starting without it. See _machineFacts.
 const MACHINE_FACTS_DEADLINE_MS = 2500;
 
+const ADAPTIVE_FAILURE_CLASSES = [
+  [/(?:matching[- ]track[- ]not[- ]found|track.*not found)/i, "matching-track-not-found"],
+  [/(?:ambiguous[- ]target|matches? \d+ things|more than one)/i, "ambiguous-target"],
+  [/(?:target[- ]not[- ]found|not on screen|could not find|label.*absent)/i, "target-not-found"],
+  [/(?:input[- ]blocked|keyboard.*did not|keystrokes?.*refused)/i, "input-blocked"],
+  [/(?:already work in this document|document.*occupied)/i, "document-occupied"],
+  [/(?:screen.*unchanged|nothing.*changed|no progress)/i, "no-state-change"],
+  [/(?:timed? out|timeout)/i, "timeout"],
+  [/(?:not installed|unavailable|could not be launched)/i, "unavailable"],
+  [/(?:unconfirmed|could not confirm|verification)/i, "verification-unconfirmed"]
+];
+
+function adaptiveFailureClass(result) {
+  const text = [result?.raw?.reason, result?.raw?.evidence?.observed, result?.text].filter(Boolean).join(" ");
+  return ADAPTIVE_FAILURE_CLASSES.find(([pattern]) => pattern.test(text))?.[1] ?? "tool-failed";
+}
+
+function adaptiveApplication(tool, args, result) {
+  const named = result?.raw?.application ?? args?.application;
+  if (named) return String(named).toLowerCase().replace(/\.exe$/i, "").replace(/[^a-z0-9_.-]+/g, "-").slice(0, 60);
+  if (/music/i.test(String(tool))) return "spotify";
+  return "general";
+}
+
 // THE OUTPUT CEILING IS SHARED WITH THE MODEL'S THINKING, AND THINKING GOES FIRST.
 //
 // This endpoint is a reasoning model: `reasoning_content` is billed as
@@ -135,6 +159,59 @@ const MODEL_OUTPUT_CEILING = 4096;
 // cannot slow down or embellish a task that was going fine. The endpoint was
 // measured to accept up to 65,536.
 const MODEL_OUTPUT_CEILING_RETRY = 16384;
+
+// THINKING IS OFF FOR AN ORDINARY STEP AND ON FOR A TURN THAT NEEDED IT.
+//
+// The endpoint serves a reasoning model, and reasoning is billed as completion
+// tokens out of the SAME ceiling the tool call has to fit inside — which is the
+// documented cause of turns that deliberate past the limit and emit no call at
+// all. It is also most of the latency: the model streams its whole deliberation
+// before it writes the first character of a tool call.
+//
+// The obvious move is to turn it off, and the obvious move has been wrong here
+// before — the same reasoning ("a ceiling is not a cost") was applied to the
+// output limit, raised for every turn, and measured a 9-point drop in pass rate.
+// So this was measured before it was written, on the real endpoint, against the
+// real system prompt and the real 36-tool schema, over seven decisions this
+// project has actually paid for getting wrong (scripts/probe-model-bakeoff.mjs,
+// 3 repeats, 28 Aug 2026):
+//
+//   deepseek-ai/DeepSeek-V4-Flash-0731   thinking ON    6/7 correct   1,576ms
+//   deepseek-ai/DeepSeek-V4-Flash-0731   thinking OFF   7/7 correct   1,312ms
+//
+// Faster AND more correct, which is not the trade-off anybody expected. The one
+// case thinking LOST was `click the Send button`: given room to deliberate it
+// talked itself into re-reading a screen it had just read. That is the same
+// behaviour the output-ceiling measurement found — given more room a reasoning
+// model does not think the same thoughts more carefully, it ATTEMPTS MORE.
+//
+// WHAT THIS MEASUREMENT DOES NOT COVER, said plainly: every case is a SINGLE
+// decision. A long multi-application task, or a drawing, may still be worth
+// deliberating over, and the recorded reasoning distribution on one drawing
+// decision was p50 6,350 tokens. So this is not a global off switch. Thinking
+// comes back for exactly the turn that has demonstrated it needs it — the retry
+// after a turn was cut off or arrived malformed — which is the identical shape
+// to MODEL_OUTPUT_CEILING_RETRY above, for the identical reason.
+//
+// BOTH SPELLINGS ARE SENT. Measured the same day, all of `thinking:false`,
+// `enable_thinking:false` and `reasoning_effort:"none"` produced zero reasoning
+// tokens, while `reasoning_effort:"low"` did not — so `low` is not off, and the
+// endpoint really is reading these rather than ignoring unknown keys. The base
+// URL fronts several serving stacks and they do not all read the same field; an
+// unknown key is ignored by the stack that does not know it. Sending only the
+// spelling this month's deployment happens to honour is how this quietly stops
+// working after somebody else's upgrade.
+const THINKING_OFF = Object.freeze({
+  chat_template_kwargs: { thinking: false, enable_thinking: false },
+  reasoning_effort: "none"
+});
+
+// `SYSCORA_MODEL_THINKING=always` restores the old behaviour, `never` refuses it
+// even on a retry, and anything else is the measured default. An escape hatch,
+// because the measurement above is one endpoint on one day and the next model
+// this is pointed at may want the opposite — and a default that cannot be turned
+// off is a finding nobody can reproduce.
+const THINKING_MODE = String(process.env.SYSCORA_MODEL_THINKING ?? "adaptive").toLowerCase();
 
 // Things that can only be true because a tool said so.
 //
@@ -296,14 +373,34 @@ function coarse(args) {
 // guard. Reads are repeatable observations; actions are attempts. Android's
 // single- and multi-device read tools are aliases for the same observation and
 // cannot be used to route around a no-progress guard.
+// READING IS NOT ATTEMPTING, AND `web_read` WAS BEING COUNTED AS AN ATTEMPT.
+//
+// `screen` has always been exempt here — looking at the same window twice is how
+// you find out whether the last action worked. The web tools were added later
+// and `web_read` was never added to this list, so reading a page was scored as a
+// repeated failed action by the no-progress guard.
+//
+// Measured live, 28 Aug 2026, on a flight search: the agent typed into a field,
+// read the page to find the airport suggestion it had to click — which is the
+// only correct next move — and was told "This is the 3rd time you have run
+// exactly this in one request, and it has not got you anywhere. STOP and ask the
+// user." It did that three separate times, on three different sites, and the run
+// ended PARTIALLY_COMPLETED at 392,537 tokens having found nothing.
+//
+// The type-then-read-back cycle is the whole shape of driving a form. A guard
+// that forbids it forbids using the web at all. This is the same defect family
+// as the seven inverted gates already recorded in the docs: a check that throws
+// away correct work and then blames the model for the failure it caused.
 function isUiObservation(name, args = {}) {
-  return name === "screen" || name === "android_screen"
+  return name === "screen" || name === "android_screen" || name === "web_read"
     || (name === "android_many" && args.operation === "read_ui");
 }
 
 function mayRepeatCall(name, args = {}) {
   if (isUiObservation(name, args)) return true;
-  if (/^(scroll|key|wait|windows|run|run_jobs|draw|drag)$/.test(name)) return true;
+  // `web_scroll` for the same reason as `scroll`: moving down a page twice is
+  // two different views, not one repeated attempt.
+  if (/^(scroll|web_scroll|key|wait|windows|run|run_jobs|draw|drag)$/.test(name)) return true;
   return name === "android_act" && /^(?:scroll|key)$/.test(String(args.operation ?? ""));
 }
 
@@ -568,10 +665,12 @@ HOW YOU WORK
 CHOOSING A TOOL
 - WHETHER SOFTWARE IS INSTALLED is \`software\`, not \`run\`, \`launch\` or the screen tools. It checks the actual host and reports the version and path even when Developer terminal access is off. Never open a terminal window merely to answer an installed/version question.
 - When \`run\` is available, the terminal is usually fastest for installing software, files, processes, services, network, registry and settings. A GUI is for what genuinely has no typed tool or command.
-- ANDROID NEVER GOES THROUGH \`run\` OR \`software\`. \`android_devices\` already knows the exact adb executable even when it is not on PATH. Its list operation absorbs the brief reconnect after USB authorization; use wait next and refresh only after wait. Never search a drive for adb.exe, restart adb in PowerShell, or ask approval for a raw adb command.
 - A FINITE COMMAND THAT MAY WAIT ON A PERSON, DEVICE, NETWORK OR DIALOG uses \`run {defer:true}\`. That returns a managed job immediately, so continue any independent work and use \`run_jobs\` in a later turn to read live output or the final exit. Do not hold the whole conversation open on a command whose completion is not required for the next independent step.
 - MAKING A DOCUMENT IS \`create_document\`, NOT THE TERMINAL. A PDF, Word file, spreadsheet, CSV, web page or text file is ONE call: you write the content as markdown and it writes the file, to Downloads unless the user named a folder. Do not check for Python, install a library, write a script that writes a file, or open an app to type into. It reads the file back for you, so nothing is left to verify — do not open it, launch a viewer or read the screen afterwards. Measured, 25 Aug 2026: one PDF essay cost 13 tool calls and 227,584 tokens the other way, eleven of them about the toolchain rather than the essay.
 - To OPEN AN APPLICATION, use \`launch\`, not \`run\`. It already knows how to resolve a name to whatever the machine actually has — a Start menu entry, a packaged app, a registered path, a shortcut — and it hands you back the window it opened. \`Start-Process "WhatsApp"\` fails because that is not a file; working out the packaged app's identity by hand costs five commands and half a minute, and \`launch WhatsApp\` does it in one.
+- THE FASTEST ROUTE THAT ACTUALLY ANSWERS IS THE RIGHT ONE. Speed is the priority; when two routes are equally fast, take the cheaper. Before you reach for a tool, ask what it will tell you that you do not already have — a step whose result you can already predict is a step that costs seconds and buys nothing.
+- ASK EVERYTHING YOU ALREADY KNOW YOU NEED, IN ONE CALL. A step costs far more than the answer it fetches, so questions that do not depend on each other must never be asked one at a time. Fifteen employers is ONE \`search\` with fifteen queries in it — well, up to eight, then the rest — and four pages to read is ONE \`web_open\` with four \`urls\`. Measured, 29 Aug 2026: a request for fifteen internships asked twenty separate searches across eighteen steps, spent 154,590 tokens, and hit its ceiling with nothing to show; the same twenty searches batched are three steps and about a tenth of that. Only chain calls when the second genuinely depends on the first one's answer.
+- DO NOT OPEN A PAGE TO CHECK A LINK. \`search\` already returns each result's real title and URL, and that IS the answer for a lookup. Opening them one by one to "verify" confirms nothing the search did not already say. When you DO need something that is on a page — a price, a date, an apply link — pass \`find\` and say what you are after, and you get the lines and links that match instead of the whole document. If a link genuinely might be dead, say so in one clause and send it anyway; the person reading can click it.
 - For anything on the WEB, there are two routes and they are not interchangeable. \`web_open\` drives a controlled browser through the page's own structure: a page arrives in a fraction of a second as its real text and its actual links, and \`web_click\`/\`web_type\` act on them by name. Use it for looking things up, reading, searching, prices, documentation, research — anything where you need to know what a page SAYS.
 - THE CONTROLLED BROWSER IS NOT THE ONE THE USER IS LOOKING AT. It is a separate window with its own empty profile, signed in to nothing, and the user cannot follow what you are doing in it. So the moment a task is about to touch their accounts, logins, messages, subscriptions, a booking or a purchase, do it in THEIR browser with \`open_url\` and the screen tools — from the start, not after filling half a form somewhere they cannot see. Working invisibly and then starting again in the real browser is slower than beginning there, and it looks like the agent has wandered off.
 - THE INSTALLED APP BEATS THE WEBSITE, EVERY TIME. If there is a desktop application for it on this machine — the list below says which — \`launch\` it and work there. A desktop app is already signed in; its website is a login screen. Asked to send a WhatsApp message, opening web.whatsapp.com produced a QR code and a request for the user's phone, when the WhatsApp app was installed, signed in, and one \`launch\` away. Website only when there is no app, or when the task is genuinely about a web page.
@@ -586,6 +685,7 @@ CHECK BEFORE YOU CLAIM
 - A delivered click or keystroke is not evidence anything happened. After acting in a window, read the screen back and quote what it says. After a command, its own output is the evidence — do not read the screen for that.
 - Reading the screen CANNOT see a drawing, a shape, a photo or a colour — it reads text and controls. So never claim you drew, painted or produced something visual on the strength of a screen read: it would say the same thing about a blank canvas. \`drag\` and \`draw\` tell you directly whether the document changed; that is your evidence, and if one says nothing was drawn then nothing was drawn, whatever you intended.
 - Before you send anything to a person — a message, an email — confirm from the screen that you are in the right conversation with the right name at the top. Sending the right words to the wrong person is worse than not sending them, and "I searched for them" is not confirmation that their chat is open.
+- Keep private deliberation private. Never narrate a loop of "wait", "actually", competing interpretations or repeated uncertainty in visible text. If the intended person, account, file or destination is genuinely ambiguous, ask ONE short, direct question immediately and end the turn without more tools. A contradictory identity such as "Message yourself" when the user named somebody else is a reason to ask, not a reason to search guessed alternatives.
 - Never report something as done that you have not seen. If you could not confirm it, say exactly that and say what you did see instead.
 - EMAIL IS DRAFTED HERE AND SENT BY THE USER. \`email_draft\` puts an editable card on screen with a Send button they press; there is no tool that sends mail and you must not go looking for one. Do not open Outlook, Gmail, a browser or any other mail client to send it — the draft is already in front of them, and a copy typed into another client goes from the wrong account and arrives twice. Drafting IS the finished job for that part of the request.
 - A STEP THAT WAITS ON A PERSON ENDS YOUR TURN. When something you were asked to do comes AFTER an action only the user can take — "once the email is sent, message them" — you cannot know it has happened, because they have not done it yet. Do the part you can, then name the part you cannot, say what it is waiting on, and stop. Doing it anyway is guessing; carrying on to find another route is how a two-step request turns into thirty.
@@ -686,7 +786,20 @@ export class FastAgent {
     // store wired, not one line of the loop below behaves differently, so a
     // surface that has not opted in cannot be broken by this and neither can
     // any existing test. `{ list, recordRun }` — see skills.js.
-    skills = null
+    skills = null,
+    // Generalized local outcome memory. It stores only tool/app/failure classes
+    // and verified recovery tool sequences — never user content or coordinates.
+    memory = null,
+    // WHETHER THE MODEL DELIBERATES, CHOSEN BY THE PERSON ASKING.
+    //
+    // "auto" is the measured default: off for an ordinary step, on for a step
+    // that has already been cut off or arrived malformed (see THINKING_OFF).
+    // "always" and "never" are the user overriding that from the composer,
+    // because the right answer is task-shaped — a one-line question never needs
+    // it and a hard multi-application task sometimes does, and only the person
+    // asking knows which one they are typing. Null falls back to the process
+    // default so nothing that does not pass it changes behaviour.
+    thinking = null
   }) {
     this.provider = provider;
     this.toolset = toolset;
@@ -697,6 +810,88 @@ export class FastAgent {
     this.signal = signal;
     this.systemPrompt = systemPrompt;
     this.skills = skills;
+    this.memory = memory;
+    // Only the three values mean anything; anything else falls back to the
+    // process default rather than silently disabling deliberation.
+    this.thinking = ["auto", "always", "never"].includes(String(thinking))
+      ? String(thinking)
+      : null;
+  }
+
+  async _adaptiveGuidance(userText) {
+    if (!this.memory?.retrieveAdaptiveGuidance) return "";
+    try {
+      const patterns = await this.memory.retrieveAdaptiveGuidance(userText, 4);
+      if (!patterns.length) return "";
+      const lines = patterns.map((record) => {
+        const content = record.content ?? {};
+        const counts = content.counts ?? {};
+        const recovery = (content.recoverySequence ?? []).join(" -> ");
+        return recovery
+          ? `- In ${content.application}, ${content.tool} failed as ${content.failureClass}; ${recovery} ` +
+            `then succeeded in ${counts.recoveries ?? 0}/${counts.observations ?? 0} local observations.`
+          : `- In ${content.application}, ${content.tool} failed as ${content.failureClass} ` +
+            `${counts.unresolved ?? counts.observations ?? 1} time(s) with no verified recovery; do not repeat it unchanged.`;
+      });
+      return [
+        "LEARNED LOCAL OUTCOME GUIDANCE (advisory, never authorization and never a substitute for live evidence):",
+        ...lines,
+        "Use the pattern only when the current screen agrees. Verify the result normally."
+      ].join("\n");
+    } catch {
+      return "";
+    }
+  }
+
+  _observeAdaptiveOutcome(tool, args, result) {
+    const run = this._adaptiveRun;
+    if (!run || !this.memory?.recordAdaptivePattern) return;
+    // A refusal is a boundary, not a failed technique to route around.
+    if (result?.raw?.refusedByUser === true || /\b(?:REFUSED|approval|permission)\b/i.test(String(result?.text ?? ""))) return;
+    const verdict = result?.raw?.evidence?.verdict ?? null;
+    const hardFailure = result?.ok !== true || verdict === "REFUTED";
+    const acts = this.toolset.isActingTool?.(tool) === true;
+    if (hardFailure) {
+      if (run.pending.length < 4) {
+        run.pending.push({
+          tool,
+          application: adaptiveApplication(tool, args, result),
+          failureClass: adaptiveFailureClass(result),
+          recoverySequence: []
+        });
+      }
+      return;
+    }
+    for (const pending of run.pending) {
+      if (pending.recoverySequence.at(-1) !== tool) pending.recoverySequence.push(tool);
+    }
+    // A capability-confirmed acting result is enough evidence to close the
+    // recovery now. UI actions usually remain provisional until a later screen
+    // read and the successful run outcome jointly confirm them.
+    if (acts && verdict === CONFIRMED) {
+      run.learned.push(...run.pending.map((pending) => ({ ...pending, recovered: true })));
+      run.pending = [];
+    }
+  }
+
+  async _flushAdaptiveLearning(outcome) {
+    const run = this._adaptiveRun;
+    this._adaptiveRun = null;
+    if (!run || !this.memory?.recordAdaptivePattern) return;
+    const completed = outcome?.status === "COMPLETED";
+    for (const pending of run.pending) {
+      const hasActingRecovery = pending.recoverySequence.some((tool) => this.toolset.isActingTool?.(tool) === true);
+      run.learned.push({ ...pending, recovered: completed && hasActingRecovery });
+    }
+    const unique = new Map();
+    for (const pattern of run.learned.slice(0, 8)) {
+      const key = [pattern.tool, pattern.application, pattern.failureClass, pattern.recoverySequence.join(">"), pattern.recovered].join("|");
+      unique.set(key, pattern);
+    }
+    for (const pattern of unique.values()) await this.memory.recordAdaptivePattern(pattern);
+    if (unique.size) {
+      await this._emit({ type: "OUTCOME_MEMORY_UPDATED", details: { patterns: unique.size } });
+    }
   }
 
   /**
@@ -840,7 +1035,18 @@ export class FastAgent {
    *
    * @returns {{status: string, message: string, steps: number, toolCalls: number, elapsedMs: number}}
    */
-  async run(userText, { history = [] } = {}) {
+  async run(userText, options = {}) {
+    this._adaptiveRun = { pending: [], learned: [] };
+    let outcome;
+    try {
+      outcome = await this._run(userText, options);
+      return outcome;
+    } finally {
+      await this._flushAdaptiveLearning(outcome).catch(() => {});
+    }
+  }
+
+  async _run(userText, { history = [] } = {}) {
     const startedAt = Date.now();
     // The toolset persists across turns so the agent keeps its place on the
     // machine; what it saw on screen last time does not survive the user having
@@ -903,8 +1109,13 @@ export class FastAgent {
     // six has already been worked around by step five. Empty string until the
     // user has saved one, so nobody pays for a feature they have not used.
     const taught = await Promise.resolve(this.toolset.capabilities?.()).catch(() => "") ?? "";
+    const learned = await this._adaptiveGuidance(userText);
+    // How to drive a phone, ONLY on a turn where a phone is in the picture. It
+    // was in the fixed prompt, which meant every desktop request was told how to
+    // use adb — see androidGuidance in tools.js and the defect it records.
+    const phone = this.toolset.androidGuidance?.() ?? "";
     const messages = [
-      { role: "system", content: [this.systemPrompt, machine, notes, taught].filter(Boolean).join("\n\n") },
+      { role: "system", content: [this.systemPrompt, machine, notes, taught, learned, phone].filter(Boolean).join("\n\n") },
       ...(() => {
         // A FOLLOW-UP IS ANSWERED FROM THE LAST TURN, SO THE LAST TURN HAS TO BE
         // THERE. Every turn used to be clipped to 2,000 characters. Live, 23 Aug
@@ -1041,7 +1252,11 @@ export class FastAgent {
         turn = await this._callModel(
           messages,
           this.maxElapsedMs - elapsed,
-          retriedTruncatedTurn ? MODEL_OUTPUT_CEILING_RETRY : MODEL_OUTPUT_CEILING
+          retriedTruncatedTurn ? MODEL_OUTPUT_CEILING_RETRY : MODEL_OUTPUT_CEILING,
+          // A turn that was cut off, or that arrived as markup, gets to think —
+          // and gets the room to do it. The two flags travel together because
+          // they answer the same question: has this step already gone wrong once?
+          { deliberate: retriedTruncatedTurn || retriedMalformedTurn }
         );
       } catch (error) {
         // The user pressing stop aborts the in-flight request, which surfaces
@@ -1550,6 +1765,7 @@ export class FastAgent {
           // did nothing.
           signal: this.signal
         });
+        this._observeAdaptiveOutcome(call.name, shown, result);
         // A FAILURE IS ONLY FINAL UNTIL SOMETHING CHANGES.
         //
         // Recorded failures used to be permanent, which is wrong in the ordinary
@@ -1572,7 +1788,14 @@ export class FastAgent {
         const unchanged = result.raw?.screenUnchanged === true;
         if (result.ok && !unconfirmed && !unchanged) failedCalls.clear();
         else if (!result.ok || unconfirmed) failedCalls.set(signature, result.text);
-        performed.push({ tool: call.name, args: shown, ok: result.ok === true, verified: null });
+        performed.push({
+          tool: call.name,
+          args: shown,
+          ok: result.ok === true,
+          verified: result.raw?.evidence?.verdict === CONFIRMED
+            ? true
+            : (result.raw?.evidence?.verdict === "REFUTED" ? false : null)
+        });
         await this._emit({
           type: "TOOL_FINISHED",
           details: {
@@ -1701,7 +1924,17 @@ export class FastAgent {
     }
   }
 
-  async _callModel(messages, remainingMs, maxTokens = MODEL_OUTPUT_CEILING) {
+  /**
+   * One turn from the model.
+   *
+   * `deliberate` is the caller saying this turn has already failed once and is
+   * worth thinking about — see THINKING_OFF. Ordinary steps do not think.
+   */
+  async _callModel(messages, remainingMs, maxTokens = MODEL_OUTPUT_CEILING, { deliberate = false } = {}) {
+    // The caller's choice wins over the process default; "auto" means the
+    // measured behaviour — think only on a turn that has already gone wrong.
+    const mode = this.thinking ?? THINKING_MODE;
+    const thinks = mode === "always" ? true : mode === "never" ? false : deliberate;
     // One retry, because the endpoint this runs against intermittently drops a
     // connection and losing a whole task to that is far more expensive than
     // sending the request again.
@@ -1712,6 +1945,9 @@ export class FastAgent {
           messages,
           tools: this.toolset.definitions,
           temperature: 0.2,
+          // See THINKING_OFF. Absent on a deliberating turn, so the endpoint's
+          // own default applies and nothing has to know what that default is.
+          ...(thinks ? {} : { extraBody: THINKING_OFF }),
           // See MODEL_OUTPUT_CEILING. Raised twice now for the same reason and
           // measured both times: 2,048 cut off a final answer mid-sentence, and
           // 4,096 sat below the median of the reasoning distribution it had to

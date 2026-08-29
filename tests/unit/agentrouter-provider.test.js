@@ -94,12 +94,13 @@ test("createModelProvider returns AgentRouter when a key is present, Mock otherw
   assert.equal(noKey.name, "mock");
 });
 
-test("loadModelConfig reads provider/key/model from a local config file", async () => {
+test("loadModelConfig reads provider/key/model but does not infer external-AI consent", async () => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-cfg-"));
-  const prev = { p: process.env.SYSCORA_MODEL_PROVIDER, k: process.env.SYSCORA_MODEL_API_KEY, a: process.env.AGENTROUTER_API_KEY };
+  const prev = { p: process.env.SYSCORA_MODEL_PROVIDER, k: process.env.SYSCORA_MODEL_API_KEY, a: process.env.AGENTROUTER_API_KEY, c: process.env.SYSCORA_EXTERNAL_AI_CONSENT_SCOPES };
   delete process.env.SYSCORA_MODEL_PROVIDER;
   delete process.env.SYSCORA_MODEL_API_KEY;
   delete process.env.AGENTROUTER_API_KEY;
+  delete process.env.SYSCORA_EXTERNAL_AI_CONSENT_SCOPES;
   try {
     await fs.mkdir(path.join(base, ".syscora"), { recursive: true });
     await fs.writeFile(
@@ -110,10 +111,12 @@ test("loadModelConfig reads provider/key/model from a local config file", async 
     assert.equal(cfg.provider, "agentrouter");
     assert.equal(cfg.apiKey, "sk-file");
     assert.equal(cfg.model, "gpt-5.5");
+    assert.deepEqual(cfg.externalAIConsent.scopes, ["EXTERNAL_AI_DISABLED"]);
   } finally {
     if (prev.p !== undefined) process.env.SYSCORA_MODEL_PROVIDER = prev.p;
     if (prev.k !== undefined) process.env.SYSCORA_MODEL_API_KEY = prev.k;
     if (prev.a !== undefined) process.env.AGENTROUTER_API_KEY = prev.a;
+    if (prev.c !== undefined) process.env.SYSCORA_EXTERNAL_AI_CONSENT_SCOPES = prev.c;
     await fs.rm(base, { recursive: true, force: true });
   }
 });

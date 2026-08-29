@@ -145,13 +145,47 @@ const INDEXES = [
 // This is not evasion of a rate limit or a paywall: the requests are one per
 // search, from a person's own machine, for the pages they asked to look at.
 // It is a client describing itself accurately.
+// AND THE VERSION GOES STALE, WHICH IS THE SAME BUG A SECOND TIME.
+//
+// The headers above were written to fix an HTTP 202, and they did. Then the
+// version they name got old, and on 29 Aug 2026 DuckDuckGo started answering
+// them with an outright 403. Measured the same day, one query, five header sets,
+// against `lite.duckduckgo.com`:
+//
+//   Chrome 124 + matching sec-ch-ua   403     <- what this file was sending
+//   Chrome 141 UA alone               202     <- the original contradiction
+//   UA + accept-language only         202
+//   plain "Mozilla/5.0 (Windows...)"  200  RESULTS
+//   Chrome 141 + matching sec-ch-ua   200  RESULTS
+//
+// The COST of that 403 is the part worth writing down, because nothing reported
+// it: `searchWeb` returned eight results and `errors: none reported`, having
+// silently lost both DuckDuckGo endpoints and answered from Bing alone. With one
+// engine there is no consensus left, and consensus is what this ranker is built
+// on — so "how to change a tyre" returned a percent-change calculator,
+// change.org and a dictionary definition of "change". That is the exact class of
+// failure `scripts/bench-search.mjs` was written for, back again, and the user
+// reported it as "the browser search works like shit today".
+//
+// ONE VERSION, USED IN BOTH PLACES. The UA and the sec-ch-ua brand list have to
+// agree — a Chrome that names one version in its user-agent and another in its
+// client hints is the contradiction that earns the 202. They were two string
+// literals, so keeping them in step was somebody remembering to. Now they are
+// built from one constant and cannot disagree.
+//
+// WHEN THIS BREAKS AGAIN — and it will, this is the second time — the signature
+// is a 403 or a 202 from DuckDuckGo while a plain-UA request from the same
+// machine gets a 200. Bump the number. `node scripts/bench-search.mjs` shows the
+// damage; the engine column in its output naming a single engine is the tell.
+const CHROME_VERSION = "141";
+
 const BROWSER_HEADERS = {
   "user-agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION}.0.0.0 Safari/537.36`,
   // xml is in the list because one endpoint returns a feed.
   accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
   "accept-language": "en-US,en;q=0.9",
-  "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "sec-ch-ua": `"Chromium";v="${CHROME_VERSION}", "Google Chrome";v="${CHROME_VERSION}", "Not?A_Brand";v="24"`,
   "sec-ch-ua-mobile": "?0",
   "sec-ch-ua-platform": '"Windows"',
   "sec-fetch-dest": "document",
@@ -713,15 +747,137 @@ export async function searchWeb(query, {
   return found;
 }
 
-/** How the results are shown to the model and, through it, to the user. */
-export function renderResults({ query, results, provider }) {
-  const lines = [`${results.length} result${results.length === 1 ? "" : "s"} for "${query}" (${provider})`, ""];
-  for (const [index, result] of results.entries()) {
-    lines.push(`${index + 1}. ${result.title}`);
-    lines.push(`   ${result.url}`);
-    if (result.snippet) lines.push(`   ${result.snippet}`);
+// A STEP COSTS MORE THAN A SEARCH DOES.
+//
+// This is the measurement the batching below exists for, and it is not about
+// HTTP at all. Probed against this machine's own endpoint on 29 Aug 2026
+// (`node scripts/probe-prompt-cache.mjs`): prefix caching is on and works, and
+// it is quantised into 8,192-token blocks. So every step re-buys whatever sits
+// in the incomplete tail block — on average about 4,000 tokens — before it has
+// looked at anything at all.
+//
+// That is the floor: a round trip costs roughly 4,000-8,000 billed tokens no
+// matter how small the tool result is. A search result set is ~700. The step is
+// five to ten times the price of the thing it went to get.
+//
+// Measured on the live run this was written for: fifteen internships asked for,
+// twenty searches issued ONE AT A TIME across eighteen steps, 154,590 fresh
+// tokens, and the run hit its ceiling with the answer unfinished. The searches
+// themselves were about 14,000 of those tokens. The other 140,000 was the cost
+// of asking twenty separate times.
+//
+// So the unit this tool should trade in is a BATCH, and the whole point is that
+// the queries are independent: fifteen employers is fifteen questions that do
+// not depend on each other's answers, and there is no reason for the model to
+// find that out fifteen round trips in a row.
+//
+// FOUR AT A TIME, WHICH IS A MEASUREMENT AND NOT A GUESS.
+//
+// DuckDuckGo enforces a rolling budget and starts answering 202 once it is
+// spent — and it is the best of the three indexes, so losing it costs real
+// quality (see the consensus argument at the top of this file). Measured the
+// same day, eight queries through this path:
+//
+//   4 at a time   3.9s wall   7/8 queries answered by all three indexes
+//   3 at a time   3.6s wall   0/8 — DuckDuckGo had already been spent by the
+//                             previous run a minute earlier
+//
+// The second row is the important one: the limit is a budget over TIME, not a
+// burst width, so going slower does not protect it and only spends the same
+// allowance later. Four is where the wall clock stops improving.
+const SEARCH_CONCURRENCY = 4;
+
+// Above this a batch is not a batch, it is a crawl: DuckDuckGo's budget goes,
+// consensus collapses to Bing, and Bing alone is measurably worse than failing
+// (see the benchmark table at the top of this file).
+export const MAX_BATCH_QUERIES = 8;
+
+/**
+ * Run several independent searches at once. Returns one `searchWeb` result per
+ * query, in the order asked.
+ *
+ * Every query still goes through `searchWeb`, so the cache, the consensus
+ * ranking and the per-index failure reporting are identical to a single search.
+ * The only thing this adds is that they do not each cost a model round trip.
+ */
+export async function searchMany(queries, { concurrency = SEARCH_CONCURRENCY, ...options } = {}) {
+  const wanted = (Array.isArray(queries) ? queries : [queries])
+    .map((query) => String(query ?? "").trim())
+    .filter(Boolean);
+  // The same question twice in one batch is one request. The model writes these
+  // in a single burst and duplicates are common; paying an index twice for the
+  // same answer is the exact spending the rate limit punishes.
+  const unique = [...new Map(wanted.map((query) => [query.toLowerCase().replace(/\s+/g, " "), query])).values()];
+  if (unique.length === 0) return [];
+
+  const results = new Array(unique.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, unique.length)) }, async () => {
+    for (;;) {
+      const position = next;
+      next += 1;
+      if (position >= unique.length) return;
+      results[position] = await searchWeb(unique[position], options);
+    }
+  }));
+  return results;
+}
+
+/**
+ * Search results, as the model sees them — one query or eight.
+ *
+ * ONE FORMATTER, BECAUSE THE CLIENT PARSES THIS BACK OUT.
+ *
+ * There were briefly two: `renderResults` for a single search and this for a
+ * batch. That is a shape kept in step by somebody remembering to, and
+ * `renderSearchResults` in demo.js reads this text back to draw the results as
+ * clickable links — so the half of the shape it had not been told about would
+ * have rendered as a wall of unclickable text, exactly the defect that function
+ * was written to fix. A batch of one is a batch, so there is one function.
+ *
+ * THE SAME PAGE UNDER FIVE HEADINGS IS PAID FOR FIVE TIMES.
+ *
+ * Related queries return overlapping results — that is what makes them related
+ * — and a batch of eight prints the same SEO aggregator eight times unless
+ * something stops it. Measured on the internship batch: 64 result rows carrying
+ * 41 distinct pages.
+ *
+ * So a page is printed ONCE, at its best position, and every later appearance
+ * becomes a cross-reference by number. That is both the token saving and a
+ * ranking signal worth having: a page several independent queries all surface
+ * is a better answer than one that only came back for a single phrasing, and
+ * saying which queries found it is exactly the consensus argument this file is
+ * built on, applied across queries instead of across indexes.
+ */
+export function renderBatch(found) {
+  const printed = new Map();
+  const sections = [];
+  let numbered = 0;
+
+  for (const one of found) {
+    if (!one.ok) {
+      sections.push(`No results for "${one.query}": ${one.reason}`);
+      continue;
+    }
+    const lines = [`${one.results.length} result${one.results.length === 1 ? "" : "s"} for "${one.query}" (${one.provider})`, ""];
+    for (const result of one.results) {
+      const key = canonicalUrl(result.url);
+      const already = printed.get(key);
+      if (already) {
+        // Named, not just numbered: "same as 3" is only useful if you can see
+        // what 3 was without scrolling back through eight sections.
+        lines.push(`   = ${already.at}. ${already.title}`);
+        continue;
+      }
+      numbered += 1;
+      printed.set(key, { at: numbered, title: result.title });
+      lines.push(`${numbered}. ${result.title}`);
+      lines.push(`   ${result.url}`);
+      if (result.snippet) lines.push(`   ${result.snippet}`);
+    }
+    sections.push(lines.join("\n"));
   }
-  return lines.join("\n");
+  return sections.join("\n\n");
 }
 
 // Exported for the toolset's own use; kept here so the escaping rule lives with

@@ -112,3 +112,38 @@ test("no trusted keys configured means no plugin can verify", async () => {
   const ok = await verifier({ digest: "abc", signature: Buffer.from("x").toString("base64") });
   assert.equal(ok, false);
 });
+
+test("a signed manifest cannot load an entry through a junction outside its plugin directory", { skip: process.platform !== "win32" }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-plugin-boundary-"));
+  try {
+    const pluginDirectory = path.join(root, "plugin");
+    const outside = path.join(root, "outside");
+    await fs.mkdir(pluginDirectory, { recursive: true });
+    await fs.mkdir(outside, { recursive: true });
+    await fs.writeFile(path.join(outside, "index.js"), PLUGIN_ENTRY);
+    await fs.symlink(outside, path.join(pluginDirectory, "linked"), "junction");
+
+    const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+    const manifest = {
+      manifestVersion: "1",
+      pluginId: "test.boundary",
+      version: "1.0.0",
+      runtimeVersion: ">=0.1.0",
+      entry: "linked/index.js",
+      capabilities: ["plugin.signed.echo"],
+      dependencies: [],
+      signature: "PLACEHOLDER"
+    };
+    const signature = crypto.sign(null, Buffer.from(digestForManifest(manifest), "utf8"), privateKey).toString("base64");
+    const manifestPath = path.join(pluginDirectory, "syscora-capability.json");
+    await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, signature }));
+
+    const loader = new CapabilityPluginLoader({
+      registry: new CapabilityRegistry(),
+      verifySignature: createPluginSignatureVerifier({ trustedKeys: [publicKey] })
+    });
+    await assert.rejects(loader.load(manifestPath), /canonical plugin directory/);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

@@ -1,0 +1,57 @@
+name: Signed release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+      CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - name: Require signing credentials
+        shell: pwsh
+        run: |
+          if (-not $env:CSC_LINK -or -not $env:CSC_KEY_PASSWORD) { throw 'Windows signing credentials are not configured.' }
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run license:check
+      - run: npm run sbom
+      - run: npm run security:audit
+      - run: npm run history:audit
+      - run: npm run dist -- --publish never
+      - name: Verify signatures and smoke installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist -Filter 'SYSCORA-*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No installer was built.' }
+          $installerSignature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
+          if ($installerSignature.Status -ne 'Valid') { throw "Installer signature is $($installerSignature.Status)." }
+          $appSignature = Get-AuthenticodeSignature -LiteralPath 'dist/win-unpacked/SYSCORA.exe'
+          if ($appSignature.Status -ne 'Valid') { throw "Executable signature is $($appSignature.Status)." }
+          ./scripts/installer-smoke.ps1 -Installer $installer.FullName
+      - run: npm run release:gate
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | Where-Object { $_.Extension -in '.exe','.blockmap','.yml' } | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -LiteralPath artifacts/SHA256SUMS.txt -Encoding utf8
+      - name: Create draft GitHub release
+        shell: pwsh
+        run: |
+          gh release create '${{ github.ref_name }}' --draft --verify-tag --title "SYSCORA ${{ github.ref_name }}" --generate-notes `
+            dist/*.exe dist/*.blockmap dist/latest.yml artifacts/sbom.cdx.json artifacts/licenses.json artifacts/npm-audit.json artifacts/SHA256SUMS.txt

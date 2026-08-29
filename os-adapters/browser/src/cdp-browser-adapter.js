@@ -13,6 +13,23 @@ const throwIfAborted = (signal) => {
   throw error;
 };
 
+// WHERE THIS BROWSER THINKS IT IS. See the launch arguments for the defect.
+//
+// Taken from the machine rather than hard-coded, because the user's own locale
+// is the only defensible default — an agent that silently browsed as an American
+// would be the same bug pointing the other way. `Intl` reads the OS settings,
+// which is what the user's real browser uses too.
+const systemLocale = () => {
+  try {
+    const resolved = Intl.DateTimeFormat().resolvedOptions();
+    return { locale: resolved.locale || "en-US", timeZone: resolved.timeZone || "UTC" };
+  } catch {
+    return { locale: "en-US", timeZone: "UTC" };
+  }
+};
+export const BROWSER_LOCALE = process.env.SYSCORA_BROWSER_LOCALE || systemLocale().locale;
+export const BROWSER_TIMEZONE = process.env.SYSCORA_BROWSER_TIMEZONE || systemLocale().timeZone;
+
 export const BROWSER_TARGET_KIND = "BROWSER_DOM";
 export const DESKTOP_TARGET_KIND = "DESKTOP_UI";
 export const MAX_BROWSER_TEXT_BYTES = 64 * 1024;
@@ -213,6 +230,25 @@ export class CdpBrowserAdapter {
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-dev-shm-usage",
+      // A BLANK PROFILE HAS A NATIONALITY, AND NOBODY CHOSE IT.
+      //
+      // This browser launched with no language, no locale and no timezone, so
+      // every site geolocated it by IP. Measured live, 28 Aug 2026, twice: asked
+      // for the cheapest business-class seat from New York to Seattle, Google
+      // Flights opened with "Mysuru" as the origin and prices in ₹, and Kayak
+      // opened on Kozhikode. The agent drove both forms correctly and could not
+      // win, because the page it was driving was answering a different question.
+      // Two runs, 728,095 tokens, no flight found.
+      //
+      // `--lang` alone is not enough: Chromium sends Accept-Language from it, but
+      // sites also read `navigator.language`, and the timezone and geolocation
+      // are set over CDP once the connection is up (see _applyLocale).
+      //
+      // Overridable, because the right locale is the USER's, not a constant:
+      // SYSCORA_BROWSER_LOCALE / _TIMEZONE. The default is the machine's own,
+      // falling back to en-US.
+      `--lang=${BROWSER_LOCALE}`,
+      `--accept-lang=${BROWSER_LOCALE}`,
       ...(headless ? ["--disable-gpu"] : []),
       ...(process.env.SYSCORA_BROWSER_DISABLE_SANDBOX === "1" ? ["--no-sandbox"] : []),
       ...(headless ? ["--headless=new"] : []),
@@ -266,6 +302,7 @@ export class CdpBrowserAdapter {
         returnByValue: true
       });
       if (ready?.result?.value !== 2) throw browserError("DOM_UNAVAILABLE", "Browser runtime is unavailable");
+      await this._applyLocale();
       this.target = { targetId: target.targetId, url: target.url };
       this._transition(BrowserLifecycleState.READY, { targetId: target.targetId });
       throwIfAborted(signal);
@@ -791,29 +828,103 @@ export class CdpBrowserAdapter {
     return { found: true, target: normalizeBrowserElement(found) };
   }
 
+  /**
+   * Tell the page where it is, over CDP.
+   *
+   * `--lang` sets Accept-Language and nothing else; a page that asks
+   * `navigator.language`, or formats a date, or reads the timezone, still gets
+   * whatever the process inherited. Google Flights reads all three, which is how
+   * a New York → Seattle search opened on Mysuru with prices in rupees.
+   *
+   * BEST-EFFORT ON PURPOSE. Every one of these is an Emulation domain command
+   * and a Chromium build that does not support one must not cost the caller
+   * their browser — a slightly mislocalised page is worth far more than no page.
+   * Each is tried separately so one failure does not skip the rest.
+   */
+  async _applyLocale() {
+    const attempts = [
+      ["Emulation.setTimezoneOverride", { timezoneId: BROWSER_TIMEZONE }],
+      ["Emulation.setLocaleOverride", { locale: BROWSER_LOCALE }],
+      ["Network.setUserAgentOverride", { userAgent: "", acceptLanguage: BROWSER_LOCALE }]
+    ];
+    for (const [method, params] of attempts) {
+      // An empty userAgent means "keep the real one" — only the language is
+      // being set here. Impersonating a different browser is a separate
+      // decision and not one this method should make quietly.
+      if (method === "Network.setUserAgentOverride") {
+        const agent = await this.connection.send("Browser.getVersion").catch(() => null);
+        if (!agent?.userAgent) continue;
+        params.userAgent = agent.userAgent;
+      }
+      await this.connection.send(method, params).catch(() => null);
+    }
+  }
+
   async findBest({ selector, text, minCoverage = 0.5 } = {}) {
     if (!selector || !text) return { found: false, reason: "selector-and-text-required" };
     const query = JSON.stringify({ selector: String(selector), text: String(text), minCoverage: Number(minCoverage) });
     const found = await this._evaluate(`(() => {
       const q=${query}; let candidates=[]; try{candidates=[...document.querySelectorAll(q.selector)]}catch{return null}
       const tokens=value=>String(value||"").toLowerCase().match(/[a-z0-9]+/g)?.filter(x=>x.length>=2)||[];
-      const wanted=[...new Set(tokens(q.text))]; let best=null;
+      const wanted=[...new Set(tokens(q.text))]; let scored=[];
       for(const hit of candidates){
         const label=(hit.innerText||hit.textContent||hit.getAttribute("aria-label")||hit.getAttribute("title")||"").trim();
         const actual=new Set(tokens(label)); const hits=wanted.filter(token=>actual.has(token)).length;
-        const coverage=wanted.length?hits/wanted.length:0;
-        if(!best||coverage>best.coverage||(coverage===best.coverage&&label.length>best.label.length))best={hit,label,coverage};
+        // COVERAGE ALONE CANNOT TELL "THE THING YOU ASKED FOR" FROM "SOMETHING
+        // THAT CONTAINS IT".
+        //
+        // recall = how much of what you asked for is here.
+        // precision = how much of what is here you asked for.
+        //
+        // Only recall was measured, so a candidate could carry every word of the
+        // request plus fifty of its own and score a perfect 1.0 — which is what a
+        // container wrapping a whole dropdown does, and what any row that happens
+        // to repeat the request's words does. Measured live, 28 Aug 2026, on
+        // Google Flights: asked for "New York, USA City in New York State" it
+        // clicked "Niagara Falls, New York, USA" — twice — and the resulting
+        // navigation took the whole task somewhere else.
+        //
+        // F1 is the harmonic mean, so a candidate has to be BOTH mostly what was
+        // asked for and mostly nothing else. It is deliberately harsh on the
+        // long-container case, which is the one that silently steals clicks.
+        const recall=wanted.length?hits/wanted.length:0;
+        const precision=actual.size?hits/actual.size:0;
+        const score=(recall+precision)?(2*recall*precision)/(recall+precision):0;
+        if(label) scored.push({hit,label,recall,score});
       }
-      if(!best||best.coverage<Math.max(0,Math.min(1,q.minCoverage||0.5)))return null;
+      // SHORTER WINS A TIE, NOT LONGER. The old rule preferred the longest label
+      // on an equal score, which is precisely backwards: among things that match
+      // your words equally well, the one with least extra text is the one you
+      // meant.
+      scored.sort((a,b)=>b.score-a.score||a.label.length-b.label.length);
+      const best=scored[0]; const runnerUp=scored[1]||null;
+      // The floor is still expressed as coverage/recall so existing callers keep
+      // their meaning, but the RANKING is by F1.
+      if(!best||best.recall<Math.max(0,Math.min(1,q.minCoverage||0.5)))return null;
       const r=best.hit.getBoundingClientRect(); const token="syscora-"+(globalThis.crypto?.randomUUID?.()||Math.random().toString(36).slice(2));
       best.hit.dataset.syscoraTarget=token;
       return {targetId:token,source:"DOM",selector:'[data-syscora-target="'+token+'"]',name:best.label,
         controlType:best.hit.tagName.toLowerCase(),boundingRect:{x:r.x,y:r.y,width:r.width,height:r.height},
-        confidence:best.coverage,observedAt:new Date().toISOString(),url:location.href,textCoverage:best.coverage};
+        confidence:best.score,observedAt:new Date().toISOString(),url:location.href,textCoverage:best.recall,
+        // What else nearly won, so the caller can refuse instead of guessing.
+        // A silent pick between two plausible rows is how a click lands on the
+        // wrong city and navigates the page out from under the task.
+        matchScore:best.score,
+        runnerUp:runnerUp?{name:runnerUp.label.slice(0,120),score:runnerUp.score}:null,
+        alternatives:scored.slice(0,5).map(s=>({name:s.label.slice(0,120),score:Number(s.score.toFixed(3))}))};
     })()`);
     if (!found) return { found: false, reason: "matching-dom-target-not-found" };
     this.observedTargets.set(found.targetId, found);
-    return { found: true, target: normalizeBrowserElement(found), textCoverage: found.textCoverage };
+    return {
+      found: true,
+      target: normalizeBrowserElement(found),
+      textCoverage: found.textCoverage,
+      // Forwarded so the tool can refuse an ambiguous click rather than pick one
+      // and navigate. `normalizeBrowserElement` keeps only the element fields.
+      matchScore: found.matchScore,
+      runnerUp: found.runnerUp ?? null,
+      alternatives: found.alternatives ?? []
+    };
   }
 
   // AN INPUT HAS NO TEXT IN IT, WHICH IS THE WHOLE POINT OF AN INPUT.

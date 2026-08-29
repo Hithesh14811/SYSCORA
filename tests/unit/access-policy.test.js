@@ -15,6 +15,11 @@ test("new requests default to balanced access with arbitrary terminal off", () =
   assert.equal(policy.shellExecutionMode, "none");
 });
 
+test("enabling developer mode without a boundary defaults to isolation", () => {
+  const policy = normalizeAccessPolicy({ developerMode: true });
+  assert.equal(policy.shellExecutionMode, "isolated");
+});
+
 test("legacy autoApprove is accepted only as an approval-mode compatibility field", () => {
   assert.equal(normalizeAccessPolicy({ autoApprove: true }).approvalMode, ApprovalMode.FULL);
   assert.equal(normalizeAccessPolicy({ autoApprove: true }).developerMode, false,

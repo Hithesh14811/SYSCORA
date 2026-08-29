@@ -185,12 +185,78 @@ export function relevanceOf({ title = "", snippet = "", url = "", text = "" }, t
 // DO NOT ADD IT BACK WITHOUT RUNNING `node scripts/bench-search.mjs --repeat 3`
 // FIRST. It is a plausible idea that costs a second of latency and pays nothing.
 
+// THE SITE THAT IS THE SUBJECT IS NOT THE SAME AS A SITE THAT MENTIONS IT.
+//
+// `relevanceOf` deliberately strips the hostname before scoring, and the reason
+// given is sound: counting it as ordinary term frequency would score
+// "python.org" full marks for "python" on every page it serves. But throwing the
+// host away entirely loses the strongest authority signal there is — when the
+// query names an organisation and the registrable domain IS that organisation,
+// that page is the primary source and everything else is somebody describing it.
+//
+// Measured, 29 Aug 2026, "Microsoft university internship visa sponsorship
+// apply", before this existed:
+//
+//   1. opportunitiescorners.com   2. scholarshipforphd.com   3. edvyra.com
+//   hit@1 MISS   hit@3 MISS   MRR 0.13
+//
+// careers.microsoft.com was in the results and buried under three SEO farms that
+// name Microsoft and link to nothing you can apply through. That is the exact
+// failure a user reported: fifteen internships asked for, listicles returned.
+//
+// SCORED SEPARATELY AND CAPPED, never folded into term frequency, so the
+// python.org objection still holds: this cannot make a hostname match outrank
+// what a page is actually about, it can only break the tie between pages that
+// are equally about it.
+//
+// WEIGHTED BY IDF, which is what stops it rewarding a farm called
+// "internshipsabroad.com". A term every candidate mentions has almost no inverse
+// frequency, so a domain built out of common words earns almost nothing; a term
+// only one candidate carries — "microsoft", "nvidia" — earns the most. The
+// signal is "this domain IS the rare thing you asked about", not "this domain
+// contains a word from your query".
+const PUBLIC_SUFFIX_TAIL = /\.(?:co|com|org|net|gov|edu|ac)\.[a-z]{2}$/i;
+
+export function registrableDomain(url) {
+  let host = "";
+  try {
+    host = new URL(String(url)).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+  host = host.replace(/^www\./, "");
+  const labels = host.split(".");
+  // `careers.microsoft.com` -> `microsoft.com`; `example.co.uk` -> `example.co.uk`.
+  const keep = PUBLIC_SUFFIX_TAIL.test(host) ? 3 : 2;
+  return labels.slice(-keep).join(".");
+}
+
+export function authorityOf(url, terms, idf) {
+  const domain = registrableDomain(url);
+  if (!domain) return 0;
+  // The name only, without the suffix: `microsoft.com` -> `microsoft`. Matching
+  // against the suffix would give every `.org` credit for the word "org".
+  const name = domain.split(".").slice(0, -(PUBLIC_SUFFIX_TAIL.test(domain) ? 2 : 1)).join(".");
+  if (!name) return 0;
+  let earned = 0;
+  let available = 0;
+  for (const term of terms) {
+    const weight = idf.get(term) ?? 1;
+    available += weight;
+    // Substring rather than equality: `amazon` matches `amazon.jobs`, and
+    // `microsoft` matches `microsoft`. Bounded at 3 characters so that short
+    // stopword-ish fragments cannot match half the web.
+    if (term.length >= 3 && name.includes(term)) earned += weight;
+  }
+  return available > 0 ? earned / available : 0;
+}
+
 /**
  * Re-order fused results by what they are actually about.
  *
- * Returns the results re-ordered, each carrying `relevance` and `support`, so
- * that WHY a result is where it is stays inspectable rather than becoming a
- * number nobody can argue with.
+ * Returns the results re-ordered, each carrying `relevance`, `authority` and
+ * `support`, so that WHY a result is where it is stays inspectable rather than
+ * becoming a number nobody can argue with.
  */
 export function rerank(query, results) {
   const terms = queryTerms(query);
@@ -204,17 +270,60 @@ export function rerank(query, results) {
   const scored = results.map((result) => ({
     ...result,
     support: result.foundBy?.length ?? 1,
-    relevance: relevanceOf(result, terms, idf)
+    relevance: relevanceOf(result, terms, idf),
+    authority: authorityOf(result.url, terms, idf)
   }));
 
   // The fused score, tilted by how well each candidate answers the question.
   // MULTIPLICATIVE rather than additive, so relevance modulates the engines'
-  // opinion instead of overruling it — the engines know about authority,
-  // freshness and popularity, none of which any amount of word matching here can
-  // see. The 0.45 floor is what stops a page with a terse title being buried for
-  // saying little about itself.
-  return [...scored].sort((left, right) =>
-    (right.score * (0.45 + right.relevance)) - (left.score * (0.45 + left.relevance)));
+  // opinion instead of overruling it — the engines know about freshness and
+  // popularity, which no amount of word matching here can see. The 0.45 floor is
+  // what stops a page with a terse title being buried for saying little about
+  // itself.
+  //
+  // AUTHORITY IS THE SMALLER OF THE TWO TERMS ON PURPOSE. The comment above used
+  // to say the engines know about authority; on a long-tail query they plainly
+  // do not — they ranked three SEO farms above the employer's own careers page.
+  // So it is scored here, and scored SMALL: at most 0.35 against relevance's
+  // 1.0, which is enough to lift the primary source past a farm that is equally
+  // on-topic and not enough to lift an off-topic page for owning a lucky domain.
+  // OFF BY DEFAULT, AND NOW MEASURED: IT IS WORSE.
+  //
+  // The claim above was based on two queries read once, and it did not survive
+  // being measured properly. The measurement kept failing for a week because
+  // every attempt used `bench-search.mjs`, which refetches — and seven runs in an
+  // hour spend DuckDuckGo's rolling budget, after which both arms are ranking
+  // Bing's opinion alone and the difference reported is the difference between a
+  // warm minute and a cold one.
+  //
+  // `scripts/bench-rank.mjs` fixes that: it fetches ONE candidate pool per query
+  // and ranks that same pool both ways, so the comparison is exact, repeatable
+  // and free after the first run. Against all fourteen benchmark queries, all
+  // pools three-index except one, 29 Aug 2026:
+  //
+  //                  hit@1   hit@3   hit@8   poison@3    MRR
+  //   authority OFF    79%     93%    100%        0%   0.869
+  //   authority ON     71%     93%    100%        0%   0.833
+  //
+  // Only one query actually moved, and it moved the wrong way: "how to stop
+  // windows 11 from reopening apps after restart" lost a page that answers it
+  // for `thewindowsclub.com`, which earns the domain bonus for the rare term
+  // "windows" while being the older Windows 10 article.
+  //
+  // THE PREMISE WAS WRONG, WHICH IS THE PART WORTH KEEPING. The two queries this
+  // was built for — the ones that returned three SEO farms above the employer's
+  // own careers page — are answered correctly with the signal OFF. Consensus and
+  // lexical relevance had already fixed them by the time this was written; the
+  // fix was attributed to the wrong change. A domain bonus is not needed to find
+  // a careers page, and it costs a real answer elsewhere.
+  //
+  // Left in and left dark rather than deleted, because the reasoning is sound and
+  // a future pool may say otherwise. Re-decide it, cheaply, with:
+  //
+  //   node scripts/bench-rank.mjs --fresh
+  const weight = process.env.SYSCORA_SEARCH_AUTHORITY === "1" ? 0.35 : 0;
+  const tilt = (row) => 0.45 + row.relevance + (weight * row.authority);
+  return [...scored].sort((left, right) => (right.score * tilt(right)) - (left.score * tilt(left)));
 }
 
 /**

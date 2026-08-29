@@ -3,7 +3,7 @@
 // process passed as a command-line argument and exposes ONLY that token to the
 // page via contextBridge — the token travels main → renderer entirely
 // in-process and is never sent over HTTP or embedded in served HTML.
-const { contextBridge, webUtils } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 function readTokenArg() {
   const prefix = "--syscora-token=";
@@ -33,5 +33,17 @@ contextBridge.exposeInMainWorld("syscora", {
     } catch {
       return null;
     }
-  }
+  },
+  updates: Object.freeze({
+    check: () => ipcRenderer.invoke("syscora:update-check"),
+    download: () => ipcRenderer.invoke("syscora:update-download"),
+    install: () => ipcRenderer.invoke("syscora:update-install"),
+    onStatus: (listener) => {
+      if (typeof listener !== "function") return () => {};
+      const handler = (_event, status) => listener(status);
+      ipcRenderer.on("syscora:update-status", handler);
+      return () => ipcRenderer.removeListener("syscora:update-status", handler);
+    }
+  }),
+  openLegal: (documentName) => ipcRenderer.invoke("syscora:open-legal", documentName)
 });

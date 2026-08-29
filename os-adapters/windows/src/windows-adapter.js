@@ -7,14 +7,10 @@ import { CdpBrowserAdapter } from "../../browser/src/cdp-browser-adapter.js";
 import { classifyShellCommand, ShellVerdict } from "../../../packages/policy-engine/src/shell-rules.js";
 import { accessibilityLaunchArgs } from "./webview-windows.js";
 import { executeInWindowsSandbox } from "./windows-sandbox.js";
+import { isCanonicalPathInside } from "../../../packages/shared-types/src/canonical-path.js";
 
 function pathIsInside(candidate, root) {
-  try {
-    const relative = path.relative(path.resolve(String(root)), path.resolve(String(candidate)));
-    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-  } catch {
-    return false;
-  }
+  return isCanonicalPathInside(candidate, root, { allowMissingCandidate: false });
 }
 
 function blockedCommand(command, args, reason, rule) {
@@ -54,6 +50,19 @@ function serializeEnvContents(pairs) {
 
 function escapePowerShellSingleQuoted(value) {
   return String(value).replace(/'/g, "''");
+}
+
+function processIsAlive(processId) {
+  const pid = Number(processId);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    // Signal 0 performs an existence/permission check; it does not terminate or
+    // otherwise modify the process.
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const COMMAND_PROBE_ALIASES = Object.freeze({
@@ -313,6 +322,48 @@ export function spotifyNameMatchesQuery(name, query) {
 
 function uiBounds(target) {
   return target?.boundingRect ?? target?.bounds ?? {};
+}
+
+// Pick an action from a rendered result row using the relationship between the
+// action and the nearby labels. Chromium applications frequently expose these
+// as siblings rather than as one accessible control, so an exact-name lookup
+// alone cannot see that "Play" belongs to "Senorita". This is intentionally a
+// generic geometric/token match: it learns nothing about a particular song.
+function spotifyPlayCandidate(elements, query) {
+  const expected = spotifyQueryTokens(query);
+  if (expected.length === 0) return null;
+  const visible = (elements ?? []).filter((element) => {
+    const bounds = uiBounds(element);
+    return element?.offscreen !== true && element?.enabled !== false &&
+      Number(bounds.width) > 0 && Number(bounds.height) > 0;
+  });
+  const actions = visible.filter((element) => {
+    const name = String(element?.name ?? element?.text ?? "").trim();
+    const type = String(element?.controlType ?? element?.role ?? "");
+    return /^play(?:\s|$)/i.test(name) && !/^pause(?:\s|$)/i.test(name) &&
+      /(?:Button|DataItem|ListItem|Hyperlink)$/i.test(type);
+  });
+  const near = (left, right) => {
+    const a = uiBounds(left); const b = uiBounds(right);
+    const ay = Number(a.y) + Number(a.height) / 2;
+    const by = Number(b.y) + Number(b.height) / 2;
+    const ax = Number(a.x) + Number(a.width) / 2;
+    const bx = Number(b.x) + Number(b.width) / 2;
+    return Math.abs(ay - by) <= Math.max(220, Number(a.height) * 4) && Math.abs(ax - bx) <= 1600;
+  };
+  const scored = actions.map((action) => {
+    const related = visible.filter((element) => element === action || near(action, element));
+    const words = spotifyQueryTokens(related.map((element) => element.name ?? element.text ?? "").join(" "));
+    const hits = expected.filter((token) => words.some((word) =>
+      word === token || spotifyTokenDistance(word, token) <= 1
+    )).length;
+    const label = related.map((element) => String(element.name ?? element.text ?? "")).join(" ");
+    const episodePenalty = /\b(?:episode|podcast|your episodes)\b/i.test(label) ? 2 : 0;
+    return { action, hits, score: hits * 10 - episodePenalty };
+  }).filter((entry) => entry.hits >= Math.max(1, Math.ceil(expected.length * 0.5)))
+    .sort((left, right) => right.score - left.score);
+  if (!scored.length || (scored[1] && scored[1].score === scored[0].score)) return null;
+  return scored[0].action;
 }
 
 function identityTokens(value) {
@@ -1711,6 +1762,11 @@ export class WindowsAdapter {
       `$roots = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('CommonPrograms')) | Where-Object { $_ }; ` +
       `$shortcut = $roots | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter '*.lnk' -File -Recurse -ErrorAction SilentlyContinue } | ` +
       `Where-Object { $_.BaseName -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
+      // A .lnk is only an installed identity if its target still exists. Windows
+      // leaves shortcuts behind after interrupted/unusual uninstalls; accepting
+      // one caused Start-Process to report a transient PID and made the caller
+      // wait for a window that could never exist.
+      `if ($shortcut) { try { $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut.FullName); if (-not $link.TargetPath -or -not (Test-Path -LiteralPath $link.TargetPath)) { $shortcut = $null } } catch { $shortcut = $null } }; ` +
       // where.exe answers the same question as Get-Command in 174ms instead of
       // 4.5 seconds, because it looks at the PATH and stops rather than building
       // PowerShell's whole command table. It is what finds notepad, the
@@ -1731,11 +1787,14 @@ export class WindowsAdapter {
     if (parsed?.ok === true && parsed.resolved !== true) {
       const slow = await this.runPowerShell(
         `$ErrorActionPreference = 'SilentlyContinue'; ` +
-        `$app = Get-StartApps | Where-Object { $_.Name -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
-        `if (-not $app) { $app = Get-StartApps | Where-Object { $_.Name -ilike '${escapedApplication}*' } | Select-Object -First 1 }; ` +
+        // Enumerate once. Calling Get-StartApps twice and then repeating the
+        // already-completed PATH lookup through Get-Command made a missing app
+        // one of the slowest "no" answers in the product.
+        `$apps = @(); try { $folder = (New-Object -ComObject Shell.Application).NameSpace('shell:AppsFolder'); if ($folder) { $apps = @($folder.Items() | ForEach-Object { [pscustomobject]@{ Name = $_.Name; AppID = $_.Path } }) } } catch {}; ` +
+        `if (-not $folder) { $apps = @(Get-StartApps) }; ` +
+        `$app = $apps | Where-Object { $_.Name -ieq '${escapedApplication}' } | Select-Object -First 1; ` +
+        `if (-not $app) { $app = $apps | Where-Object { $_.Name -ilike '${escapedApplication}*' } | Select-Object -First 1 }; ` +
         `$command = $null; ` +
-        `if (-not $app) { $command = Get-Command -Name '${escapedExe}' -ErrorAction SilentlyContinue | Select-Object -First 1 }; ` +
-        `if (-not $app -and -not $command) { $command = Get-Command -Name '${escapedExeWithSuffix}' -ErrorAction SilentlyContinue | Select-Object -First 1 }; ` +
         `if ($app) { $kind = 'start-menu'; $target = $app.AppID } ` +
         `elseif ($command) { $kind = 'command'; $target = $command.Source } ` +
         `else { $kind = $null; $target = $null } ` +
@@ -1855,7 +1914,7 @@ export class WindowsAdapter {
     };
   }
 
-  async launchApplication(application) {
+  async launchApplication(application, options = {}) {
     const launchStartedAt = Date.now();
     const map = {
       notepad: "notepad.exe",
@@ -1864,7 +1923,9 @@ export class WindowsAdapter {
       spotify: "spotify.exe"
     };
     const exe = map[application.toLowerCase()] ?? application;
-    const beforeWindows = await this.listWindows();
+    const beforeWindows = Array.isArray(options.beforeWindows)
+      ? options.beforeWindows
+      : await this.listWindows();
     // Resolution and launch are two separate stages. A launch may only target a
     // concrete installed identity — a Start menu AppUserModelId, a resolvable
     // command, an App Paths registration, or a Start menu shortcut. The previous
@@ -1917,11 +1978,15 @@ export class WindowsAdapter {
       windows = await this.listWindows();
       correlation = correlateLaunchWindow({ application, beforeWindows, afterWindows: windows, launch });
       if (correlation.grounded) break;
-      const processProgress = Boolean(launch?.processId || launch?.appId);
+      const processProgress = Boolean(launch?.appId) || processIsAlive(launch?.processId);
       const windowProgress = (correlation.candidates ?? []).some((candidate) =>
         (candidate.signals ?? []).some((signal) => ["launched-pid", "new-hwnd", "title-similarity"].includes(signal))
       );
-      if (!progressExtended && (processProgress || windowProgress)) {
+      // A stale Start-menu shortcut can briefly return a process id even though
+      // its target immediately exits. Extending at the first poll turned that
+      // transient into a 12-second wait. Only grant the long cold-start window
+      // when progress still exists near the end of the ordinary deadline.
+      if (!progressExtended && Date.now() >= baseDeadline - 600 && (processProgress || windowProgress)) {
         deadline = hardDeadline;
         progressExtended = true;
       }
@@ -2258,6 +2323,50 @@ public static class SyscoraAudio {
       return { running: Boolean(parsed?.Id), window: null, ...this.interpretSpotifyPlayback(""), commandResult: process };
     }
 
+    // The persistent host already owns the UIA connection. Reuse it instead of
+    // starting a new PowerShell process and rebuilding Spotify's large Chromium
+    // accessibility tree for every verification. This is the normal production
+    // path; the isolated scan below remains a compatibility fallback.
+    if (this.automationHost) {
+      try {
+        const inspected = await this.hostRequest("ui.inspect", {
+          application: "spotify",
+          windowId: String(window.WindowHandle),
+          maxElements: 500
+        }, { timeoutMs: 6000 });
+        const targets = inspected?.targets ?? [];
+        const pause = targets.find((target) =>
+          target?.offscreen !== true && target?.enabled !== false &&
+          String(target?.name ?? "").trim().toLowerCase() === "pause" &&
+          /Button$/i.test(String(target?.controlType ?? target?.role ?? ""))
+        );
+        const nowPlayingTarget = targets.find((target) =>
+          target?.offscreen !== true && /^now playing:/i.test(String(target?.name ?? target?.text ?? "").trim())
+        );
+        const accessibleLabel = String(nowPlayingTarget?.name ?? nowPlayingTarget?.text ?? "")
+          .replace(/^Now playing:\s*/i, "").trim();
+        const fallback = this.interpretSpotifyPlayback(window.MainWindowTitle);
+        const fallbackIsIdle = new Set(["spotify", "spotify free", "spotify premium"])
+          .has(fallback.title.trim().toLowerCase());
+        const playing = Boolean(pause);
+        const title = playing && accessibleLabel
+          ? accessibleLabel
+          : (playing && !fallbackIsIdle ? fallback.title : null);
+        return {
+          running: true,
+          window,
+          playing,
+          title,
+          nowPlaying: title,
+          accessibilityLabel: accessibleLabel || null,
+          host: "persistent"
+        };
+      } catch {
+        // Compatibility fallback below. A host fault must not turn a playback
+        // verification into an invented result.
+      }
+    }
+
     // Spotify's window title is commonly just "Spotify Free" even during
     // playback. Read the player controls and the accessible "Now playing: ..."
     // label instead. A Pause button inside the *Player controls* group is the
@@ -2334,8 +2443,9 @@ public static class SyscoraAudio {
     // called anything, because a page chooses its own title.
     const BROWSER = /^(chrome|msedge|firefox|opera|brave|avastbrowser|vivaldi|iexplore|safari)$/i;
     let window = null;
+    let windows = [];
     while (Date.now() < deadline) {
-      const windows = await this.listWindows();
+      windows = await this.listWindows();
       const named = windows.filter((w) => applicationWindowScore(w, needle) > 0);
       window = named[0] ?? null;
       if (!window && matchTitle) {
@@ -2346,7 +2456,7 @@ public static class SyscoraAudio {
       if (window) break;
       await new Promise((r) => setTimeout(r, 400));
     }
-    return { ready: Boolean(window), window, match: needle };
+    return { ready: Boolean(window), window, windows, match: needle };
   }
 
   // Play a track in the installed Spotify desktop client via bounded, window-
@@ -2364,15 +2474,36 @@ public static class SyscoraAudio {
     const playDeadlineMs = clampInt(options.playDeadlineMs, 500, 15000, 6000);
     const steps = [];
 
-    // 1. Launch or focus Spotify (reuses the Start-menu/executable launch path).
-    const launch = await this.launchApplication("spotify");
-    steps.push({ step: "launch", ok: Boolean(launch?.launch?.started || launch?.window) });
+    // 1. Reuse a ready client. Starting Spotify again when it is already open
+    // was the largest fixed cost in repeated music requests and could surface
+    // an installer/protocol dialog over the working window.
+    let ready = await this.waitForApplicationWindow("spotify", 500);
+    let launch = null;
+    if (!ready.ready) {
+      launch = await this.launchApplication("spotify", { beforeWindows: ready.windows });
+      steps.push({ step: "launch", ok: Boolean(launch?.launch?.started || launch?.window), reused: false });
+      if (launch?.window) {
+        ready = { ready: true, window: launch.window, match: "spotify" };
+      } else if (Number(launch?.grounding?.attempts ?? 0) > 0 || launch?.resolution?.resolved === false) {
+        // launchApplication already performed the complete bounded readiness
+        // wait. Repeating it added another eight seconds to every stale or
+        // missing-app failure without creating any new evidence.
+        ready = { ready: false, window: null, match: "spotify" };
+      } else {
+        // Compatibility for injected/degraded adapters whose launch operation
+        // does not itself report grounding details.
+        ready = await this.waitForApplicationWindow("spotify", readyTimeoutMs);
+      }
+    } else {
+      steps.push({ step: "launch", ok: true, reused: true });
+    }
 
     // 2. Bounded wait for the Spotify window to be ready.
-    const ready = await this.waitForApplicationWindow("spotify", readyTimeoutMs);
     steps.push({ step: "window-ready", ok: ready.ready });
     if (!ready.ready) {
-      const playback = await this.readSpotifyPlayback();
+      const playback = launch?.resolution?.resolved === false
+        ? { running: false, playing: false, title: "", nowPlaying: "", reason: launch.resolution.reason }
+        : await this.readSpotifyPlayback();
       if (!playback.running) {
         return {
           query: text, available: false,
@@ -2505,7 +2636,31 @@ public static class SyscoraAudio {
       // song. Wait for that relationship locally, waking on UIA changes and
       // polling only as a fallback. This is the general primitive the screen
       // tool already teaches the model manually as "beside it".
-      const remainingMs = Math.min(2500, Math.max(0, limit - (Date.now() - startedAt)));
+      // THE RESULTS ARE NOT IN THE TREE YET, AND THIS IS THE STEP THAT WAITS.
+      //
+      // Capped at 1,000ms, this was the only attempt that can match what Spotify
+      // actually publishes for a top result — a bare DataItem named "Play" beside
+      // the title — and it was given a second to do it while the enclosing call
+      // spent seven.
+      //
+      // Measured live, 29 Aug 2026 (scripts/probe-spotify-play.mjs), two runs of
+      // the same query back to back:
+      //
+      //   cold search, results still rendering   all attempts missed, 7,064ms,
+      //                                          resultFound false, nothing played
+      //   results already on screen              matched, played, first attempt
+      //
+      // So the selector was right the whole time and the tree was simply not
+      // ready. The first hypothesis for this defect was that the two semantic
+      // attempts ate the budget; the probe disproved it — they cost 289ms and
+      // 50ms. Measuring before changing is what stopped a pointless fix.
+      //
+      // The cost of being wrong is asymmetric. Waiting longer costs at most a
+      // couple of seconds INSIDE a call that is already spending seven; missing
+      // costs the agent four more steps, four more model round trips and a
+      // ~9-second detour through screen-read-and-click, on every music request.
+      // Still bounded by `limit`, so a Spotify that never renders cannot hang.
+      const remainingMs = Math.min(3500, Math.max(0, limit - (Date.now() - startedAt)));
       if (remainingMs >= 50) {
         try {
           const selector = {
@@ -2572,9 +2727,48 @@ public static class SyscoraAudio {
           // process-isolated matcher.
         }
       }
-      // The persistent host already performed every bounded semantic route. Do
-      // not buy a second process startup and another tree walk after it misses;
-      // returning now lets the existing screen fallback act immediately.
+      // If the provider cannot express the sibling relationship through its
+      // selector, inspect once and resolve it locally from the same evidence the
+      // model would otherwise need another full turn to read. This keeps the
+      // fast path deterministic and avoids a costly manual screen/click loop.
+      try {
+        const inspected = await this.inspectUi({
+          application: "spotify",
+          windowId: windowHandle,
+          maxElements: 500
+        });
+        const target = spotifyPlayCandidate(inspected?.elements ?? inspected?.targets ?? [], query);
+        if (target) {
+          const bounds = uiBounds(target);
+          const invoked = await this.invokeControl({
+            windowId: target.windowId ?? target.windowHandle ?? windowHandle,
+            name: target.name ?? target.text,
+            x: Number(bounds.x) + Number(bounds.width) / 2,
+            y: Number(bounds.y) + Number(bounds.height) / 2
+          });
+          const action = invoked?.performed === true ? invoked : await this.pointerAction("click", {
+            windowId: String(target.windowId ?? target.windowHandle ?? windowHandle),
+            x: Number(bounds.x) + Number(bounds.width) / 2,
+            y: Number(bounds.y) + Number(bounds.height) / 2,
+            button: "left",
+            clicks: 1
+          }).catch(() => null);
+          if (action?.performed === true) {
+            return {
+              found: true,
+              invoked: true,
+              name: target.name ?? target.text ?? null,
+              matchedLabel: String(query).trim(),
+              matchedBounds: bounds,
+              reason: null,
+              semantic: action,
+              recovery: "inspected-nearby-labels"
+            };
+          }
+        }
+      } catch {
+        // A bounded miss is returned below; it is never converted to success.
+      }
       return {
         found: false,
         invoked: false,

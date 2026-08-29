@@ -38,7 +38,9 @@ export function normalizeAccessPolicy(value = {}) {
   let shellExecutionMode = String(value.shellExecutionMode ?? "").trim().toLowerCase();
   if (!developerMode) shellExecutionMode = ShellExecutionMode.NONE;
   else if (!SHELL_MODES.has(shellExecutionMode) || shellExecutionMode === ShellExecutionMode.NONE) {
-    shellExecutionMode = ShellExecutionMode.WORKSPACE;
+    // A caller that enables arbitrary shell but omits the execution boundary
+    // receives the disposable boundary, never an implicit host process.
+    shellExecutionMode = ShellExecutionMode.ISOLATED;
   }
 
   const roots = Array.isArray(value.workspaceRoots) ? value.workspaceRoots : [];

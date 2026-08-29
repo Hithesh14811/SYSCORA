@@ -130,14 +130,12 @@ test("desktop intent client returns a resumable approval session without waiting
   assert.deepEqual(result, session);
 });
 
-test("both desktop intent forms consume the shared async response handler", () => {
+test("the desktop intent form consumes the shared async response handler", () => {
   const demoHtml = fs.readFileSync(path.join(repoRoot, "apps/desktop/demo.html"), "utf8");
   const demoJs = fs.readFileSync(path.join(repoRoot, "apps/desktop/demo.js"), "utf8");
-  const consoleJs = fs.readFileSync(path.join(repoRoot, "apps/desktop/app.js"), "utf8");
 
   assert.match(demoHtml, /<script src="\/demo\.js" type="module"><\/script>/);
   assert.match(demoJs, /readIntentSession\(res,\s*\{/);
-  assert.match(consoleJs, /readIntentSession\(response\)/);
   assert.doesNotMatch(demoJs, /No response from the runtime\./);
 });
 

@@ -45,3 +45,18 @@ test("Electron is pinned to the reviewed supported release", () => {
   const manifest = JSON.parse(read("package.json"));
   assert.equal(manifest.devDependencies.electron, "43.4.1");
 });
+
+test("packaged startup uses app.asar as modules, never as the daemon working directory", () => {
+  const source = read("apps/desktop-shell/src/main.js");
+  assert.match(source, /const applicationRoot = app\.isPackaged\s*\? app\.getAppPath\(\)\s*:\s*path\.resolve/);
+  assert.match(source, /const daemonCwd = app\.isPackaged \? path\.dirname\(applicationRoot\) : applicationRoot/);
+  assert.match(source, /cwd: daemonCwd/);
+  assert.match(source, /app\.getPath\("userData"\), "state"/);
+});
+
+test("provider settings require an explicit external-AI acknowledgement", () => {
+  const server = read("apps/daemon/src/server.js");
+  const client = read("apps/desktop/demo.js");
+  assert.match(server, /payload\.externalAIConsent !== true/);
+  assert.match(client, /externalAIConsent: privacyConsent\?\.checked === true/);
+});

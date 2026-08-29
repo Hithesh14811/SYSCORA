@@ -155,7 +155,18 @@ export async function openAiCompatibleChat({
   // Only retried when NOTHING has been emitted yet. Once prose has reached the
   // user, sending the request again would say it twice.
   rateLimitRetries = 2,
-  onRetry = null
+  onRetry = null,
+  // Endpoint-specific body fields, forwarded verbatim to sendChatOnce. See the
+  // note on its own `extraBody` parameter for why this is a passthrough rather
+  // than a named argument.
+  //
+  // IT HAS TO BE DECLARED HERE TOO. This function destructures its options
+  // explicitly and builds `attemptOptions` by hand, so a field it does not name
+  // is silently dropped on the floor — which is exactly what happened the first
+  // time this was wired: the inner function accepted `extraBody`, the caller
+  // sent it, and nothing arrived, because the entry point in between had never
+  // heard of it. The test that caught it asserts on the request BODY.
+  extraBody = null
 }) {
   if (!apiKey) throw new Error("No API key");
   // ONLY THE FIELDS THIS WIRE FORMAT DECLARES.
@@ -209,7 +220,7 @@ export async function openAiCompatibleChat({
   const attemptOptions = {
     baseUrl, apiKey, model, headers, wireMessages, tools,
     temperature, maxTokens, stream, onTextDelta, onReasoningDelta, onToolCallDelta,
-    signal, deadline, idleTimeoutMs
+    signal, deadline, idleTimeoutMs, extraBody
   };
 
   let attempt = 0;
@@ -254,7 +265,20 @@ export async function openAiCompatibleChat({
 async function sendChatOnce({
   baseUrl, apiKey, model, headers, wireMessages, tools,
   temperature, maxTokens, stream, onTextDelta, onReasoningDelta, onToolCallDelta = null,
-  signal, deadline, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS
+  signal, deadline, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS,
+  // ENDPOINT-SPECIFIC BODY FIELDS, PASSED STRAIGHT THROUGH.
+  //
+  // Reasoning control is the reason this exists: the configured endpoint accepts
+  // `chat_template_kwargs` and `reasoning_effort` to decide whether the model
+  // deliberates before it answers, and that decision belongs to the CALLER — the
+  // agent loop knows whether this turn is an ordinary step or a retry after one
+  // was cut off, and the transport cannot know either.
+  //
+  // A passthrough rather than a named `thinking` argument because the field
+  // names are the endpoint's, not ours: they differ between serving stacks and
+  // they will change again. Naming them here would put a vendor's spelling in
+  // the one file that is supposed to be vendor-neutral.
+  extraBody = null
 }) {
   const controller = new AbortController();
   // A TOTAL-DURATION TIMEOUT CANNOT TELL THINKING FROM A DEAD SOCKET.
@@ -302,7 +326,10 @@ async function sendChatOnce({
         ...(tools.length > 0 ? { tools, tool_choice: "auto" } : {}),
         temperature,
         max_tokens: maxTokens,
-        stream
+        stream,
+        // Last, so an endpoint field can override a default above it rather than
+        // being silently dropped by it.
+        ...(extraBody ?? {})
       }),
       signal: controller.signal
     });
@@ -1084,12 +1111,23 @@ export class AnthropicModelProvider extends LanguageModelProvider {
     this.name = "anthropic";
   }
 
-  async healthCheck() {
-    if (!this.apiKey) {
-      return { ok: false, error: "No Anthropic API key" };
+  async healthCheck({ timeoutMs = 5000 } = {}) {
+    if (!this.apiKey) return { ok: false, error: "No Anthropic API key" };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/models`, {
+        method: "GET",
+        headers: { "x-api-key": this.apiKey, "anthropic-version": this.version },
+        signal: controller.signal
+      });
+      if (response.status >= 500) return { unknown: true, status: response.status };
+      return { ok: response.ok, status: response.status, model: this.model };
+    } catch (error) {
+      return { unknown: true, error: error.message };
+    } finally {
+      clearTimeout(timeout);
     }
-    // A cheap, side-effect-free reachability check.
-    return { ok: true, type: "AnthropicModelProvider", model: this.model };
   }
 
   capabilities() {

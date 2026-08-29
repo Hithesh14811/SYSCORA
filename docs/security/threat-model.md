@@ -74,7 +74,7 @@ Web pages are untrusted model context. Detected instructions aimed at the agent 
 
 Reading a file or clipboard does not authorize obeying it. The same content-injection boundary applies to pages, documents, screen text, messages, and clipboard contents. Writes are read back through a separate path, and supported file changes prepare undo information before mutation.
 
-Ask mode treats a write outside an attached workspace as external. Workspace membership is resolved with normalized absolute paths. Symlinks, junctions, reparse points, races, and applications that write through their own APIs remain residual risks and require future canonical handle-based checks.
+Ask mode treats a write outside an attached workspace as external. Workspace membership resolves existing components through symlinks, junctions and reparse points, then reconstructs missing leaves from the nearest canonical parent. Plugin entry points and file-card open actions use the same canonical boundary. A same-user process racing a path after validation and applications that write through their own APIs remain residual risks; stronger Windows handle-based execution is future defense in depth.
 
 ## Email
 

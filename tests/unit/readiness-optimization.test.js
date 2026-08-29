@@ -49,7 +49,8 @@ test("Spotify waits for the Play control beside the requested row without a mode
 
 test("Spotify search has no fixed settle delay before its grounded activation", async () => {
   const adapter = new WindowsAdapter({ automationHost: { request: async () => ({}) }, browserAutomation: {} });
-  adapter.launchApplication = async () => ({ launch: { started: true } });
+  let launches = 0;
+  adapter.launchApplication = async () => { launches += 1; return { launch: { started: true } }; };
   adapter.waitForApplicationWindow = async () => ({ ready: true, window: { WindowHandle: 1234 } });
   adapter.openSpotifySearch = async () => ({ launch: { opened: true } });
   adapter._invokeSpotifyPlayButton = async () => ({ found: true, invoked: true, name: "Play Baby" });
@@ -60,29 +61,121 @@ test("Spotify search has no fixed settle delay before its grounded activation", 
   const result = await adapter.playSpotifyTrack("Baby Justin Bieber", { searchSettleMs: 6000 });
 
   assert.equal(result.playback.playing, true);
+  assert.equal(launches, 0, "an already-ready client must be reused, not launched again");
+  assert.equal(result.steps.find((step) => step.step === "launch").reused, true);
   assert.ok(Date.now() - started < 200, "a deprecated settle option must not reintroduce a blind multi-second sleep");
 });
 
-test("a persistent-host Spotify miss returns without starting the legacy PowerShell matcher", async () => {
+test("Spotify does not repeat a completed launch-readiness wait after a stale shortcut", async () => {
+  const adapter = new WindowsAdapter({ automationHost: false, browserAutomation: {} });
+  let readinessReads = 0;
+  adapter.waitForApplicationWindow = async () => {
+    readinessReads += 1;
+    return { ready: false, window: null };
+  };
+  adapter.launchApplication = async () => ({
+    launch: { started: true, processId: 77 },
+    resolution: { resolved: true, kind: "start-menu-shortcut" },
+    grounding: { grounded: false, attempts: 6, readinessState: "PROCESS_WITHOUT_WINDOW" },
+    window: null
+  });
+  adapter.readSpotifyPlayback = async () => ({ running: false, playing: false, title: "" });
+
+  const result = await adapter.playSpotifyTrack("Baby Justin Bieber");
+
+  assert.equal(result.available, false);
+  assert.equal(readinessReads, 1, "launchApplication already paid the bounded readiness wait");
+});
+
+test("a persistent-host selector miss resolves the Play control from one inspected result row", async () => {
   const requests = [];
+  const play = {
+    windowId: "1234", name: "Play", controlType: "ControlType.DataItem",
+    boundingRect: { x: 900, y: 300, width: 50, height: 50 }
+  };
   const adapter = new WindowsAdapter({
     automationHost: {
       async request(operation) {
         requests.push(operation);
         if (operation === "ui.find") return { found: false, reason: "target-not-found" };
         if (operation === "ui.wait") return { matched: false, reason: "ui-wait-timeout", elapsedMs: 40 };
+        if (operation === "ui.inspect") return {
+          window: { windowId: "1234", processName: "Spotify", title: "Spotify" },
+          targets: [
+            { windowId: "1234", name: "Baby", controlType: "ControlType.Text", boundingRect: { x: 600, y: 300, width: 220, height: 50 } },
+            play,
+            { windowId: "1234", name: "Play", controlType: "ControlType.Button", boundingRect: { x: 900, y: 900, width: 50, height: 50 } }
+          ]
+        };
+        if (operation === "ui.invoke") return { performed: false, reason: "no-invoke-pattern" };
+        if (operation === "pointer.click") return { performed: true, method: "SendInput" };
         throw new Error(`unexpected operation ${operation}`);
       }
     },
     browserAutomation: {}
   });
-  adapter.runPowerShell = async () => { throw new Error("legacy matcher must not start after a host miss"); };
+  adapter.runPowerShell = async () => { throw new Error("the isolated legacy matcher must not start"); };
 
   const result = await adapter._invokeSpotifyPlayButton("Baby", 6000, 1234);
 
-  assert.equal(result.invoked, false);
-  assert.equal(result.reason, "matching-track-not-found");
-  assert.deepEqual(requests, ["ui.find", "ui.find", "ui.wait"]);
+  assert.equal(result.invoked, true);
+  assert.equal(result.recovery, "inspected-nearby-labels");
+  assert.deepEqual(requests, ["ui.find", "ui.find", "ui.wait", "ui.inspect", "ui.invoke", "pointer.click"]);
+});
+
+test("Spotify playback verification reuses the persistent host tree", async () => {
+  const operations = [];
+  const adapter = new WindowsAdapter({
+    automationHost: {
+      async request(operation) {
+        operations.push(operation);
+        if (operation === "window.enumerate") return { windows: [{
+          processId: 7, processName: "Spotify", title: "Spotify Free", windowId: "1234"
+        }] };
+        if (operation === "ui.inspect") return {
+          window: { windowId: "1234", processName: "Spotify", title: "Spotify Free" },
+          targets: [
+            { name: "Pause", controlType: "ControlType.Button", enabled: true, offscreen: false },
+            { name: "Now playing: Baby by Justin Bieber", controlType: "ControlType.Text", offscreen: false }
+          ]
+        };
+        throw new Error(`unexpected operation ${operation}`);
+      }
+    },
+    browserAutomation: {}
+  });
+  adapter.runPowerShell = async () => { throw new Error("verification must not start PowerShell"); };
+
+  const playback = await adapter.readSpotifyPlayback();
+
+  assert.equal(playback.playing, true);
+  assert.equal(playback.nowPlaying, "Baby by Justin Bieber");
+  assert.equal(playback.host, "persistent");
+  assert.deepEqual(operations, ["window.enumerate", "ui.inspect"]);
+});
+
+test("a self-chat mismatch is surfaced as one clarification boundary", async () => {
+  const capabilities = {
+    "screen.read": async () => ({
+      read: true,
+      windowId: "9",
+      application: "WhatsApp",
+      title: "Chintu (You)",
+      visibleText: "Chintu (You)\nMessage yourself",
+      elements: []
+    })
+  };
+  const toolset = buildToolset({
+    registry: { get: (name) => capabilities[name] ? { execute: capabilities[name] } : null },
+    adapter: { focusedElement: async () => null }
+  });
+  toolset.beginTurn("send Chintu the link of that song");
+
+  const reading = await toolset.execute("screen", { application: "WhatsApp" });
+
+  assert.match(reading.text, /RECIPIENT SAFETY/);
+  assert.match(reading.text, /Ask one direct question/);
+  assert.match(reading.text, /do not search guessed variants/i);
 });
 
 test("near and role resolve duplicate desktop labels in one click without an extra UI scan", async () => {

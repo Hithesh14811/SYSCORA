@@ -11,6 +11,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  BROWSER_HEADERS,
   canonicalUrl,
   clearSearchCache,
   fuseRankings,
@@ -18,7 +19,8 @@ import {
   parseResults,
   parseRssResults,
   parseYahooResults,
-  renderResults,
+  renderBatch,
+  searchMany,
   searchWeb,
   unwrapBingClick,
   unwrapRedirect
@@ -348,7 +350,19 @@ test("a browser's whole header set is sent, because that is what the 202 was abo
       return { ok: true, status: 200, text: async () => LITE_BODY };
     }
   });
-  assert.match(sent["user-agent"], /Chrome\/124/);
+  // NOT A SPECIFIC VERSION, AND IT USED TO BE ONE.
+  //
+  // This asserted `/Chrome\/124/` — the exact string DuckDuckGo began answering
+  // with HTTP 403 on 29 Aug 2026. So the test written to protect the header set
+  // was pinning the value that broke it, and would have failed the fix rather
+  // than caught the fault. A test that hard-codes something which must age
+  // enforces the bug it was meant to prevent.
+  //
+  // The version is owned by the two tests at the end of this file, which check
+  // that the user-agent and the client hints agree and that the number has not
+  // been left to rot. What belongs HERE is the thing this test is named for: a
+  // Chrome is claimed, and the rest of Chrome's headers are beside it.
+  assert.match(sent["user-agent"], /Chrome\/\d+\./);
   for (const header of ["sec-ch-ua", "sec-fetch-mode", "sec-fetch-dest", "upgrade-insecure-requests"]) {
     assert.ok(sent[header], `${header} was dropped — this is exactly what got us refused`);
   }
@@ -471,9 +485,136 @@ test("a failed search is not remembered", async () => {
 });
 
 test("results render with the title, the URL and the snippet on separate lines", () => {
-  const text = renderResults({ query: "ml", provider: "duckduckgo", results: parseResults(LITE_BODY) });
+  const text = renderBatch([{ ok: true, query: "ml", provider: "duckduckgo", results: parseResults(LITE_BODY) }]);
   assert.match(text, /2 results for "ml"/);
   assert.match(text, /1\. Machine Learning Internships in India/);
   assert.match(text, /https:\/\/in\.prosple\.com/);
 });
 
+
+// THE HEADERS THAT GOT US BLOCKED, TWICE.
+//
+// Measured 29 Aug 2026 against lite.duckduckgo.com, one query, five header sets:
+//
+//   Chrome 124 + matching sec-ch-ua   403     <- what this file was sending
+//   Chrome 141 UA alone               202     <- the original contradiction
+//   Chrome 141 + matching sec-ch-ua   200  RESULTS
+//
+// Nothing reported the 403: searchWeb returned eight results and no errors,
+// having silently lost both DuckDuckGo endpoints and answered from Bing alone.
+// With one engine there is no consensus left, and "how to change a tyre"
+// returned a percent-change calculator and a dictionary definition of "change".
+//
+// The version is now built from one constant so the user-agent and the client
+// hints cannot drift apart -- that drift is what earns the 202, and keeping two
+// string literals in step was somebody remembering to.
+test("the user-agent and the client hints name the same Chrome version", () => {
+  const ua = BROWSER_HEADERS["user-agent"];
+  const hints = BROWSER_HEADERS["sec-ch-ua"];
+  const uaVersion = /Chrome\/(\d+)\./.exec(ua)?.[1];
+  assert.ok(uaVersion, `no Chrome version in the user-agent: ${ua}`);
+  // Every version named in sec-ch-ua except the deliberate "Not?A_Brand" decoy,
+  // which is part of the real header and carries a nonsense version on purpose.
+  const hinted = [...hints.matchAll(/"([^"]+)";v="(\d+)"/g)]
+    .filter(([, brand]) => !/not.?a.?brand/i.test(brand))
+    .map(([, , version]) => version);
+  assert.ok(hinted.length > 0, `no brand versions in sec-ch-ua: ${hints}`);
+  for (const version of hinted) {
+    assert.equal(
+      version, uaVersion,
+      `sec-ch-ua says Chrome ${version} while the user-agent says ${uaVersion} — that contradiction is what returns HTTP 202`
+    );
+  }
+});
+
+test("the impersonated Chrome is not an ancient one", () => {
+  // Chrome 124 is what started returning 403. This does not chase the real
+  // release train -- it just fails loudly if the number is left to rot again,
+  // which is the actual defect: a hard-coded version nobody revisits.
+  const version = Number(/Chrome\/(\d+)\./.exec(BROWSER_HEADERS["user-agent"])?.[1] ?? 0);
+  assert.ok(
+    version >= 140,
+    `Chrome ${version} is stale; 124 was being answered with HTTP 403. Bump CHROME_VERSION in web-search.js.`
+  );
+});
+
+// BATCHING, WHICH IS ABOUT MODEL TOKENS AND NOT ABOUT HTTP.
+//
+// See the note above searchMany in web-search.js. Prefix caching on this
+// endpoint is quantised into 8,192-token blocks, so a step re-buys its tail
+// block — about 4,000 tokens — before it fetches anything, while a result set
+// costs about 700. Twenty searches issued one at a time is 140,000 tokens of
+// ASKING, and that is exactly how a live request for fifteen internships hit its
+// ceiling on 29 Aug 2026 with nothing to show for it.
+
+test("several queries are asked at once, and come back in the order they were asked", async () => {
+  const asked = [];
+  const fetchImpl = async (url, options) => {
+    asked.push(String(url));
+    return stub({ lite: { body: LITE_BODY }, html: { body: HTML_BODY }, bing: { body: RSS_BODY }, yahoo: { body: YAHOO_BODY } })(url, options);
+  };
+  const found = await searchMany(["first question", "second question", "third question"], { useCache: false, fetchImpl });
+
+  assert.equal(found.length, 3);
+  assert.deepEqual(found.map((one) => one.query), ["first question", "second question", "third question"]);
+  for (const one of found) assert.equal(one.ok, true, one.reason ?? "");
+  // Every index, for every query — the batch must not quietly ask fewer.
+  assert.ok(asked.some((url) => url.includes("first+question") || url.includes("first%20question")));
+  assert.ok(asked.some((url) => url.includes("third+question") || url.includes("third%20question")));
+});
+
+test("the same question twice in one batch is one request, not two", async () => {
+  let requests = 0;
+  const fetchImpl = async (url, options) => {
+    requests += 1;
+    return stub({ lite: { body: LITE_BODY }, html: { body: HTML_BODY }, bing: { body: RSS_BODY }, yahoo: { body: YAHOO_BODY } })(url, options);
+  };
+  // Differing only in case and spacing, which is how a model writes the same
+  // question twice inside one burst.
+  const found = await searchMany(["ml internships", "ML  Internships", "ml internships"], { useCache: false, fetchImpl });
+  assert.equal(found.length, 1, "three spellings of one question are one search");
+  const single = requests;
+
+  requests = 0;
+  await searchMany(["ml internships"], { useCache: false, fetchImpl });
+  assert.equal(requests, single, "the deduplicated batch cost exactly what one query costs");
+});
+
+test("one query failing does not take the rest of the batch with it", async () => {
+  // The generic `batch` tool stops at the first failure, which is right for a
+  // menu path and wrong for independent research: a question nobody could
+  // answer must not cancel the seven that were answered.
+  const fetchImpl = async (url, options) => {
+    if (String(url).includes("doomed")) throw new Error("DNS exploded");
+    return stub({ lite: { body: LITE_BODY }, html: { body: HTML_BODY }, bing: { body: RSS_BODY }, yahoo: { body: YAHOO_BODY } })(url, options);
+  };
+  const found = await searchMany(["doomed query", "ml internships"], { useCache: false, fetchImpl });
+  assert.equal(found.length, 2);
+  assert.equal(found[0].ok, false);
+  assert.equal(found[1].ok, true, "the second query was answered despite the first one failing");
+});
+
+test("a page several queries all return is printed once, and cross-referenced after that", async () => {
+  const page = { title: "Internshala", url: "https://internshala.com/internships/", snippet: "Machine learning internships" };
+  const other = { title: "Somewhere else", url: "https://example.com/jobs", snippet: "Jobs" };
+  const text = renderBatch([
+    { ok: true, query: "one", provider: "duckduckgo", results: [page, other] },
+    { ok: true, query: "two", provider: "duckduckgo", results: [page] }
+  ]);
+
+  // The URL itself appears once. The second sighting is a reference to the
+  // number the first one was given, which is what makes it cheap AND readable.
+  assert.equal(text.split("https://internshala.com/internships/").length - 1, 1);
+  assert.match(text, /= 1\. Internshala/);
+  // Numbering runs across the whole batch, so "3" means one thing in the reply.
+  assert.match(text, /2\. Somewhere else/);
+});
+
+test("a batch says which queries came back empty instead of leaving a gap", async () => {
+  const text = renderBatch([
+    { ok: true, query: "answered", provider: "duckduckgo", results: [{ title: "A page", url: "https://example.com/", snippet: "" }] },
+    { ok: false, query: "refused", results: [], reason: "duckduckgo-lite: declined the request (HTTP 202)" }
+  ]);
+  assert.match(text, /No results for "refused": duckduckgo-lite: declined/);
+  assert.match(text, /1\. A page/);
+});

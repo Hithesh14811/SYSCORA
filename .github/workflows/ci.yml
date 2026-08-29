@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test-and-package:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run license:check
+      - run: npm run sbom
+      - run: npm run security:audit
+      - run: npm run history:audit
+      - run: npm run dist
+      - shell: pwsh
+        run: |
+          $installer = Get-ChildItem dist -Filter 'SYSCORA-*.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'No installer was built.' }
+          ./scripts/installer-smoke.ps1 -Installer $installer.FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: syscora-${{ github.sha }}
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            artifacts/*.json
+          if-no-files-found: error

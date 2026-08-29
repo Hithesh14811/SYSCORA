@@ -30,6 +30,10 @@ import { describeAttachments, prepareAttachment, prepareFolder } from "./attachm
 // of email-card.js and the one in apps/daemon/src/gmail.js.
 import { emailCard, sealReplayedDraft } from "./email-card.js";
 import { fileCard, sealReplayedFile } from "./file-card.js";
+// The route a finished run offers to keep, and the panel that manages the ones
+// already kept. Until these existed the loop emitted SKILL_OFFERED to nobody and
+// the daemon's save endpoint had no caller but the eval harness.
+import { skillCard, sealReplayedSkill } from "./skill-card.js";
 
 const TOKEN_STORAGE_KEY = "syscora_token";
 // A KNOWN TOKEN IS NOT A TOKEN.
@@ -97,8 +101,8 @@ function storedValue(key, fallback) {
 let approvalMode = ACCESS_MODES[storedValue(ACCESS_STORAGE_KEY, "balanced")]
   ? storedValue(ACCESS_STORAGE_KEY, "balanced") : "balanced";
 let developerTerminal = storedValue(TERMINAL_STORAGE_KEY, "0") === "1";
-let selectedShellMode = ["workspace", "isolated", "host"].includes(storedValue(SHELL_MODE_STORAGE_KEY, "workspace"))
-  ? storedValue(SHELL_MODE_STORAGE_KEY, "workspace") : "workspace";
+let selectedShellMode = ["workspace", "isolated", "host"].includes(storedValue(SHELL_MODE_STORAGE_KEY, "isolated"))
+  ? storedValue(SHELL_MODE_STORAGE_KEY, "isolated") : "isolated";
 
 function showConnect(message) {
   if (message) { connectError.textContent = message; connectError.hidden = false; }
@@ -149,6 +153,65 @@ const providerModel = document.getElementById("providerModel");
 const providerBaseUrl = document.getElementById("providerBaseUrl");
 const providerApiKey = document.getElementById("providerApiKey");
 const providerStatus = document.getElementById("providerStatus");
+const providerTestButton = document.getElementById("providerTestButton");
+const providerMigrateButton = document.getElementById("providerMigrateButton");
+const providerResetButton = document.getElementById("providerResetButton");
+const privacyRetentionDays = document.getElementById("privacyRetentionDays");
+const privacyStatus = document.getElementById("privacyStatus");
+const privacyExportButton = document.getElementById("privacyExportButton");
+const privacyDeleteButton = document.getElementById("privacyDeleteButton");
+const updateStatus = document.getElementById("updateStatus");
+const updateActionButton = document.getElementById("updateActionButton");
+let updateState = "idle";
+
+document.querySelectorAll("[data-legal-document]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    try {
+      if (!window.syscora?.openLegal) throw new Error("Legal documents are available in the installed desktop app.");
+      await window.syscora.openLegal(button.dataset.legalDocument);
+    } catch (error) {
+      onboardingError.hidden = false;
+      onboardingError.textContent = `Could not open the document: ${error.message}`;
+    }
+  });
+});
+
+const readableBytes = (bytes) => {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  return `${(value / 1024 ** 3).toFixed(2)} GB`;
+};
+
+function showProviderStatus(status) {
+  if (!providerStatus) return;
+  const health = status?.health;
+  const credential = status?.credentialStatus;
+  const base = status?.configured
+    ? `${status.provider || "Current provider"} · ${status.model || "current model"}`
+    : "No usable provider credential is configured";
+  const condition = credential === "unreadable"
+    ? "The protected key cannot be decrypted by this Windows account. Remove it and enter a new key."
+    : credential === "plaintext"
+      ? "The key is still plaintext. Protect it before using this build."
+      : health?.ok === true
+        ? "Connection verified."
+        : health?.ok === false
+          ? "The saved provider did not pass its connection test."
+          : "The protected key is never shown.";
+  providerStatus.textContent = `${base}. ${condition}`;
+  if (providerMigrateButton) providerMigrateButton.hidden = status?.migrationAvailable !== true && credential !== "plaintext";
+}
+
+async function refreshPrivacyStatus() {
+  const response = await fetch("/api/privacy");
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const status = await response.json();
+  if (privacyRetentionDays) privacyRetentionDays.value = String(status.retentionDays);
+  if (privacyStatus) privacyStatus.textContent = `${readableBytes(status.bytes)} in ${status.files} local files. Credentials are excluded from exports.`;
+  return status;
+}
 
 function syncTerminalSettings() {
   developerTerminal = developerTerminalToggle?.checked === true;
@@ -176,12 +239,9 @@ async function openSafetySettings({ firstRun = false } = {}) {
     const response = await fetch("/api/settings/model");
     if (!response.ok) return;
     const status = await response.json();
-    if (providerStatus) {
-      providerStatus.textContent = status.configured
-        ? `${status.provider || "Current provider"} · ${status.model || "current model"}. The protected key is never shown.`
-        : "No provider key is configured yet. The key is never shown after saving.";
-    }
+    showProviderStatus(status);
   } catch { /* daemon status already appears elsewhere */ }
+  try { await refreshPrivacyStatus(); } catch { /* settings remain usable offline */ }
 }
 
 function closeSafetySettings() {
@@ -192,11 +252,255 @@ function closeSafetySettings() {
 }
 
 developerTerminalToggle?.addEventListener("change", syncTerminalSettings);
+providerTestButton?.addEventListener("click", async () => {
+  providerStatus.textContent = "Testing the configured provider…";
+  try {
+    const response = await fetch("/api/settings/model/test", { method: "POST" });
+    const status = await response.json();
+    if (!response.ok) throw new Error(status.error || `HTTP ${response.status}`);
+    showProviderStatus(status);
+  } catch (error) {
+    providerStatus.textContent = `Connection test failed: ${error.message}`;
+  }
+});
+providerMigrateButton?.addEventListener("click", async () => {
+  try {
+    const response = await fetch("/api/settings/model/migrate", { method: "POST" });
+    const status = await response.json();
+    if (!response.ok) throw new Error(status.error || `HTTP ${response.status}`);
+    showProviderStatus(status);
+  } catch (error) {
+    providerStatus.textContent = `The key could not be protected: ${error.message}`;
+  }
+});
+providerResetButton?.addEventListener("click", async () => {
+  if (!window.confirm("Remove the saved model provider and its protected key from this Windows account?")) return;
+  try {
+    const response = await fetch("/api/settings/model", { method: "DELETE" });
+    const status = await response.json();
+    if (!response.ok) throw new Error(status.error || `HTTP ${response.status}`);
+    showProviderStatus(status);
+  } catch (error) {
+    providerStatus.textContent = `The provider was not removed: ${error.message}`;
+  }
+});
+privacyExportButton?.addEventListener("click", async () => {
+  privacyStatus.textContent = "Exporting local data to Downloads…";
+  try {
+    const response = await fetch("/api/privacy/export", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ browserChats: chats })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    privacyStatus.textContent = `Exported ${readableBytes(result.bytes)} to ${result.destination}.`;
+  } catch (error) {
+    privacyStatus.textContent = `Export failed: ${error.message}`;
+  }
+});
+privacyDeleteButton?.addEventListener("click", async () => {
+  const confirmation = window.prompt("This permanently deletes chats, memory, audit history, integrations, settings, and protected keys. Type DELETE MY SYSCORA DATA to continue.");
+  if (confirmation !== "DELETE MY SYSCORA DATA") return;
+  try {
+    const response = await fetch("/api/privacy/data", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ confirmation })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    localStorage.clear();
+    window.alert("Local SYSCORA data was deleted. Restart SYSCORA to complete the reset.");
+  } catch (error) {
+    privacyStatus.textContent = `Deletion failed: ${error.message}`;
+  }
+});
+window.syscora?.updates?.onStatus?.((status) => {
+  updateState = status?.state ?? "idle";
+  if (!updateStatus || !updateActionButton) return;
+  const descriptions = {
+    disabled: "Automatic updates are available in signed installed builds.",
+    checking: "Checking for a signed update…",
+    current: `SYSCORA ${status.version || ""} is current.`,
+    available: `SYSCORA ${status.version || "a new version"} is available.`,
+    downloading: `Downloading signed update… ${Math.round(status.percent || 0)}%`,
+    ready: `SYSCORA ${status.version || "update"} is ready to install.`,
+    error: `Update check failed: ${status.message || "unknown error"}`
+  };
+  updateStatus.textContent = descriptions[updateState] || "Updates are checked automatically.";
+  updateActionButton.hidden = updateState === "checking" || updateState === "downloading";
+  updateActionButton.textContent = updateState === "available" ? "Download" : updateState === "ready" ? "Restart and install" : "Check for updates";
+});
+updateActionButton?.addEventListener("click", async () => {
+  try {
+    if (updateState === "available") await window.syscora?.updates?.download?.();
+    else if (updateState === "ready") await window.syscora?.updates?.install?.();
+    else await window.syscora?.updates?.check?.();
+  } catch (error) {
+    if (updateStatus) updateStatus.textContent = `Update action failed: ${error.message}`;
+  }
+});
 safetySettingsButton?.addEventListener("click", () => {
   openMoreMenu(false);
   openSafetySettings({ firstRun: false });
 });
 onboardingCancel?.addEventListener("click", closeSafetySettings);
+
+// WHETHER THE MODEL THINKS BEFORE IT ACTS — THE USER'S CALL.
+//
+// Measured 28 Aug 2026 (`scripts/probe-model-bakeoff.mjs`): on ordinary single
+// decisions, not deliberating is both faster (1,312ms vs 1,576ms) and slightly
+// more accurate (7/7 vs 6/7) — given room to think the model talked itself into
+// re-reading a screen it had just read. So "auto" leaves it off for a normal
+// step and switches it on for a step that has already been cut off.
+//
+// That is the right default and it is NOT the right answer for every request.
+// A long, unfamiliar, multi-application task may genuinely want deliberation,
+// and the only person who knows which kind of request they are typing is the
+// one typing it. Hence a control rather than a constant.
+//
+// It rides on the NEXT MESSAGE rather than being a standing setting, for the
+// same reason the approval mode does: it is a property of the task, and a
+// setting silently left on from last week is how "why is it slow again" starts.
+// The last choice is remembered so it does not have to be set every time.
+const THINK_MODES = [
+  ["auto", "Auto", "Thinking: automatic — only when a step goes wrong"],
+  ["always", "Always", "Thinking: always on — slower, for hard multi-step tasks"],
+  ["never", "Off", "Thinking: off — fastest, no deliberation even after a failure"]
+];
+const THINK_STORAGE_KEY = "syscora_thinking_mode_v1";
+const thinkButton = document.getElementById("thinkButton");
+const thinkButtonLabel = document.getElementById("thinkButtonLabel");
+let thinkingMode = (() => {
+  const saved = storedValue(THINK_STORAGE_KEY, "auto");
+  return THINK_MODES.some(([value]) => value === saved) ? saved : "auto";
+})();
+
+function renderThinkButton() {
+  const entry = THINK_MODES.find(([value]) => value === thinkingMode) ?? THINK_MODES[0];
+  if (thinkButtonLabel) thinkButtonLabel.textContent = entry[1];
+  if (thinkButton) {
+    thinkButton.setAttribute("aria-label", entry[2]);
+    thinkButton.title = entry[2];
+    // Auto is the measured default and should not look like a setting somebody
+    // changed; the two overrides should.
+    thinkButton.classList.toggle("overridden", thinkingMode !== "auto");
+  }
+}
+thinkButton?.addEventListener("click", () => {
+  const index = THINK_MODES.findIndex(([value]) => value === thinkingMode);
+  thinkingMode = THINK_MODES[(index + 1) % THINK_MODES.length][0];
+  try { localStorage.setItem(THINK_STORAGE_KEY, thinkingMode); } catch { /* private mode */ }
+  renderThinkButton();
+});
+renderThinkButton();
+
+// THE SKILLS PANEL — the half of the feature that decides whether it is a
+// product or a store nobody can see into.
+//
+// The offer card next door creates routes; this is where they are read and
+// removed. Both halves are required by docs/skills.md §11 ("do not hide skills
+// from the user"), and neither existed: the loop offered to nobody, the daemon's
+// endpoints had no caller but the eval, and `.syscora/skills` was empty on the
+// real machine after weeks of use.
+const skillsPanel = document.getElementById("skillsPanel");
+const skillsList = document.getElementById("skillsList");
+const skillsError = document.getElementById("skillsError");
+const skillsButton = document.getElementById("skillsButton");
+const skillsButtonHint = document.getElementById("skillsButtonHint");
+
+// HOW WELL IT IS STILL WORKING, IN THE USER'S WORDS.
+//
+// §8: a route that falls back constantly is the worst of both worlds — replay
+// latency PLUS the full model cost — and it is felt as an unexplained slowdown
+// rather than as an error. The store already retires one below 70% over five
+// runs; this is what makes that visible before it happens.
+function describeSkillHealth(stats = {}) {
+  const runs = Number(stats.runs ?? 0);
+  if (stats.retired) return { text: "Retired — it stopped working often enough that it is no longer used", tone: "bad" };
+  if (!runs) return { text: "Saved, not used yet", tone: "" };
+  const clean = Number(stats.cleanReplays ?? 0);
+  const rate = Math.round((clean / runs) * 100);
+  return {
+    text: `Replayed cleanly ${clean} of ${runs} time${runs === 1 ? "" : "s"} (${rate}%)`,
+    tone: rate >= 70 ? "ok" : "bad"
+  };
+}
+
+async function refreshSkills() {
+  if (!skillsList) return;
+  try {
+    const response = await fetch("/api/skills");
+    if (!response.ok) throw new Error(`The daemon answered ${response.status}.`);
+    const { skills = [] } = await response.json();
+    // The menu entry carries the count, so the panel is worth opening or is
+    // obviously not. An entry that always reads the same is one nobody clicks.
+    if (skillsButtonHint) {
+      skillsButtonHint.textContent = skills.length
+        ? `${skills.length} route${skills.length === 1 ? "" : "s"} it has learned`
+        : "Nothing learned yet";
+    }
+    skillsList.replaceChildren();
+    if (!skills.length) {
+      // AN EMPTY STATE THAT SAYS HOW TO LEAVE IT. "No skills" is a dead end;
+      // this says the one thing the user can do about it.
+      const empty = el("p", "skills-empty",
+        "Nothing yet. Finish a task that works and SYSCORA will offer to keep the route — "
+        + "accept it and the next time you ask for the same thing it replays in about a second, "
+        + "with no model call.");
+      skillsList.appendChild(empty);
+      return;
+    }
+    for (const skill of skills) {
+      const row = el("div", "skill-row");
+      const main = el("div", "skill-row-body");
+      main.appendChild(el("div", "skill-row-name", skill.title || skill.id));
+      const steps = Array.isArray(skill.steps) ? skill.steps.length : 0;
+      main.appendChild(el("div", "skill-row-facts",
+        `${steps} step${steps === 1 ? "" : "s"} · ${skill.id}`));
+      const health = describeSkillHealth(skill.stats);
+      main.appendChild(el("div", `skill-row-health ${health.tone}`.trim(), health.text));
+
+      const remove = el("button", "settings-danger skill-row-delete", "Delete");
+      remove.type = "button";
+      remove.addEventListener("click", async () => {
+        remove.disabled = true;
+        try {
+          const gone = await fetch(`/api/skills/${encodeURIComponent(skill.id)}`, { method: "DELETE" });
+          if (!gone.ok) throw new Error(`The daemon answered ${gone.status}.`);
+          await refreshSkills();
+        } catch (error) {
+          skillsError.textContent = error?.message ?? String(error);
+          skillsError.hidden = false;
+          remove.disabled = false;
+        }
+      });
+      row.append(main, remove);
+      skillsList.appendChild(row);
+    }
+  } catch (error) {
+    skillsError.textContent = error?.message ?? String(error);
+    skillsError.hidden = false;
+  }
+}
+
+function openSkillsPanel(open) {
+  if (!skillsPanel) return;
+  skillsError.hidden = true;
+  skillsPanel.hidden = !open;
+  if (open) void refreshSkills();
+}
+
+skillsButton?.addEventListener("click", () => {
+  openMoreMenu(false);
+  openSkillsPanel(true);
+});
+document.getElementById("skillsClose")?.addEventListener("click", () => openSkillsPanel(false));
+skillsPanel?.addEventListener("click", (event) => {
+  // The backdrop, not the card. Clicking inside the panel must not close it.
+  if (event.target === skillsPanel) openSkillsPanel(false);
+});
 
 onboardingForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -205,7 +509,8 @@ onboardingForm?.addEventListener("submit", async (event) => {
     provider: providerName?.value || undefined,
     model: providerModel?.value.trim() || undefined,
     baseUrl: providerBaseUrl?.value.trim() || undefined,
-    apiKey: providerApiKey?.value.trim() || undefined
+    apiKey: providerApiKey?.value.trim() || undefined,
+    externalAIConsent: privacyConsent?.checked === true
   };
   if (Object.values(providerUpdate).some(Boolean)) {
     try {
@@ -216,13 +521,27 @@ onboardingForm?.addEventListener("submit", async (event) => {
       });
       if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `HTTP ${response.status}`);
     } catch (error) {
-      onboardingError.textContent = `The provider settings were not saved: ${error.message}`;
+      onboardingError.textContent = `The provider is not ready: ${error.message}`;
       onboardingError.hidden = false;
       return;
     }
   }
+  try {
+    const retentionDays = Number(privacyRetentionDays?.value ?? 90);
+    const response = await fetch("/api/privacy", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ retentionDays })
+    });
+    if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `HTTP ${response.status}`);
+    localStorage.setItem("syscora_retention_days", String(retentionDays));
+  } catch (error) {
+    onboardingError.textContent = `Privacy retention was not saved: ${error.message}`;
+    onboardingError.hidden = false;
+    return;
+  }
   developerTerminal = developerTerminalToggle?.checked === true;
-  selectedShellMode = shellExecutionMode?.value || "workspace";
+  selectedShellMode = shellExecutionMode?.value || "isolated";
   try {
     localStorage.setItem(TERMINAL_STORAGE_KEY, developerTerminal ? "1" : "0");
     localStorage.setItem(SHELL_MODE_STORAGE_KEY, selectedShellMode);
@@ -281,6 +600,12 @@ async function checkHealth() {
 }
 checkHealth();
 setInterval(checkHealth, 5000);
+// The count on the Skills menu entry, read once at startup rather than only when
+// the panel is opened — an entry that always reads the same is one nobody
+// clicks, and the whole point of surfacing the routes is that the user knows
+// they exist. Best-effort: a daemon that is not up yet simply leaves the
+// default text, and opening the panel reads it again.
+void refreshSkills();
 
 // ---- Small DOM helpers -------------------------------------------------------
 
@@ -442,7 +767,7 @@ function stripAttachmentBlocks(text) {
 }
 
 // Search results, parsed back out of the block the tool rendered and drawn as
-// links. The shape is fixed by renderResults() in web-search.js:
+// links. The shape is fixed by renderBatch() in web-search.js:
 //
 //   1. Title
 //      https://url
@@ -462,19 +787,56 @@ function domainOf(url) {
   }
 }
 
+// A SEARCH IS NOW SEVERAL SEARCHES, AND THE READER HAS TO SEE WHICH IS WHICH.
+//
+// `search` takes a list of queries and answers them all in one step, because a
+// round trip costs far more than the answer it fetches. That makes the result a
+// sequence of SECTIONS, each with its own heading, and this parser used to skip
+// line 0 and treat every later line as belonging to whatever hit came before —
+// so the second query's heading appeared as a snippet under the first query's
+// last result, which reads as gibberish.
+//
+// Anchored on the heading's shape rather than on its position, so the number of
+// sections does not matter.
+const SECTION_HEAD = /^\s*\d+\s+results?\s+for\s+"([\s\S]+)"\s+\((.+)\)\s*$/;
+const SECTION_EMPTY = /^\s*No results for\s+"([\s\S]+?)":\s*(.*)$/;
+// The same page returned by more than one query is printed once and referred to
+// afterwards by its number. Without this the reference line reads as a snippet.
+const CROSS_REFERENCE = /^\s*=\s*(\d+)\.\s+(.*)$/;
+
 function renderSearchResults(text) {
   const wrap = el("div", "step-output search-results");
   const lines = text.split("\n");
   const header = lines[0]?.trim();
   const hits = [];
+  // Sections in order, so a multi-query search can be grouped under its
+  // questions and a single-query one can keep looking exactly as it did.
+  const sections = [];
   let current = null;
-  for (const line of lines.slice(1)) {
+  for (const line of lines) {
+    const sectionHead = SECTION_HEAD.exec(line) ?? SECTION_EMPTY.exec(line);
+    if (sectionHead) {
+      sections.push({ query: sectionHead[1], note: SECTION_HEAD.test(line) ? null : sectionHead[2], hits: [] });
+      current = null;
+      continue;
+    }
+    const reference = CROSS_REFERENCE.exec(line);
+    if (reference) {
+      // Not a hit of its own — it is the same page, already listed above. Shown
+      // as a plain line so the reader can see that this query found it too.
+      const row = el("div", "search-hit search-hit-reference");
+      row.appendChild(el("span", "search-hit-snippet", `Also result ${reference[1]}: ${reference[2]}`));
+      (sections.at(-1)?.hits ?? hits).push(row);
+      current = null;
+      continue;
+    }
     const title = /^\s*\d+\.\s+(.*)$/.exec(line);
     const url = /^\s*(https?:\/\/\S+)\s*$/.exec(line);
     if (title) {
       current = el("div", "search-hit");
       current.dataset.title = title[1];
       hits.push(current);
+      sections.at(-1)?.hits.push(current);
     } else if (url && current) {
       // The title becomes the link once its URL is known — the anchor needs an
       // href, and the href arrives on the line after the title.
@@ -502,9 +864,29 @@ function renderSearchResults(text) {
   // the useful part of the header line, the engine's name is not.
   const count = el("div", "search-sources-head");
   count.appendChild(el("span", null, `Sources · ${hits.length}`));
-  if (header) count.appendChild(el("span", "search-provider", header.replace(/^\d+\s+results?\s+for\s+/i, "")));
+  if (sections.length > 1) {
+    count.appendChild(el("span", "search-provider", `${sections.length} searches`));
+  } else if (header) {
+    count.appendChild(el("span", "search-provider", header.replace(/^\d+\s+results?\s+for\s+/i, "")));
+  }
   wrap.appendChild(count);
-  for (const hit of hits) wrap.appendChild(hit);
+
+  // One query: unchanged, a flat list. Several: grouped under the question each
+  // one answers, because "which of my eight searches found this" is the whole
+  // reason the reader is looking.
+  if (sections.length <= 1) {
+    for (const hit of hits) wrap.appendChild(hit);
+    return wrap;
+  }
+  for (const section of sections) {
+    const heading = el("div", "search-query-head");
+    heading.appendChild(el("span", null, section.query));
+    // A query nobody could answer says so here rather than leaving a gap the
+    // reader has to interpret as "found nothing" or "was never asked".
+    if (section.note) heading.appendChild(el("span", "search-provider", section.note));
+    wrap.appendChild(heading);
+    for (const hit of section.hits) wrap.appendChild(hit);
+  }
   return wrap;
 }
 
@@ -1624,6 +2006,39 @@ function handleEvent(turn, event) {
   if (type === "APPROVAL_REQUIRED") {
     return turn.askApproval(d);
   }
+
+  // THE ROUTE THIS RUN WORKED OUT, OFFERED FOR NEXT TIME.
+  //
+  // Emitted by the loop at a COMPLETED settle, and rendered nowhere at all until
+  // this line existed — so the feature the plan calls "the actual moat" could not
+  // be used by anyone, and the skills directory on the real machine was empty.
+  // The card asks; nothing is written until the user says yes. See skill-card.js.
+  if (type === "SKILL_OFFERED") {
+    if (d.skill) turn.append(skillCard(d.skill, { onSaved: () => { void refreshSkills(); } }));
+    return;
+  }
+  // A saved route answered instead of the model. Worth saying out loud: a reply
+  // that appears instantly with no working-out shown is unsettling if nothing
+  // explains it, and the skill is the thing they can inspect or delete when it
+  // starts doing the wrong thing.
+  if (type === "SKILL_REPLAYED") {
+    return turn.note(
+      `Replayed a saved route — ${d.steps ?? "?"} steps in ${((d.elapsedMs ?? 0) / 1000).toFixed(1)}s, no model calls.`
+    );
+  }
+  // It stopped part-way and handed back to the model. Not a failure: the run
+  // still finishes, it just costs what it used to. §8 retires a route that does
+  // this too often, which is why the count matters more than the event.
+  if (type === "SKILL_HANDOVER") {
+    return turn.note("A saved route stopped part-way, so I worked the rest out.");
+  }
+  // Why a run that worked was NOT offered as a route. The refusals are the
+  // useful part — "step 3 is positional" means perception could not name a
+  // control, which is a bug worth fixing rather than a route worth saving.
+  if (type === "SKILL_NOT_OFFERED") {
+    if (debug) turn.note(`Not saveable as a route: ${(d.reasons ?? []).join("; ")}`);
+    return;
+  }
   if (type === "APPROVAL_RESOLVED") {
     return turn.settleApproval(d.approvalId, d.approved);
   }
@@ -1916,6 +2331,7 @@ function getPayload(json) { return json?.envelope?.payload ?? json; }
 const CHATS_KEY = "syscora_chats";
 const ACTIVE_CHAT_KEY = "syscora_active_chat";
 const LEGACY_CONVERSATION_KEY = "syscora_conversation";
+const PRIVACY_RETENTION_KEY = "syscora_retention_days";
 // Bounds, because localStorage is a few megabytes and a screen reading is a few
 // thousand characters. Old chats fall off the end rather than the store failing.
 const MAX_CHATS = 25;
@@ -1927,7 +2343,11 @@ const newId = () => `chat_${Date.now().toString(36)}_${Math.random().toString(36
 function loadChats() {
   try {
     const saved = JSON.parse(localStorage.getItem(CHATS_KEY) ?? "[]");
-    return Array.isArray(saved) ? saved : [];
+    if (!Array.isArray(saved)) return [];
+    const retentionDays = Number(localStorage.getItem(PRIVACY_RETENTION_KEY) ?? 90);
+    if (!Number.isFinite(retentionDays) || retentionDays <= 0) return saved;
+    const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+    return saved.filter((chat) => Number(chat?.updatedAt ?? chat?.createdAt ?? 0) >= cutoff);
   } catch {
     return [];
   }
@@ -2527,6 +2947,9 @@ function renderStoredChat(chat, { resumed = true } = {}) {
     // record of creating, so Open would be refused — correctly, and confusingly.
     // The path stays, and it says why.
     for (const card of turn.root.querySelectorAll(".file-card")) sealReplayedFile(card);
+    // Same reason as the file and draft cards above: the decision this one asks
+    // for belonged to a run that has finished. See sealReplayedSkill.
+    for (const card of turn.root.querySelectorAll(".skill-card")) sealReplayedSkill(card);
   }
   // THE "Carrying on from here" RULE IS GONE.
   //
@@ -2944,11 +3367,13 @@ async function submit(text, { attachments = [], routing = null, display = null }
           protocolVersion: "1.0.0",
           type: "intent_request",
           requestId: `demo-${reqId++}`,
-          payload: { text, history, ...accessPolicy }
+          payload: { text, history, ...accessPolicy, thinking: thinkingMode }
         },
         text,
         history,
-        ...accessPolicy
+        ...accessPolicy,
+        // The composer's Thinking control, for THIS message. See thinkButton.
+        thinking: thinkingMode
       })
     });
     const session = await readIntentSession(res, {

@@ -1,19 +1,15 @@
 {
   "name": "syscora",
   "version": "0.1.0",
+  "description": "A supervised Windows agent that observes, acts, verifies, and keeps users in control.",
+  "author": "Hithesh",
+  "license": "UNLICENSED",
   "private": true,
   "type": "module",
   "main": "apps/desktop-shell/src/main.js",
-  "os": [
-    "win32"
-  ],
-  "engines": {
-    "node": ">=22.5.0"
-  },
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
+  "os": ["win32"],
+  "engines": { "node": ">=22.5.0" },
+  "workspaces": ["apps/*", "packages/*"],
   "scripts": {
     "mvp:demo": "node apps/cli/src/index.js set-env",
     "mvp:status": "node apps/daemon/src/index.js sessions",
@@ -26,18 +22,29 @@
     "test:raw": "node --test --test-timeout=240000 --test-concurrency=1 --test-force-exit tests/**/*.test.js",
     "capabilities:validate": "node --test tests/unit/capability-framework.test.js",
     "eval": "node tests/eval/runner.mjs",
-    "eval:mock": "node tests/eval/runner.mjs --mock"
+    "eval:mock": "node tests/eval/runner.mjs --mock",
+    "lint": "node scripts/lint.mjs",
+    "static:check": "node scripts/release-static-checks.mjs",
+    "check": "npm run lint && npm run static:check && npm run capabilities:validate",
+    "license:check": "node scripts/license-audit.mjs",
+    "sbom": "node scripts/generate-sbom.mjs",
+    "security:audit": "node scripts/dependency-audit.mjs",
+    "history:audit": "node scripts/audit-git-history.mjs",
+    "release:gate": "node scripts/release-gate.mjs"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9"
   },
   "devDependencies": {
     "electron": "43.4.1",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "26.15.7"
   },
   "build": {
     "appId": "com.syscora.desktop",
     "productName": "SYSCORA",
-    "directories": {
-      "output": "dist"
-    },
+    "artifactName": "SYSCORA-${version}-${arch}.${ext}",
+    "beforePack": "scripts/before-pack.cjs",
+    "directories": { "output": "dist" },
     "files": [
       "apps/**/*",
       "packages/**/*",
@@ -46,18 +53,25 @@
       "!**/*.md",
       "!tests/**",
       "!dist/**",
-      "!.syscora/**",
-      "!**/node_modules/**"
+      "!.syscora/**"
+    ],
+    "extraResources": [
+      { "from": "release/build-info.json", "to": "build-info.json" },
+      { "from": "LICENSE", "to": "legal/LICENSE" },
+      { "from": "NOTICE", "to": "legal/NOTICE" },
+      { "from": "PRIVACY.md", "to": "legal/PRIVACY.md" },
+      { "from": "SECURITY.md", "to": "legal/SECURITY.md" },
+      { "from": "SUPPORT.md", "to": "legal/SUPPORT.md" },
+      { "from": "TERMS.md", "to": "legal/TERMS.md" }
     ],
     "asarUnpack": [
       "os-adapters/**/*",
       "packages/privileged-helpers/schema/**/*"
     ],
     "win": {
-      "target": [
-        "nsis"
-      ],
-      "icon": "apps/desktop/icon.ico"
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "apps/desktop/icon.ico",
+      "verifyUpdateCodeSignature": true
     },
     "nsis": {
       "oneClick": false,
@@ -66,7 +80,10 @@
       "installerIcon": "apps/desktop/icon.ico",
       "uninstallerIcon": "apps/desktop/icon.ico",
       "installerHeaderIcon": "apps/desktop/icon.ico",
-      "shortcutName": "SYSCORA"
-    }
+      "shortcutName": "SYSCORA",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "publish": [{ "provider": "github", "owner": "Hithesh14811", "repo": "SYSCORA" }]
   }
 }

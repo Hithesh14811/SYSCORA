@@ -5,6 +5,15 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createRuntime, loadCapabilityPlugins, reloadRuntimeModelProvider } from "./runtime-factory.js";
+import { loadModelConfig } from "./model-config.js";
+import { migrateModelCredentials, resetModelCredentials } from "./model-settings.js";
+import {
+  applyRetentionPolicy,
+  createPrivacyExport,
+  deleteAllLocalData,
+  privacySummary,
+  savePrivacySettings
+} from "./privacy-service.js";
 import { PROTOCOL_VERSION, ValidationError } from "../../../packages/shared-types/src/domain.js";
 import { AgentRuntime } from "../../../packages/agent-runtime/src/index.js";
 import { buildEnvelope, parseRequestBodyWithEnvelope } from "../../../packages/protocol/src/envelope.js";
@@ -13,6 +22,7 @@ import { projectSessionLifecycle } from "../../../packages/shared-types/src/sess
 import { closeWindowsAutomationHost } from "../../../os-adapters/windows-host/src/client.js";
 import { resolveStateDir } from "../../../packages/shared-types/src/state-path.js";
 import { normalizeAccessPolicy } from "../../../packages/shared-types/src/access-policy.js";
+import { canonicalizePath } from "../../../packages/shared-types/src/canonical-path.js";
 import { isProtectedReference, protectToFile } from "../../../packages/secrets/src/protected-value.js";
 import { installCrashGuards, reportInterruptedRun } from "./crash-guard.js";
 import { reportPreflight } from "./preflight.js";
@@ -84,8 +94,9 @@ async function readJsonBody(request, limit = MAX_REQUEST_BODY_BYTES) {
 
 function parseStaticPath(urlPathname) {
   if (urlPathname === "/") {
-    // The demo chat is the default face of the MVP. The developer console
-    // remains available at /console.html for debugging.
+    // The conversation surface is the only shipped desktop UI. An older
+    // developer console was removed instead of leaving an unmaintained second
+    // unauthenticated surface reachable by URL.
     return path.join(desktopDirectory, "demo.html");
   }
   // Chromium asks for /favicon.ico regardless of the <link rel="icon"> in the
@@ -112,6 +123,11 @@ function inferContentType(filePath) {
 
 export function startServer({ port = 4317, basePath = process.cwd(), runtime: injectedRuntime = null, warmHost = true } = {}) {
   const runtime = injectedRuntime ?? createRuntime(basePath);
+  queueMicrotask(() => {
+    applyRetentionPolicy(runtime, basePath).catch((error) => {
+      process.emitWarning(`SYSCORA could not apply the configured privacy retention policy: ${error?.message ?? error}`);
+    });
+  });
   const intentRuns = new Map();
   // THE ONE PHYSICAL MOUSE, CLAIMED.
   //
@@ -142,11 +158,12 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
   // every file a tool reported creating, and the route can open one of those or
   // nothing. A path the user never asked for was never in a card, so it is not
   // in this set, whatever a request says.
-  const openableFiles = new Set();
+  const openableFiles = new Map();
   const noteOpenableFile = (event) => {
     const card = (event?.details ?? event)?.card;
     if (card?.kind === "file" && typeof card.path === "string" && card.path) {
-      openableFiles.add(path.resolve(card.path).toLowerCase());
+      const lexical = path.resolve(card.path).toLowerCase();
+      openableFiles.set(lexical, canonicalizePath(card.path).toLowerCase());
     }
   };
 
@@ -310,15 +327,49 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         let parsed = {};
         try { parsed = JSON.parse(await fs.readFile(path.join(stateDirectory, "config.json"), "utf8")); } catch {}
         const model = parsed?.model ?? parsed ?? {};
+        const resolved = loadModelConfig(basePath);
         sendJson(response, 200, {
-          provider: model.provider ?? process.env.SYSCORA_MODEL_PROVIDER ?? null,
-          model: model.model ?? process.env.SYSCORA_MODEL_NAME ?? null,
-          configured: Boolean(
-            process.env.SYSCORA_MODEL_API_KEY || model.primaryApiKey || model.apiKey ||
-            (Array.isArray(model.apiKeys) && model.apiKeys.length > 0)
-          ),
-          protected: isProtectedReference(model.primaryApiKey) || isProtectedReference(model.apiKey)
+          provider: resolved.provider ?? model.provider ?? null,
+          model: resolved.model ?? model.model ?? null,
+          configured: Boolean(resolved.apiKey || resolved.apiKeys?.length),
+          protected: resolved.credentialStatus === "protected",
+          credentialStatus: resolved.credentialStatus,
+          migrationAvailable: resolved.credentialStatus === "plaintext",
+          diagnostics: resolved.diagnostics
         });
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/settings/model/test" && request.method === "POST") {
+        try {
+          const status = reloadRuntimeModelProvider(runtime, basePath);
+          const health = await runtime.reasoningEngine.modelProvider.health();
+          sendJson(response, 200, { ...status, health: { ok: health?.ok === true, providers: health?.providers ?? [], reason: health?.reason ?? null } });
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error), health: { ok: false } });
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/settings/model/migrate" && request.method === "POST") {
+        try {
+          const migration = await migrateModelCredentials(basePath);
+          const status = reloadRuntimeModelProvider(runtime, basePath);
+          sendJson(response, 200, { ...migration, ...status });
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error) });
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/settings/model" && request.method === "DELETE") {
+        try {
+          const result = await resetModelCredentials(basePath);
+          const status = reloadRuntimeModelProvider(runtime, basePath);
+          sendJson(response, 200, { ...result, ...status });
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error) });
+        }
         return;
       }
 
@@ -338,21 +389,34 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           }
           const apiKey = payload.apiKey == null ? "" : String(payload.apiKey).trim();
           if (apiKey && (apiKey.length < 8 || apiKey.length > 4096)) throw new Error("The API key length is invalid.");
+          if (payload.externalAIConsent !== true) {
+            throw new Error("External AI consent must be explicitly acknowledged before provider settings are enabled.");
+          }
 
           const stateDirectory = resolveStateDir(basePath);
           const configPath = path.join(stateDirectory, "config.json");
           let config = {};
-          try { config = JSON.parse(await fs.readFile(configPath, "utf8")); } catch {}
+          let previousConfig = null;
+          try {
+            previousConfig = await fs.readFile(configPath, "utf8");
+            config = JSON.parse(previousConfig);
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw new Error(`Fix or reset the existing config before replacing it: ${error?.message ?? error}`);
+          }
           if (!config || Array.isArray(config) || typeof config !== "object") config = {};
           const existingModel = config.model && typeof config.model === "object" ? config.model : {};
           const nextModel = { ...existingModel };
+          const previousProtectedReference = isProtectedReference(existingModel.primaryApiKey)
+            ? existingModel.primaryApiKey
+            : null;
+          let stagedSecretName = null;
           if (provider) nextModel.provider = provider;
           if (modelName) nextModel.model = modelName;
           if (baseUrl) nextModel.baseUrl = baseUrl.replace(/\/$/, "");
           if (apiKey) {
-            const secretName = "model-primary.bin";
-            await protectToFile(path.join(stateDirectory, "secrets", secretName), apiKey);
-            nextModel.primaryApiKey = `dpapi:${secretName}`;
+            stagedSecretName = `model-primary-${crypto.randomUUID()}.bin`;
+            await protectToFile(path.join(stateDirectory, "secrets", stagedSecretName), apiKey);
+            nextModel.primaryApiKey = `dpapi:${stagedSecretName}`;
             delete nextModel.apiKey;
             delete nextModel.apiKeys;
           }
@@ -365,11 +429,93 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
             }
           };
           await fs.mkdir(stateDirectory, { recursive: true });
-          const temporary = `${configPath}.${process.pid}.tmp`;
+          const temporary = `${configPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
           await fs.writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
           await fs.rename(temporary, configPath);
           const status = reloadRuntimeModelProvider(runtime, basePath);
-          sendJson(response, 200, { ...status, protected: Boolean(apiKey) || isProtectedReference(nextModel.primaryApiKey) });
+          let health;
+          try {
+            health = await runtime.reasoningEngine.modelProvider.health();
+          } catch (error) {
+            health = { ok: false, reason: error?.message ?? String(error), providers: [] };
+          }
+          if (health?.ok !== true) {
+            const rollback = `${configPath}.${process.pid}.${crypto.randomUUID()}.rollback`;
+            if (previousConfig == null) await fs.rm(configPath, { force: true });
+            else {
+              await fs.writeFile(rollback, previousConfig, { encoding: "utf8", mode: 0o600 });
+              await fs.rename(rollback, configPath);
+            }
+            if (stagedSecretName) await fs.rm(path.join(stateDirectory, "secrets", stagedSecretName), { force: true });
+            reloadRuntimeModelProvider(runtime, basePath);
+            sendJson(response, 422, {
+              error: "The provider connection failed, so the previous working configuration was restored.",
+              health: { ok: false, providers: health?.providers ?? [], reason: health?.reason ?? null }
+            });
+            return;
+          }
+          if (stagedSecretName && previousProtectedReference) {
+            const previousName = previousProtectedReference.slice("dpapi:".length);
+            if (previousName && path.basename(previousName) === previousName && previousName !== stagedSecretName) {
+              await fs.rm(path.join(stateDirectory, "secrets", previousName), { force: true });
+            }
+          }
+          sendJson(response, 200, {
+            ...status,
+            protected: Boolean(apiKey) || isProtectedReference(nextModel.primaryApiKey),
+            health: { ok: true, providers: health?.providers ?? [], reason: health?.reason ?? null }
+          });
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error) });
+        }
+        return;
+      }
+
+      // ---- Local privacy and data controls ---------------------------------
+      if (requestUrl.pathname === "/api/privacy" && request.method === "GET") {
+        sendJson(response, 200, await privacySummary(basePath));
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/privacy" && request.method === "POST") {
+        try {
+          const payload = await readJsonBody(request);
+          const settings = await savePrivacySettings(basePath, payload);
+          const retention = await applyRetentionPolicy(runtime, basePath, { vacuum: payload.vacuum === true });
+          sendJson(response, 200, { ...settings, retention });
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error) });
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/privacy/export" && request.method === "POST") {
+        if (activeIntent) {
+          sendJson(response, 409, { error: "Wait for the active task to finish before exporting a consistent data snapshot." });
+          return;
+        }
+        try {
+          const payload = await readJsonBody(request, MAX_ATTACHMENT_BODY_BYTES);
+          const result = await createPrivacyExport(runtime, basePath, { browserChats: payload.browserChats });
+          sendJson(response, 200, result);
+        } catch (error) {
+          sendJson(response, 400, { error: error?.message ?? String(error) });
+        }
+        return;
+      }
+
+      if (requestUrl.pathname === "/api/privacy/data" && request.method === "DELETE") {
+        if (activeIntent) {
+          sendJson(response, 409, { error: "Cancel or finish the active task before deleting local data." });
+          return;
+        }
+        try {
+          const payload = await readJsonBody(request);
+          if (payload.confirmation !== "DELETE MY SYSCORA DATA") {
+            throw new Error("The deletion confirmation phrase did not match.");
+          }
+          const result = await deleteAllLocalData(basePath);
+          sendJson(response, 200, result);
         } catch (error) {
           sendJson(response, 400, { error: error?.message ?? String(error) });
         }
@@ -447,7 +593,8 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         try {
           const payload = await readJsonBody(request);
           const wanted = path.resolve(String(payload?.path ?? ""));
-          if (!openableFiles.has(wanted.toLowerCase())) {
+          const approvedCanonical = openableFiles.get(wanted.toLowerCase());
+          if (!approvedCanonical || canonicalizePath(wanted).toLowerCase() !== approvedCanonical) {
             sendJson(response, 403, { ok: false, error: "That file was not created here, so it cannot be opened from here." });
             return;
           }
@@ -664,7 +811,17 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
                 role: String(turn?.role ?? "user"),
                 text: String(turn?.text ?? "").slice(0, 2000)
               }))
-            : []
+            : [],
+          // WHETHER THE MODEL DELIBERATES, from the composer's Thinking control.
+          //
+          // Read from THIS request only, like autoApprove above and for the same
+          // reason: it is a choice about the task being typed, not a standing
+          // setting. Anything that is not one of the three known values is
+          // dropped rather than forwarded, so a malformed client cannot turn
+          // deliberation off by sending nonsense.
+          thinking: ["auto", "always", "never"].includes(String(payload.thinking))
+            ? String(payload.thinking)
+            : null
         };
         if (requestUrl.searchParams.get("sync") === "true") {
           // `finally`, not a release after the send: a run that throws must not
@@ -1214,7 +1371,7 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
 
       const staticPath = parseStaticPath(requestUrl.pathname);
       const desktopRoot = `${desktopDirectory}${path.sep}`;
-      if (!staticPath.startsWith(desktopRoot) && staticPath !== path.join(desktopDirectory, "index.html")) {
+      if (!staticPath.startsWith(desktopRoot)) {
         sendJson(response, 403, { error: "Forbidden" });
         return;
       }

@@ -299,6 +299,19 @@ export class SessionStore {
     }
   }
 
+  async pruneBefore(cutoff, { vacuum = false } = {}) {
+    const iso = new Date(cutoff).toISOString();
+    await this.ensureSchema();
+    const db = new DatabaseSync(this.databasePath);
+    try {
+      const result = db.prepare("DELETE FROM sessions WHERE datetime(updated_at) < datetime(?)").run(iso);
+      if (vacuum && result.changes > 0) db.exec("VACUUM");
+      return { removed: Number(result.changes), cutoff: iso, vacuumed: Boolean(vacuum && result.changes > 0) };
+    } finally {
+      db.close();
+    }
+  }
+
   /** File size and row count, for the probe and for anyone asking "is it bounded". */
   async stats() {
     await this.ensureSchema();

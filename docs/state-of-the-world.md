@@ -598,6 +598,97 @@ cap added in W0 protects `sessions.sqlite` (78.8 MB for 2,234 sessions) and
 nothing else. `semantic-state` belongs to the offline pipeline the eval reports
 reached 0 times, so 370 MB of it is worth explaining before it is capped.
 
+### Done 28 Aug 2026: the moat was switched on, and thinking was switched off
+
+Two findings from a full read of the product, both the same shape the project
+keeps producing — correct machinery nothing reaches.
+
+**1. NO USER COULD EVER HAVE CREATED A SKILL.** The loop emitted `SKILL_OFFERED`,
+the daemon had `POST /api/skills`, `writeSkill` refused unsafe routes correctly,
+and `grep -ic skill` over `apps/desktop/demo.{html,js}` returned **0 and 0**. The
+only caller of the save endpoint in the entire repository was `tests/eval/runner.mjs`,
+whose own comment reads *"accepting it is a separate, explicit step, because in
+the product a person does that"* — and in the product there was nowhere to do it.
+`.syscora/skills` on the real machine was **empty** after weeks of use. So the
+feature `docs/skills.md` calls "the thing that turns SYSCORA from a demo into
+infrastructure", and the plan calls "the actual moat", was unreachable, and every
+0-token replay figure ever quoted came from the eval harness rather than from the
+product.
+
+Built: `apps/desktop/skill-card.js` (the offer, with the steps shown BEFORE the
+yes, because that is the thing being agreed to) and a Skills panel that lists
+saved routes with their clean-replay rate and deletes them — §8 and §11.
+`describeSkills()` remains uncalled and is the next loose end.
+
+**Measured end to end through the real UI and the real daemon, 28 Aug 2026:**
+
+```
+  first run    4.1s   1 tool call   24,015 tokens (15,648 fresh)
+  replay       0.1s   1 tool call        0 tokens, no model call
+```
+
+**41× faster and free**, and verified against the machine rather than the screen:
+the file the replay wrote was read back off disk, and the skill's stats moved to
+`runs 1, cleanReplays 1`. This is the first skill ever saved by a user in this
+product.
+
+**2. THINKING WAS ON FOR EVERY STEP, AND IT WAS COSTING ACCURACY AS WELL AS TIME.**
+Nothing in the repository ever sent a reasoning parameter, so the endpoint's
+default applied to all 80 steps of every task. Measured against the live endpoint
+with the real system prompt and the real 36-tool schema, over seven decisions
+this project has actually paid for getting wrong — `node scripts/probe-model-bakeoff.mjs`,
+3 repeats:
+
+```
+  deepseek-ai/DeepSeek-V4-Flash-0731   thinking ON    6/7 correct   1,576ms
+  deepseek-ai/DeepSeek-V4-Flash-0731   thinking OFF   7/7 correct   1,312ms
+  deepseek-ai/DeepSeek-V4-Pro-0813     thinking ON    7/7 correct   1,462ms
+  zai-org/GLM-5.2-Fast                 thinking OFF   7/7 correct   2,167ms
+```
+
+Faster AND more correct, which is not the trade-off anyone expected. The case
+thinking LOST was `click the Send button`: given room to deliberate it talked
+itself into re-reading a screen it had just read — the same behaviour the output
+ceiling measurement found, where more room produced more ATTEMPTS rather than
+better ones.
+
+So thinking is off for an ordinary step and back on for a turn that has already
+been cut off or arrived malformed — the identical shape to
+`MODEL_OUTPUT_CEILING_RETRY`, for the identical reason. `SYSCORA_MODEL_THINKING=
+always|never` overrides. One live request, `which windows are open right now`:
+**12.2s → 8.9s**, output tokens 471 → 290. (The two runs had different cache
+states, so read the latency, not the token totals.)
+
+Held by `tests/unit/model-thinking.test.js`, which asserts on the REQUEST BODY
+rather than on the constant — and was proven able to fail by deleting the
+forwarding, which fails 5 of its 6 tests. **The first version of the wiring did
+not work**: `sendChatOnce` accepted `extraBody` and `openAiCompatibleChat`, which
+destructures its options explicitly and builds `attemptOptions` by hand, dropped
+it on the floor. The test caught it because it reads the body.
+
+**3. The failure-learning loop works, and had simply never been exercised.**
+`recordAdaptivePattern` / `retrieveAdaptiveGuidance` are wired through
+`agent-runtime` and the memory database held **0** of them. Exercised on purpose
+with a request that must fail — `open the application called zzzqqqfakeapp` — it
+recorded `zzzqqqfakeapp: launch / unavailable; recovery none verified` with
+counts and a confidence, and retrieval returns it for a related request and
+**stays silent for `open spotify` and `play some music`**. That silence is the
+half worth keeping: a memory that fires on everything is one that gets switched
+off.
+
+**Configuration, same day.** One provider, no fallback: `fallbackProviderConfigs`,
+`fallbackProviders`, `apiKeys` and the duplicate `apiKey` removed from
+`config.json`; the key replaced and DPAPI-encrypted via
+`scripts/protect-model-key.mjs`, verified through the daemon's own loader
+(`credentialStatus: protected`, 0 fallbacks). `FailoverModelProvider` is left in
+the tree because five scripts and four test files use it and it is inert with one
+provider configured — deleting it is a cleanup session, not a side quest.
+
+**Found and not fixed: six config backups in the state directory still hold
+plaintext keys** (`config.json.bak`, three `bak-2026-08-22*`, `gemini-backup`,
+`kimi-backup`). They are the user's files and some are revert points, so they
+were left alone and reported rather than deleted.
+
 ### Still open
 
 - **The Baseten account is out of credit** (`HTTP 402: please check your current
@@ -921,6 +1012,36 @@ Two live bugs fell out of the pass:
 - **Latency.** `screen` on WhatsApp is ~2–4s, dominated by a full-tree `FindAll`
   (W3.2, untouched). A shell command is now ~6s end to end, not 41s. Requests
   that need no model at all now take 115–461ms and no tokens (W3.1, done).
+- ~~**Research tasks cost a fortune and do not finish.**~~ Fixed 29 Aug. The
+  cause was not search, which is fast and cheap: a live request for fifteen
+  internships issued twenty searches ONE AT A TIME across eighteen steps, spent
+  154,590 fresh tokens and hit the ceiling with nothing to show. Only ~14,000 of
+  those tokens were results. **The step is the expensive unit, not the request:**
+  `scripts/probe-prompt-cache.mjs` shows this endpoint caches prefixes in
+  8,192-token blocks, so every round trip re-buys its incomplete tail block —
+  about 4,000 billed tokens — before it fetches anything at all.
+  So `search` now takes `queries` (up to 8, run 4-wide) and `web_open` takes
+  `urls` (up to 6, fetched at once). Measured on identical data, eight searches:
+  8 steps → 1, 38,332 → 9,674 billed tokens (**4.0x**), 7.8s → 2.4s.
+  Four-wide is a measurement, not a guess: DuckDuckGo enforces a rolling budget
+  and starts answering 202 once it is spent, and it is the best of the three
+  indexes, so losing it collapses the consensus the ranker is built on. At 4-wide
+  7 of 8 queries kept all three indexes.
+- ~~**A page arrives as furniture wrapped around the answer.**~~ Fixed 29 Aug.
+  `web_open` takes `find`, and returns the lines and links that match it instead
+  of 2,500 characters from the top plus sixty links in document order.
+  `bestPassages` had been written for exactly this on 23 Aug and was never called
+  by anything. Measured on three real careers pages: **3,907 → 1,018 tokens,
+  3 steps → 1, 4.2s → 1.1s** — and the focused read surfaced
+  `amazon.jobs/applicant/jobs/3116030/apply` and Microsoft's "Yes, Microsoft
+  provides visa sponsorship", both of which the blind read had buried.
+- **The domain-authority ranking signal is worse, and is now measured as worse.**
+  It shipped dark on 29 Aug with a note saying two queries suggested it helped.
+  `node scripts/bench-rank.mjs` fetches one candidate pool and A/Bs rankings
+  against it offline — which is what every previous attempt got wrong, because
+  refetching between arms measures DuckDuckGo's rate limit rather than the
+  ranking. Over all fourteen benchmark queries: hit@1 79% → 71%, MRR
+  0.869 → 0.833, one query moved and it moved the wrong way. It stays off.
 - ~~**One provider, no failover.**~~ Two endpoints are configured from 19 Aug —
   `model.fallbackProviderConfigs` in `.syscora/config.json`. The code was always
   there; the gap was ten lines of JSON. `node scripts/probe-failover.mjs` proves

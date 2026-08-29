@@ -363,9 +363,9 @@ test("the card the tool emits is the card the surface draws", () => {
 // C:\Windows\System32\calc.exe came back 403 "That file was not created here".
 test("the daemon will only open a file it watched a tool create", () => {
   const server = source("apps/daemon/src/server.js");
-  assert.match(server, /const openableFiles = new Set\(\)/);
+  assert.match(server, /const openableFiles = new Map\(\)/);
   assert.match(server, /card\?\.kind === "file"/, "nothing fills the set, so nothing can ever be opened");
-  assert.match(server, /if \(!openableFiles\.has\(wanted\.toLowerCase\(\)\)\)/,
+  assert.match(server, /canonicalizePath\(wanted\)\.toLowerCase\(\) !== approvedCanonical/,
     "the open route does not check the path against what this daemon actually made");
   // `start` is a cmd.exe builtin, so it needs a shell, and a shell needs the
   // path quoted — which is how a filename with an ampersand in it becomes a

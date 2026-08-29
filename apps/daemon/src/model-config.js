@@ -16,6 +16,7 @@ import { isProtectedReference, resolveProtectedValue } from "../../../packages/s
 export function loadModelConfig(basePath = process.cwd()) {
   let fileConfig = {};
   let consentConfig = {};
+  const diagnostics = [];
   const configPath = path.join(resolveStateDir(basePath), "config.json");
   try {
     if (fs.existsSync(configPath)) {
@@ -45,6 +46,7 @@ export function loadModelConfig(basePath = process.cwd()) {
       "provider. If answers look wrong or nothing reaches your model, this is why.",
       "SyscoraConfigWarning"
     );
+    diagnostics.push({ code: "CONFIG_PARSE_FAILED", message: "The local model configuration could not be parsed." });
     fileConfig = {};
   }
 
@@ -73,6 +75,7 @@ export function loadModelConfig(basePath = process.cwd()) {
   // Memoised per load, not across loads: this is a decrypt, not a cache of
   // secrets, and it dies with the call.
   const decrypted = new Map();
+  let protectedValueFailed = false;
   const unprotect = (value, what) => {
     if (!isProtectedReference(value)) return value;
     if (decrypted.has(value)) return decrypted.get(value);
@@ -81,6 +84,11 @@ export function loadModelConfig(basePath = process.cwd()) {
       decrypted.set(value, plaintext);
       return plaintext;
     } catch (error) {
+      protectedValueFailed = true;
+      diagnostics.push({
+        code: "PROTECTED_VALUE_UNREADABLE",
+        message: `The ${what} cannot be decrypted by this Windows account.`
+      });
       process.emitWarning(
         `SYSCORA: the ${what} is stored encrypted and could not be read — ${error?.message ?? error}. ` +
         "No model will be reachable until this is fixed.",
@@ -94,7 +102,7 @@ export function loadModelConfig(basePath = process.cwd()) {
   const fallbackProviderConfigs = Array.isArray(fileConfig.fallbackProviderConfigs)
     ? fileConfig.fallbackProviderConfigs.map((fallback) => (
       fallback?.apiKeyFromExistingConfig
-        ? { ...fallback, apiKey: unprotect(fileConfig.apiKey, "primary model key") }
+        ? { ...fallback, apiKey: unprotect(fileConfig.primaryApiKey ?? fileConfig.apiKey, "primary model key") }
         : { ...fallback, apiKey: unprotect(fallback?.apiKey, `fallback model key for ${fallback?.baseUrl ?? "an endpoint"}`) }
     ))
     : [];
@@ -104,26 +112,47 @@ export function loadModelConfig(basePath = process.cwd()) {
   // SYSCORA_* names rather than requiring the key to be renamed on the way in.
   // SYSCORA_* still wins, because it is the more specific of the two.
   const provider = process.env.SYSCORA_MODEL_PROVIDER || process.env.LLM_PROVIDER || fileConfig.provider || "mock";
-  // Anything that is not the deterministic offline Mock reaches the network.
-  const remoteProvider = String(provider).toLowerCase() !== "mock";
+  const providerEnvironmentApiKey = ({
+    openai: process.env.OPENAI_API_KEY,
+    anthropic: process.env.ANTHROPIC_API_KEY,
+    mistral: process.env.MISTRAL_API_KEY,
+    gemini: process.env.GEMINI_API_KEY,
+    google: process.env.GOOGLE_API_KEY,
+    agentrouter: process.env.AGENTROUTER_API_KEY
+  })[String(provider).toLowerCase()];
+  const environmentApiKey =
+    process.env.SYSCORA_MODEL_API_KEY ||
+    process.env.LLM_API_KEY ||
+    providerEnvironmentApiKey ||
+    null;
+  const storedPrimaryValue = fileConfig.primaryApiKey ?? fileConfig.apiKey ?? null;
+  const resolvedPrimaryApiKey = environmentApiKey || unprotect(storedPrimaryValue, "primary model key") || null;
+  const configuredApiKeys = (() => {
+    const configured = process.env.SYSCORA_MODEL_API_KEYS || fileConfig.apiKeys || [];
+    return (Array.isArray(configured) ? configured : String(configured).split(","))
+      .map((key, index) => unprotect(String(key).trim(), `model key pool entry ${index + 1}`))
+      .filter(Boolean);
+  })();
+  const fileContainsPlaintextCredential = Boolean(
+    (storedPrimaryValue && !isProtectedReference(storedPrimaryValue)) ||
+    (Array.isArray(fileConfig.apiKeys) && fileConfig.apiKeys.some((key) => key && !isProtectedReference(key))) ||
+    (Array.isArray(fileConfig.fallbackProviderConfigs) &&
+      fileConfig.fallbackProviderConfigs.some((fallback) => fallback?.apiKey && !isProtectedReference(fallback.apiKey)))
+  );
+  const credentialStatus = environmentApiKey
+    ? "environment"
+    : protectedValueFailed
+      ? "unreadable"
+      : fileContainsPlaintextCredential
+        ? "plaintext"
+        : (resolvedPrimaryApiKey || configuredApiKeys.length > 0)
+          ? "protected"
+          : "missing";
 
   return {
     provider,
-    apiKey:
-      process.env.SYSCORA_MODEL_API_KEY ||
-      process.env.LLM_API_KEY ||
-      process.env.AGENTROUTER_API_KEY ||
-      // Environment variables still win, and are never references: a value
-      // exported into the environment was put there by someone who meant it.
-      unprotect(fileConfig.primaryApiKey, "primary model key") ||
-      unprotect(fileConfig.apiKey, "primary model key") ||
-      null,
-    apiKeys: (() => {
-      const configured = process.env.SYSCORA_MODEL_API_KEYS || fileConfig.apiKeys || [];
-      return (Array.isArray(configured) ? configured : String(configured).split(","))
-        .map((key) => String(key).trim())
-        .filter(Boolean);
-    })(),
+    apiKey: resolvedPrimaryApiKey,
+    apiKeys: configuredApiKeys,
     model: process.env.SYSCORA_MODEL_NAME || process.env.LLM_MODEL || fileConfig.model || undefined,
     baseUrl: process.env.SYSCORA_MODEL_BASE_URL || process.env.LLM_BASE_URL || fileConfig.baseUrl || undefined,
     // Ceiling on a single completion. Only large enough to matter for the
@@ -144,26 +173,17 @@ export function loadModelConfig(basePath = process.cwd()) {
       process.env.SYSCORA_MODEL_FALLBACK_PROVIDERS || fileConfig.fallbackProviders || "",
     fallbackProviderConfigs,
     externalAIConsent: {
-      // CONFIGURING A REMOTE MODEL IS THE CONSENT DECISION.
-      //
-      // The default here was EXTERNAL_AI_DISABLED whether or not a remote model
-      // had been set up — which was harmless only for as long as nothing checked
-      // it. Now that the kill switch is actually wired to the agent loop (see
-      // ConsentAwareModelProvider.supportsChat), that default would silently
-      // demote anyone who configured a provider through environment variables to
-      // the offline pipeline, for a switch they never set.
-      //
-      // Pointing SYSCORA at a hosted model IS choosing to send it what it needs
-      // to work; there is no version of this product that talks to a remote model
-      // without doing so. So the default follows the provider: a real one implies
-      // the scopes it cannot run without, and Mock — no network — implies none.
-      // Setting the scopes explicitly always wins, including setting them to
-      // EXTERNAL_AI_DISABLED, which now genuinely disables it.
+      // A configured endpoint is not consent. Desktop setup writes these scopes
+      // only after the disclosure checkbox is submitted. Headless developers
+      // must set SYSCORA_EXTERNAL_AI_CONSENT_SCOPES explicitly; otherwise the
+      // provider remains configured but model content cannot leave the machine.
       scopes: String(
         process.env.SYSCORA_EXTERNAL_AI_CONSENT_SCOPES ||
         (Array.isArray(consentConfig.scopes) ? consentConfig.scopes.join(",") : consentConfig.scopes) ||
-        (remoteProvider ? "EXTERNAL_AI_SANITIZED_REASONING,EXTERNAL_AI_STRUCTURED_UI_CONTEXT" : "EXTERNAL_AI_DISABLED")
+        "EXTERNAL_AI_DISABLED"
       ).split(",").map((scope) => scope.trim()).filter(Boolean)
-    }
+    },
+    credentialStatus,
+    diagnostics
   };
 }

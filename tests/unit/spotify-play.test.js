@@ -283,7 +283,10 @@ test("Spotify queue selector stays localized and has a grounded click fallback",
 });
 
 test("live Spotify verification uses Player controls Pause plus Now playing label", async () => {
-  const adapter = new WindowsAdapter();
+  // This fixture verifies the compatibility scan specifically. Opt out of the
+  // production persistent host so it cannot inspect the real desktop and
+  // replace the mocked PowerShell observation below.
+  const adapter = new WindowsAdapter({ automationHost: false, browserAutomation: {} });
   adapter.listWindows = async () => [{
     Id: 7,
     ProcessName: "Spotify",

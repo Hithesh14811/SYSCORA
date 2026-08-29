@@ -74,6 +74,15 @@
                  entirely until an account is actually connected — an empty row
                  saying "not connected" is a setting about nothing. -->
             <div id="mailAccounts" class="more-mail" hidden></div>
+            <!-- THE ROUTES IT HAS LEARNED, AND THE ONLY PLACE THEY CAN BE
+                 CORRECTED. A saved skill drives the machine without a model
+                 deciding anything, so §11 of docs/skills.md says it must never
+                 be hidden from the user: they can read what each one does, see
+                 how often it still works, and delete it. Without this the store
+                 was write-only from the daemon's side and invisible from here. -->
+            <button id="skillsButton" class="more-settings-button" type="button" role="menuitem">
+              <span>Skills</span><em id="skillsButtonHint">Routes it has learned</em>
+            </button>
             <button id="safetySettingsButton" class="more-settings-button" type="button" role="menuitem">
               <span>Safety &amp; privacy</span><em>Access mode, terminal and provider</em>
             </button>
@@ -254,6 +263,11 @@
             </label>
           </div>
           <p id="providerStatus" class="settings-status">The current key is never shown here.</p>
+          <div class="settings-actions">
+            <button id="providerTestButton" type="button" class="settings-secondary">Test connection</button>
+            <button id="providerMigrateButton" type="button" class="settings-secondary" hidden>Protect existing key</button>
+            <button id="providerResetButton" type="button" class="settings-danger">Remove provider</button>
+          </div>
         </fieldset>
 
         <fieldset class="onboarding-section">
@@ -262,6 +276,30 @@
             <input id="privacyConsent" type="checkbox" required />
             <span>I understand that prompts and necessary file, screen, browser, or email context may be sent to my model provider.</span>
           </label>
+          <label class="retention-row">Keep local conversations and learned state
+            <select id="privacyRetentionDays">
+              <option value="7">7 days</option>
+              <option value="30">30 days</option>
+              <option value="90">90 days</option>
+              <option value="365">1 year</option>
+              <option value="0">Until I delete it</option>
+            </select>
+          </label>
+          <p id="privacyStatus" class="settings-status">Local storage usage is being measured.</p>
+          <div class="settings-actions">
+            <button id="privacyExportButton" type="button" class="settings-secondary">Export my data</button>
+            <button id="privacyDeleteButton" type="button" class="settings-danger">Delete all local data</button>
+          </div>
+          <nav class="legal-links" aria-label="Legal and support">
+            <button type="button" data-legal-document="privacy">Privacy</button>
+            <button type="button" data-legal-document="terms">Terms</button>
+            <button type="button" data-legal-document="security">Security</button>
+            <button type="button" data-legal-document="support">Support</button>
+          </nav>
+          <div class="update-row">
+            <span id="updateStatus">Updates are checked automatically in installed builds.</span>
+            <button id="updateActionButton" type="button" class="settings-secondary">Check for updates</button>
+          </div>
         </fieldset>
 
         <fieldset class="onboarding-section">
@@ -273,8 +311,8 @@
           </label>
           <label id="shellModeRow" class="shell-mode-row" hidden>Run terminal commands
             <select id="shellExecutionMode">
-              <option value="workspace">Start in an attached workspace (fast, not isolated)</option>
               <option value="isolated">In a disposable Windows Sandbox</option>
+              <option value="workspace">Start in an attached workspace (fast, not isolated)</option>
               <option value="host">Directly on this Windows account</option>
             </select>
           </label>
@@ -287,6 +325,31 @@
           <button type="submit" class="settings-primary">Save and continue</button>
         </footer>
       </form>
+    </section>
+
+    <!-- THE ROUTES IT HAS LEARNED.
+         A skill replays a verified sequence of actions on this machine with no
+         model deciding anything, so the user has to be able to see exactly what
+         each one does and remove it without ceremony (docs/skills.md §11). The
+         list is read from GET /api/skills; Delete is DELETE /api/skills/<id>.
+         Nothing here can create one — that happens only from the card a finished
+         run offers, which is where the consent belongs. -->
+    <section id="skillsPanel" class="onboarding-panel" hidden aria-modal="true" role="dialog"
+             aria-labelledby="skillsTitle">
+      <div class="onboarding-card skills-card">
+        <header>
+          <span class="onboarding-kicker">Learned on this machine</span>
+          <h2 id="skillsTitle">Skills</h2>
+          <p>A skill is a route SYSCORA worked out once and verified. Replaying one costs no
+             model call at all. It retires itself if it stops working, and you can delete any
+             of them here.</p>
+        </header>
+        <div id="skillsList" class="skills-list" aria-live="polite"></div>
+        <p id="skillsError" class="settings-error" hidden></p>
+        <footer>
+          <button id="skillsClose" type="button" class="settings-secondary">Close</button>
+        </footer>
+      </div>
     </section>
 
     <main class="demo-layout">
@@ -457,6 +520,26 @@
             </button>
             <div id="accessMenu" class="access-menu" role="menu" hidden></div>
           </div>
+          <!-- WHETHER THE MODEL DELIBERATES BEFORE IT ACTS.
+               Measured 28 Aug 2026: not thinking is both faster and slightly
+               MORE accurate on ordinary single decisions, so Auto keeps it off
+               for a normal step and turns it back on for a step that has already
+               been cut off. But which of those a request is depends on the
+               request, and only the person typing knows — so this is theirs.
+               Cycles Auto → Always → Off; the choice rides on the next message
+               rather than being a standing setting. -->
+          <button id="thinkButton" class="access-button think-button" type="button"
+                  aria-label="Thinking: automatic"
+                  title="Whether the model thinks before acting. Auto: only when a step goes wrong.">
+            <span class="think-button-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                   stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3a5.6 5.6 0 0 0-3.4 10.1c.5.4.8 1 .8 1.6v.8h5.2v-.8c0-.6.3-1.2.8-1.6A5.6 5.6 0 0 0 12 3z"/>
+                <path d="M9.4 18.6h5.2M10.2 21h3.6"/>
+              </svg>
+            </span>
+            <span id="thinkButtonLabel">Auto</span>
+          </button>
           <!-- The hint takes the slack between the two ends of the row, so the
                attach control stays on the left edge and the model picker stays
                with the send button on the right. -->

@@ -43,14 +43,20 @@ function baseAdapter() {
 // passes on review.
 const NO_HTTP = async (url) => ({ ok: false, url, title: "", text: "", links: [], reason: "stubbed off" });
 
-function toolsetOver(adapter, { readPageOverHttp = NO_HTTP } = {}) {
+// The same, for search: three indexes per query and up to eight queries a call,
+// so an unstubbed suite would spend somebody else's rate limit on every run.
+const NO_SEARCH = async (queries) => queries.map((query) => ({
+  ok: false, query, results: [], provider: null, reason: "stubbed off"
+}));
+
+function toolsetOver(adapter, { readPageOverHttp = NO_HTTP, searchTheWeb = NO_SEARCH } = {}) {
   return buildToolset({
-    registry: createDefaultCapabilityRegistry(adapter), adapter, basePath: "C:\\work", readPageOverHttp
+    registry: createDefaultCapabilityRegistry(adapter), adapter, basePath: "C:\\work", readPageOverHttp, searchTheWeb
   });
 }
 
 // A toolset whose browser answers like a real page.
-function webToolset({ page = {}, elements = [], best = null, field = null, afterClick = null, typeResult = null, readPageOverHttp = NO_HTTP } = {}) {
+function webToolset({ page = {}, elements = [], best = null, field = null, afterClick = null, typeResult = null, clickResult = null, readPageOverHttp = NO_HTTP } = {}) {
   const calls = [];
   const state = {
     url: page.url ?? "https://example.com/",
@@ -80,7 +86,7 @@ function webToolset({ page = {}, elements = [], best = null, field = null, after
         }
         case "findBest": return best ?? { found: false, reason: "matching-dom-target-not-found" };
         case "findField": return field ?? { found: false, reason: "field-not-found", labels: ["Email", "Password"] };
-        case "click": return { performed: true, target: params.target };
+        case "click": return clickResult ?? { performed: true, target: params.target };
         case "type": return typeResult ?? { performed: true, landed: String(params.text ?? ""), length: String(params.text ?? "").length };
         case "pressKey": return { performed: true, key: "Enter" };
         case "scroll": return { performed: true, moved: true, scrollBefore: { x: 0, y: 0 }, scrollAfter: { x: 0, y: 600 } };
@@ -267,8 +273,21 @@ test("driving a search engine through the browser is refused, and named", async 
   const { toolset, calls } = webToolset({ readPageOverHttp: httpPage() });
   const result = await toolset.execute("web_open", { url: "https://www.google.com/search?q=best+laptops+2026" });
   assert.equal(result.ok, false);
-  assert.match(result.text, /search\(\{ query: "best laptops 2026" \}\)/, "the way out has to be the exact call to make");
+  assert.match(result.text, /search\(\{ queries: \["best laptops 2026"\] \}\)/, "the way out has to be the exact call to make");
   assert.ok(!calls.some((entry) => entry.operation === "launch"), "it went to the browser anyway");
+});
+
+test("a batch of urls is not a way around the search-engine refusal", async () => {
+  // A refusal with a way around it teaches the model the way around rather than
+  // the rule. The check used to live inside the single-page path, so putting the
+  // same URL in `urls` walked straight past it.
+  const { toolset, calls } = webToolset({ readPageOverHttp: httpPage() });
+  const result = await toolset.execute("web_open", {
+    urls: ["https://news.example/story", "https://duckduckgo.com/?q=best+laptops+2026"]
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.text, /Do not drive duckduckgo/);
+  assert.ok(!calls.some((entry) => entry.operation === "launch"));
 });
 
 test("an ordinary page on a search engine's domain is still just a page", async () => {
@@ -436,4 +455,304 @@ test("closing an application checks the process list rather than trusting the re
   };
   const closed = await toolsetOver(gone).execute("close_app", { application: "notepad.exe" });
   assert.match(closed.text, /is closed/);
+});
+
+// AN UNCHANGED PAGE MUST NOT BE PAID FOR TWICE.
+//
+// The identical-reading notice used to be appended AFTER the whole reading, so
+// re-reading a page that had not moved sent the entire page again and then said
+// it was identical -- the most expensive possible way to say "nothing changed".
+// `screen` has always answered an unchanged window with one line.
+//
+// It became much worse on 28 Aug 2026, when `web_read` was added to
+// `isUiObservation` so that reading a form back would stop tripping the
+// no-progress guard. That change is correct, but the guard had been the only
+// thing capping the repeat at three, and removing it uncapped a full-price one.
+// Measured live the same day on a flight search: six near-identical Google
+// Flights readings in one request, each ~2,500 characters of text plus sixty
+// footer links, and the run hit its 150,000-token ceiling having found nothing.
+test("re-reading an unchanged page returns a sentence, not the page again", async () => {
+  const body = "Departure Return Search ".repeat(60);
+  const { toolset } = webToolset({ readPageOverHttp: httpPage({ text: body }) });
+  await toolset.execute("web_open", { url: "https://flights.example/search" });
+
+  const first = await toolset.execute("web_read", {});
+  const second = await toolset.execute("web_read", {});
+
+  assert.ok(first.text.includes("Departure"), "the first read must carry the page");
+  assert.match(second.text, /IDENTICAL/, "the second must say the page did not move");
+  assert.ok(
+    !second.text.includes("Departure Return Search Departure"),
+    "the second must NOT repeat the page body"
+  );
+  // The size is the whole point of this test, so it is asserted directly rather
+  // than implied: a repeat that is not dramatically smaller has not been fixed.
+  assert.ok(
+    second.text.length < first.text.length / 4,
+    `an unchanged re-read cost ${second.text.length} chars against ${first.text.length} for the real one`
+  );
+});
+
+test("a page that really changed is still returned in full", async () => {
+  // The counter-case. Suppressing a CHANGED reading would be a far worse bug
+  // than the one being fixed, so it is held here.
+  let call = 0;
+  const { toolset } = webToolset({
+    readPageOverHttp: async (url) => {
+      call += 1;
+      return (await httpPage({ text: `Results page ${call}. ${"row ".repeat(50)}` })(url));
+    }
+  });
+  await toolset.execute("web_open", { url: "https://flights.example/a" });
+  const first = await toolset.execute("web_read", {});
+  await toolset.execute("web_open", { url: "https://flights.example/b" });
+  const second = await toolset.execute("web_read", {});
+  assert.doesNotMatch(second.text, /IDENTICAL/, "a genuinely different page must not be called identical");
+  assert.ok(second.text.length > first.text.length / 2, "and must be returned in full");
+});
+
+// A CONTROL THE DOM WILL NOT CLICK IS USUALLY ONE THE ACCESSIBILITY TREE WILL.
+//
+// Measured live, 29 Aug 2026, on Google Flights: its trip-type and cabin
+// controls are bare divs that CDP will not fire, so web_click refused six times
+// across "One way", "Round trip" and "Departure", and one call even reached for
+// the desktop click tool with a browser element index -- eleven wasted calls.
+// The agent then solved it in four: windows -> screen chrome -> click "Change
+// ticket type. Round trip" -> click "One way", both landing first time, because
+// Chromium publishes those divs to UIA as named comboboxes.
+//
+// Tokens SENT grow with the square of the step count, so those eleven calls are
+// most of why that run sent 1.2M. The refusal now carries the way out.
+test("an unclickable element sends the model to the window, not to another label", async () => {
+  const { toolset } = webToolset({
+    best: { found: true, target: { name: "Round trip", targetId: "t1" }, matchScore: 1, runnerUp: null, alternatives: [] },
+    clickResult: { performed: false, reason: "the element could not be clicked" }
+  });
+  const result = await toolset.execute("web_click", { text: "Round trip", saw: "the form", say: "switching to one way" });
+
+  assert.equal(result.ok, false, "a click that did not land must not report success");
+  // The route out, named exactly, because a refusal without one is what the
+  // model spent eleven calls working around.
+  assert.match(result.text, /windows/, "must name the windows tool");
+  assert.match(result.text, /screen/, "must name the screen tool");
+  // And it must say NOT to keep trying labels, which is what actually happened.
+  assert.match(result.text, /another label|refuse the same way/i);
+});
+
+// ---- one step, several questions ---------------------------------------------
+//
+// The expensive unit here is the STEP, not the request. Prefix caching on this
+// endpoint is quantised into 8,192-token blocks, so every round trip re-buys its
+// tail block — about 4,000 billed tokens — before it has looked at anything,
+// while a search result set costs about 700 and an HTTP page read about 300.
+//
+// Measured live on 29 Aug 2026: a request for fifteen internships issued twenty
+// searches ONE AT A TIME across eighteen steps, spent 154,590 fresh tokens, and
+// hit its ceiling with the answer unfinished. About 14,000 of those tokens were
+// the results. The rest was the asking.
+
+test("several pages are read in one call, and the ones that failed are still reported", async () => {
+  const pages = {
+    "https://a.example/": { title: "Page A", text: `Alpha applies here. ${"Filler. ".repeat(60)}`, links: [{ label: "Apply now", href: "https://a.example/apply" }] },
+    "https://b.example/": { title: "Page B", text: `Beta applies too. ${"Filler. ".repeat(60)}`, links: [{ label: "Apply", href: "https://b.example/apply" }] }
+  };
+  const { toolset, calls } = webToolset({
+    readPageOverHttp: async (url) => (pages[url]
+      ? { ok: true, url, status: 200, readable: true, reason: null, links: [], ...pages[url] }
+      : { ok: false, url, title: "", text: "", links: [], reason: "the site answered HTTP 404" })
+  });
+
+  const result = await toolset.execute("web_open", { urls: ["https://a.example/", "https://b.example/", "https://gone.example/"] });
+  assert.equal(result.ok, true);
+  assert.match(result.text, /Read 2 of 3 pages/);
+  assert.match(result.text, /Page A/);
+  assert.match(result.text, /Page B/);
+  // FOUR URLS IN AND THREE PAGES OUT is how a confident answer gets written
+  // about a page nobody looked at. Every URL gets a line whatever happened.
+  assert.match(result.text, /https:\/\/gone\.example\/[\s\S]*COULD NOT READ[\s\S]*404/);
+  assert.ok(!calls.some((entry) => entry.operation === "launch"), "a batch read must not spend a browser");
+});
+
+test("a batch of pages does not become 'the page' that clicking acts on", async () => {
+  // The batch is read-only on purpose. web_click, web_type and web_scroll all
+  // act on ONE page, and quietly picking which of three that is would be the
+  // "whose window is this" defect with a browser in place of a window.
+  const { toolset, calls } = webToolset({
+    best: domTarget("Read more"),
+    readPageOverHttp: httpPage()
+  });
+  await toolset.execute("web_open", { url: "https://news.example/story" });
+  await toolset.execute("web_open", { urls: ["https://other.example/one", "https://other.example/two"] });
+  await toolset.execute("web_click", { text: "Read more" });
+
+  const launched = calls.filter((entry) => entry.operation === "launch").map((entry) => entry.params.url);
+  assert.deepEqual(launched, ["https://news.example/story"],
+    "the click followed the batch instead of the page that was actually open");
+});
+
+test("asking a page a question returns the lines and links about it, not the page", async () => {
+  // bestPassages was written for exactly this on 23 Aug 2026 and then never
+  // called by anything for six days, while pages kept arriving as thousands of
+  // characters of navigation wrapped around the two sentences that mattered.
+  const { toolset } = webToolset({
+    readPageOverHttp: httpPage({
+      title: "Internship",
+      text: [
+        "Cookie preferences and privacy settings for this website.",
+        "Follow us on social media for updates about our company.",
+        "This internship pays a stipend of $9,000 per month and we sponsor visas.",
+        "Our offices are open Monday to Friday between nine and five."
+      ].join("\n"),
+      links: [
+        { label: "Cookie policy", href: "https://x.example/cookies" },
+        { label: "Apply for this internship", href: "https://x.example/apply" },
+        { label: "About us", href: "https://x.example/about" }
+      ]
+    })
+  });
+  const result = await toolset.execute("web_open", { url: "https://x.example/job", find: "stipend visa sponsorship apply" });
+
+  assert.equal(result.ok, true);
+  assert.match(result.text, /stipend of \$9,000 per month/);
+  assert.match(result.text, /https:\/\/x\.example\/apply/);
+  // The page furniture is what this exists to leave behind.
+  assert.ok(!/Follow us on social media/.test(result.text), "an unrelated line was returned anyway");
+  assert.ok(!/x\.example\/cookies/.test(result.text), "an unrelated link was returned anyway");
+  // How much was actually searched, so the model can tell a thin page from a
+  // thin answer.
+  assert.match(result.text, /Searched all [\d,]+ characters/);
+});
+
+test("a page that does not mention what was asked says so, and shows what it is instead", async () => {
+  // Silence here is indistinguishable from a page that failed to load, and the
+  // recoveries are opposite: look somewhere else, versus look again.
+  const { toolset } = webToolset({
+    readPageOverHttp: httpPage({ title: "Recipes", text: `How to poach an egg. ${"Stir gently. ".repeat(40)}`, links: [] })
+  });
+  const result = await toolset.execute("web_open", { url: "https://x.example/", find: "quarterly dividend yield" });
+  assert.match(result.text, /Nothing on this page mentions "quarterly dividend yield"/);
+  assert.match(result.text, /poach an egg/, "the opening has to come back so the wrong page is visible as one");
+});
+
+test("a find that the browser route cannot honour says so rather than being ignored", async () => {
+  // A request that is silently dropped is one the model has no way to stop
+  // making. The browser hands back an already-clipped reading, so searching it
+  // would report "nothing mentions it" about text further down the page.
+  const { toolset } = webToolset({
+    page: { url: "https://app.example/", title: "Dashboard", text: "Rendered by the browser." },
+    readPageOverHttp: httpPage({ text: "", readable: false })
+  });
+  const result = await toolset.execute("web_open", { url: "https://app.example/", find: "pricing" });
+  assert.match(result.text, /`find` was not applied/);
+});
+
+test("too many pages at once is refused with the number that would work", async () => {
+  const { toolset } = webToolset({ readPageOverHttp: httpPage() });
+  const many = Array.from({ length: 9 }, (unused, index) => `https://x.example/${index}`);
+  const result = await toolset.execute("web_open", { urls: many });
+  assert.equal(result.ok, false);
+  assert.match(result.text, /too many/i);
+  assert.match(result.text, /at most 6/);
+});
+
+test("a url list written as a single JSON string is understood rather than refused", async () => {
+  // The same model that is given `urls: string[]` sends the array as text. There
+  // is exactly one sensible reading of that, so refusing it buys nothing and
+  // costs a round trip — and a round trip is the expensive unit here.
+  const { toolset } = webToolset({ readPageOverHttp: httpPage() });
+  const result = await toolset.execute("web_open", { urls: '["https://a.example/", "https://b.example/"]' });
+  assert.equal(result.ok, true);
+  assert.match(result.text, /Read 2 of 2 pages/);
+});
+
+test("all the questions go out in one call, and each one's results are labelled", async () => {
+  const asked = [];
+  const toolset = toolsetOver(baseAdapter(), {
+    searchTheWeb: async (queries) => {
+      asked.push(queries);
+      return queries.map((query) => ({
+        ok: true, query, provider: "duckduckgo+yahoo+bing", cached: false,
+        results: [{ title: `${query} — a page`, url: `https://example.com/${encodeURIComponent(query)}`, snippet: "" }]
+      }));
+    }
+  });
+
+  const result = await toolset.execute("search", { queries: ["nvidia intern", "stripe intern", "meta intern"] });
+  assert.equal(result.ok, true);
+  assert.equal(asked.length, 1, "three questions must not be three calls");
+  assert.deepEqual(asked[0], ["nvidia intern", "stripe intern", "meta intern"]);
+  for (const query of ["nvidia intern", "stripe intern", "meta intern"]) {
+    assert.match(result.text, new RegExp(`results? for "${query}"`));
+  }
+  // Numbered continuously across the batch, so a result can be referred to by a
+  // number that means one thing in the whole reply rather than something
+  // different under every heading.
+  assert.match(result.text, /1\. nvidia intern/);
+  assert.match(result.text, /2\. stripe intern/);
+  assert.match(result.text, /3\. meta intern/);
+});
+
+test("a single query still behaves exactly as it did", async () => {
+  const toolset = toolsetOver(baseAdapter(), {
+    searchTheWeb: async (queries) => queries.map((query) => ({
+      ok: true, query, provider: "duckduckgo", cached: false,
+      results: [{ title: "Only result", url: "https://example.com/one", snippet: "A snippet." }]
+    }))
+  });
+  const result = await toolset.execute("search", { query: "one thing" });
+  assert.equal(result.ok, true);
+  assert.match(result.text, /1 result for "one thing" \(duckduckgo\)/);
+  assert.match(result.text, /1\. Only result/);
+  assert.match(result.text, /https:\/\/example\.com\/one/);
+});
+
+test("a batch where some queries came back empty is still a success for the ones that did not", async () => {
+  const toolset = toolsetOver(baseAdapter(), {
+    searchTheWeb: async (queries) => queries.map((query, index) => (index === 0
+      ? { ok: false, query, results: [], provider: null, reason: "duckduckgo-lite: declined the request (HTTP 202)" }
+      : { ok: true, query, provider: "bing", cached: false, results: [{ title: "Found", url: "https://example.com/", snippet: "" }] }))
+  });
+  const result = await toolset.execute("search", { queries: ["refused", "answered"] });
+  assert.equal(result.ok, true, "one refused index must not fail the whole batch");
+  assert.match(result.text, /No results for "refused"/);
+  assert.match(result.text, /1\. Found/);
+});
+
+test("every query being refused is a failure that names the engines' own words", async () => {
+  const toolset = toolsetOver(baseAdapter(), {
+    searchTheWeb: async (queries) => queries.map((query) => ({
+      ok: false, query, results: [], provider: null, reason: "duckduckgo-lite: declined the request (HTTP 202)"
+    }))
+  });
+  const result = await toolset.execute("search", { queries: ["a", "b"] });
+  assert.equal(result.ok, false);
+  assert.match(result.text, /None of the 2 searches returned anything/);
+  // Rate-limited and "nothing matched" lead opposite ways, so they must not
+  // collapse into one sentence.
+  assert.match(result.text, /refusing requests from this machine/);
+});
+
+test("too many queries at once is refused with the number that would work", async () => {
+  // Truncating silently would lose questions the model believes it asked, and it
+  // would then report on results it never got — the exact false-success shape the
+  // evidence layer exists to prevent.
+  const toolset = toolsetOver(baseAdapter(), {
+    searchTheWeb: async () => assert.fail("a batch over the cap must never reach the engines")
+  });
+  const result = await toolset.execute("search", { queries: Array.from({ length: 12 }, (unused, i) => `q${i}`) });
+  assert.equal(result.ok, false);
+  assert.match(result.text, /too many/i);
+  assert.match(result.text, /at most 8/);
+});
+
+test("the same question written twice in one batch is asked once", async () => {
+  let seen = null;
+  const toolset = toolsetOver(baseAdapter(), {
+    searchTheWeb: async (queries) => {
+      seen = queries;
+      return queries.map((query) => ({ ok: true, query, provider: "bing", results: [], cached: false }));
+    }
+  });
+  await toolset.execute("search", { queries: ["same thing", "same thing", "other"] });
+  assert.deepEqual(seen, ["same thing", "other"]);
 });

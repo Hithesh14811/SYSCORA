@@ -233,7 +233,9 @@ export function reloadRuntimeModelProvider(runtime, basePath = process.cwd()) {
     provider: modelConfig.provider,
     model: modelConfig.model ?? null,
     configured: Boolean(modelConfig.apiKey),
-    remote: String(modelConfig.provider).toLowerCase() !== "mock"
+    remote: String(modelConfig.provider).toLowerCase() !== "mock",
+    credentialStatus: modelConfig.credentialStatus,
+    diagnostics: modelConfig.diagnostics
   };
 }
 

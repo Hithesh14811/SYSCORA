@@ -1,0 +1,6 @@
+{
+  "audience": "developer-preview",
+  "managedProviderRequired": false,
+  "unattendedUseAllowed": false,
+  "sensitiveUseAllowed": false
+}

@@ -392,6 +392,67 @@
         "merriam-webster.com",
         "linkedin.com/jobs"
       ]
+    },
+    {
+      "id": "official-source-internship",
+      "query": "Microsoft university internship visa sponsorship apply",
+      "why": "THE FAILURE THE USER HIT, 29 Aug 2026. Asked for internships with apply links, the pipeline returned nigeriaprivateschools.com, globalinterndesk.com and campuslifestyle.org -- SEO listicles that name companies and link to nothing you can apply through. The answer to \"where do I apply\" is the EMPLOYER page. Note internship-longtail scores aggregators as GOOD: that row is a disambiguation test, this one is a source-quality test, and they pull in opposite directions on purpose.",
+      "good": [
+        "careers.microsoft.com",
+        "microsoft.com",
+        "jobs.careers.microsoft.com",
+        "amazon.jobs",
+        "google.com",
+        "nvidia.com",
+        "tesla.com",
+        "metacareers.com",
+        "goldmansachs.com",
+        "jpmorganchase.com",
+        "deloitte.com",
+        "siemens.com",
+        "oecd.org",
+        "unicef.org",
+        "jobs.unicef.org",
+        "apple.com",
+        "intel.com"
+      ],
+      "bad": [
+        "nigeriaprivateschools.com",
+        "globalinterndesk.com",
+        "campuslifestyle.org",
+        "globaljobsatlas.com",
+        "researchjobshub.com",
+        "careersworldwide.org",
+        "opportunitiesforyouth.org",
+        "opportunitiesfeed.com",
+        "flexjobspace.com",
+        "brightscholarship.com",
+        "eliteopportunities.org",
+        "eduspur.com",
+        "schoolngr.com",
+        "gradualin.com",
+        "officevibehub.com",
+        "unitednationsrecruit.com"
+      ]
+    },
+    {
+      "id": "official-source-careers",
+      "query": "NVIDIA internship application page",
+      "why": "The same shape with a different employer, so a fix cannot pass by knowing one lucky domain. The primary source is nvidia.com; everything else is somebody describing it second-hand.",
+      "good": [
+        "nvidia.com",
+        "jobs.nvidia.com",
+        "nvidia.wd5.myworkdayjobs.com"
+      ],
+      "bad": [
+        "campuslifestyle.org",
+        "opportunitiesforyouth.org",
+        "foundit.in",
+        "researchjobshub.com",
+        "globaljobsatlas.com",
+        "careersworldwide.org",
+        "opportunitiesfeed.com"
+      ]
     }
   ]
 }

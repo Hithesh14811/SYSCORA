@@ -1358,6 +1358,19 @@ body {
   color: var(--muted);
 }
 .search-provider { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: .75; }
+/* One `search` call now answers several questions at once, so the results
+   arrive in groups. The heading is what tells the reader which question each
+   group belongs to; without it eight searches read as one long list. */
+.search-query-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 12px 0 4px; margin-top: 4px;
+  border-top: 1px solid rgba(125, 155, 205, 0.09);
+  font-size: 12px; color: var(--text); opacity: .82;
+}
+.search-query-head:first-of-type { border-top: 0; margin-top: 0; }
+/* A page more than one query returned is listed once and referred to here. It
+   is not a result of its own, so it does not get a result's weight. */
+.search-hit-reference { opacity: .6; padding-top: 4px; padding-bottom: 4px; }
 .search-hit {
   padding: 9px 10px;
   margin: 0 -10px;
@@ -2860,6 +2873,19 @@ body.sidebar-open .sidebar-toggle:hover .panel-fill { opacity: .7; }
   background: rgba(140, 170, 220, .08);
 }
 .access-button-icon { display: grid; place-items: center; color: var(--text-dim); }
+
+/* The Thinking control. Same pill as the access picker beside it, because it is
+   the same kind of thing: a property of the message about to be sent, not a
+   setting buried in a panel. Auto is the measured default and stays quiet;
+   an explicit override lights up, so "why is it slow" has a visible answer. */
+.think-button-icon { display: grid; place-items: center; color: var(--text-dim); }
+.think-button.overridden {
+  color: #cfe0ff;
+  border-color: rgba(91, 157, 255, .34);
+  background: rgba(91, 157, 255, .14);
+}
+.think-button.overridden .think-button-icon { color: #9dc0ff; }
+.think-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .access-button.full, .access-button.full .access-button-icon { color: #ff914f; }
 .access-button.open .model-caret { transform: rotate(180deg); }
 .access-menu {
@@ -2966,6 +2992,17 @@ body.sidebar-open .sidebar-toggle:hover .panel-fill { opacity: .7; }
 }
 .settings-grid input:focus, .settings-grid select:focus, .shell-mode-row select:focus { border-color: var(--accent); }
 .settings-status { margin-top: 9px !important; font-size: 11.5px; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 11px; }
+.settings-actions button { font: inherit; }
+.legal-links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 11px; }
+.legal-links button { border: 0; padding: 0; color: var(--muted); background: transparent; font: inherit; font-size: 11.5px; text-decoration: underline; cursor: pointer; }
+.legal-links button:hover { color: var(--text); }
+.settings-danger { padding: 9px 14px; border: 1px solid rgba(255, 105, 105, .35); border-radius: 10px; color: #ffb1b1; background: rgba(142, 34, 48, .18); cursor: pointer; }
+.settings-danger:hover { background: rgba(168, 42, 58, .28); }
+.retention-row { display: grid; gap: 7px; margin-top: 13px; color: var(--muted); font-size: 12px; }
+.retention-row select { width: 100%; }
+.update-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 13px; color: var(--muted); font-size: 11.5px; }
+.update-row button { flex: 0 0 auto; }
 .consent-row, .developer-terminal-row { display: flex; align-items: flex-start; gap: 11px; color: var(--text-dim); font-size: 12.5px; line-height: 1.45; cursor: pointer; }
 .consent-row input, .developer-terminal-row input { margin-top: 3px; accent-color: var(--accent); }
 .developer-terminal-row span { display: flex; flex-direction: column; gap: 2px; }
@@ -6191,3 +6228,117 @@ body {
 /* Replayed out of a saved chat: this daemon has no record of making that file,
    so Open would be refused. The path stays and the card says why. */
 .file-card.replayed .file-icon { opacity: .7; }
+
+/* THE ROUTE OFFERED FOR NEXT TIME.
+   Deliberately the same shape as the file card above rather than a new visual
+   language: both are "the turn produced a THING, here it is". What differs is
+   that this one is a QUESTION, so it carries the accent border a card awaiting
+   an answer earns, and it loses it once answered. */
+.skill-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0 13px;
+  margin: 10px 0 2px;
+  padding: 14px 15px;
+  background: var(--panel);
+  border: 1px solid rgba(91, 157, 255, .28);
+  border-radius: 13px;
+}
+.skill-card.saved { border-color: var(--border); }
+.skill-icon {
+  grid-row: 1 / span 2;
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 11px;
+  color: #9dc0ff;
+  background: rgba(91, 157, 255, .12);
+  border: 1px solid rgba(91, 157, 255, .22);
+}
+.skill-body { grid-row: 1; grid-column: 2; min-width: 0; }
+.skill-name { font-weight: 600; font-size: 13.5px; color: var(--text); overflow-wrap: anywhere; }
+.skill-facts { margin-top: 2px; font-size: 12px; color: var(--text-dim); }
+
+/* The steps, closed by default. See the note in skill-card.js: this is the thing
+   being agreed to, so it has to be reachable — but most routes are four lines
+   and forcing them open would push the answer off the screen. */
+.skill-steps { margin-top: 9px; }
+.skill-steps-summary {
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.skill-steps-summary::-webkit-details-marker { display: none; }
+.skill-steps-summary::before { content: "▸ "; }
+.skill-steps[open] .skill-steps-summary::before { content: "▾ "; }
+.skill-steps-summary:hover { color: var(--text); }
+.skill-step-list { margin: 7px 0 0; padding-left: 20px; }
+.skill-step { font-size: 12.5px; color: var(--text); margin: 3px 0; overflow-wrap: anywhere; }
+.skill-step-flag {
+  margin-left: 7px;
+  padding: 1px 6px;
+  font-size: 10.5px;
+  color: #ffcf8a;
+  background: rgba(224, 160, 60, .14);
+  border: 1px solid rgba(224, 160, 60, .3);
+  border-radius: 5px;
+}
+
+.skill-actions {
+  grid-row: 2;
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 11px;
+}
+.skill-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+.skill-button:hover:not(:disabled) { background: rgba(140, 170, 220, .12); border-color: rgba(140, 170, 220, .3); }
+.skill-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.skill-button:disabled { opacity: .45; cursor: default; }
+.skill-button.primary { background: rgba(91, 157, 255, .16); border-color: rgba(91, 157, 255, .34); color: #cfe0ff; }
+.skill-button.primary:hover:not(:disabled) { background: rgba(91, 157, 255, .24); }
+.skill-saved { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ok); }
+.skill-note { grid-row: 3; grid-column: 2; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.skill-note.ok { color: var(--ok); }
+.skill-note.bad { color: var(--danger); }
+.skill-note:empty { display: none; }
+.skill-card.replayed .skill-icon { opacity: .7; }
+
+/* THE PANEL. One row per saved route, with how well it is still working —
+   §8 says surface the rate, "without this metric you will not notice". */
+.skills-card { max-width: 620px; }
+.skills-list { display: flex; flex-direction: column; gap: 9px; margin: 4px 0 2px; }
+.skills-empty { font-size: 13px; color: var(--text-dim); line-height: 1.55; margin: 6px 0; }
+.skill-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 13px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+}
+.skill-row-body { flex: 1; min-width: 0; }
+.skill-row-name { font-weight: 600; font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+.skill-row-facts { margin-top: 2px; font-size: 11.5px; color: var(--text-dim); overflow-wrap: anywhere; }
+.skill-row-health { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
+.skill-row-health.ok { color: var(--ok); }
+.skill-row-health.bad { color: var(--danger); }
+.skill-row-delete { flex: none; }

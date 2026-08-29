@@ -109,6 +109,61 @@ test("a failing tool is reported to the model as a result, not as the end of the
   assert.match(provider.seen[1].find((message) => message.role === "tool").content, /not recognised/);
 });
 
+test("a failed action followed by a confirmed recovery becomes generalized outcome memory", async () => {
+  const provider = scriptedProvider([
+    { text: "Trying the direct route.", toolCalls: [{ name: "play_music", args: { query: "a private song title" } }] },
+    { text: "Using the visible result.", toolCalls: [{ name: "click", args: { text: "Play" } }] },
+    { text: "It is playing now." }
+  ]);
+  const recorded = [];
+  const toolset = stubToolset({
+    play_music: async () => ({ ok: false, text: "matching-track-not-found", raw: { reason: "matching-track-not-found" } }),
+    click: async () => ({
+      ok: true,
+      text: "Clicked Play and playback changed.",
+      raw: { evidence: { verdict: "CONFIRMED", observed: "playback changed" } }
+    })
+  });
+  toolset.isActingTool = (name) => ["play_music", "click"].includes(name);
+  const memory = {
+    retrieveAdaptiveGuidance: async () => [],
+    recordAdaptivePattern: async (pattern) => { recorded.push(pattern); }
+  };
+  const agent = new FastAgent({ provider, toolset, memory });
+
+  const outcome = await agent.run("play some music");
+
+  assert.equal(outcome.status, "COMPLETED");
+  assert.equal(recorded.length, 1);
+  assert.deepEqual(recorded[0], {
+    tool: "play_music",
+    application: "spotify",
+    failureClass: "matching-track-not-found",
+    recoverySequence: ["click"],
+    recovered: true
+  });
+  assert.equal(JSON.stringify(recorded).includes("private song title"), false,
+    "adaptive memory must not retain queries, message text or other user content");
+});
+
+test("relevant adaptive guidance is present before the model's first decision", async () => {
+  const provider = scriptedProvider([{ text: "Done." }]);
+  const memory = {
+    retrieveAdaptiveGuidance: async () => [{ content: {
+      application: "spotify", tool: "play_music", failureClass: "target-not-found",
+      recoverySequence: ["screen", "click"], counts: { observations: 2, recoveries: 2 }
+    } }],
+    recordAdaptivePattern: async () => {}
+  };
+  const agent = new FastAgent({ provider, toolset: stubToolset(), memory });
+
+  await agent.run("play music on spotify");
+
+  assert.match(provider.seen[0][0].content, /LEARNED LOCAL OUTCOME GUIDANCE/);
+  assert.match(provider.seen[0][0].content, /screen -> click/);
+  assert.match(provider.seen[0][0].content, /never authorization/);
+});
+
 test("an invented tool name is answered with the real list instead of ending the run", async () => {
   const provider = scriptedProvider([
     { text: "", toolCalls: [{ name: "os_api.disk_space", args: {} }] },
@@ -486,6 +541,8 @@ test("a refused command comes back as the reason, not as a crash", async () => {
       executeCommand: async () => ({ blocked: true, exitCode: -1, stdout: "", stderr: "I won't run this command because it formats a disk." })
     }
   });
+  toolset.setAccessPolicy({ developerMode: true, shellExecutionMode: "host" });
+  toolset.setConfirmer(async () => true);
 
   const result = await toolset.execute("run", { command: "format C:" });
   // It comes back as text the model reads rather than as an exception — and it
@@ -500,6 +557,8 @@ test("command output is passed back with its exit code and clipped, not dumped w
     registry: stubRegistry({}),
     adapter: { executeCommand: async () => ({ stdout: "x".repeat(20000), stderr: "", exitCode: 0 }) }
   });
+  toolset.setAccessPolicy({ developerMode: true, shellExecutionMode: "host" });
+  toolset.setConfirmer(async () => true);
 
   const result = await toolset.execute("run", { command: "big" });
   assert.ok(result.text.length < 8000, `tool output must be bounded, got ${result.text.length}`);

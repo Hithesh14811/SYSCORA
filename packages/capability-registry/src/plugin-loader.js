@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { satisfiesVersion } from "./contract.js";
 import { validateCapabilityPackage, validatePluginCapabilityDefinition, validatePluginManifest } from "./quality.js";
+import { canonicalizePath, isCanonicalPathInside } from "../../shared-types/src/canonical-path.js";
 
 const MANIFEST_FILE = "syscora-capability.json";
 
@@ -71,7 +72,11 @@ export class CapabilityPluginLoader {
     }
     await this._verifySignature(manifest, directory);
     const entryPath = path.resolve(directory, manifest.entry);
-    if (!entryPath.startsWith(`${directory}${path.sep}`) && entryPath !== directory) throw new Error("Plugin entry must remain inside plugin directory");
+    if (!isCanonicalPathInside(entryPath, directory)) {
+      throw new Error("Plugin entry must remain inside the canonical plugin directory");
+    }
+    const entryStat = await fs.stat(canonicalizePath(entryPath));
+    if (!entryStat.isFile()) throw new Error("Plugin entry must be a regular file");
     const module = await import(`${pathToFileURL(entryPath).href}?plugin=${encodeURIComponent(manifest.version)}-${Date.now()}`);
     const capabilities = module.capabilities ?? [];
     if (!Array.isArray(capabilities)) throw new Error("Plugin capabilities export must be an array");

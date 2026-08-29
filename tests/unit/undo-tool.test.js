@@ -319,7 +319,7 @@ function messagingToolset({ boxAfter = "" } = {}) {
     getForegroundWindow: async () => ({ windowId: 1, title: "WhatsApp", application: "WhatsApp" }),
     listWindows: async () => [{ windowId: 1, title: "WhatsApp", application: "WhatsApp" }]
   };
-  return buildToolset({
+  const toolset = buildToolset({
     registry,
     adapter: messagingAdapter,
     basePath: "C:\work",
@@ -327,6 +327,11 @@ function messagingToolset({ boxAfter = "" } = {}) {
     // records once a send has been authorised, not whether it asks.
     askPermission: async () => ({ approved: true })
   });
+  // The generic action boundary and the send-specific approval card are
+  // intentionally separate fail-closed gates. This fixture approves both so
+  // these tests can reach the journal semantics they exist to verify.
+  toolset.setConfirmer(async () => true);
+  return toolset;
 }
 
 test("after a send, undo says the message cannot be unsent — not 'nothing to undo'", async () => {

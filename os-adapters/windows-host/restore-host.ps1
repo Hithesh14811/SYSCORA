@@ -1161,8 +1161,39 @@ function Resolve-Window($params) {
     if($processNeedle -and $window.processName -and $window.processName.Equals($processNeedle,[StringComparison]::OrdinalIgnoreCase)){$score+=35;$signals+="process"}
     if($params.className -and $window.className -eq [string]$params.className){$score+=25;$signals+="class"}
     if($params.title -and $window.title -eq [string]$params.title){$score+=35;$signals+="title"}
+    # NAMING AN APPLICATION IS NOT NAMING A DOCUMENT THAT MENTIONS IT.
+    #
+    # These two used to be one test worth +25 either way, so a window whose
+    # PROCESS is the app and a window whose TITLE merely contains the word
+    # scored identically — and the tie broke on window AREA, i.e. whichever
+    # happened to be bigger.
+    #
+    # Measured live, 28 Aug 2026: a Notepad left open from an earlier session,
+    # titled "*play tum hi ho on spotify - Notepad", tied with Spotify itself on
+    # `application: "spotify"` and won on size. `focus spotify` answered NOT
+    # FOCUSED naming Notepad, and `screen spotify` returned the Notepad window's
+    # contents. The agent then spent two steps working out it was looking at a
+    # text editor. Every desktop task on this machine was paying for that stray
+    # window, and it got worse the longer the machine stayed up.
+    #
+    # A process-name match is direct evidence about WHICH PROGRAM this is. A
+    # title substring is a coincidence about what somebody happened to type. They
+    # are not the same claim and they must not carry the same weight.
     $partial=if($params.titleContains){[string]$params.titleContains}elseif($params.application){[string]$params.application}else{$null}
-    if($partial -and (($window.title -and $window.title.IndexOf($partial,[StringComparison]::OrdinalIgnoreCase)-ge 0) -or ($window.processName -and $window.processName.IndexOf($partial,[StringComparison]::OrdinalIgnoreCase)-ge 0))){$score+=25;$signals+="partial"}
+    if($partial){
+      $processHit = $window.processName -and $window.processName.IndexOf($partial,[StringComparison]::OrdinalIgnoreCase) -ge 0
+      $titleHit = $window.title -and $window.title.IndexOf($partial,[StringComparison]::OrdinalIgnoreCase) -ge 0
+      # Deliberately above the 25 floor on its own, so naming an application
+      # always resolves to the application when it is running.
+      if($processHit){$score+=30;$signals+="partial-process"}
+      # Deliberately BELOW the floor on its own: a title coincidence is a hint,
+      # never enough by itself to decide which window somebody meant. It still
+      # resolves a document when combined with anything else, and it still wins
+      # when nothing else matches at all — see titleContains, which is how a
+      # caller asks for a title on purpose.
+      elseif($titleHit -and $params.titleContains){$score+=25;$signals+="partial-title"}
+      elseif($titleHit){$score+=12;$signals+="partial-title-weak"}
+    }
     if($window.foreground){$score+=3}
     if($score -gt 0){$candidates+=@{window=$window;score=$score;signals=$signals;area=([int64]$window.bounds.width*[int64]$window.bounds.height)}}
   }
