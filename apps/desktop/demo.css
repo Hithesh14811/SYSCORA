@@ -3874,6 +3874,46 @@ body::after {
 }
 .mail-chip-remove:hover { background: rgba(255, 255, 255, .16); color: #fff; }
 
+/* ATTACHMENTS. Shaped like the recipient chips rather than like a file list,
+   because they belong to the same question the card exists to answer: what is
+   about to leave this machine, and is any of it wrong? Squarer corners than an
+   address chip so the two are not mistaken for each other at a glance. */
+.mail-attach-row { align-items: flex-start; }
+.mail-attach-row[hidden] { display: none; }
+.mail-attachments { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; }
+.mail-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 5px 4px 9px;
+  border: 1px solid rgba(140, 175, 255, .24);
+  border-radius: 8px;
+  background: rgba(120, 160, 255, .1);
+  font-size: 12.5px;
+  color: var(--text);
+}
+.mail-attachment svg { flex: 0 0 auto; color: var(--text-dim); }
+.mail-attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mail-attachment-size { flex: 0 0 auto; color: var(--text-dim); font-size: 11.5px; }
+.mail-attachment-remove {
+  display: grid;
+  place-items: center;
+  width: 18px; height: 18px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.mail-attachment-remove:hover { background: rgba(255, 255, 255, .16); color: #fff; }
+/* A sent card keeps its attachments as the record of what went; there is just
+   nothing left to press. */
+.mail-card.sent .mail-attachment { background: rgba(120, 160, 255, .07); }
+.mail-file-input { display: none; }
+
 .mail-input {
   flex: 1 1 90px;
   min-width: 90px;

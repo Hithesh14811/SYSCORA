@@ -408,7 +408,99 @@ const base64Body = (text) => Buffer.from(String(text ?? ""), "utf8").toString("b
  * recipient whose client shows plain text must still get a readable message
  * rather than a page of tags.
  */
-export function buildMessage({ from, to = [], cc = [], bcc = [], subject = "", html = "", text = "" }) {
+// ATTACHMENTS TRAVEL AS PATHS, NOT AS PAYLOADS.
+//
+// The obvious design is to base64 the file in the browser and post it with the
+// draft. It does not fit: `readJsonBody` caps a request at 1 MiB and base64
+// inflates by a third, so anything worth attaching would be refused by the
+// transport before it reached the mailbox — and raising that cap to email-sized
+// would raise it for every other route too.
+//
+// The composer already solved this for chat attachments, and the answer is the
+// same one: a file on this machine is a PLACE. The card sends `{name, path,
+// size}`, the daemon reads the bytes at send time, and nothing large ever goes
+// through JSON. `window.syscora.pathForFile(file)` gives the renderer the real
+// disk path for a file the user picked, so the user's route and the agent's
+// route produce the same shape and share this one reader.
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+// Gmail's own ceiling is far higher, but `messages.send` with a JSON `raw` body
+// is not the upload endpoint, and a 25 MB base64 string in one POST is a bad
+// way to find that out. Bounded here so the refusal names a number.
+const MAX_ATTACHMENTS_TOTAL_BYTES = 20 * 1024 * 1024;
+
+const CONTENT_TYPES = Object.freeze({
+  pdf: "application/pdf", txt: "text/plain", csv: "text/csv", md: "text/markdown",
+  html: "text/html", htm: "text/html", json: "application/json", xml: "application/xml",
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+  zip: "application/zip", mp3: "audio/mpeg", mp4: "video/mp4",
+  doc: "application/msword", xls: "application/vnd.ms-excel", ppt: "application/vnd.ms-powerpoint",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+});
+
+export function contentTypeFor(name) {
+  const extension = /\.([A-Za-z0-9]{1,8})$/.exec(String(name ?? ""))?.[1]?.toLowerCase();
+  return CONTENT_TYPES[extension] ?? "application/octet-stream";
+}
+
+/**
+ * Read the files a draft names. Returns `[{ filename, contentType, content }]`.
+ *
+ * THE STATE DIRECTORY IS NEVER ATTACHABLE. `.syscora` holds the Google refresh
+ * token, the model API keys and the session store in plaintext — CLAUDE.md says
+ * so — and an email is the one route in this product that carries bytes off the
+ * machine to an address. A draft is already reviewed by a person before it goes,
+ * but "the user glanced at a filename" is not a control anyone should have to
+ * rely on for a credential store. Refused outright, and named in the refusal.
+ */
+export function readAttachments(list, { basePath = process.cwd(), readFile = fs.readFileSync, statFile = fs.statSync } = {}) {
+  const wanted = (Array.isArray(list) ? list : []).filter(Boolean);
+  if (wanted.length === 0) return [];
+  const stateDir = path.resolve(resolveStateDir(basePath));
+  const read = [];
+  let total = 0;
+
+  for (const entry of wanted) {
+    const filePath = String(typeof entry === "string" ? entry : entry?.path ?? "").trim();
+    if (!filePath) throw new Error("An attachment needs a file path.");
+    const resolved = path.resolve(filePath);
+    const relative = path.relative(stateDir, resolved);
+    if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+      throw new Error(
+        `${path.basename(resolved)} is inside SYSCORA's own state directory, which holds credentials in ` +
+        "plaintext. Nothing in there can be attached to an email."
+      );
+    }
+
+    let stats;
+    try {
+      stats = statFile(resolved);
+    } catch {
+      throw new Error(`There is no file at ${resolved}, so it could not be attached.`);
+    }
+    if (!stats.isFile()) throw new Error(`${resolved} is not a file, so it could not be attached.`);
+    if (stats.size > MAX_ATTACHMENT_BYTES) {
+      throw new Error(
+        `${path.basename(resolved)} is ${(stats.size / 1024 / 1024).toFixed(1)} MB, over the ` +
+        `${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB limit for one attachment.`
+      );
+    }
+    total += stats.size;
+    if (total > MAX_ATTACHMENTS_TOTAL_BYTES) {
+      throw new Error(`Those attachments come to over ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together, which is too much for one message.`);
+    }
+    read.push({
+      filename: path.basename(resolved),
+      contentType: contentTypeFor(resolved),
+      content: readFile(resolved)
+    });
+  }
+  return read;
+}
+
+export function buildMessage({ from, to = [], cc = [], bcc = [], subject = "", html = "", text = "", attachments = [] }) {
   const recipients = to.map(oneLine).filter(Boolean);
   if (recipients.length === 0) throw new Error("An email needs at least one recipient.");
   const copies = cc.map(oneLine).filter(Boolean);
@@ -431,18 +523,14 @@ export function buildMessage({ from, to = [], cc = [], bcc = [], subject = "", h
   // you cannot un-disclose an address. `tests/unit/email-draft.test.js` asserts
   // the header is present (or the copies never arrive) and that nothing else in
   // this codebase ever renders it back to a recipient.
-  const headers = [
-    `From: ${oneLine(from)}`,
-    `To: ${recipients.join(", ")}`,
-    copies.length ? `Cc: ${copies.join(", ")}` : null,
-    blind.length ? `Bcc: ${blind.join(", ")}` : null,
-    `Subject: ${encodeHeader(oneLine(subject))}`,
-    "MIME-Version: 1.0",
-    `Content-Type: multipart/alternative; boundary="${boundary}"`
-  ].filter(Boolean);
+  const files = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
 
-  const body = [
-    "",
+  // The message body proper: the two alternatives a mail client picks between.
+  // This is unchanged, and when there are no attachments it is still the WHOLE
+  // message — a plain email built by this function is byte-for-byte what it was
+  // before attachments existed, which is what stops this change touching the
+  // overwhelming majority of mail that goes through here.
+  const alternative = [
     `--${boundary}`,
     "Content-Type: text/plain; charset=UTF-8",
     "Content-Transfer-Encoding: base64",
@@ -453,13 +541,70 @@ export function buildMessage({ from, to = [], cc = [], bcc = [], subject = "", h
     "Content-Transfer-Encoding: base64",
     "",
     base64Body(html || escapeHtml(plain).replace(/\n/g, "<br>")),
-    `--${boundary}--`,
-    ""
+    `--${boundary}--`
   ];
 
-  const raw = [...headers, ...body].join("\r\n");
-  return { raw: base64url(Buffer.from(raw, "utf8")), recipients, copies, blind };
+  const headers = [
+    `From: ${oneLine(from)}`,
+    `To: ${recipients.join(", ")}`,
+    copies.length ? `Cc: ${copies.join(", ")}` : null,
+    blind.length ? `Bcc: ${blind.join(", ")}` : null,
+    `Subject: ${encodeHeader(oneLine(subject))}`,
+    "MIME-Version: 1.0"
+  ].filter(Boolean);
+
+  if (files.length === 0) {
+    const raw = [...headers, `Content-Type: multipart/alternative; boundary="${boundary}"`, "", ...alternative, ""]
+      .join("\r\n");
+    return { raw: base64url(Buffer.from(raw, "utf8")), recipients, copies, blind, attachments: [] };
+  }
+
+  // WITH ATTACHMENTS THE SHAPE HAS TO CHANGE, not just gain a part.
+  //
+  // `multipart/alternative` means "these are the same message, pick one", so an
+  // attachment dropped into it is a third version of the message rather than a
+  // file — and clients duly show the body OR the PDF, never both. The file is
+  // an addition, not an alternative, so the whole thing is wrapped in
+  // `multipart/mixed`: first part the alternative body, then one part per file.
+  const outer = `syscora_mixed_${crypto.randomBytes(12).toString("hex")}`;
+  const parts = [
+    `--${outer}`,
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    "",
+    ...alternative,
+    ""
+  ];
+  for (const file of files) {
+    const name = oneLine(file.filename ?? file.name ?? "attachment");
+    parts.push(
+      `--${outer}`,
+      `Content-Type: ${oneLine(file.contentType ?? contentTypeFor(name))}; name="${mimeName(name)}"`,
+      "Content-Transfer-Encoding: base64",
+      // `attachment` rather than `inline`: the user picked a file to send, not
+      // an image to embed in the text.
+      `Content-Disposition: attachment; filename="${mimeName(name)}"`,
+      "",
+      Buffer.from(file.content ?? "").toString("base64").replace(/(.{76})/g, "$1\r\n")
+    );
+  }
+  parts.push(`--${outer}--`, "");
+
+  const raw = [...headers, `Content-Type: multipart/mixed; boundary="${outer}"`, "", ...parts].join("\r\n");
+  return {
+    raw: base64url(Buffer.from(raw, "utf8")),
+    recipients,
+    copies,
+    blind,
+    attachments: files.map((file) => oneLine(file.filename ?? file.name ?? "attachment"))
+  };
 }
+
+// A filename lands inside a quoted MIME parameter, so a quote or a newline in it
+// would end the parameter early and let the rest be read as headers — the same
+// injection the recipient fields are guarded against with `oneLine`. Filenames
+// come from disk here rather than from a person, but "the attacker cannot name a
+// file" is not an assumption worth resting a header parser on.
+const mimeName = (value) => oneLine(value).replace(/["\\]/g, "_");
 
 const escapeHtml = (value) => String(value ?? "")
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -495,7 +640,13 @@ export async function sendGmail(basePath, draft) {
   if (!from) throw new Error("No Google account is connected.");
   const known = gmailAccounts(basePath).some((account) => account.address === from);
   if (!known) throw new Error(`${from} is not connected to SYSCORA, so nothing was sent.`);
-  const { raw, recipients, copies, blind } = buildMessage({ ...draft, from });
+  // Read from disk HERE, at send time, not when the card was drawn. A draft can
+  // sit on screen while the user edits it, and the file that goes is the file as
+  // it is when they press Send — which is also what they would expect of any
+  // other mail client. A path that has since moved fails here, with its name in
+  // the message, rather than silently sending an empty part.
+  const files = readAttachments(draft?.attachments ?? [], { basePath });
+  const { raw, recipients, copies, blind, attachments } = buildMessage({ ...draft, from, attachments: files });
   const token = await accessToken(basePath, from);
   const response = await fetch(SEND_ENDPOINT, {
     method: "POST",
@@ -508,5 +659,5 @@ export async function sendGmail(basePath, draft) {
   // `bcc` is a COUNT and the addresses both, because the card has to be able to
   // say "and 3 blind copies" to the person who sent it — they are allowed to
   // see their own blind list, and they are the only one who is.
-  return { id: json.id, threadId: json.threadId ?? null, from, to: recipients, cc: copies, bcc: blind };
+  return { id: json.id, threadId: json.threadId ?? null, from, to: recipients, cc: copies, bcc: blind, attachments };
 }

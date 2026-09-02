@@ -47,6 +47,7 @@ const ICON = {
   check: '<path d="M5 12.6l4.6 4.6L19 6.8"/>',
   caret: '<path d="M6.5 9.5l5.5 5.5 5.5-5.5"/>',
   plus: '<path d="M12 5.5v13M5.5 12h13"/>',
+  clip: '<path d="M17.6 9.5 10.4 16.7a3.1 3.1 0 0 1-4.4-4.4l7.9-7.9a2.1 2.1 0 0 1 3 3l-7.9 7.9a1 1 0 0 1-1.5-1.5l7.1-7.1"/>',
   bold: '<path d="M7 5h6.4a3.5 3.5 0 0 1 0 7H7z"/><path d="M7 12h7.2a3.5 3.5 0 0 1 0 7H7z"/>',
   italic: '<path d="M15.5 5h-5M13.5 19h-5M14.6 5l-3.4 14"/>',
   underline: '<path d="M7 4.5v6.2a5 5 0 0 0 10 0V4.5"/><path d="M5.5 19.5h13"/>',
@@ -474,7 +475,92 @@ export function emailCard(draft, { fetchImpl = fetch, onSent = null } = {}) {
   const ccToggle = revealToggle("Cc", cc);
   const bccToggle = revealToggle("Bcc", bcc);
 
-  body.append(to.row, cc.row, bcc.row, subjectRow, compose.wrap);
+  // ---- attachments ----------------------------------------------------------
+  //
+  // PATHS, NOT PAYLOADS. A file the user picks here is read by the DAEMON at
+  // send time, not base64'd into the request: `readJsonBody` caps a request at
+  // 1 MiB, so anything worth attaching would be refused by the transport before
+  // it reached the mailbox. `window.syscora.pathForFile` gives the real disk
+  // path for a picked file, which is the same shape the agent's `email_draft`
+  // produces — so both routes end at one reader in gmail.js.
+  //
+  // BOTH DIRECTIONS MATTER. The agent can propose attachments and the user can
+  // add their own, and either can remove any of them. That is the same rule the
+  // recipients follow, for the same reason: this card is the last place a person
+  // sees what is about to leave the machine, so everything on it has to be
+  // theirs to change.
+  const attachments = (draft.attachments ?? [])
+    .map((file) => ({
+      name: String(file?.name ?? "").trim() || "attachment",
+      path: String(file?.path ?? ""),
+      size: Number(file?.size) || 0
+    }))
+    .filter((file) => file.path);
+
+  const attachRow = el("div", "mail-row mail-attach-row");
+  const attachList = el("div", "mail-attachments");
+  const picker = document.createElement("input");
+  picker.type = "file";
+  picker.multiple = true;
+  picker.className = "mail-file-input";
+  picker.hidden = true;
+
+  const sizeLabel = (bytes) => {
+    if (!bytes) return "";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  };
+
+  function drawAttachments() {
+    attachList.textContent = "";
+    // An empty row is a row about nothing. The Attach button lives in the foot
+    // beside Send, so there is still a way to add one when none are shown.
+    attachRow.hidden = attachments.length === 0;
+    for (const file of attachments) {
+      const chip = el("div", "mail-attachment");
+      chip.appendChild(svg(ICON.clip, 13));
+      const name = el("span", "mail-attachment-name", file.name);
+      // The full path in the tooltip: two files can share a name, and when the
+      // AGENT chose them the user's only way to tell which is which is where it
+      // came from.
+      name.title = file.path;
+      chip.appendChild(name);
+      if (file.size) chip.appendChild(el("span", "mail-attachment-size", sizeLabel(file.size)));
+      const remove = el("button", "mail-attachment-remove");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Remove ${file.name}`);
+      remove.appendChild(svg(ICON.close, 12));
+      remove.addEventListener("click", () => {
+        const at = attachments.indexOf(file);
+        if (at >= 0) attachments.splice(at, 1);
+        drawAttachments();
+      });
+      chip.appendChild(remove);
+      attachList.appendChild(chip);
+    }
+  }
+
+  picker.addEventListener("change", () => {
+    for (const file of [...(picker.files ?? [])]) {
+      const filePath = window.syscora?.pathForFile?.(file) ?? "";
+      if (!filePath) {
+        // Outside the desktop shell there is no path, and reading the bytes here
+        // would hit the 1 MiB request cap. Saying so is better than attaching
+        // something that silently fails at Send.
+        setNote("This file could not be attached — attachments need the SYSCORA desktop app.", "bad");
+        continue;
+      }
+      if (attachments.some((existing) => existing.path === filePath)) continue;
+      attachments.push({ name: file.name, path: filePath, size: file.size });
+    }
+    picker.value = "";
+    drawAttachments();
+  });
+
+  attachRow.append(el("label", "mail-label", "Files"), attachList);
+  body.append(to.row, cc.row, bcc.row, subjectRow, compose.wrap, attachRow, picker);
+  drawAttachments();
 
   // ---- the foot: the one button that does something irreversible ------------
   const foot = el("div", "mail-foot");
@@ -484,7 +570,13 @@ export function emailCard(draft, { fetchImpl = fetch, onSent = null } = {}) {
   send.type = "button";
   send.appendChild(svg(ICON.send, 15));
   send.appendChild(el("span", null, "Send"));
-  actions.append(ccToggle, bccToggle, send);
+  // Beside Cc and Bcc because it is the same kind of control: a thing this
+  // message can have that it does not have yet. Unlike them it does not hide
+  // itself once used — a second attachment is an ordinary thing to want.
+  const attachButton = el("button", "mail-cc-toggle mail-attach", "Attach");
+  attachButton.type = "button";
+  attachButton.addEventListener("click", () => picker.click());
+  actions.append(ccToggle, bccToggle, attachButton, send);
   foot.append(note, actions);
   card.appendChild(foot);
 
@@ -666,7 +758,10 @@ export function emailCard(draft, { fetchImpl = fetch, onSent = null } = {}) {
           bcc: bcc.values(),
           subject: subject.value,
           html: compose.html(),
-          text: compose.text()
+          text: compose.text(),
+          // Paths only. The daemon reads the bytes at send time — see the note
+          // above the attachment row, and readAttachments in gmail.js.
+          attachments: attachments.map((file) => ({ name: file.name, path: file.path }))
         })
       });
       const json = await response.json().catch(() => ({}));
@@ -695,6 +790,12 @@ export function emailCard(draft, { fetchImpl = fetch, onSent = null } = {}) {
     send.remove();
     ccToggle.remove();
     bccToggle.remove();
+    // WHAT WENT WITH IT STAYS ON THE CARD. The attachment row is the sender's
+    // only record of which files left the machine, so it is kept and only the
+    // ways to change it are taken away — the same rule the Bcc row follows.
+    attachButton.remove();
+    picker.remove();
+    for (const remove of card.querySelectorAll(".mail-attachment-remove")) remove.remove();
     // An empty Bcc row on a sent card is a row about nothing; a filled one is
     // the only record the sender has of who got a blind copy, so it stays.
     if (bcc.values().length === 0) bcc.row.hidden = true;
@@ -767,6 +868,11 @@ export function sealReplayedDraft(card) {
     field.tabIndex = -1;
   }
   for (const remove of card.querySelectorAll(".mail-chip-remove")) remove.remove();
+  // The same reason the Cc and Bcc toggles go: a control that edits a draft
+  // which can no longer be sent is a control that does nothing. The attachment
+  // CHIPS stay — they are the record of what this draft was going to carry.
+  for (const remove of card.querySelectorAll(".mail-attachment-remove")) remove.remove();
+  card.querySelector(".mail-file-input")?.remove();
   const state = card.querySelector(".mail-state");
   if (state) state.textContent = "Draft";
   const note = card.querySelector(".mail-note");

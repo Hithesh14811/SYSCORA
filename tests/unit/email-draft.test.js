@@ -21,7 +21,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildToolset } from "../../packages/fast-agent/src/tools.js";
-import { buildMessage } from "../../apps/daemon/src/gmail.js";
+import { buildMessage, contentTypeFor, readAttachments } from "../../apps/daemon/src/gmail.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..", "..");
@@ -432,4 +432,198 @@ test("bcc travels the whole way: model, tool, card, request", async () => {
   const sealer = /export function sealReplayedDraft[\s\S]*?\n}/.exec(card)?.[0] ?? "";
   assert.match(sealer, /querySelectorAll\(["'`]\.mail-cc-toggle/,
     "the replay sealer removes only one of the two reveal toggles");
+});
+
+// ---------------------------------------------------------------------------
+// Attachments
+//
+// They travel as PATHS, not payloads. `readJsonBody` caps a request at 1 MiB and
+// base64 inflates by a third, so a file worth attaching would be refused by the
+// transport before it reached the mailbox — and raising that cap would raise it
+// for every other route. The card sends `{name, path}`, the daemon reads the
+// bytes at send time, and the agent's route produces the same shape.
+
+const decodeRaw = (raw) => Buffer.from(raw.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+const tempDir = () => fs.mkdtempSync(path.join(process.env.TEMP || "/tmp", "syscora-attach-"));
+
+test("a message with no attachments keeps the shape it always had", () => {
+  // The overwhelming majority of mail carries nothing. This change must not
+  // touch its shape at all.
+  const fields = { from: "me@example.com", to: ["you@example.com"], subject: "Hello", text: "Body." };
+  const plain = decodeRaw(buildMessage(fields).raw);
+  const explicitlyEmpty = decodeRaw(buildMessage({ ...fields, attachments: [] }).raw);
+
+  assert.match(plain, /Content-Type: multipart\/alternative/);
+  assert.ok(!/multipart\/mixed/.test(plain), "a message with no files must not become multipart/mixed");
+  // Boundaries are random per call, so compare with them normalised away.
+  const shape = (text) => text.replace(/syscora_[a-f0-9]+/g, "B");
+  assert.equal(shape(explicitlyEmpty), shape(plain));
+});
+
+test("an attached file becomes a mixed part beside the message, not an alternative to it", () => {
+  // multipart/alternative means "these are the same message, pick one" — a file
+  // dropped in there is a third version of the message, and clients duly show
+  // the body OR the PDF rather than both.
+  const { raw, attachments } = buildMessage({
+    from: "me@example.com",
+    to: ["you@example.com"],
+    subject: "Resume",
+    text: "Attached.",
+    attachments: [{ filename: "resume.pdf", contentType: "application/pdf", content: Buffer.from("%PDF-1.7 hello") }]
+  });
+  const message = decodeRaw(raw);
+
+  assert.match(message, /Content-Type: multipart\/mixed; boundary="syscora_mixed_[a-f0-9]+"/);
+  // The body is still an alternative pair, nested inside the mixed wrapper.
+  assert.match(message, /Content-Type: multipart\/alternative/);
+  assert.match(message, /Content-Type: text\/plain; charset=UTF-8/);
+  assert.match(message, /Content-Type: text\/html; charset=UTF-8/);
+  assert.match(message, /Content-Type: application\/pdf; name="resume\.pdf"/);
+  assert.match(message, /Content-Disposition: attachment; filename="resume\.pdf"/);
+  assert.match(message, new RegExp(Buffer.from("%PDF-1.7 hello").toString("base64")));
+  assert.deepEqual(attachments, ["resume.pdf"]);
+});
+
+test("a filename cannot break out of the header it sits in", () => {
+  // The filename lands inside a quoted MIME parameter. A quote or a newline in
+  // it would end the parameter early and let the rest be read as headers — the
+  // same injection the recipient fields are guarded against with oneLine.
+  const message = decodeRaw(buildMessage({
+    from: "me@example.com",
+    to: ["you@example.com"],
+    subject: "s",
+    text: "b",
+    attachments: [{ filename: "evil\".pdf\r\nBcc: attacker@example.com\r\n", content: Buffer.from("x") }]
+  }).raw);
+  assert.ok(!/^Bcc: attacker@example\.com/m.test(message), "a filename smuggled a header into the message");
+  assert.match(message, /filename="evil_\.pdf Bcc: attacker@example\.com"/);
+});
+
+test("several files all arrive, each as its own part", () => {
+  const message = decodeRaw(buildMessage({
+    from: "me@example.com", to: ["you@example.com"], subject: "s", text: "b",
+    attachments: [
+      { filename: "a.txt", content: Buffer.from("one") },
+      { filename: "b.png", content: Buffer.from("two") }
+    ]
+  }).raw);
+  assert.match(message, /Content-Type: text\/plain; name="a\.txt"/);
+  assert.match(message, /Content-Type: image\/png; name="b\.png"/);
+  assert.match(message, /filename="a\.txt"/);
+  assert.match(message, /filename="b\.png"/);
+});
+
+test("a file type is named from its extension rather than guessed at", () => {
+  assert.equal(contentTypeFor("resume.pdf"), "application/pdf");
+  assert.equal(contentTypeFor("sheet.xlsx"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  assert.equal(contentTypeFor("photo.JPG"), "image/jpeg");
+  // Unknown is a real answer, not a wrong one.
+  assert.equal(contentTypeFor("thing.qqq"), "application/octet-stream");
+  assert.equal(contentTypeFor("noextension"), "application/octet-stream");
+});
+
+// THE STATE DIRECTORY IS NEVER ATTACHABLE.
+//
+// It holds the Google refresh token, the model API keys and the session store in
+// plaintext, and email is the one route in this product that carries bytes off
+// the machine to an address. The draft card is reviewed by a person, but "the
+// user glanced at a filename" is not a control to rest a credential store on.
+test("nothing inside SYSCORA own state directory can be attached", () => {
+  const base = tempDir();
+  const stateDir = path.join(base, ".syscora");
+  fs.mkdirSync(stateDir, { recursive: true });
+  const secret = path.join(stateDir, "config.json");
+  fs.writeFileSync(secret, "{}");
+
+  assert.throws(
+    () => readAttachments([secret], { basePath: base }),
+    /state directory|plaintext/i,
+    "a credential file was attachable"
+  );
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("a file that is not there is refused by name rather than sent empty", () => {
+  assert.throws(
+    () => readAttachments(["C:\\nope\\missing.pdf"], { basePath: process.cwd() }),
+    /no file at/i
+  );
+});
+
+test("an oversized file is refused with the limit in the message", () => {
+  const statFile = () => ({ isFile: () => true, size: 9 * 1024 * 1024 });
+  assert.throws(
+    () => readAttachments(["C:\\big.zip"], { basePath: process.cwd(), statFile, readFile: () => Buffer.alloc(0) }),
+    /over the 5 MB limit/i
+  );
+});
+
+test("reading a listed file returns its bytes, its name and its type", () => {
+  const base = tempDir();
+  const file = path.join(base, "notes.txt");
+  fs.writeFileSync(file, "hello");
+  const [loaded] = readAttachments([file], { basePath: path.join(base, "elsewhere") });
+  assert.equal(loaded.filename, "notes.txt");
+  assert.equal(loaded.contentType, "text/plain");
+  assert.equal(loaded.content.toString("utf8"), "hello");
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("the draft tool attaches a real file and refuses a path that is not one", async () => {
+  const base = tempDir();
+  const file = path.join(base, "resume.pdf");
+  fs.writeFileSync(file, "%PDF-1.7");
+
+  const ok = await toolset().execute("email_draft", {
+    to: "you@example.com", subject: "Resume", body: "Attached.", attachments: [file]
+  });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.raw.draft.attachments.length, 1);
+  assert.equal(ok.raw.draft.attachments[0].name, "resume.pdf");
+  assert.equal(ok.raw.draft.attachments[0].path, file);
+  // The model has to say what is riding along, in the sentence it reads back.
+  assert.match(ok.text, /resume\.pdf/);
+
+  // A path the model guessed wrong must fail HERE, not at Send — otherwise the
+  // user presses the button and gets an error about a file they never chose.
+  const bad = await toolset().execute("email_draft", {
+    to: "you@example.com", subject: "s", body: "b", attachments: [path.join(base, "nope.pdf")]
+  });
+  assert.equal(bad.ok, false);
+  assert.match(bad.text, /no file at/i);
+
+  const folder = await toolset().execute("email_draft", {
+    to: "you@example.com", subject: "s", body: "b", attachments: [base]
+  });
+  assert.equal(folder.ok, false);
+  assert.match(folder.text, /folder, not a file/i);
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test("a draft with no attachments still carries an empty list, not undefined", async () => {
+  // The card reads draft.attachments; undefined and [] behave the same there
+  // today, and this is what keeps that true if the card ever stops guarding.
+  const result = await toolset().execute("email_draft", { to: "you@example.com", subject: "s", body: "b" });
+  assert.deepEqual(result.raw.draft.attachments, []);
+});
+
+test("the card sends paths and never file bytes", () => {
+  // If this ever base64s the file into the request it will start failing at
+  // 1 MiB — readJsonBody's cap — for reasons that will look like a mail bug.
+  const card = read("apps/desktop/email-card.js");
+  assert.match(card, /attachments: attachments\.map\(/, "the card no longer posts its attachments");
+  assert.ok(!/readAsDataURL|arrayBuffer\(\)|toString\("base64"\)/.test(card),
+    "the card is reading file bytes; attachments must travel as paths");
+  assert.match(card, /pathForFile/, "the card must resolve a real disk path for a picked file");
+});
+
+test("a sent card keeps the record of what went with it", () => {
+  // The attachment chips are the sender's only record of which files left the
+  // machine. Only the ways to CHANGE them are removed — the same rule the Bcc
+  // row follows.
+  const card = read("apps/desktop/email-card.js");
+  const sealed = card.slice(card.indexOf("function sealAsSent"));
+  assert.match(sealed, /mail-attachment-remove/, "a sent card still offers a Remove button");
+  assert.ok(!/attachList\.remove\(\)|attachRow\.remove\(\)/.test(sealed),
+    "a sent card threw away the list of what it sent");
 });
