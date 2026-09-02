@@ -30,7 +30,7 @@ jobs:
           $installer = Get-ChildItem dist -Filter 'SYSCORA-*.exe' | Select-Object -First 1
           if (-not $installer) { throw 'No installer was built.' }
           ./scripts/installer-smoke.ps1 -Installer $installer.FullName
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: syscora-${{ github.sha }}
           path: |
