@@ -320,3 +320,82 @@ test("generic GUI capabilities expose read perception and guarded interaction", 
   const decision = new PolicyEngine().decide(assessment, plan, { capabilities: [interact] });
   assert.equal(decision.effect, "CONFIRM");
 });
+
+// ---- "not playing", read one beat too early ---------------------------------
+//
+// Measured live, 29 Aug 2026, "play ankhose batana on spotify": the playback
+// read returned playing=false, `play_music` reported REFUTED — "Spotify is not
+// playing: no track started" — and the very next `screen`, one step later,
+// showed "Spotify — Dikshant - Aankhon Se Batana" with a Pause button. The
+// track had started; the read simply beat the transport to it.
+//
+// A step on this endpoint costs ~5,300 fresh tokens whatever it does, because
+// the prompt cache serves whole 8,192-token blocks and the fixed prefix is
+// re-bought every time. The two steps the model then spent proving the thing
+// had worked cost about 10,000 tokens — half the run — for want of 400ms.
+//
+// THE SPEED GUARANTEE IS WHAT THESE MOSTLY COVER. The settle is off by default
+// and short-circuits the moment a reading says "playing", so no existing caller
+// and no successful play can be slowed down by it.
+
+const countingAdapter = (readings) => {
+  const adapter = new WindowsAdapter({ automationHost: false, browserAutomation: {} });
+  const calls = [];
+  adapter._readSpotifyPlaybackOnce = async () => {
+    const reading = readings[Math.min(calls.length, readings.length - 1)];
+    calls.push(reading);
+    return reading;
+  };
+  return { adapter, calls };
+};
+
+const PLAYING = { running: true, playing: true, title: "Aankhon Se Batana", nowPlaying: "Aankhon Se Batana" };
+const SILENT = { running: true, playing: false, title: null, nowPlaying: null };
+
+test("an ordinary playback read still costs exactly one look", async () => {
+  // Every existing caller — screen, the capability's verify, media-providers —
+  // passes no options. If this ever becomes two reads, every one of them pays
+  // for a UIA scan of Spotify's Chromium tree that it did not ask for.
+  const { adapter, calls } = countingAdapter([SILENT, PLAYING]);
+  const state = await adapter.readSpotifyPlayback();
+  assert.equal(calls.length, 1, "the default read must not settle");
+  assert.equal(state.playing, false);
+});
+
+test("a track that is already playing is not waited for", async () => {
+  // The happy path, and the one that must not get slower: the first reading
+  // says "playing", so there is nothing to settle and nothing to pay for.
+  const { adapter, calls } = countingAdapter([PLAYING, PLAYING]);
+  const state = await adapter.readSpotifyPlayback({ confirmStart: true, settleMs: 0 });
+  assert.equal(calls.length, 1, "a confirmed reading must return immediately");
+  assert.equal(state.playing, true);
+});
+
+test("a transport that has not caught up yet is read again rather than called a failure", async () => {
+  const { adapter, calls } = countingAdapter([SILENT, PLAYING]);
+  const state = await adapter.readSpotifyPlayback({ confirmStart: true, settleMs: 0 });
+  assert.equal(calls.length, 2);
+  assert.equal(state.playing, true);
+  assert.equal(state.nowPlaying, "Aankhon Se Batana");
+});
+
+test("silence that is really silence is still reported as silence", async () => {
+  // The settle re-reads the same authoritative signal — a Pause button inside
+  // the Player controls group — so it can only ever turn a premature "no" into
+  // a "yes". It must never invent a track, or this becomes the false-success
+  // defect it was written to prevent.
+  const { adapter, calls } = countingAdapter([SILENT, SILENT]);
+  const state = await adapter.readSpotifyPlayback({ confirmStart: true, settleMs: 0 });
+  assert.equal(calls.length, 2, "one retry, not an unbounded poll");
+  assert.equal(state.playing, false);
+  assert.equal(state.nowPlaying, null);
+});
+
+test("a Spotify that is not running is not waited for either", async () => {
+  // Waiting for a track to start in an application that is not there is waiting
+  // for something that cannot happen.
+  const { adapter, calls } = countingAdapter([{ running: false, playing: false }, PLAYING]);
+  const state = await adapter.readSpotifyPlayback({ confirmStart: true, settleMs: 0 });
+  assert.equal(calls.length, 1);
+  assert.equal(state.playing, false);
+});

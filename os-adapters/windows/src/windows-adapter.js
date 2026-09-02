@@ -2304,10 +2304,55 @@ public static class SyscoraAudio {
     return { title: raw, playing, nowPlaying: playing ? raw : null };
   }
 
-  // Fresh, independent read of the live Spotify playback state from the window
-  // title. Used by the capability's verify() so playback is confirmed from the OS
-  // itself, never merely trusted from the action's own return value.
-  async readSpotifyPlayback() {
+  // Fresh, independent read of the live Spotify playback state. Used by the
+  // capability's verify() so playback is confirmed from the OS itself, never
+  // merely trusted from the action's own return value.
+  //
+  // "NOT PLAYING" READ ONE BEAT TOO EARLY, AND THE THREE STEPS IT COST.
+  //
+  // Measured live, 29 Aug 2026, "play ankhose batana on spotify": this returned
+  // playing=false, `play_music` reported REFUTED — "Spotify is not playing: no
+  // track started" — and the very next `screen`, one step later, showed
+  // "Spotify — Dikshant - Aankhon Se Batana" with a Pause button. The track had
+  // started. The read simply happened before the transport flipped.
+  //
+  // The model then spent two further steps establishing that the thing had
+  // worked. A step on this endpoint costs ~5,300 fresh tokens whatever it does
+  // (the prompt cache serves whole 8,192-token blocks, so the fixed prefix is
+  // re-bought every time), so that one premature read cost about 10,000 tokens
+  // — half the run — for want of 400 milliseconds.
+  //
+  // WHY THE EXISTING RETRY DID NOT CATCH IT. There is already one, just below,
+  // and it fires only when `playing === true` and the LABEL is missing. The
+  // opposite case — the label is there and the transport has not caught up —
+  // had no retry at all, which is the case that actually costs steps.
+  //
+  // OFF BY DEFAULT, AND THAT IS THE WHOLE SPEED ARGUMENT. Every existing caller
+  // — `screen`, the capability's verify, media-providers — reads exactly once
+  // and costs exactly what it did before. Only `playSpotifyTrack` asks for
+  // confirmation, and only after it has actually invoked a Play button, because
+  // that is the only moment a track is expected to be starting. A read that
+  // already says "playing" returns immediately, so the happy path is untouched
+  // too: this can only spend time on a run that was otherwise about to report a
+  // false failure and pay for two more steps.
+  async readSpotifyPlayback({ confirmStart = false, settleMs = 400 } = {}) {
+    const first = await this._readSpotifyPlaybackOnce();
+    // Nothing to settle for: either it is playing, or Spotify is not running at
+    // all, or nobody pressed anything. Waiting for a track that was never
+    // started is waiting for something that cannot happen.
+    if (!confirmStart || first.playing === true || first.running !== true) return first;
+
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, settleMs)));
+    const second = await this._readSpotifyPlaybackOnce();
+    // The second reading only ever REPLACES a "not playing" with a "playing" —
+    // it reads the same authoritative signal (a Pause button inside the Player
+    // controls group), so it cannot invent a track and cannot turn a genuine
+    // silence into a success. When it also says nothing is playing, the first
+    // answer stands and the caller reports the failure it was going to report.
+    return second.playing === true ? second : first;
+  }
+
+  async _readSpotifyPlaybackOnce() {
     // Do not use Get-Process.MainWindowHandle here.  Modern Spotify can host its
     // visible Chromium window in a process for which that property is zero.  The
     // top-level window enumeration below sees the actual interactive surface.
@@ -2567,7 +2612,12 @@ public static class SyscoraAudio {
       // bounded settle before the legacy playback read.
       await new Promise((r) => setTimeout(r, 1200));
     }
-    const playback = await this.readSpotifyPlayback();
+    // Confirmation is asked for ONLY when a Play button was actually invoked —
+    // that is the only moment a track is expected to be starting, and it is the
+    // moment the transport lags the click. See readSpotifyPlayback: a reading
+    // that already says "playing" comes straight back, so this costs nothing on
+    // a run that worked, and nothing at all on a run where nothing was pressed.
+    const playback = await this.readSpotifyPlayback({ confirmStart: uia.invoked === true });
 
     return {
       query: text,
