@@ -756,3 +756,101 @@ test("the same question written twice in one batch is asked once", async () => {
   await toolset.execute("search", { queries: ["same thing", "same thing", "other"] });
   assert.deepEqual(seen, ["same thing", "other"]);
 });
+
+// ---- watching something finish, in one step ---------------------------------
+//
+// `wait` took `{ms}` and nothing else, so "wait until it is done" had only one
+// shape: sleep, look, sleep, look — and every look is a model round trip costing
+// ~7,000 billed tokens whatever it finds.
+//
+// Measured live, 29 Aug 2026, installing a 190 MB app from the Store:
+// wait 3s -> screen -> wait 8s -> screen -> wait 20s -> screen -> wait 8s. Seven
+// round trips to read a progress bar, ~50,000 tokens. The six `wait` calls in
+// that run produced 191 tokens of output between them.
+//
+// The machinery already existed and the loop could not reach it: waitForUiTarget
+// polls in 250ms slices and wakes on UI Automation change events. It was never
+// registered as a capability, so no tool could call it.
+
+const waitToolset = (waitForUiTarget) => {
+  const adapter = { ...baseAdapter(), waitForUiTarget };
+  return toolsetOver(adapter);
+};
+
+test("a blind sleep still behaves exactly as it did", async () => {
+  // Everything that worked before must keep working, and must not start
+  // reaching for a window that was never named.
+  let asked = 0;
+  const toolset = waitToolset(async () => { asked += 1; return { matched: true }; });
+  const result = await toolset.execute("wait", { ms: 10 });
+  assert.equal(result.ok, true);
+  assert.match(result.text, /Waited 10ms/);
+  assert.equal(asked, 0, "a blind sleep must not watch a window");
+});
+
+test("waiting for a label to go returns the moment it goes, in one call", async () => {
+  const seen = [];
+  const toolset = waitToolset(async (request) => {
+    seen.push(request);
+    return { matched: true, elapsedMs: 1200, polls: 5, eventWakeups: 3 };
+  });
+  const result = await toolset.execute("wait", {
+    until: "gone", text: "Almost done", application: "Microsoft Store"
+  });
+  assert.equal(result.ok, true);
+  assert.equal(seen.length, 1, "a satisfied condition must not be asked twice");
+  assert.equal(seen[0].condition, "absent", "\"gone\" has to become an absent condition, not a present one");
+  assert.equal(seen[0].selector.nameContains, "Almost done");
+  assert.equal(seen[0].application, "Microsoft Store");
+  assert.match(result.text, /"Almost done" is gone/);
+});
+
+test("waiting for a label to appear asks for a present condition", async () => {
+  const seen = [];
+  const toolset = waitToolset(async (request) => { seen.push(request); return { matched: true }; });
+  await toolset.execute("wait", { until: "appears", text: "Open", application: "Microsoft Store" });
+  assert.equal(seen[0].condition, "present");
+});
+
+test("a wait that runs out is UNCONFIRMED, not a failure", async () => {
+  // A download may still be running. "Could not check in time" and "it failed"
+  // lead opposite ways, so they must not collapse into one verdict.
+  const toolset = waitToolset(async () => ({ matched: false, reason: "ui-wait-timeout" }));
+  const result = await toolset.execute("wait", {
+    until: "gone", text: "Downloading", application: "Microsoft Store", timeoutMs: 1000
+  });
+  assert.match(result.text, /UNCONFIRMED|still there/i);
+  assert.match(result.text, /read the screen/, "a timeout has to say what to do instead of waiting again");
+});
+
+test("a long wait keeps asking rather than giving up at the host's 20-second clamp", async () => {
+  // The host clamps one wait to 20s. A 190 MB download takes longer, and the
+  // whole point is that it stays ONE step.
+  let calls = 0;
+  const toolset = waitToolset(async () => {
+    calls += 1;
+    return calls < 3 ? { matched: false, reason: "ui-wait-timeout" } : { matched: true };
+  });
+  const result = await toolset.execute("wait", {
+    until: "gone", text: "Downloading", application: "Microsoft Store", timeoutMs: 60000
+  });
+  assert.equal(result.ok, true);
+  assert.ok(calls >= 3, `the wait gave up after ${calls} slices instead of continuing to the deadline`);
+  assert.match(result.text, /is gone/);
+});
+
+test("a missing automation host stops immediately instead of spinning to the deadline", async () => {
+  // A host that is not there will not become there by being asked again, and
+  // spinning for two minutes to discover that would be the most expensive
+  // possible way to report it.
+  let calls = 0;
+  const toolset = waitToolset(async () => {
+    calls += 1;
+    return { matched: false, reason: "automation-host-unavailable" };
+  });
+  const result = await toolset.execute("wait", {
+    until: "gone", text: "Downloading", timeoutMs: 60000
+  });
+  assert.equal(calls, 1);
+  assert.match(result.text, /automation-host-unavailable/);
+});

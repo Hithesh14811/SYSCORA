@@ -25,6 +25,7 @@ import path from "node:path";
 import { isCanonicalPathInside } from "../../shared-types/src/canonical-path.js";
 import {
   classifyShellCommand,
+  isPackageInstall,
   requiresClickConfirmation,
   requiresConfirmation,
   requiresSendConfirmation,
@@ -7766,7 +7767,12 @@ export function buildToolset({
           // stops it putting a private list in `cc`.
           bcc: { type: "string", description: "Optional blind copies, comma separated" },
           subject: { type: "string" },
-          body: { type: "string", description: "Plain text. Blank lines separate paragraphs." }
+          body: { type: "string", description: "Plain text. Blank lines separate paragraphs." },
+          attachments: {
+            type: "array",
+            items: { type: "string" },
+            description: "Full paths of files on this machine to attach. The user sees each one and can remove it."
+          }
         },
         required: ["to", "subject", "body"]
       },
@@ -7789,7 +7795,33 @@ export function buildToolset({
         }
         const subject = String(args.subject ?? "").trim();
         const body = String(args.body ?? "").trim();
-        const draft = { kind: "email-draft", to, cc, bcc, subject, body };
+
+        // CHECKED HERE, WHERE THE MODEL CAN STILL DO SOMETHING ABOUT IT.
+        //
+        // The file is read at Send time, by the daemon, which is right — the
+        // bytes that go are the bytes as they are when the person presses it.
+        // But a path that was wrong the moment it was written should not survive
+        // as far as a card the user is invited to trust: they would press Send,
+        // get an error about a file they never chose, and have no idea which of
+        // the agent's guesses was bad. So existence and size are established
+        // now, and a bad path is a refusal the model reads immediately.
+        const attachments = [];
+        for (const entry of asList(args.attachments)) {
+          const resolved = path.resolve(String(entry));
+          let stats = null;
+          try {
+            stats = await fs.stat(resolved);
+          } catch {
+            throw new Error(
+              `There is no file at ${resolved}, so it cannot be attached. Check the path — ` +
+              "list the folder first if you are not certain of the name."
+            );
+          }
+          if (!stats.isFile()) throw new Error(`${resolved} is a folder, not a file. Attach the files inside it individually.`);
+          attachments.push({ name: path.basename(resolved), path: resolved, size: stats.size });
+        }
+
+        const draft = { kind: "email-draft", to, cc, bcc, subject, body, attachments };
         return {
           drafted: true,
           draft,
@@ -7798,7 +7830,9 @@ export function buildToolset({
           // "the client has something to draw that is not a line of output".
           uiCard: draft,
           evidence: evidence({
-            observed: `a draft to ${to.join(", ")} was put in the conversation for the user to review`,
+            observed: `a draft to ${to.join(", ")}` +
+              (attachments.length ? ` with ${attachments.map((file) => file.name).join(", ")} attached` : "") +
+              " was put in the conversation for the user to review",
             // The card is the observation: it exists on the surface, which is
             // the only thing this tool claims to have done.
             method: "compose card",
@@ -7827,7 +7861,10 @@ export function buildToolset({
       // that, so the honest move is to stop and say what it is waiting on.
       render: (result) => confirmed(
         result,
-        `Draft ready for ${result.draft.to.join(", ")} — subject "${result.draft.subject}". ` +
+        `Draft ready for ${result.draft.to.join(", ")} — subject "${result.draft.subject}"` +
+        (result.draft.attachments?.length
+          ? `, with ${result.draft.attachments.map((file) => file.name).join(", ")} attached`
+          : "") + ". " +
         "It is on screen with a Send button the user presses themselves.\n" +
         "NOTHING HAS BEEN SENT, AND YOU CANNOT SEND IT. There is no tool here that sends mail. " +
         "Do NOT open Outlook, Gmail, a browser or any other mail client to send it yourself: the " +
@@ -7840,30 +7877,126 @@ export function buildToolset({
       )
     },
     {
+      // WATCHING SOMETHING FINISH MUST NOT COST A ROUND TRIP PER GLANCE.
+      //
+      // This took `{ms}` and nothing else, so "wait until it is done" had only
+      // one shape: sleep, look, sleep, look. Every one of those looks is a model
+      // step, and a step on this endpoint costs ~7,000 billed tokens whatever it
+      // does — the prompt cache serves whole 8,192-token blocks, so the
+      // 11,208-token fixed prefix is re-bought every time.
+      //
+      // Measured live, 29 Aug 2026, installing a 190 MB app from the Store:
+      // `wait 3s → screen → wait 8s → screen → wait 20s → screen → wait 8s`.
+      // Seven round trips to read a progress bar, about 50,000 tokens. The six
+      // `wait` calls in that run produced 191 tokens of output between them and
+      // cost roughly 43,000 in steps. The whole request hit the 150,000 ceiling
+      // with the install unfinished.
+      //
+      // The machinery to do it properly already existed and the loop could not
+      // reach it: `waitForUiTarget` polls in 250ms slices, wakes on UI Automation
+      // change events rather than a timer, and returns the instant the condition
+      // holds. `play_music` has used it in production for weeks. It was never
+      // registered as a capability, so no tool could call it.
+      //
+      // `ms` alone still means exactly what it meant, so nothing that worked
+      // before changes.
       name: "wait",
-      description: "Wait a moment for something to finish loading or appearing.",
-      parameters: { type: "object", properties: { ms: { type: "number" } }, required: ["ms"] },
-      preview: (args) => `${args.ms}ms`,
+      description:
+        "Wait for something. With `until` and `text` it watches a window and returns the moment that label " +
+        "appears or goes — one step however long it takes, so use it instead of sleeping and looking again. " +
+        "`ms` alone is a blind sleep.",
+      parameters: {
+        type: "object",
+        properties: {
+          until: { type: "string", enum: ["appears", "gone"], description: "Watch for `text` to appear, or to go" },
+          text: { type: "string", description: "The visible label to watch, e.g. \"Almost done\" or \"Install\"" },
+          application: { type: "string", description: "Which window to watch" },
+          ms: { type: "number", description: "Blind sleep, when there is nothing nameable to watch for" },
+          timeoutMs: { type: "number", description: "Give up after this. Default 120000, max 240000." }
+        },
+        required: []
+      },
+      preview: (args) => (args.until && args.text
+        ? `until "${String(args.text).slice(0, 40)}" ${args.until}`
+        : `${Math.min(30000, Math.max(0, Number(args.ms) || 0))}ms`),
       // Changes nothing about the machine, so there is nothing to verify: the
       // clock IS the observation, and it is the one instrument here that has
       // never been wrong.
       acts: false,
-      execute: async (args) => {
-        const ms = Math.min(30000, Math.max(0, Number(args.ms) || 0));
+      execute: async (args, { signal = null } = {}) => {
+        const until = String(args.until ?? "").trim().toLowerCase();
+        const text = String(args.text ?? "").trim();
         const startedAt = Date.now();
-        await new Promise((resolve) => setTimeout(resolve, ms));
+
+        // The blind sleep, byte for byte what it always was.
+        if (!until || !text) {
+          const ms = Math.min(30000, Math.max(0, Number(args.ms) || 0));
+          await new Promise((resolve) => setTimeout(resolve, ms));
+          const elapsed = Date.now() - startedAt;
+          return {
+            waited: ms,
+            elapsed,
+            evidence: evidence({
+              observed: `${elapsed}ms elapsed on the clock`, method: "clock", verdict: CONFIRMED
+            })
+          };
+        }
+
+        if (typeof adapter.waitForUiTarget !== "function") {
+          throw new Error("This system cannot watch a window for a label. Use wait {ms} and read the screen.");
+        }
+        // Bounded well under the run's own six-minute budget: a wait that eats
+        // the whole allowance to report that nothing happened has spent the
+        // request on the one outcome that needed it least.
+        const budget = Math.min(240000, Math.max(1000, Number(args.timeoutMs) || 120000));
+        const deadline = startedAt + budget;
+        const condition = until === "gone" ? "absent" : "present";
+
+        // The host clamps one wait to 20s. Longer waits are that call in a loop,
+        // which keeps the event-driven behaviour — each slice still returns the
+        // instant the condition holds — rather than degrading to a poll.
+        let last = null;
+        while (Date.now() < deadline) {
+          if (signal?.aborted) break;
+          last = await adapter.waitForUiTarget({
+            application: args.application ?? null,
+            selector: { nameContains: text },
+            condition,
+            timeoutMs: Math.min(20000, deadline - Date.now())
+          }).catch((error) => ({ matched: false, reason: String(error?.message ?? error).slice(0, 80) }));
+          if (last?.matched === true) break;
+          // A host that is not there will not become there by being asked again.
+          if (last?.reason === "automation-host-unavailable") break;
+        }
+
         const elapsed = Date.now() - startedAt;
+        const matched = last?.matched === true;
         return {
-          waited: ms,
-          elapsed,
+          until, text, matched, elapsed, waited: elapsed,
+          reason: matched ? null : (last?.reason ?? "ui-wait-timeout"),
           evidence: evidence({
-            observed: `${elapsed}ms elapsed on the clock`,
-            method: "clock",
-            verdict: CONFIRMED
+            observed: matched
+              ? `${JSON.stringify(text)} ${until === "gone" ? "was gone from" : "appeared in"} the window after ${elapsed}ms`
+              : `${JSON.stringify(text)} was still ${until === "gone" ? "present" : "absent"} after ${elapsed}ms`,
+            method: "ui.wait",
+            // UNCONFIRMED, NOT REFUTED. A wait that ran out says the thing did
+            // not happen IN TIME, which is not the same as the thing failing —
+            // a download may still be running. Three verdict states, never two.
+            verdict: matched ? CONFIRMED : UNCONFIRMED
           })
         };
       },
-      render: (result) => reported(result, `Waited ${result.waited}ms.`)
+      render: (result) => {
+        if (!result.until) return reported(result, `Waited ${result.waited}ms.`);
+        if (result.matched) {
+          return confirmed(result, `"${result.text}" ${result.until === "gone" ? "is gone" : "appeared"} — ` +
+            `after ${(result.elapsed / 1000).toFixed(1)}s.`);
+        }
+        return unconfirmed(result,
+          `"${result.text}" was still ${result.until === "gone" ? "there" : "not there"} after ` +
+          `${(result.elapsed / 1000).toFixed(1)}s (${result.reason}). It may still be in progress — read the ` +
+          "screen to see where it actually got to, rather than waiting again on the same words.");
+      }
     }
   ];
 
@@ -8364,11 +8497,24 @@ export function buildToolset({
         const { say, saw, ...inputs } = args;
         if (name === "run" && state.accessPolicy.shellExecutionMode === ShellExecutionMode.WORKSPACE &&
             state.accessPolicy.workspaceRoots.length === 0 &&
-            classifyShellCommand(String(inputs.command ?? "")).verdict !== ShellVerdict.ALLOW) {
+            classifyShellCommand(String(inputs.command ?? "")).verdict !== ShellVerdict.ALLOW &&
+            // See isPackageInstall in shell-rules.js. Installing an application
+            // is not workspace work, and refusing it for want of an attached
+            // folder sent one live request down the Store GUI for 21 steps and
+            // 150,385 tokens. The exemption is from the FOLDER requirement only:
+            // DENY, the CONFIRM table and the ask-mode boundary below all still
+            // apply to it.
+            !isPackageInstall(String(inputs.command ?? ""))) {
           return {
             ok: false,
+            // NAME THE ROUTE THAT WORKS. The old wording sent the model to ask
+            // the user to attach a project, which for "install an app" is a
+            // non-sequitur it cannot act on — so it improvised the GUI instead
+            // and never said why. A refusal that does not name an alternative
+            // is a refusal the model routes around at its own expense.
             text: "This command can change the system, so Workspace terminal access needs an attached folder. " +
-              "Attach the project with + and try again. Read-only version and status checks do not need a folder.",
+              "Attach the project with + and try again. Read-only version and status checks do not need a folder. " +
+              "Installing an application does NOT need a folder — `winget install --id <id>` runs from here.",
             durationMs: Date.now() - startedAt
           };
         }
