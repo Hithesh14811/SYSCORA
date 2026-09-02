@@ -420,6 +420,46 @@ export function isReadOnlyShellCommand(command, args = []) {
   return classifyShellCommand(command, args).verdict === ShellVerdict.ALLOW;
 }
 
+// INSTALLING AN APPLICATION HAS NOTHING TO DO WITH HAVING A PROJECT FOLDER OPEN.
+//
+// The workspace gate in the toolset refuses any command that is not read-only
+// when no folder is attached, and tells the user to attach one. For a developer
+// terminal scoped to a project that is exactly right. For "install Quick Share"
+// it is a non-sequitur, and it is expensive: measured live, 29 Aug 2026, the two
+// refused `winget` calls pushed the whole request down the Store GUI instead —
+// 21 steps, 99.5s, and it hit the 150,000-token ceiling before the install
+// finished. The same install through `winget install --id` is about three steps.
+//
+// The bill is almost entirely the STEPS, not the work: tool output across all 21
+// calls was 5,624 tokens, under 4% of what was spent. A round trip costs ~7,000
+// billed tokens on this endpoint whatever it does.
+//
+// SO THIS IS AN EXEMPTION FROM THE FOLDER REQUIREMENT, NOT FROM SAFETY. The
+// command still goes through DENY, still goes through the CONFIRM table, and
+// still goes through the ask-mode boundary. All that changes is that not having
+// a project attached stops being a reason to refuse an install.
+//
+// NARROW ON PURPOSE, AND ANCHORED. The whole command must be one package-manager
+// install and nothing else. A shell separator anywhere means this returns false,
+// so `winget install x; Remove-Item -Recurse C:\` is not an install as far as
+// this is concerned — it is whatever the rest of the rules make of it.
+//
+// `uninstall` is deliberately absent: it has its own CONFIRM rule above, and
+// removing an application is the unrecoverable direction.
+const PACKAGE_INSTALL = /^\s*(?:winget|choco|scoop)(?:\.exe)?\s+(?:install|upgrade|update)\b/i;
+// Anything that could chain, redirect or expand into a second command. Checked
+// against the raw string rather than parsed, because the question is only "is
+// this one plain install", and anything unusual answers no.
+const SHELL_COMPOSITION = /[;&|><`$\n\r]|\$\(|\(\s*\)/;
+
+export function isPackageInstall(command, args = []) {
+  const whole = [String(command ?? ""), ...args.map((arg) => String(arg ?? ""))].join(" ");
+  if (!PACKAGE_INSTALL.test(whole)) return false;
+  if (SHELL_COMPOSITION.test(whole)) return false;
+  // A DENY is a DENY. This exemption may never be the thing that lets one past.
+  return classifyShellCommand(command, args).verdict !== ShellVerdict.DENY;
+}
+
 // THE THINGS WORTH ONE CLICK.
 //
 // ALLOW/ASK/DENY above describes the whole space, and the agent loop enforces

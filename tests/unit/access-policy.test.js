@@ -176,3 +176,62 @@ test("a background wrapper cannot disguise an original hard-DENY command", async
   assert.equal(result.blocked, true);
   assert.equal(result.blockedRule, "disk-format");
 });
+
+// ---- installing an app is not workspace work --------------------------------
+//
+// The workspace gate refuses any non-read-only command when no folder is
+// attached and tells the user to attach one. Measured live, 29 Aug 2026, that
+// refusal pushed "install Quick Share from Microsoft Store" down the Store GUI
+// instead: 21 steps, 99.5s, and it hit the 150,000-token ceiling before the
+// install finished. The same install through `winget install --id` is ~3 steps.
+//
+// The exemption is from the FOLDER requirement, not from safety — which is what
+// the second and third tests here exist to hold.
+
+const workspaceToolset = (run) => {
+  const toolset = buildToolset({
+    registry: { get: () => null },
+    adapter: { executeCommand: run ?? (async () => ({ stdout: "done", stderr: "", exitCode: 0 })) }
+  });
+  toolset.setAccessPolicy({
+    approvalMode: "balanced", developerMode: true, shellExecutionMode: "workspace", workspaceRoots: []
+  });
+  toolset.beginTurn("install quick share");
+  return toolset;
+};
+
+test("a package install is not refused for want of an attached folder", async () => {
+  const toolset = workspaceToolset();
+  const result = await toolset.execute("run", { command: "winget install --id 9PCTGDFXVZLJ --source msstore" });
+  assert.ok(
+    !/needs an attached folder/.test(result.text ?? ""),
+    `the install was still refused for want of a folder: ${result.text}`
+  );
+});
+
+test("an ordinary system-changing command still needs the folder", async () => {
+  // The exemption is narrow on purpose. If it widened to "anything that changes
+  // the system" it would have quietly removed the workspace gate altogether.
+  const toolset = workspaceToolset();
+  const result = await toolset.execute("run", { command: "Remove-Item -Recurse -Force C:\Users\hithe\Documents" });
+  assert.equal(result.ok, false);
+  assert.match(result.text, /needs an attached folder/);
+});
+
+test("an install with a second command smuggled behind it is still refused", async () => {
+  const toolset = workspaceToolset();
+  const result = await toolset.execute("run", {
+    command: "winget install x; Remove-Item -Recurse -Force C:\Users"
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.text, /needs an attached folder/);
+});
+
+test("the refusal names the route that actually works", async () => {
+  // The old wording sent the model to ask the user to attach a project, which
+  // for "install an app" is a non-sequitur it cannot act on — so it improvised
+  // the GUI and never said why.
+  const toolset = workspaceToolset();
+  const result = await toolset.execute("run", { command: "Set-Content C:\a.txt hi" });
+  assert.match(result.text, /Installing an application does NOT need a folder/);
+});
