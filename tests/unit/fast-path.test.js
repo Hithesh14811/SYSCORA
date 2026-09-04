@@ -259,3 +259,80 @@ test("a request the router does not recognise never touches a tool", async () =>
   assert.deepEqual(toolset.calls, [], "an unrecognised request must not act on the machine");
   assert.equal(provider.asked, 1);
 });
+
+// ---- The messages that are not requests -------------------------------------
+//
+// "hi" WAS COSTING BETWEEN 5,085 AND 27,064 BILLED TOKENS, fifteen times, across
+// 143 real sessions — a full round trip with the system prompt and a 39-tool
+// schema attached, so that the model could say hello back.
+//
+// This is the only reply in the product with no tool behind it, so most of what
+// follows is about the boundary: it must fire on a bare greeting and on nothing
+// that carries a request with it.
+
+test("a bare greeting is answered with no model and no tool", async () => {
+  for (const greeting of ["hi", "Hi!", "hello", "hey", "  Hey there ", "good morning", "yo", "hii"]) {
+    const provider = neverAskedProvider();
+    const toolset = toolsetThatAnswers("should not run", CONFIRMED);
+    const agent = new FastAgent({ provider, toolset });
+
+    const outcome = await agent.run(greeting);
+
+    assert.equal(provider.asked, 0, `${JSON.stringify(greeting)} reached the model`);
+    assert.deepEqual(toolset.calls, [], `${JSON.stringify(greeting)} touched a tool`);
+    assert.equal(outcome.status, "COMPLETED");
+    assert.match(outcome.message, /Hello\./);
+  }
+});
+
+test("thanks and acknowledgements are answered the same way", async () => {
+  for (const [said, expected] of [["thanks", /Any time/], ["thank you", /Any time/], ["ok", /Right/], ["got it", /Right/]]) {
+    const provider = neverAskedProvider();
+    const agent = new FastAgent({ provider, toolset: toolsetThatAnswers("should not run", CONFIRMED) });
+    const outcome = await agent.run(said);
+    assert.equal(provider.asked, 0, `${JSON.stringify(said)} reached the model`);
+    assert.match(outcome.message, expected);
+  }
+});
+
+test("a greeting with a request attached still reaches the model", async () => {
+  // THE FAILURE THIS GUARDS. Answering the greeting and dropping the request is
+  // far worse than never firing at all — the user would be told "Hello" and
+  // their actual instruction would vanish.
+  for (const said of [
+    "hi, can you open spotify",
+    "hey what's my volume",
+    "hello — is python installed?",
+    "thanks, now close notepad",
+    "ok do it"
+  ]) {
+    const provider = neverAskedProvider();
+    const agent = new FastAgent({ provider, toolset: toolsetThatAnswers("ran", CONFIRMED) });
+    const outcome = await agent.run(said);
+    assert.doesNotMatch(String(outcome.message), /^Hello\. Tell me what you would like/,
+      `${JSON.stringify(said)} was answered as a bare greeting`);
+  }
+});
+
+test("the greeting reply claims nothing about the machine", async () => {
+  // It is a fixed literal, which is the entire reason it needs no evidence. If
+  // it ever mentions a version, a path, a state or a count, it has become a
+  // claim and belongs in the loop with a tool behind it.
+  const provider = neverAskedProvider();
+  const agent = new FastAgent({ provider, toolset: toolsetThatAnswers("should not run", CONFIRMED) });
+  const outcome = await agent.run("hi");
+  assert.doesNotMatch(outcome.message, /\bv?\d+\.\d+/, "a version number is a claim about this machine");
+  assert.doesNotMatch(outcome.message, /[a-z]:[\\/]/i, "a path is a claim about this machine");
+  assert.doesNotMatch(outcome.message, /\b(?:installed|running|open|muted|playing)\b/i,
+    "a state word is a claim about this machine");
+});
+
+test("a greeting costs nothing, and the numbers say so", async () => {
+  const provider = neverAskedProvider();
+  const agent = new FastAgent({ provider, toolset: toolsetThatAnswers("should not run", CONFIRMED) });
+  const outcome = await agent.run("hello");
+  assert.equal(outcome.steps, 0);
+  assert.equal(outcome.toolCalls, 0);
+  assert.equal(outcome.metrics?.tokensIn ?? 0, 0);
+  assert.equal(outcome.metrics?.tokensOut ?? 0, 0);
+});

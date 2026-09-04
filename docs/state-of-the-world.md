@@ -689,8 +689,282 @@ plaintext keys** (`config.json.bak`, three `bak-2026-08-22*`, `gemini-backup`,
 `kimi-backup`). They are the user's files and some are revert points, so they
 were left alone and reported rather than deleted.
 
+### Done 3 Sep 2026: the GUI told the model to do something the prompt forbade, and code was unreadable past line 150
+
+Five defects, from one live music request and one audit. Four of them are the
+same shape the project keeps producing — the machinery is correct and something
+above it makes it unreachable.
+
+**1. THE REFUSAL AND THE SYSTEM PROMPT CONTRADICTED EACH OTHER, AND THE PROMPT WON.**
+
+A live request, `play apsara ali in spotify`: **7 steps, 31.4s, 102,528 tokens**
+for one song. Two of those steps were the identical call `click {text: "Play"}`,
+refused both times for ambiguity, followed by a fall back to raw coordinates.
+
+The disambiguation was already doing the right thing. It has said
+`Call ONE of these exactly: click {element: 64}` since 28 Aug, when this exact
+Spotify loop was first measured, and it names what sits beside each candidate so
+the choice can be made. **The system prompt said, of clicking:
+`never an index or a coordinate you made up`.** So the model was handed the exact
+call to copy and simultaneously told never to make that call — and it obeyed the
+prompt, which is the stronger instruction, and went to coordinates instead.
+
+Nothing was wrong with the refusal, the ranker, or the click. The fix is one
+paragraph in the prompt naming the disambiguation as the one case where an index
+is exact rather than guessed. **This is the general lesson and it is not about
+Spotify:** every tool that teaches a recovery in its failure text is competing
+with the system prompt, and when the two disagree the prompt wins silently.
+
+**2. `play_music` gave the only attempt that can work 3.5s of a 6s budget.**
+
+`_invokeSpotifyPlayButton` has three attempts; the third — a bare `Play`
+DataItem NEAR the requested title — is the shape Spotify actually publishes for
+a top result. Measured with `node scripts/probe-spotify-play.mjs "Apsara Ali"`:
+
+```
+  attempt 1  semantic, controlType=Button    713ms   no match
+  attempt 2  semantic, controlType=null      146ms   no match
+  attempt 3  waitForUiTarget, cap 3500ms   1,042ms   MATCHED, track played
+```
+
+Warm, it matches in a second. The failing run was a COLD search: Spotify had
+just been launched and the results had not been published to the tree before the
+cap expired. The budget is now 9,000ms and attempt 3 gets whatever is left of it
+(~8s) rather than an arbitrary 3.5s slice. **The asymmetry decides the number:**
+three more seconds inside a call that already spends nine, against the six extra
+steps and ~60,000 fresh tokens the fallback actually cost.
+
+**NOT VERIFIED END TO END, AND THIS IS WHY.** Two cold runs after the change
+disagreed: one matched in 955ms with the raised timeout visible in the trace
+(`timeoutMs=8187`) but reported `nowPlaying` as a DIFFERENT track — Spotify
+cold-launches and auto-resumes its previous queue — and the next found nothing
+in 6.2s. Spotify then exited and stopped appearing in the window list at all, so
+the measurement could not be repeated. **The budget change is measured as taking
+effect and the unit tests pass (30/30); the cold path remains flaky and is not
+fixed by a budget alone.** The honesty layer holds throughout: `matchesTrackQuery`
+compares the live window title against the request, so the wrong-track run
+reported REFUTED rather than claiming success. The geometry was checked and
+cleared — `dy <= sameRowTolerance AND dx <= maxDistance` is enforced in
+`restore-host.ps1`, so the transport's own Play button 800px away cannot be
+mistaken for a row's.
+
+**3. A SOURCE FILE WAS UNREADABLE PAST ITS FIRST ~150 LINES.**
+
+`read_file` returned the whole file through `clip`, which cuts at 6,000
+characters and says only `[N more characters]`. **There was no argument that
+could reach line 200.** So on any real repository the agent could read the top of
+a file and nothing else, and `search_code` reporting the interesting line as
+6,326 was useless because nothing could then go and look at 6,326.
+
+It now takes `offset`/`limit`, defaults to 400 lines, numbers every line
+(`6326\tname: "edit_file",`) and — the half that matters — **names the exact call
+that fetches the rest**: `read_file {path: "…", offset: 401}`. A truncated read
+that does not say how to continue is one the model treats as the whole file.
+
+The numbering has a mirror-image failure, and it is handled where it is read
+rather than where it is caused: an anchor copied out of a numbered window carries
+prefixes that are in no file, so `edit_file` now detects that shape on the anchor
+itself and says so, instead of reporting a wrong snippet. The first version put
+the warning at the end of every read — ~25 tokens on every read of every file for
+a whole session — which is the house rule about lessons belonging in the failure,
+got wrong and then corrected.
+
+**4. `git` — the agent could not see what it had just changed.**
+
+`github` reads repositories on github.com. **Nothing read the one on this disk.**
+So after editing four files the agent could not produce a diff, could not say
+what was uncommitted, and could not review its own work; the only route was
+`run`, and the terminal is OFF by default.
+
+New `git` tool, read-only by design: `status`, `diff`, `log`, `branch`, `show`.
+No commit, no push, no checkout, no reset — those are irreversible or they move
+work the user has not finished, and this codebase already draws that line once
+(the agent drafts, a person sends). The action picks a fixed string from a table;
+the only caller-supplied fragment is a path, refused by shape if it could end the
+command, and the composed line still goes through the shell floor.
+
+**And it needed a new origin at the spawn boundary, which is a safety decision
+rather than a detail.** `project`'s comment claims it "does not need Developer
+terminal access"; it passes `shellOrigin: "model"`, which the adapter refuses
+unless `developerMode === true`, so **that claim has never been true** — measured
+here, `project {action: "lint"}` on a default install does not run. `git` uses
+`shellOrigin: "readonly-verb"`, and the adapter **re-derives read-only from the
+floor instead of believing the label**: the command must independently classify
+`ALLOW`. So the label cannot be borrowed. Held by
+`tests/unit/git-tool.test.js`, and **proven able to fail** — changing the gate to
+trust the label makes `git push`, `git reset --hard`, `npm run lint` and
+`Remove-Item -Recurse` all run, and the test goes red.
+
+**`project` was deliberately NOT given the same treatment.** `npm test` runs
+whatever the repository's manifest says, which is arbitrary code with the user's
+permissions — finite and enumerable, but not read-only. **That it cannot run on a
+default install is now a known, stated gap rather than a false claim in a
+comment**, and widening it is a decision for whoever owns the security model, not
+a side effect of adding a git verb.
+
+**5. The honesty backstop could not see the passive voice.**
+
+`claimsWithoutEvidence` is the last line — it runs only on a turn that called
+ZERO tools. Every pattern in it was anchored on the first person or on a verb
+plus an object. Probed against the live export:
+
+```
+  CAUGHT  "Done — volume is now 20%."     MISSED  "The file has been created."
+  CAUGHT  "The app was closed."           MISSED  "The volume has been set to 20%."
+  CAUGHT  "Node v22.14.0 is installed."   MISSED  "Your file is saved."
+```
+
+The right column is the left column with the agent taken out of the sentence —
+and the passive is what a model reaches for when it is being careful, which is
+the turn where it has done nothing. Anchored on a DEFINITE subject, because that
+is what separates a claim from a definition: "A pull request is opened by pushing
+a branch" is somebody being told how GitHub works, and nudging it costs a step.
+`tests/unit/evidence-claims.test.js` holds both halves — 15 claims that must be
+caught, 11 ordinary sentences that must not.
+
+Found on the way: the verb list was written out three times and the copies had
+**already drifted** — `renamed it` was uncaught while `I renamed it` was caught.
+One shared list now, with a test that checks each verb in all three arrangements.
+
+**6. The eval had no coding row at all.** 22 tasks, none of which exercised
+`search_code`, `find_files` or `project`. The capability being compared to
+dedicated coding tools was measured by nothing. Two rows added — `code-find-and-fix`
+(a bug the prompt does not locate: search, read, edit one line, run the project's
+own tests) and `code-read-long-file` (a marker at line 700 of 900, unreachable
+by the old read). Both fixtures were built and checked by hand: the first FAILS
+before the fix and PASSES after, and the second's marker really is at line 700.
+`code-find-and-fix` asserts the TEST FILE is unchanged, because "fix the failing
+test" has an obvious wrong solution. **Not run — the suite needs a quiet machine
+and a full baseline, and neither was available.**
+
+**Cost of all of this:** the fixed prefix went 10,501 → **11,157 tokens/step**
+(+656: three prompt rules and the `git` schema). Inside the cached prefix, so
+~66 fresh-token-equivalents per step after the first — against the six steps and
+~60,000 tokens one music request paid. **But the system prompt is now 4,392
+tokens and about seventy-five directives, and nothing has ever measured whether
+any given section still earns its place.** `scripts/probe-model-bakeoff.mjs` is
+the tool for that and has never been pointed at prompt sections.
+
+`npm test`: **1,659 tests, 1,657 pass, 0 fail, 2 skipped** (was 1,648 / 1,646).
+
+### Fixed 3 Sep 2026: it could not write a second file, and it reported the job done
+
+**A user asked for a folder and a three-file web app. It wrote `index.html`, said
+"Now the CSS:" and called nothing — three times across three requests, ~215
+seconds and ~218,000 tokens, and `style.css` never existed.** Asked twice why it
+had stopped, it apologised, re-read the HTML it had already written, said "Let me
+write both files now", and called nothing again.
+
+Reproduced end to end on a scratch folder: **the run settled `COMPLETED`** — a
+green tick — on the sentence *"Now the CSS — this is where the beauty comes in."*
+with one of three files on disk. The user's runs got `PARTIALLY_COMPLETED`; the
+difference is only whether `looksUnfinished` happens to match the last sentence.
+
+**THE LOOP'S HANDLING WAS CORRECT AND WAS NOT THE BUG.** The nudge, the wrap-up
+ask and the settle all did exactly what they say. Nothing above the model can fix
+a turn the model was never allowed to make.
+
+**The cause is the output ceiling, and the endpoint lies about hitting it.** A
+stylesheet for that page is ~14 KB, which is ~5,000 output tokens in one
+`write_file` call — above `MODEL_OUTPUT_CEILING`, which was 4,096. Measured
+directly against the configured endpoint, streaming, the shape the loop uses:
+
+```
+  max_tokens  4,096   21-31s, [DONE], finish_reason NULL, usage 1 token,
+                      no tool call, no text.  The turn is thrown away silently.
+  max_tokens 16,384   finish_reason "tool_calls", 5,020 tokens,
+                      write_file carrying 14,647 bytes of CSS.  It works.
+```
+
+Non-streaming, the same ceiling answers **HTTP 500, 4/4**. Neither shape ever says
+`length`, so `wasTruncated` — which matches `length|max_tokens` — **cannot fire**,
+the retry-with-more-room path is unreachable, and the loop reads "no tool calls"
+as the model having finished. Every request needing a file over ~11 KB lost the
+turn, burned 20–30 seconds, and reported success.
+
+**This is the tenth instance of the class this project keeps producing: the
+machinery is correct and something above it makes it unreachable.** The truncation
+retry was written for exactly this event and had never once run on it.
+
+**Two fixes, because one of them does not scale.**
+
+**1. `MODEL_OUTPUT_CEILING` 4,096 → 8,192.** The comment on that constant said
+`DO NOT RAISE THIS ONE`, and it was right about what it measured: on 21 Aug a
+global 16,384 dropped the eval 100% → 91% because *reasoning* expanded to fill the
+room. **Thinking has been off by default since 28 Aug and this endpoint really
+does return `reasoning_tokens: 0`, so that mechanism cannot operate** — which is
+an argument, so it was measured. `node scripts/probe-output-ceiling.mjs
+--repeat 3`, thinking off, streaming, median output tokens:
+
+| decision | 4,096 | 8,192 | 16,384 |
+|---|---|---|---|
+| `needs-room` (write the stylesheet) | **1t · 0/3, 2 DISCARDED** | 4,981t · 3/3 | 5,018t · 3/3 |
+| `click-by-label` | 106t · 3/3 | 105t · 3/3 | 108t · 3/3 |
+| `draw-a-shape` — **the row that regressed** | 120t | 119t | 121t |
+| `installed-question` | 94t · 3/3 | 95t · 3/3 | 95t · 3/3 |
+| `arithmetic` (must call NO tool) | 9t · 2/3 | 9t · 2/3 | **92t · 0/3** |
+
+Every ordinary decision is **flat to within 2%** across a 4× range of room,
+`draw-a-shape` included. **8,192 and not 16,384 because of the last row**: at
+16,384 the arithmetic case stopped answering without a tool. n=3 is thin and it is
+the same "more room, more attempts" shape the original warning names, so it is
+taken at face value rather than explained away. 8,192 is the smallest ceiling
+measured to fit a real file write and the largest measured to change nothing else.
+
+**2. `wasDiscarded()` — because a bigger number is not a fix.** A 30 KB file will
+not fit in 8,192 either, and the next endpoint will lie in its own way. So the
+detection is anchored on **what arrived**, never on what the provider says about
+itself — the house rule about verification not sharing a code path with the thing
+it verifies, applied to the provider. A turn with no `finishReason`, no tool calls
+and no text consumed real time and delivered nothing; it is retried once with the
+bigger ceiling, and on a second failure the run settles `PARTIALLY_COMPLETED` and
+**tells the user the recovery they can act on** — write the file in parts with
+`write_file {existing: "append"}`. It shares `retriedTruncatedTurn` deliberately:
+a run does not get one free retry per failure *name* for what is one failure.
+
+**Measured after the fix, same request, same folder, clean:** 30 steps, 182s,
+166,997 fresh tokens — **`index.html` 8,103 B, `style.css` 18,027 B, `app.js`
+13,153 B, all three on disk.** Verified independently of the agent's own report,
+by serving the folder and driving the page: 12 product cards render, Add-to-cart
+moves the badge 0 → 2 and persists the right item and price to `localStorage`, the
+Audio filter narrows 12 → 3, and the console is clean.
+
+Four tests in `tests/unit/fast-agent.test.js`, **proven able to fail**: neutering
+`wasDiscarded` turns 3 of them red. The ceiling test now pins a *band* — at least
+5,000 so a real file fits, at most 8,192 so the arithmetic row is not disturbed —
+rather than the bare number, because the number without its bounds is what got
+raised wrongly last time.
+
+`scripts/probe-multifile-stall.mjs` is kept even though it never reproduced the
+stall: it is what ruled out the prompt and the conversation shape, and re-testing
+those is the expensive way to learn it twice.
+
+`npm test`: **1,663 tests, 1,661 pass, 0 fail, 2 skipped** (was 1,659 / 1,657).
+
 ### Still open
 
+- **`project` cannot run on a default install.** Its own comment says it "does
+  not need Developer terminal access"; it passes `shellOrigin: "model"`, which
+  the adapter refuses unless `developerMode === true`. Measured 3 Sep 2026. So
+  the edit-run-read loop — the thing that makes a coding assistant trustworthy —
+  is behind the most dangerous switch in the product. `git` was fixed with a
+  read-only origin; `project` cannot use it, because `npm test` runs whatever the
+  manifest says. **The options are: leave it (a coding user turns the switch on),
+  or give manifest commands their own approval path that does not imply arbitrary
+  terminal access. This is a security-model decision and has not been made.**
+- **The cold Spotify path is still flaky.** The attempt budget was raised and
+  measured as taking effect, but two cold runs after the change disagreed — one
+  played the previous queue's track (reported REFUTED, correctly), one found
+  nothing. `node scripts/probe-spotify-play.mjs` is how to see it. What is not
+  yet understood is what Spotify does to its own tree in the seconds after a cold
+  launch, and no budget change fixes that.
+- **The system prompt has never been ablated.** 4,392 tokens, ~75 directives,
+  every one of them added because of a specific observed defect and none of them
+  ever measured for whether it still earns its place. Adding a rule is cheap and
+  reversible; nobody has checked whether the twentieth "NEVER" weakens the first.
+- **The eval has not been run since 22 Aug**, and the scoreboard on disk is a
+  partial 1-row run. Roughly 2,250 uncommitted lines predate this session and
+  ~1,000 more were added in it, none of it measured against the gate.
 - **The Baseten account is out of credit** (`HTTP 402: please check your current
   payment status`). The primary is the DeepSeek endpoint directly, with Baseten
   kept as the fallback entry so the chain is real, but there is nothing healthy

@@ -118,7 +118,12 @@ test("a replay that cannot prove a step hands the model the situation", async ()
 test("with no skills wired, nothing about a run changes", async () => {
   const provider = fakeProvider([{ text: "Hello.", toolCalls: [] }]);
   const toolset = fakeToolset();
-  const settled = await new FastAgent({ provider, toolset }).run("hello");
+  // NOT "hello" ANY MORE. A bare greeting is now answered by the conversational
+  // fast path with no model call at all, which would make `provider.calls` zero
+  // and this test pass for a reason that has nothing to do with skills. What is
+  // being checked here is that an ORDINARY request is unaffected by there being
+  // no skill store, so it needs an ordinary request.
+  const settled = await new FastAgent({ provider, toolset }).run("summarise what is on my desktop");
   assert.equal(provider.calls, 1);
   assert.equal(settled.status, "COMPLETED");
 });

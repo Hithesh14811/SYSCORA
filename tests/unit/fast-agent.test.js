@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FastAgent, buildToolset, claimsWithoutEvidence, looksUnfinished, wasTruncated } from "../../packages/fast-agent/src/index.js";
+import { FastAgent, buildToolset, claimsWithoutEvidence, looksUnfinished, wasDiscarded, wasTruncated } from "../../packages/fast-agent/src/index.js";
 
 // A provider that plays back scripted turns. Each turn is what a real endpoint
 // would stream: some prose, then zero or more tool calls.
@@ -923,19 +923,37 @@ function ceilingRecordingProvider(turns) {
   };
 }
 
-// THE ORDINARY TURN KEEPS THE BASELINE CEILING. This assertion is the scar from
+// THE ORDINARY TURN KEEPS THE MEASURED CEILING. This assertion is the scar from
 // the first attempt at the fix, which raised the ceiling for EVERY turn: a
 // reasoning model given more room thinks longer and then attempts more, and a
 // full eval measured draw-shape-in-paint falling from 3/3 to 1/3 at 3x the
 // tokens, app-type doubling its steps, and the pass rate going 100% → 91%.
-// Raising this again without re-running the eval will reproduce that.
-test("an ordinary turn is not given more room than the baseline measured", async () => {
+//
+// 4,096 → 8,192 ON 3 SEP 2026, AND THE BOUNDS ARE WHAT THIS TEST NOW PINS.
+//
+// The floor exists because 4,096 sat one third of the way into an ordinary file
+// write: a 14 KB stylesheet is ~5,000 output tokens in one `write_file`, and at
+// 4,096 this endpoint discarded the whole turn silently rather than reporting
+// `length`. A run built one file of three and settled COMPLETED.
+//
+// The ceiling exists because the warning above is still true. Measured with
+// `scripts/probe-output-ceiling.mjs`, thinking off: every ordinary decision is
+// flat to within 2% from 4,096 to 16,384 — including draw-a-shape, the row that
+// regressed — but `arithmetic`, which must answer with NO tool call, went 2/3 to
+// 0/3 at 16,384. So there is a band, and this holds the value inside it.
+test("an ordinary turn is given the measured ceiling — enough to write a file, not more", async () => {
   const provider = ceilingRecordingProvider([{ text: "Done." }]);
   await new FastAgent({ provider, toolset: stubToolset(), maxSteps: 4 }).run("say hello");
 
-  assert.equal(
-    provider.ceilings[0], 4096,
-    "the eval baseline was recorded at 4,096; a turn that has not truncated must not be given more"
+  assert.ok(
+    provider.ceilings[0] >= 5000,
+    `an ordinary turn must have room to write a real file in one call — a 14 KB stylesheet is ~5,000 ` +
+    `output tokens, and this endpoint DISCARDS the turn rather than truncating it. Got ${provider.ceilings[0]}.`
+  );
+  assert.ok(
+    provider.ceilings[0] <= 8192,
+    `8,192 is the largest ceiling measured to change nothing else; at 16,384 the arithmetic case stopped ` +
+    `answering without a tool. Got ${provider.ceilings[0]}. Re-run scripts/probe-output-ceiling.mjs before raising it.`
   );
 });
 
@@ -998,6 +1016,105 @@ test("the request deadline is not shorter than the retry ceiling needs", async (
     provider.timeouts[1] >= secondsNeeded * 1000,
     `a ${retryCeiling}-token ceiling needs ~${Math.round(secondsNeeded)}s to generate, ` +
     `but the request was given ${Math.round(provider.timeouts[1] / 1000)}s`
+  );
+});
+
+// ---- The turn the endpoint threw away without saying so --------------------
+//
+// Measured against the configured endpoint 3 Sep 2026, streaming, on the real
+// decision that shipped the bug — "write the stylesheet for the page you just
+// wrote", which is ~5,000 output tokens:
+//
+//   max_tokens  4,096   21-31s, [DONE], finish_reason NULL, usage 1 token,
+//                       no tool call and no text. The turn is discarded.
+//   max_tokens 16,384   finish_reason "tool_calls", write_file, 14,647 bytes.
+//
+// `wasTruncated` cannot see the first row, so the loop read it as the model
+// having finished and settled the run COMPLETED with two of three files missing.
+// These tests pin the detector and the recovery.
+
+// A provider that can return a turn exactly as the endpoint really returned it,
+// including a null finish reason — which `scriptedProvider` cannot express,
+// because it defaults to "stop".
+function discardingProvider(turns) {
+  const ceilings = [];
+  return {
+    ceilings,
+    supportsChat: () => true,
+    async chat({ maxTokens }) {
+      ceilings.push(maxTokens);
+      const turn = turns.shift() ?? { text: "Done.", finishReason: "stop" };
+      return {
+        text: turn.text ?? "",
+        toolCalls: (turn.toolCalls ?? []).map((call, index) => ({
+          id: `call_${index}`, name: call.name, arguments: JSON.stringify(call.args ?? {})
+        })),
+        // Deliberately NOT defaulted. `null` is the value under test.
+        finishReason: turn.finishReason ?? null,
+        usage: turn.usage ?? { completion_tokens: 1 }
+      };
+    }
+  };
+}
+
+test("a turn with nothing in it and no finish reason is a discarded turn", () => {
+  assert.equal(wasDiscarded({ finishReason: null, toolCalls: [], text: "" }), true);
+  assert.equal(wasDiscarded({ finishReason: undefined, toolCalls: [], text: "  \n " }), true,
+    "whitespace is not text — the endpoint sent \"\\n\\n\" on the measured failure");
+});
+
+test("an ordinary end of turn is never mistaken for a discarded one", () => {
+  // The commonest turn there is: the model answers in words and stops. Retrying
+  // it would put an extra step on every completed conversation.
+  assert.equal(wasDiscarded({ finishReason: "stop", toolCalls: [], text: "" }), false,
+    "a provider that said how the turn ended is not hiding anything");
+  assert.equal(wasDiscarded({ finishReason: null, toolCalls: [], text: "Python 3.12 is installed." }), false,
+    "prose arrived, so the turn delivered something");
+  assert.equal(wasDiscarded({ finishReason: null, toolCalls: [{ name: "run" }], text: "" }), false,
+    "a tool call arrived, so the turn delivered something");
+});
+
+test("a discarded turn is retried with more room, not settled as an answer", async () => {
+  const provider = discardingProvider([
+    // The measured shape: nothing at all, and the endpoint will not say why.
+    { text: "", toolCalls: [], finishReason: null },
+    { text: "Wrote the stylesheet.", finishReason: "stop" }
+  ]);
+  const outcome = await new FastAgent({ provider, toolset: stubToolset(), maxSteps: 6 })
+    .run("build me a three file web app");
+
+  assert.ok(provider.ceilings.length >= 2, "a discarded turn must be retried, not settled on");
+  assert.ok(
+    provider.ceilings[1] > provider.ceilings[0],
+    `the retry must raise the ceiling — got ${provider.ceilings[0]} then ${provider.ceilings[1]}. ` +
+    "The turn was thrown away for being too large; asking again with the same room asks for the same failure."
+  );
+  assert.equal(outcome.status, "COMPLETED");
+});
+
+test("a discarded turn twice is reported, never settled COMPLETED on old prose", async () => {
+  // THE EXACT SHAPE THAT SHIPPED. A tool call succeeds, the model narrates the
+  // next file, and the turn that would have written it is discarded — twice.
+  // Settling COMPLETED here is how "Now the CSS:" became the final answer of a
+  // run that had built one file of three.
+  const provider = discardingProvider([
+    { text: "Writing the HTML.", toolCalls: [{ name: "run", args: {} }], finishReason: "tool_calls" },
+    { text: "", toolCalls: [], finishReason: null },
+    { text: "", toolCalls: [], finishReason: null }
+  ]);
+  const outcome = await new FastAgent({
+    provider,
+    toolset: stubToolset({ run: () => ({ ok: true, text: "Wrote index.html." }) }),
+    maxSteps: 8
+  }).run("build me a three file web app");
+
+  assert.equal(
+    outcome.status, "PARTIALLY_COMPLETED",
+    "a run that never got its tool call made is not a completed one, whatever the last sentence said"
+  );
+  assert.match(
+    outcome.message, /smaller pieces/,
+    "the user must be told the recovery, because the run cannot take it themselves"
   );
 });
 

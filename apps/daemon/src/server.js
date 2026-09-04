@@ -673,11 +673,19 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           sendJson(response, 400, { error: "approvalId is required." });
           return;
         }
-        const delivered = runtime.resolveApproval?.(approvalId, body?.approved === true) === true;
+        // `remember` only ever means anything alongside a yes. Sent as a
+        // separate field rather than as a third value of `approved` so an older
+        // client, which sends neither, behaves exactly as it always did.
+        const delivered = runtime.resolveApproval?.(
+          approvalId,
+          body?.approved === true,
+          body?.remember === true
+        ) === true;
         sendJson(response, delivered ? 200 : 409, {
           sessionId,
           approvalId,
           approved: body?.approved === true,
+          remember: body?.approved === true && body?.remember === true,
           delivered,
           ...(delivered ? {} : { error: "That question is no longer waiting for an answer." })
         });

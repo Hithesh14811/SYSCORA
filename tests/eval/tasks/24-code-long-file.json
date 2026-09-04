@@ -1,0 +1,17 @@
+{
+  "id": "code-read-long-file",
+  "category": "code",
+  "prompt": "In {workspace}\\big, find where MARKER_TOKEN_ZULU is defined and tell me the exact value it is set to, then change that value to 'rewritten'.",
+  "why": "A SOURCE FILE THAT DOES NOT FIT IN ONE READ. `read_file` used to hand the whole file to a 6,000-character clip — about 150 lines — with no argument that could reach line 200, so on any real repository the agent could read the top of a file and nothing else. The marker here sits at roughly line 700 of 900, which is unreachable by that route and trivial by the intended one: search_code says which line, read_file takes a window around it, edit_file changes it. The last two checks are what stop a passing run from having rewritten the file: the line count must still be 900 and the final line must still be there, so replacing a 900-line module with a four-line one that happens to contain the marker fails. NOTE: the runner verifies the MACHINE, never the agent's prose, so 'tell me the value' is not checked directly — reaching line 700 to edit it is the observable proof it got there.",
+  "timeoutMs": 300000,
+  "setup": [
+    { "run": "New-Item -ItemType Directory -Force -Path '{workspace}\\big' | Out-Null" },
+    { "run": "$lines = 1..900 | ForEach-Object { \"const filler$_ = $_;\" }; $lines[699] = 'const MARKER_TOKEN_ZULU = ''kilo-niner-four'';'; Set-Content '{workspace}\\big\\module.js' -Value $lines" }
+  ],
+  "verify": [
+    { "run": "Get-Content '{workspace}\\big\\module.js' -Raw -ErrorAction SilentlyContinue", "expect": "MARKER_TOKEN_ZULU = 'rewritten'" },
+    { "run": "Get-Content '{workspace}\\big\\module.js' -Raw -ErrorAction SilentlyContinue", "expectNot": "kilo-niner-four" },
+    { "run": "(Get-Content '{workspace}\\big\\module.js' | Measure-Object -Line).Lines", "expect": "900" },
+    { "run": "Get-Content '{workspace}\\big\\module.js' -Raw -ErrorAction SilentlyContinue", "expect": "const filler900 = 900;" }
+  ]
+}

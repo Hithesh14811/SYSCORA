@@ -174,3 +174,78 @@ export function matchFastPath(userText) {
 // Exported for the test that proves every rule is reachable and that none of
 // them overlaps another.
 export const FAST_PATH_RULES = RULES.map((rule) => rule.id);
+
+// ---------------------------------------------------------------------------
+// THE MESSAGES THAT ARE NOT REQUESTS AT ALL.
+//
+// Measured on 143 real sessions, 28 Aug – 1 Sep 2026: "hi" was sent fifteen
+// times and cost between 5,085 and 27,064 billed tokens each time, taking 1.4 to
+// 12.9 seconds. A greeting was making a round trip to a remote model, re-sending
+// the whole system prompt and a 39-tool schema, so that the model could say
+// hello back. It is the single worst cost-per-value ratio in the product.
+//
+// THIS IS THE ONE PLACE THE AGENT SPEAKS WITHOUT A TOOL, so the rule that makes
+// it safe has to be stated precisely, because the house rule it brushes against
+// — never claim something happened without evidence from a tool — is the most
+// important one there is.
+//
+// The reply is a FIXED LITERAL in this file. It is not derived from the user's
+// text, not from any observation, not from the machine. It therefore cannot
+// assert anything about the machine, and there is nothing in it that could be
+// true or false about the world — which is exactly why no evidence is needed.
+// The moment a reply here would depend on ANYTHING outside this file, it stops
+// being a greeting and belongs in the loop with a tool behind it.
+//
+// `what model are you` is deliberately NOT here: the answer depends on the
+// configuration, so it is a claim about this installation and needs a tool.
+const CONVERSATIONAL = [
+  {
+    id: "greeting",
+    pattern: /^(?:hi|hii+|hey|hello|helo|yo|hiya|howdy|good (?:morning|afternoon|evening))(?:\s+(?:there|syscora))?$/,
+    // NO STATE WORD IN HERE, and the test enforces it. An earlier draft said
+    // "open something" as an invitation; "open" is also how this agent reports
+    // that a window IS open, and a fixed literal that reads like a claim about
+    // the machine is exactly what the guard exists to keep out. Cheaper to
+    // reword the one sentence than to teach the guard about grammatical mood.
+    reply: "Hello. Tell me what you would like done on this machine — launch an app, find a file, " +
+      "look something up, draft a message — and I will get on with it."
+  },
+  {
+    id: "thanks",
+    pattern: /^(?:thanks|thank you|thx|ty|cheers|nice|great|perfect|cool|awesome)(?:\s+(?:a lot|so much|mate|syscora))?$/,
+    reply: "Any time."
+  },
+  {
+    id: "acknowledgement",
+    // "ok" on its own is the user closing a turn, not opening one. Answering it
+    // with a full model round trip is the same waste as a greeting.
+    pattern: /^(?:ok|okay|k|kk|got it|understood|right|sure|fine|alright)$/,
+    reply: "Right — say the word when you need something."
+  }
+];
+
+/**
+ * A conversational opener that needs no model and no tool, or null.
+ *
+ * Matched against the message with only case, whitespace and trailing
+ * punctuation normalised — NOT through `normalizeRequest`, which strips
+ * politeness and would reduce "thanks" to the empty string before it could
+ * match anything.
+ */
+export function matchConversational(userText) {
+  const bare = String(userText ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.!?,]+$/, "")
+    .trim();
+  // Anchored whole-message, and short. "hi, can you open spotify" is a request
+  // with a greeting on the front and must reach the loop — a router that
+  // answered the greeting and dropped the rest would be far worse than one that
+  // never fired at all.
+  if (!bare || bare.length > 30) return null;
+  const rule = CONVERSATIONAL.find((entry) => entry.pattern.test(bare));
+  return rule ? { rule: rule.id, reply: rule.reply } : null;
+}
+
+export const CONVERSATIONAL_RULES = CONVERSATIONAL.map((rule) => rule.id);

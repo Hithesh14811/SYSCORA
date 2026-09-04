@@ -68,7 +68,12 @@ test("approval is visibly waiting and resumes the exact running label", () => {
   const approval = /askApproval\(details\)\s*\{([\s\S]*?)\n  \}/.exec(demo)?.[1] ?? "";
   assert.match(approval, /Waiting for your approval/,
     "the command row claims it is running while the process has not yet crossed approval");
-  const resolved = /settleApproval\(approvalId, approved\)\s*\{([\s\S]*?)\n  \}/.exec(demo)?.[1] ?? "";
+  // The parameter list is matched loosely on purpose. What this test is about is
+  // what happens INSIDE settleApproval; pinning its exact signature meant that
+  // adding a third argument silently emptied the extracted body and failed the
+  // assertion below with a message about the live label, which is not what had
+  // changed. A body-extraction regex should locate the function, not review it.
+  const resolved = /settleApproval\([^)]*\)\s*\{([\s\S]*?)\n  \}/.exec(demo)?.[1] ?? "";
   assert.match(resolved, /runningVerbFor\(current\.capability\)/,
     "after approval the live label never returns to the operation that is now executing");
 });
@@ -265,7 +270,8 @@ test("the stream is parsed as it arrives and closed as written", () => {
     "the answer is being appended as literal characters again, and reflows in one jump at the end");
   assert.match(stream, /this\.streamText \+= text/);
 
-  const close = /_closeStream\(finalText\)\s*\{([\s\S]*?)\n  \}/.exec(demo)?.[1];
+  // Signature matched loosely, for the reason given on settleApproval above.
+  const close = /_closeStream\([^)]*\}?[^)]*\)\s*\{([\s\S]*?)\n  \}/.exec(demo)?.[1];
   assert.ok(close, "_closeStream is gone or was renamed");
   // The last painted frame may carry a closing fence this app supplied. The
   // final render must be of the text as the model actually wrote it.

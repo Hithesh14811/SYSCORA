@@ -15,6 +15,7 @@
 // this file only renders what the pipeline reports.
 
 import { readIntentSession } from "./intent-client.js";
+import { DISPLAY_LOCALE } from "./format.js";
 // THE MODEL WRITES MARKDOWN AND THIS FILE WAS SHOWING THE ASTERISKS. Every
 // answer went on screen through `textContent`, so headings, numbered steps,
 // bold names and code blocks all arrived as one wall of characters. See
@@ -1454,7 +1455,20 @@ class Turn {
   // Close the streaming block. The complete message arrives separately once the
   // model finishes its turn; when it matches what was already streamed there is
   // nothing left to draw.
-  _closeStream(finalText) {
+  // `asWorkingOut` demotes what was streamed from an answer to thinking.
+  //
+  // WHY A PARAGRAPH CHANGES MEANING DEPENDING ON WHAT CAME NEXT. Prose that ends
+  // a turn is the answer. The identical prose followed by a tool call is the
+  // model working out what to do — and the tool call carries its own `saw`/`say`,
+  // which says the same thing again in the checkable form. Left as peers, the
+  // two read as the assistant repeating itself; measured on a live run, every
+  // one of twenty-three steps was narrated twice.
+  //
+  // Nothing is deleted, because the prose is often the RICHER of the two ("the
+  // file is only 9 bytes — that's not a real MSI, likely an error page") and
+  // throwing it away to remove a duplicate would cost the user the better half.
+  // It is styled as what it is: the thought, above the decision.
+  _closeStream(finalText, { asWorkingOut = false } = {}) {
     if (!this.streamNode) return false;
     // A frame that fires after this would repaint a node that is no longer the
     // live one, and would do it from `streamText` belonging to the next turn.
@@ -1466,6 +1480,7 @@ class Turn {
     if (streamed) {
       setMarkdown(this.streamNode, streamed);
       this.streamNode.classList.remove("md-streaming");
+      if (asWorkingOut) this.streamBlock?.classList.add("thinking-aloud");
     }
     if (!streamed) this.streamBlock?.remove();
     this.streamNode = null;
@@ -1636,7 +1651,9 @@ class Turn {
     // like to somebody watching it.
     this.setStatus(runningVerbFor(capability));
     this.throttleNode = null;
-    this._closeStream(null);
+    // A tool is starting, so whatever was streamed before it was the model
+    // working out what to do — not its answer. See _closeStream.
+    this._closeStream(null, { asWorkingOut: true });
     // Whatever is still pending belongs to the round now executing; the next
     // TOOL_STREAMING starts a fresh one. See streamingStep.
     this.streamingRoundOver = true;
@@ -1847,15 +1864,43 @@ class Turn {
     const actions = el("div", "actions");
     const approve = el("button", "approve", "Allow");
     const reject = el("button", "secondary", "Don't");
+    // A THIRD ANSWER, WHEN THE SAME DECISION IS ABOUT TO BE ASKED AGAIN.
+    //
+    // Measured live, 1 Sep 2026: "can u install wsl" fired FIFTEEN of these
+    // cards across twenty-three tool calls — status, install, a dism query, four
+    // download attempts. Each one stopped the run until it was clicked, and each
+    // one was the same decision the user had already made. A gate that fires
+    // that often is one people learn to click through without reading it, which
+    // is worse than a gate that fires only on what matters.
+    //
+    // The offer is only present when the daemon sends `remember`, which
+    // shell-rules.js withholds for everything irreversible, everything with a
+    // shell separator in it, and anything that would widen to a bare
+    // executable — so this button can never appear on a delete, an uninstall or
+    // a send. The label is the daemon's, verbatim: what the user reads must be
+    // exactly the shape that will stop being asked about, or they are agreeing
+    // to something they were not shown.
+    const remember = details.remember?.label
+      ? el("button", "secondary approve-remember", `Allow, and don't ask again for ${details.remember.label}`)
+      : null;
     actions.appendChild(approve);
+    if (remember) actions.appendChild(remember);
     actions.appendChild(reject);
     card.appendChild(actions);
-    const answer = async (approved) => {
+    if (remember) {
+      // Said out loud, because "don't ask again" is the kind of phrase people
+      // read as permanent. It lasts for this conversation.
+      card.appendChild(el("p", "agent-detail approve-remember-note",
+        `"Don't ask again" applies to ${details.remember.label} commands for the rest of this chat only.`));
+    }
+    const answer = async (approved, rememberShape = false) => {
       approve.disabled = true;
       reject.disabled = true;
-      await respondToApproval(details.approvalId, approved);
+      if (remember) remember.disabled = true;
+      await respondToApproval(details.approvalId, approved, rememberShape);
     };
     approve.addEventListener("click", () => answer(true));
+    remember?.addEventListener("click", () => answer(true, true));
     reject.addEventListener("click", () => answer(false));
     this.approvals = this.approvals ?? new Map();
     this.approvals.set(details.approvalId, card);
@@ -1866,13 +1911,21 @@ class Turn {
 
   // Answered, or timed out, or the run ended. Either way the buttons stop being
   // live and the card says what was decided, because it stays in the transcript.
-  settleApproval(approvalId, approved) {
+  settleApproval(approvalId, approved, remembered = false) {
     const card = this.approvals?.get(approvalId);
     if (!card) return;
     this.approvals.delete(approvalId);
     card.querySelector(".actions")?.remove();
+    // The explanatory note belongs to the buttons; once they are gone it is
+    // describing an offer that is no longer on screen.
+    card.querySelector(".approve-remember-note")?.remove();
     card.classList.add(approved ? "approved" : "rejected");
-    card.appendChild(el("p", "agent-detail", approved ? "You allowed this." : "You said no — it was not run."));
+    card.appendChild(el("p", "agent-detail", approved
+      // WHAT WAS AGREED TO STAYS IN THE TRANSCRIPT. The card is the only record
+      // of a standing consent, so a run that stops asking has to be traceable to
+      // the moment the user said it could.
+      ? (remembered ? "You allowed this, and said not to ask again this chat." : "You allowed this.")
+      : "You said no — it was not run."));
     const current = this.pendingSteps.at(-1);
     this.setStatus(approved && current ? runningVerbFor(current.capability) : "Continuing…");
     scrollToEnd();
@@ -1907,13 +1960,15 @@ class Turn {
 // The answer travels on its own route, straight to the loop that is waiting for
 // it. A failure here is not worth surfacing: the agent times the question out on
 // its own and treats silence as no.
-async function respondToApproval(approvalId, approved) {
+async function respondToApproval(approvalId, approved, remember = false) {
   if (!runningSessionId) return;
   try {
     await fetch(`/api/intents/${encodeURIComponent(runningSessionId)}/approve`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ approvalId, approved })
+      // `remember` rides with the answer rather than as a second request, so the
+      // command and the consent to stop asking can never end up disagreeing.
+      body: JSON.stringify({ approvalId, approved, remember })
     });
   } catch { /* the question times out by itself */ }
 }
@@ -2040,7 +2095,7 @@ function handleEvent(turn, event) {
     return;
   }
   if (type === "APPROVAL_RESOLVED") {
-    return turn.settleApproval(d.approvalId, d.approved);
+    return turn.settleApproval(d.approvalId, d.approved, d.remember === true);
   }
   if (type === "AGENT_ERROR") {
     return turn.note(`Model call failed: ${d.reason ?? "unknown"} — retrying or stopping.`);
@@ -2135,9 +2190,9 @@ function renderCost(turn, metrics) {
     const cached = Number(metrics.tokensCached) || 0;
     const fresh = Number(metrics.tokensFresh) || Math.max(0, (Number(metrics.tokensIn) || 0) - cached);
     parts.push(cached > 0
-      ? `${tokens.toLocaleString()} tokens (${fresh.toLocaleString()} new in, ` +
-        `${cached.toLocaleString()} cached, ${(Number(metrics.tokensOut) || 0).toLocaleString()} out)`
-      : `${tokens.toLocaleString()} tokens (${(Number(metrics.tokensIn) || 0).toLocaleString()} in, ${(Number(metrics.tokensOut) || 0).toLocaleString()} out)`);
+      ? `${tokens.toLocaleString(DISPLAY_LOCALE)} tokens (${fresh.toLocaleString(DISPLAY_LOCALE)} new in, ` +
+        `${cached.toLocaleString(DISPLAY_LOCALE)} cached, ${(Number(metrics.tokensOut) || 0).toLocaleString(DISPLAY_LOCALE)} out)`
+      : `${tokens.toLocaleString(DISPLAY_LOCALE)} tokens (${(Number(metrics.tokensIn) || 0).toLocaleString(DISPLAY_LOCALE)} in, ${(Number(metrics.tokensOut) || 0).toLocaleString(DISPLAY_LOCALE)} out)`);
   }
   if (parts.length) turn.append(el("div", "turn-cost", parts.join(" · ")));
 }
@@ -3815,10 +3870,10 @@ function attachmentNote(file) {
   if (file.kind === "rejected") return file.error;
   if (file.kind === "image") return `image · ${humanBytes(file.bytes)}`;
   if (file.kind === "folder") {
-    return `${file.fileCount.toLocaleString()} file${file.fileCount === 1 ? "" : "s"} · ` +
+    return `${file.fileCount.toLocaleString(DISPLAY_LOCALE)} file${file.fileCount === 1 ? "" : "s"} · ` +
       (file.path ? "SYSCORA can open it where it is" : "listing only");
   }
-  return `${file.extractedBy} · ${file.text.length.toLocaleString()} characters` +
+  return `${file.extractedBy} · ${file.text.length.toLocaleString(DISPLAY_LOCALE)} characters` +
     (file.truncated ? " (clipped)" : "");
 }
 

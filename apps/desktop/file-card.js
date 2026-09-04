@@ -10,6 +10,8 @@
 // will only open a path it has seen a tool report creating; see `openableFiles`
 // in apps/daemon/src/server.js. A card is not a licence to open files.
 
+import { DISPLAY_LOCALE } from "./format.js";
+
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -73,7 +75,7 @@ export function fileCard(card, { fetchImpl = fetch } = {}) {
   const facts = [
     String(card.format ?? "").toUpperCase(),
     card.pages ? `${card.pages} page${card.pages === 1 ? "" : "s"}` : null,
-    card.words ? `${Number(card.words).toLocaleString()} words` : null,
+    card.words ? `${Number(card.words).toLocaleString(DISPLAY_LOCALE)} words` : null,
     sizeOf(card.bytes)
   ].filter(Boolean);
   body.appendChild(el("div", "file-facts", facts.join(" · ")));

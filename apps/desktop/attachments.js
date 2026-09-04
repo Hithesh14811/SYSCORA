@@ -23,6 +23,8 @@
 // A plain text file is still read here. It needs no parser, and not making a
 // round trip for it is the difference between instant and not.
 
+import { DISPLAY_LOCALE } from "./format.js";
+
 export const MAX_FILE_BYTES = 20 * 1024 * 1024;
 // Enough for a long report, bounded so one attachment cannot fill the model's
 // context and push the actual question out of it.
@@ -337,7 +339,7 @@ export function describeAttachments(attachments) {
       // complete text — but nothing in front of it said so, and a model handed
       // an unlabelled extract is right to wonder what was left out.
       const clipped = item.truncated
-        ? `\n[… the rest of ${item.name} was not sent — it is longer than ${MAX_EXTRACTED_CHARS.toLocaleString()} characters` +
+        ? `\n[… the rest of ${item.name} was not sent — it is longer than ${MAX_EXTRACTED_CHARS.toLocaleString(DISPLAY_LOCALE)} characters` +
           (item.path ? ", so read the file itself if you need the rest" : "") + "]"
         : "";
       const completeness = item.truncated
@@ -370,7 +372,7 @@ export function describeAttachments(attachments) {
       if (item.machinery?.length) {
         const total = item.machinery.reduce((sum, group) => sum + group.count, 0);
         lines.push(
-          `Not listed: ${total.toLocaleString()} generated or vendored files in ` +
+          `Not listed: ${total.toLocaleString(DISPLAY_LOCALE)} generated or vendored files in ` +
           `${item.machinery.map((group) => group.name).join(", ")}. They are still on disk.`
         );
       }
@@ -379,6 +381,20 @@ export function describeAttachments(attachments) {
       // were a third of the characters.
       lines.push(...item.entries.map((entry) => `  ${entry.path}`));
       if (item.omitted) lines.push(`  … and ${item.omitted} more files not listed here.`);
+      // A LISTING IS A MAP, NOT THE TERRITORY, AND THE MODEL HAS TO KNOW WHICH.
+      //
+      // 120 entries is a deliberate cap — somebody's project has nine thousand
+      // files and none of them is the question — but a truncated map read as a
+      // complete one is worse than no map: the agent concluded "there is no test
+      // for this" from a listing that simply stopped. Naming the two verbs that
+      // see the whole tree turns the cap from a blind spot into a starting point,
+      // and both of them default to THIS folder, so no path has to be repeated.
+      if (item.path) {
+        lines.push(
+          "This listing is a map, not everything. `find_files` and `search_code` see the whole folder " +
+          "and default to it, and `project` runs its own tests and lint."
+        );
+      }
       lines.push(`--- end of ${item.name} ---`);
       blocks.push(lines.join("\n"));
     }

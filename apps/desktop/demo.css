@@ -347,6 +347,27 @@ body {
   margin: 0 0 4px;
 }
 
+/* PROSE THAT TURNED OUT TO BE A THOUGHT, NOT AN ANSWER.
+
+   A turn that ends with prose is answering. The same prose followed by a tool
+   call is the model working out what to do — and the call carries its own
+   saw/say, which states the same decision in the checkable form. Left looking
+   identical, the two read as the assistant saying everything twice: a live run
+   on 1 Sep 2026 narrated all twenty-three of its steps that way.
+
+   Demoted rather than removed. The prose is frequently the better half ("the
+   file is only 9 bytes — that's not a real MSI"), so it keeps its place in the
+   transcript and gives up its prominence. Same treatment as .agent-observed,
+   which solves the same problem one level down. */
+.agent-says.thinking-aloud {
+  color: var(--muted);
+  font-size: 13.5px;
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  margin-bottom: 6px;
+}
+.agent-says.thinking-aloud .md { color: inherit; }
+
 /* Text still arriving. The caret is the difference between "the agent is
    thinking out loud" and "the agent has stopped mid-sentence". */
 .agent-says.streaming p { white-space: pre-wrap; }

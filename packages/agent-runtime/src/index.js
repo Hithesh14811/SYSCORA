@@ -50,7 +50,10 @@ import {
 import { summarizeReadOnlyResults } from "./read-result-summary.js";
 import { PrerequisiteResolver } from "./prerequisite-resolver.js";
 import { EnvironmentModel } from "../../context-engine/src/environment-model.js";
-import { FailureReason, FastAgent, buildToolset } from "../../fast-agent/src/index.js";
+// `FailureReason` went with the offline fallback: nothing in this file branches
+// on why the loop stopped any more, because every reason now keeps the loop's
+// own sentence. The loop still records it, and the session still carries it.
+import { FastAgent, buildToolset } from "../../fast-agent/src/index.js";
 import { deleteSkill, readSkills, recordSkillRun, writeSkill } from "../../fast-agent/src/skills.js";
 import {
   canAutoApprove,
@@ -300,10 +303,15 @@ export class AgentRuntime {
    * from a run that has since finished — so a late click cannot authorize
    * anything.
    */
-  resolveApproval(approvalId, approved) {
+  resolveApproval(approvalId, approved, remember = false) {
     const settle = this._approvals?.get(String(approvalId));
     if (!settle) return false;
-    settle(approved === true);
+    // `remember` is the user having also pressed "and don't ask again" on the
+    // card. It travels BESIDE the yes rather than as a second request, so the
+    // two can never disagree: there is no state in which the command ran and the
+    // consent to stop asking was lost, or in which the consent was recorded for
+    // something that never ran.
+    settle(approved === true, false, remember === true);
     return true;
   }
 
@@ -577,11 +585,18 @@ export class AgentRuntime {
     const askUser = (request) => new Promise((resolve) => {
       const automatic = canAutoApprove(request, accessPolicy);
       const approvalId = createId("approval");
-      const settle = (approved, automatic = false) => {
+      const settle = (approved, automatic = false, remember = false) => {
         if (!this._approvals.delete(approvalId)) return;
         clearTimeout(timer);
-        emit({ type: "APPROVAL_RESOLVED", details: { approvalId, approved, autoApproved: automatic } });
-        resolve(approved);
+        emit({
+          type: "APPROVAL_RESOLVED",
+          details: { approvalId, approved, autoApproved: automatic, remember: remember === true }
+        });
+        // AN OBJECT, NOT A BOOLEAN, because the card now carries two answers.
+        // `askPermission` in tools.js accepts either shape, so every other
+        // confirmer in the tree — the probes, the tests — keeps working
+        // unchanged and simply never sets `remember`.
+        resolve({ approved, remember: remember === true });
       };
       // Nobody answered. Not approving is the only safe reading of silence, and
       // it must not hold the run open forever.
@@ -599,7 +614,12 @@ export class AgentRuntime {
           detail: request.detail,
           timeoutMs: APPROVAL_TIMEOUT_MS,
           autoApproved: automatic,
-          approvalMode: accessPolicy.approvalMode
+          approvalMode: accessPolicy.approvalMode,
+          // WHAT THE CARD MAY ALSO OFFER TO STOP ASKING ABOUT, or absent.
+          // Decided in shell-rules.js, forwarded verbatim: the label the user
+          // reads has to be the exact shape the allowlist will match, or they
+          // are consenting to something other than what they were shown.
+          ...(request.remember ? { remember: request.remember } : {})
         }
       });
       if (automatic) settle(true, true);
@@ -694,45 +714,48 @@ export class AgentRuntime {
     // branch, because it is the only reason for which planning without a model
     // beats what the loop already has. Everything else — throttled, malformed,
     // out of budget, no evidence — keeps the loop's own honest sentence.
-    const unreachable = outcome.failureReason === FailureReason.MODEL_UNREACHABLE;
-    if (unreachable && options.fast !== true) {
-      // HOW OFTEN IS THIS ACTUALLY REACHED? production-plan.md W4.2 wants ~20,000
-      // lines of staged pipeline deleted or quarantined, and that decision should
-      // be made on a count rather than an argument. Counted per process and
-      // surfaced through the daemon so the eval can record it.
-      AgentRuntime.stagedPipelineReaches += 1;
-      emit({
-        type: "FAST_AGENT_UNAVAILABLE",
-        details: { reason: outcome.message, failureReason: outcome.failureReason }
-      });
-      const staged = await this._submitIntent(rawText, { ...options, fast: false, existingSession: session });
-      // AND IF THE FALLBACK CANNOT ANSWER EITHER, SAY THE TRUE THING.
-      //
-      // The staged pipeline plans from typed capabilities, so for a request it
-      // cannot map it does not fall silent — it maps the request to the nearest
-      // capability it has and runs that. Measured live, 16 Aug 2026: four turns
-      // in a row hit "deepseek: fetch failed" on a brief network wobble, and
-      // "is python installed?" came back as
-      //
-      //   Task 1fce993df4344396d96cb860502089b5 failed: Execution exited with
-      //   nonzero code 2316632084
-      //
-      // — a WinGet scan, a raw Win32 status and an internal GUID, for a question
-      // `python --version` answers in a second. The loop had already written the
-      // truthful message and it was thrown away to make room for that.
-      //
-      // Its successes are worth keeping: with the network genuinely down it can
-      // still describe the machine. Only its FAILURES are replaced, and only
-      // with the reason the model could not be reached.
-      if (staged?.finalResponse && staged.finalResponse.status !== "COMPLETED") {
-        staged.finalResponse = {
-          ...staged.finalResponse,
-          message: `${outcome.message}\n\nI tried to answer without the model and could not map that request ` +
-            "to something I can do offline. Nothing on the machine was changed."
-        };
-      }
-      return staged;
-    }
+    // THE STAGED PIPELINE IS NO LONGER REACHED FROM THE PRODUCT.
+    //
+    // This branch was the only route to it: when the model could not be reached,
+    // the request was re-planned from typed capabilities with no model at all.
+    // The count above it — `stagedPipelineReaches`, added expressly so the
+    // decision could be made on a number rather than an argument — answered the
+    // question it was written for:
+    //
+    //   0 of 60 runs, 19 Aug        0 of 63 runs, 21 Aug
+    //   0 of 69 runs, 22 Aug        0 of 143 real sessions, 28 Aug – 1 Sep
+    //
+    // Never once, in either the suite or five days of real use. And the two
+    // occasions it IS known to have run, it made things worse rather than
+    // better. Asked "is python installed?" on a brief network wobble it ran a
+    // WinGet package scan and answered:
+    //
+    //   Task 1fce993df4344396d96cb860502089b5 failed: Execution exited with
+    //   nonzero code 2316632084
+    //
+    // — a raw Win32 status and an internal GUID, for a question `python
+    // --version` answers in a second, replacing the truthful sentence the loop
+    // had already written. On the safety task it spent 93 further seconds
+    // re-deriving an answer that was already correct and already on screen.
+    //
+    // IT PLANS FROM TYPED CAPABILITIES, WHICH IS WHY IT CANNOT FALL SILENT. Given
+    // a request it cannot map, it does not decline — it maps it to the nearest
+    // capability it has and runs that. A fallback whose failure mode is
+    // confident nonsense is worse than no fallback, because the honest message
+    // it overwrites was the correct answer.
+    //
+    // So a request that cannot reach the model now keeps the loop's own sentence
+    // — "I could not reach the model — the connection dropped. That is the
+    // network, not the machine or the request; try again in a moment" — which is
+    // both true and actionable, and nothing on the machine is touched.
+    //
+    // WHAT IS LEFT BEHIND, DELIBERATELY. The ~15,000 lines under `_submitIntent`
+    // are now unreachable from any product route and are still in the tree. They
+    // are not deleted in this change because `_submitIntent` shares this file
+    // with the hot path, 32 test files reference it, and a deletion that large
+    // must be its own change with its own verification — mixing it in here would
+    // make any later regression impossible to attribute. `stagedPipelineReaches`
+    // stays too: it is what the eval reports, and it must keep reading 0.
 
     // COMPLETED is the only state the runtime can honestly claim here, and it
     // claims it whenever the loop finished — the model's own words say what was

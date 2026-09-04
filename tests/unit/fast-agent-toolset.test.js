@@ -22,7 +22,10 @@ function buildToolset(options) {
 }
 
 // Records what the adapter was asked to do and answers plausibly.
-function recordingAdapter() {
+// `seed` lets a test put a file of its own on this fake filesystem — used by the
+// windowed-read tests, which need a file longer than one line. Defaulted so
+// every existing caller behaves exactly as it did.
+function recordingAdapter(seed = {}) {
   const calls = [];
   // A FILESYSTEM THAT REMEMBERS WHAT WAS WRITTEN TO IT.
   //
@@ -32,6 +35,7 @@ function recordingAdapter() {
   // (the capability's input is `content`, and a caller sending `contents` wrote
   // an empty file and reported success).
   const files = new Map([["c:\\x.txt", "file body"]]);
+  for (const [path, body] of Object.entries(seed)) files.set(String(path).toLowerCase(), String(body));
   const record = (name) => (...args) => {
     calls.push({ name, args });
     if (name === "writeTextFile") {
@@ -83,8 +87,8 @@ function recordingAdapter() {
   };
 }
 
-function realToolset() {
-  const adapter = recordingAdapter();
+function realToolset({ files = {} } = {}) {
+  const adapter = recordingAdapter(files);
   const registry = createDefaultCapabilityRegistry(adapter);
   const toolset = buildToolset({ registry, adapter, basePath: "C:\\work" });
   toolset.setAccessPolicy({ developerMode: true, shellExecutionMode: "host" });
@@ -792,10 +796,62 @@ test("a command that timed out is told it may simply never have been going to ex
   assert.match(result.text, /background: true/);
 });
 
-test("reading a file returns its contents to the model", async () => {
+test("reading a file returns its contents to the model, numbered and located", async () => {
   const { toolset } = realToolset();
   const result = await toolset.execute("read_file", { path: "C:\\x.txt" });
-  assert.equal(result.text, "file body");
+  // The contents still reach the model — that is the whole job of the tool.
+  assert.match(result.text, /file body/);
+  // And now they arrive with a line number and a statement of where the window
+  // sits, which is what lets `search_code` hits and `edit_file` anchors line up
+  // against the same file. Asserted as behaviour rather than an exact string so
+  // the wording can change without a false failure.
+  assert.match(result.text, /^1\tfile body$/m);
+  assert.match(result.text, /lines 1–1 of 1/);
+});
+
+// WHAT MADE A SOURCE FILE UNREADABLE PAST ITS FIRST 150 LINES.
+//
+// `read_file` used to hand the whole file to `clip`, which cuts at 6,000
+// characters and says only "[N more characters]" — with no argument anywhere
+// that could reach line 200. These two hold the window and, more importantly,
+// hold the ROUTE OUT of it: a truncated read that does not say how to get the
+// rest is one the model treats as the whole file.
+test("a long file is read in a window, and the result says how to reach the rest", async () => {
+  const lines = Array.from({ length: 900 }, (_, index) => `line ${index + 1}`);
+  const { toolset } = realToolset({ files: { "c:\\big.js": lines.join("\n") } });
+
+  const head = await toolset.execute("read_file", { path: "C:\\big.js" });
+  assert.match(head.text, /lines 1–400 of 900/);
+  assert.match(head.text, /^400\tline 400$/m);
+  assert.doesNotMatch(head.text, /^401\t/m);
+  // The route out, naming the exact call. Without this the model cannot know
+  // there is more, let alone how to ask for it.
+  assert.match(head.text, /lines 401–900 not shown/);
+  assert.match(head.text, /read_file \{path: "C:\\big\.js", offset: 401\}/);
+
+  const tail = await toolset.execute("read_file", { path: "C:\\big.js", offset: 401 });
+  assert.match(tail.text, /lines 401–800 of 900/);
+  assert.match(tail.text, /^401\tline 401$/m);
+
+  const windowed = await toolset.execute("read_file", { path: "C:\\big.js", offset: 500, limit: 3 });
+  assert.match(windowed.text, /lines 500–502 of 900/);
+  assert.match(windowed.text, /^502\tline 502$/m);
+  assert.doesNotMatch(windowed.text, /^503\t/m);
+});
+
+// The mirror of the numbering: an anchor copied out of a numbered read carries
+// prefixes that are in no file, and the resulting failure looks like a wrong
+// snippet rather than a formatting slip.
+test("an edit anchored on numbered text is told exactly what is wrong with it", async () => {
+  const { toolset } = realToolset({ files: { "c:\\x.txt": "alpha\nbeta\ngamma" } });
+  const result = await toolset.execute("edit_file", {
+    path: "C:\\x.txt",
+    old: "2\tbeta",
+    new: "beta!"
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.text, /line-number prefixes/);
+  assert.match(result.text, /strip the leading digits and tab/);
 });
 
 test("typing and key presses reach the keyboard, clicks reach the pointer", async () => {

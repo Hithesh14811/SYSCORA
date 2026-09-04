@@ -26,9 +26,11 @@ import { isCanonicalPathInside } from "../../shared-types/src/canonical-path.js"
 import {
   classifyShellCommand,
   isPackageInstall,
+  rememberableShellShape,
   requiresClickConfirmation,
   requiresConfirmation,
   requiresSendConfirmation,
+  shellShapeIsAllowed,
   ShellVerdict
 } from "../../policy-engine/src/shell-rules.js";
 // THE BOUNDARY BETWEEN WHAT WE READ AND WHAT WE WERE ASKED.
@@ -48,6 +50,8 @@ import { buildPath, flattenPath } from "./stroke-path.js";
 import { describeMachine, readMachineProfile } from "./machine-profile.js";
 import { describeNotes, forgetNote, readNotes, rememberNote } from "./notes.js";
 import { extractDocumentText, isDocumentPath } from "./documents.js";
+import { DISPLAY_LOCALE } from "../../shared-types/src/format.js";
+import { detectProject, summariseRun } from "../../code-intel/src/project.js";
 import { DOCUMENT_FORMATS, makeDocument } from "./make-document.js";
 import { createProgressReader, reportsProgress } from "./command-progress.js";
 // Searching the web without driving a browser. See web-search.js: a search is a
@@ -1060,6 +1064,20 @@ export function buildToolset({
       shellExecutionMode: ShellExecutionMode.NONE
     }),
     approvedThisTurn: new Set(),
+    // COMMAND SHAPES THE USER HAS SAID "AND DON'T ASK ME AGAIN" ABOUT.
+    //
+    // Scoped to the CONVERSATION, not to the process: the toolset is long-lived
+    // and shared by every chat, so a Set that was never cleared would carry an
+    // answer given while working on one project into an unrelated request an
+    // hour later. `conversationKey` below is what bounds it — see beginTurn.
+    //
+    // What may go in here at all is decided by `rememberableShellShape` in
+    // shell-rules.js, next to the DENY floor and the CONFIRM table, because it
+    // is a safety rule rather than a preference.
+    shellAllowlist: new Set(),
+    // A cheap fingerprint of which conversation this is. A new chat has no
+    // history, so it fingerprints differently and the allowlist is dropped.
+    conversationKey: null,
     // The last thing typed, so a send confirmation can show it.
     lastTyped: null,
     // What the previous reading of a window looked like, so an identical one can
@@ -1138,11 +1156,28 @@ export function buildToolset({
   const askPermission = async (request) => {
     if (typeof state.confirm !== "function") return { approved: false, asked: false };
     try {
-      const approved = await state.confirm(request);
-      return { approved: approved === true, asked: true };
+      const answer = await state.confirm(request);
+      // TWO ANSWER SHAPES, BECAUSE THE OLD ONE STILL HAS TO WORK.
+      //
+      // Every existing confirmer — the runtime, five probes, four test files —
+      // returns a boolean. The card can now also offer "and don't ask again",
+      // which needs a second field, so an object answer is accepted alongside.
+      // A confirmer that knows nothing about `remember` simply never sets it,
+      // and behaves exactly as it did.
+      if (answer && typeof answer === "object") {
+        return {
+          approved: answer.approved === true,
+          // Only ever true when the user was actually OFFERED the choice. A
+          // confirmer that echoes `remember: true` on a request that carried no
+          // `remember` must not be able to create an allowlist entry.
+          remember: answer.remember === true && Boolean(request.remember),
+          asked: true
+        };
+      }
+      return { approved: answer === true, remember: false, asked: true };
     } catch {
       // Nobody answered, or the channel broke. Not approved.
-      return { approved: false, asked: true };
+      return { approved: false, remember: false, asked: true };
     }
   };
 
@@ -1159,6 +1194,29 @@ export function buildToolset({
     // The tool deliberately defaults finished documents to Downloads. It is
     // outside an attached workspace unless the user explicitly attached it.
     return path.join(os.homedir(), "Downloads", filename);
+  };
+
+  // WHERE A CODE SEARCH LOOKS WHEN NOBODY SAID.
+  //
+  // The attached folder, if there is one. That is the whole point of attaching
+  // it — the user has already answered "which project" and making the model
+  // repeat the absolute path in every call is both a chance to get it wrong and
+  // a line of prompt per search.
+  //
+  // AND A REFUSAL, NOT A GUESS, WHEN THERE IS NO FOLDER. The tempting default is
+  // the home directory, and it is the wrong one: searching a whole profile takes
+  // minutes, walks OneDrive, and returns other people's documents for a question
+  // that was about code. A refusal that names the two ways forward costs one
+  // step; a twenty-thousand-file walk costs the request.
+  const searchRoot = (requested, toolName) => {
+    const named = String(requested ?? "").trim();
+    if (named) return named;
+    const [attached] = state.accessPolicy.workspaceRoots ?? [];
+    if (attached) return attached;
+    throw new Error(
+      `${toolName} needs somewhere to look. Attach the folder with + and it becomes the default, ` +
+      "or pass `root` with the folder's path."
+    );
   };
 
   // Ask mode is deliberately broader than Balanced mode, but still pays no
@@ -1201,7 +1259,18 @@ export function buildToolset({
   };
 
   const authorizeModelShell = async ({ command, verdict }) => {
+    // ALREADY ANSWERED, THIS CONVERSATION. Checked before the card is built so
+    // the run does not stop at all — the whole point is that the fifteenth
+    // command of an install is not a fresh decision. Re-derived from the command
+    // rather than compared as text, so a remembered `npm run` cannot admit
+    // something that merely starts with those characters.
+    if (shellShapeIsAllowed(command, [], state.shellAllowlist)) return true;
+
     const critical = requiresConfirmation(command);
+    // WHAT THIS CARD MAY OFFER TO REMEMBER, or nothing. Null for everything
+    // irreversible, everything composed, and everything that would widen to a
+    // bare executable — see rememberableShellShape.
+    const shape = rememberableShellShape(command);
     const request = critical.confirm
       ? {
           kind: "command",
@@ -1215,9 +1284,14 @@ export function buildToolset({
           summary: "run a command that can change this system",
           reason: verdict?.reason || "This command is not on the read-only allow-list.",
           rule: verdict?.rule || "shell.default-ask",
-          detail: command
+          detail: command,
+          // The exact shape being offered, in the words the card will show. It
+          // must equal what the key matches, or the consent is about something
+          // other than what was agreed to.
+          ...(shape ? { remember: { key: shape.key, label: shape.label } } : {})
         };
-    const { approved } = await askPermission(request);
+    const { approved, remember } = await askPermission(request);
+    if (approved && remember && shape) state.shellAllowlist.add(shape.key);
     return approved;
   };
 
@@ -2486,7 +2560,7 @@ export function buildToolset({
       return [
         head,
         `Nothing on this page mentions ${JSON.stringify(find)} — searched all ` +
-          `${String(fetched.text ?? "").length.toLocaleString()} characters of it. The opening, so you can see ` +
+          `${String(fetched.text ?? "").length.toLocaleString(DISPLAY_LOCALE)} characters of it. The opening, so you can see ` +
           "what this page actually is:",
         clip(String(fetched.text ?? ""), 600),
         "If this is the wrong page, that is what the text above will tell you. Call web_open without `find` to " +
@@ -2495,7 +2569,7 @@ export function buildToolset({
     }
     return [
       head,
-      `Searched all ${String(fetched.text ?? "").length.toLocaleString()} characters for ${JSON.stringify(find)}.`,
+      `Searched all ${String(fetched.text ?? "").length.toLocaleString(DISPLAY_LOCALE)} characters for ${JSON.stringify(find)}.`,
       // A WEB PAGE IS THE LEAST TRUSTWORTHY THING THIS AGENT READS — the same
       // boundary a full reading gets, applied to the part that was selected.
       screenObservedContent(
@@ -3351,6 +3425,403 @@ export function buildToolset({
         }
         const details = [result.version, result.path ? `Path: ${result.path}` : null].filter(Boolean);
         return confirmed(result, `${label} is installed${details.length ? ` — ${details.join(". ")}` : "."}`);
+      }
+    },
+    {
+      name: "project",
+      // THE EDIT-RUN-READ LOOP, WHICH DID NOT EXIST.
+      //
+      // `edit_file` let the agent change code and nothing let it find out
+      // whether the change worked. So the honest end of every coding request was
+      // "I've made the change" with no evidence behind it — which is the exact
+      // claim this codebase's whole evidence layer exists to make impossible,
+      // reached by having no tool rather than by lying.
+      //
+      // AND IT IS NOT A TERMINAL. The command is resolved from the project's own
+      // manifest, so the model picks an ACTION and the repository supplies the
+      // string. `npm test` is whatever the user already wrote in package.json.
+      // A script name that is not declared is refused by name. That is why this
+      // does not need Developer terminal access: the set of runnable commands is
+      // finite, enumerable, and written by the user rather than by the model.
+      //
+      // The shell floor, the CONFIRM table and the approval card all still apply
+      // underneath, unchanged — this narrows what can be run, it does not widen
+      // who may run it.
+      description:
+        "Run this project's own checks — test, lint, build, install — resolved from its package.json, " +
+        "pyproject.toml, Cargo.toml, go.mod or Makefile. Use after editing code to find out whether it " +
+        "works. Call with no action to see what the project declares.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["inspect", "test", "lint", "build", "install", "start", "script"],
+            description: "Omit or use \"inspect\" to list what this project can run."
+          },
+          script: { type: "string", description: "With action \"script\": a name declared in the manifest." },
+          root: { type: "string", description: "The project folder. Defaults to the attached folder." },
+          timeoutMs: { type: "number", description: "Default 180000." }
+        },
+        required: []
+      },
+      preview: (args) => `${args.action ?? "inspect"}${args.script ? ` ${args.script}` : ""}`,
+      acts: true,
+      execute: async (args, { onProgress = null, signal = null } = {}) => {
+        const root = searchRoot(args.root, "project");
+        const detected = await detectProject(root);
+        if (!detected) {
+          return {
+            root,
+            detected: false,
+            evidence: evidence({
+              observed: `no package.json, pyproject.toml, Cargo.toml, go.mod or Makefile under ${root}`,
+              method: "filesystem.read",
+              verdict: REFUTED
+            })
+          };
+        }
+
+        const action = String(args.action ?? "inspect");
+        if (action === "inspect") {
+          return {
+            root, detected: true, project: detected, inspected: true,
+            evidence: evidence({
+              observed: `${detected.manifest} says this is a ${detected.kind} project` +
+                `${detected.scripts.length ? ` with ${detected.scripts.length} script(s)` : ""}`,
+              method: "filesystem.read",
+              verdict: CONFIRMED
+            })
+          };
+        }
+
+        // WHICH STRING IS ABOUT TO RUN, AND WHERE IT CAME FROM.
+        let command = null;
+        if (action === "script") {
+          const wanted = String(args.script ?? "").trim();
+          if (!wanted) throw new Error("project needs a `script` name when action is \"script\".");
+          if (!detected.invoke || !detected.scripts.includes(wanted)) {
+            // Named, not paraphrased: the model's next move is to pick one of
+            // these, and it can only do that if it can read them.
+            throw new Error(
+              `${detected.manifest} declares no script called "${wanted}". It declares: ` +
+              `${detected.scripts.length ? detected.scripts.join(", ") : "none"}. ` +
+              "Only a script the project itself declares can be run."
+            );
+          }
+          command = detected.invoke(wanted);
+        } else {
+          command = detected.commands[action] ?? null;
+          if (!command) {
+            throw new Error(
+              `This ${detected.kind} project declares no way to ${action}. ` +
+              `${detected.scripts.length
+                ? `Its scripts are: ${detected.scripts.join(", ")} — run one with action "script".`
+                : `Its manifest is ${detected.manifest}.`}`
+            );
+          }
+        }
+
+        // Everything below is the ordinary shell boundary, unchanged. A command
+        // from a manifest is still a command.
+        const shellVerdict = classifyShellCommand(command);
+        if (shellVerdict.verdict === ShellVerdict.DENY) {
+          return {
+            root, command, blocked: true, project: detected,
+            stderr: shellVerdict.reason ?? "refused by the command floor",
+            evidence: evidence({
+              observed: `the shell floor refused ${command}`, method: "shell-rules", verdict: REFUTED
+            })
+          };
+        }
+        if (shellVerdict.verdict === ShellVerdict.ASK) {
+          const approved = await authorizeModelShell({ command, verdict: shellVerdict });
+          if (!approved) {
+            return {
+              root, command, refusedByUser: true, project: detected,
+              evidence: evidence({
+                observed: "the user answered NO to the approval card, so nothing ran",
+                method: "user.approval",
+                verdict: REFUTED
+              })
+            };
+          }
+        }
+
+        const result = await adapter.executeCommand(root, command, [], {
+          timeoutMs: Number(args.timeoutMs) || 180000,
+          shellOrigin: "model",
+          authorizationCommand: command,
+          accessPolicy: state.accessPolicy,
+          // Already answered above; the adapter boundary must not ask twice.
+          authorizeShell: async () => true,
+          ...(signal ? { signal } : {}),
+          ...(onProgress
+            ? {
+              onOutput: ({ text }) => {
+                const line = String(text ?? "").split(/[\r\n]+/).map((part) => part.trim()).filter(Boolean).at(-1);
+                if (line) onProgress({ percent: null, phase: command, label: clip(line, 120) });
+              }
+            }
+            : {})
+        });
+
+        const summary = summariseRun({
+          stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode
+        });
+        return {
+          ...result,
+          root,
+          command,
+          action,
+          project: detected,
+          summary,
+          evidence: evidence({
+            // THE EXIT CODE IS THE VERDICT. Not the presence of the word
+            // "error" in the output, which appears in filenames and in passing
+            // tests named after errors, and not the model's reading of the log.
+            observed: `\`${command}\` exited ${result.exitCode} in ${root}`,
+            method: "command.run:process-exit",
+            verdict: result.timedOut ? UNCONFIRMED : CONFIRMED
+          })
+        };
+      },
+      failed: (result) => result.blocked === true || result.refusedByUser === true || result.detected === false,
+      render: (result) => {
+        if (result.detected === false) {
+          return refuted(result, `${result.root} is not a project I know how to run — there is no ` +
+            "package.json, pyproject.toml, Cargo.toml, go.mod or Makefile in it. Check the folder, or " +
+            "run the command yourself with `run` if the terminal is available.");
+        }
+        if (result.refusedByUser) {
+          return refuted(result, `The user was asked before running \`${result.command}\` and said NO. ` +
+            "It has NOT run. Carry on without it and say plainly what you could not check.");
+        }
+        if (result.blocked) {
+          return refuted(result, `REFUSED: ${result.stderr}. This is a decision, not an obstacle — ` +
+            "do not look for another way to run the same thing.");
+        }
+        if (result.inspected) {
+          const project = result.project;
+          const runnable = Object.entries(project.commands)
+            .filter(([, command]) => command)
+            .map(([name, command]) => `  ${name}: ${command}`);
+          return confirmed(result, [
+            `${project.root} is a ${project.kind} project (${project.manifest}` +
+              `${project.runner ? `, ${project.runner}` : ""}).`,
+            runnable.length ? `Actions available:\n${runnable.join("\n")}` : "It declares nothing runnable.",
+            project.scripts.length ? `Scripts it declares: ${project.scripts.join(", ")}` : null
+          ].filter(Boolean).join("\n"));
+        }
+        if (result.timedOut) {
+          return unconfirmed(result, `\`${result.command}\` was still running at the timeout, so whether it ` +
+            `passes is UNKNOWN — not failed.\n${result.summary?.text ?? ""}`);
+        }
+        // PASSING AND FAILING ARE BOTH ANSWERS, AND BOTH ARE CONFIRMED. A test
+        // suite that exits 1 has not failed to run; it has run and told the
+        // truth, and that is the most useful result this tool produces.
+        const verdict = result.exitCode === 0
+          ? `\`${result.command}\` passed (exit 0).`
+          : `\`${result.command}\` FAILED with exit ${result.exitCode}. That is the project's own verdict on ` +
+            "the current code — fix what it names rather than re-running it unchanged.";
+        return confirmed(result, [verdict, result.summary?.text].filter(Boolean).join("\n\n"));
+      }
+    },
+    {
+      name: "git",
+      // "WHAT DID I ACTUALLY CHANGE?" HAD NO ANSWER.
+      //
+      // `github` reads repositories on github.com. Nothing read the one on this
+      // disk. So after editing four files the agent could not see its own diff,
+      // could not tell which changes were already committed, and could not
+      // answer "what is uncommitted here" — the first question of any real piece
+      // of work on a repository. The only route was `run`, and the terminal is
+      // OFF by default, which is exactly the situation `project` was built for.
+      //
+      // READ-ONLY, AND THAT IS A DESIGN DECISION RATHER THAN A FIRST VERSION.
+      //
+      // The actions here all ANSWER a question. None of them change the
+      // repository: no commit, no push, no checkout, no reset, no stash, no
+      // clean. Those are either irreversible or they move work the user has not
+      // finished, and this codebase already draws that line in one place — the
+      // agent drafts and a person sends. A model that can read the diff can do
+      // the whole of code review, debugging and self-verification, which is what
+      // was missing; a model that can `git reset --hard` can lose someone's day.
+      //
+      // THE MODEL NEVER COMPOSES THE COMMAND, which is the same safety property
+      // `project` has. The action picks a fixed string from the table below. The
+      // only caller-supplied fragment is a path, and it is checked against a
+      // strict shape AND the composed line still goes through the shell floor —
+      // so a path carrying a semicolon is refused twice, by different code.
+      description:
+        "Read this repository: what has changed, the diff, recent commits, the current branch. " +
+        "Use after editing to see exactly what you changed. Read-only — it cannot commit or push.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["status", "diff", "log", "branch", "show"],
+            description: "Default \"status\"."
+          },
+          path: { type: "string", description: "Limit to one file or folder." },
+          staged: { type: "boolean", description: "With \"diff\": what is staged rather than what is not." },
+          ref: { type: "string", description: "With \"show\": a commit. Defaults to the newest." },
+          root: { type: "string", description: "The repository. Defaults to the attached folder." },
+          max: { type: "number", description: "With \"log\": how many commits. Default 20, up to 100." }
+        },
+        required: []
+      },
+      preview: (args) => `${args.action ?? "status"}${args.path ? ` ${args.path}` : ""}`,
+      // It reads; it does not act. Same as `screen` and `read_file`: the output
+      // IS the machine's answer, so there is nothing separate to verify with.
+      acts: false,
+      execute: async (args, { signal = null } = {}) => {
+        const root = searchRoot(args.root, "git");
+        // A REPOSITORY IS A FACT ABOUT THE DISK, CHECKED BEFORE ANYTHING RUNS.
+        // Without this, every action fails with git's own "not a git repository"
+        // on stderr and exit 128, which reads like a broken tool rather than the
+        // ordinary answer that this folder is not version-controlled.
+        const insideRepo = await fs.stat(path.join(root, ".git")).then(() => true).catch(() => false);
+        if (!insideRepo) {
+          return {
+            root, detected: false,
+            evidence: evidence({
+              observed: `no .git directory in ${root}`, method: "filesystem.read", verdict: REFUTED
+            })
+          };
+        }
+
+        const action = String(args.action ?? "status");
+        // A PATH IS THE ONLY THING THE CALLER CONTRIBUTES, so it is the only
+        // thing that can carry an attack. Anything that could end this command
+        // and begin another is refused by shape, before composition — and the
+        // composed line is checked again by the floor below.
+        const wantedPath = String(args.path ?? "").trim();
+        if (wantedPath && /["'`;|&$<>\n\r\\]|\.\./.test(wantedPath)) {
+          throw new Error(
+            `"${wantedPath}" is not a plain path. Give one file or folder, relative to the repository, ` +
+            "with no quotes, separators or ..");
+        }
+        const scope = wantedPath ? ` -- "${wantedPath}"` : "";
+        const max = Math.min(100, Math.max(1, Math.trunc(Number(args.max)) || 20));
+        const ref = String(args.ref ?? "").trim();
+        if (ref && !/^[A-Za-z0-9._/-]{1,64}$/.test(ref)) {
+          throw new Error(`"${ref}" is not a commit or branch name.`);
+        }
+
+        const commands = {
+          // --short --branch is the shape a person reads: one line per file,
+          // with the branch and its tracking state on top.
+          status: `git status --short --branch${scope}`,
+          // THE REAL PATCH, NOT `--stat`.
+          //
+          // The first version of this used `--stat`, which lists filenames and
+          // change counts and NONE of the changed lines — so "review my changes"
+          // got a table of numbers and the model had to go and read every file
+          // again to see what was in them. A diff whose content is missing is
+          // not a diff. It is clipped by length below instead, which loses the
+          // tail of a huge change rather than all of every change.
+          diff: `git diff${args.staged === true ? " --staged" : ""} --find-renames${scope}`,
+          log: `git log --oneline --decorate -n ${max}${scope}`,
+          branch: "git branch --show-current",
+          show: `git show --stat --find-renames ${ref || "HEAD"}${scope}`
+        };
+        const command = commands[action];
+        if (!command) throw new Error(`git has no action "${action}".`);
+
+        // The same boundary `project` uses. A read-only git command is ALLOW on
+        // the floor, so this normally passes straight through — it is here so
+        // that a path which somehow reached this point cannot become a second
+        // command, and so that the floor stays the one place that decides.
+        const shellVerdict = classifyShellCommand(command);
+        if (shellVerdict.verdict === ShellVerdict.DENY) {
+          return {
+            root, command, blocked: true,
+            stderr: shellVerdict.reason ?? "refused by the command floor",
+            evidence: evidence({
+              observed: `the shell floor refused ${command}`, method: "shell-rules", verdict: REFUTED
+            })
+          };
+        }
+
+        const result = await adapter.executeCommand(root, command, [], {
+          timeoutMs: 30000,
+          // NOT "model": the model chose an action, not a command. The adapter
+          // re-checks that this classifies ALLOW before honouring the label, so
+          // saying it here cannot smuggle a mutating command past the developer
+          // switch — see the gate in windows-adapter.js.
+          shellOrigin: "readonly-verb",
+          authorizationCommand: command,
+          accessPolicy: state.accessPolicy,
+          // Read-only and enumerated, so there is nothing here for a person to
+          // decide. `project` asks because it can run arbitrary manifest
+          // scripts; this cannot run anything that is not in the table above.
+          authorizeShell: async () => true,
+          ...(signal ? { signal } : {})
+        });
+        // NOT `summariseRun`, WHICH IS FOR TEST LOGS.
+        //
+        // That helper keeps the lines that look like failures and the tail. On a
+        // diff every one of those rules is wrong: `- throw new Error(` is a line
+        // being DELETED, not a failure, and the tail of a patch is the last file
+        // alphabetically rather than the conclusion. A diff is read top to
+        // bottom, so it is clipped from the end and the caller is told to
+        // narrow.
+        const body = [String(result.stdout ?? ""), String(result.stderr ?? "")]
+          .filter((part) => part.trim()).join("\n");
+        return {
+          ...result, root, command, action,
+          output: clip(body, 6000),
+          clipped: body.length > 6000,
+          evidence: evidence({
+            observed: `\`${command}\` exited ${result.exitCode} in ${root}`,
+            method: "command.run:process-exit",
+            verdict: result.timedOut ? UNCONFIRMED : CONFIRMED
+          })
+        };
+      },
+      failed: (result) => result.detected === false || result.blocked === true,
+      render: (result) => {
+        if (result.detected === false) {
+          return refuted(result, `${result.root} is not a git repository — there is no .git in it. ` +
+            "If the code you want is somewhere else, pass `root`.");
+        }
+        if (result.blocked) {
+          return refuted(result, `REFUSED: ${result.stderr}. This is a decision, not an obstacle.`);
+        }
+        if (result.timedOut) {
+          return unconfirmed(result, `\`${result.command}\` was still running at the timeout, so what it ` +
+            "would have said is UNKNOWN.");
+        }
+        // A NON-ZERO EXIT IS AN ANSWER, NOT A REFUTATION — the same rule
+        // `project` follows. git said something and it is true: "not a
+        // repository", "unknown revision", "bad path". Calling `refuted` here
+        // threw an EvidenceError, because the receipt correctly says CONFIRMED:
+        // the process ran and its exit code was observed. Caught by the evidence
+        // layer the first time this tool was exercised, which is what it is for.
+        if (result.exitCode !== 0) {
+          return confirmed(result, `\`${result.command}\` exited ${result.exitCode} — git refused that. ` +
+            `Read what it says rather than running it again unchanged.\n${result.output ?? ""}`);
+        }
+        // A CLEAN TREE IS AN ANSWER, AND AN EMPTY STRING IS NOT.
+        //
+        // `git status --short` on an unmodified repository prints the branch
+        // line and nothing else, and `git diff` prints nothing at all. Handed
+        // back as "" that reads as a tool that failed, and the model goes
+        // looking for another way to ask — so it is said in words instead.
+        const body = String(result.output ?? "").trim();
+        if (!body) {
+          return confirmed(result, result.action === "diff"
+            ? `Nothing has changed${result.staged ? " in the staged changes" : ""} — the diff is empty.`
+            : `\`${result.command}\` produced no output, which means there is nothing to report.`);
+        }
+        return confirmed(result, [
+          `${result.command}\n${body}`,
+          result.clipped
+            ? "\n… the rest was cut. Narrow it with `path` to see one file's changes in full."
+            : null
+        ].filter(Boolean).join("\n"));
       }
     },
     {
@@ -5536,6 +6007,148 @@ export function buildToolset({
       }
     },
     {
+      name: "find_files",
+      // THERE WAS NO WAY TO FIND A FILE WITHOUT A TERMINAL.
+      //
+      // The filesystem verbs were read, write and stat. `filesystem.search`
+      // existed as a capability and no tool ever exposed it, so "where is the
+      // file that does X" had exactly one route — PowerShell, which is OFF by
+      // default and which this prompt tells the model to prefer a typed tool
+      // over. Handed a project folder, the agent could open files it had been
+      // told the names of and nothing else.
+      description:
+        "Find files by name or glob under a folder — `**/*.test.js`, `README*`, `src/**/*.{ts,tsx}`. " +
+        "Skips node_modules, build output and anything the project's .gitignore excludes.",
+      parameters: {
+        type: "object",
+        properties: {
+          glob: { type: "string", description: "A name or glob. A bare name matches anywhere in the tree." },
+          root: { type: "string", description: "Where to look. Defaults to the attached folder." },
+          max: { type: "number", description: "Up to 200. Default 60." }
+        },
+        required: ["glob"]
+      },
+      preview: (args) => String(args.glob ?? ""),
+      acts: false,
+      execute: async (args) => {
+        const root = searchRoot(args.root, "find_files");
+        const found = await runCapability("filesystem.findFiles", {
+          rootDirectory: root, glob: String(args.glob ?? ""), max: args.max
+        });
+        return {
+          ...found,
+          evidence: evidence({
+            observed: `${found.files.length} file(s) match ${found.glob} under ${found.root}, ` +
+              `from ${found.filesScanned} scanned`,
+            method: "filesystem.findFiles",
+            verdict: CONFIRMED
+          })
+        };
+      },
+      render: (result) => {
+        // FINDING NOTHING IS AN ANSWER, AND IT HAS TO READ LIKE ONE. A search
+        // that correctly reports no match is not a failure, and rendering it as
+        // one is how a working tool teaches the model to go and try PowerShell.
+        if (!result.files.length) {
+          return reported(result, `No file matches ${result.glob} under ${result.root} ` +
+            `(${result.filesScanned} files searched). ` +
+            (result.scanLimited
+              ? "The walk hit its own limit before covering everything — search a narrower folder."
+              : "That folder really does not contain one. Try a different pattern or a wider root."));
+        }
+        const lines = result.files.map((file) => `  ${file.relative}${file.size == null ? "" : `  (${file.size} bytes)`}`);
+        return reported(result, [
+          `${result.files.length} file(s) under ${result.root}:`,
+          lines.join("\n"),
+          result.truncated ? "…more matched than are shown — narrow the pattern if you need the rest." : null
+        ].filter(Boolean).join("\n"));
+      }
+    },
+    {
+      name: "search_code",
+      // WHERE IS THIS DEFINED, AND WHAT USES IT.
+      //
+      // The single most common question anybody has about a codebase, and there
+      // was no verb for it at all. Without this the agent reads whole files to
+      // find one line — measured elsewhere in this file at ~500 tokens for a
+      // small source file and far more for a real one — or it gives up and
+      // announces a plan, which is the behaviour `edit_file` was added to fix.
+      description:
+        "Search file CONTENTS under a folder. Returns each matching line with its file and line number. " +
+        "Use this to find where something is defined or used before reading whole files.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Text to find. Literal unless `regex` is set." },
+          root: { type: "string", description: "Where to look. Defaults to the attached folder." },
+          glob: { type: "string", description: "Only search files matching this, e.g. `**/*.py`" },
+          regex: { type: "boolean", description: "Read `query` as a regular expression" },
+          context: { type: "number", description: "Lines of surrounding code, 0-4. Default 0." },
+          max: { type: "number", description: "Up to 200. Default 60." }
+        },
+        required: ["query"]
+      },
+      preview: (args) => String(args.query ?? ""),
+      acts: false,
+      execute: async (args) => {
+        const root = searchRoot(args.root, "search_code");
+        const found = await runCapability("filesystem.searchCode", {
+          rootDirectory: root,
+          query: String(args.query ?? ""),
+          regex: args.regex === true,
+          glob: args.glob ?? null,
+          max: args.max,
+          context: args.context
+        });
+        return {
+          ...found,
+          evidence: evidence({
+            observed: `${found.matches.length} match(es) for ${JSON.stringify(found.query)} in ` +
+              `${found.fileCount} of ${found.filesRead} file(s) read under ${found.root}`,
+            method: "filesystem.searchCode",
+            verdict: CONFIRMED
+          })
+        };
+      },
+      render: (result) => {
+        if (!result.matches.length) {
+          return reported(result, `Nothing under ${result.root} contains ${JSON.stringify(result.query)} ` +
+            `(${result.filesRead} files read${result.glob ? `, matching ${result.glob}` : ""}). ` +
+            "It is genuinely not there — try a shorter fragment, or drop the glob.");
+        }
+        // GROUPED BY FILE, BECAUSE THAT IS HOW THE ANSWER IS USED. Forty flat
+        // lines repeating the same path is forty copies of that path in the
+        // prompt, and it hides the shape of the answer — which files this lives
+        // in is usually more useful than which lines.
+        const byFile = new Map();
+        for (const match of result.matches) {
+          if (!byFile.has(match.relative)) byFile.set(match.relative, []);
+          byFile.get(match.relative).push(match);
+        }
+        const blocks = [...byFile].map(([file, hits]) => {
+          const lines = hits.map((hit) => [
+            ...(hit.before ?? []).map((line, index) => `  ${hit.line - (hit.before.length - index)}- ${line}`),
+            `  ${hit.line}: ${hit.text}`,
+            ...(hit.after ?? []).map((line, index) => `  ${hit.line + index + 1}- ${line}`)
+          ].join("\n"));
+          return `${file}\n${lines.join("\n")}`;
+        });
+        // The contents of somebody's files, which is exactly where an
+        // instruction aimed at the agent hides. Same notice as read_file.
+        const notice = screenObservedContent(
+          result.matches.map((match) => match.text).join("\n"),
+          `files under ${result.root}`
+        );
+        return reported(result, [
+          notice,
+          `${result.matches.length} match(es) in ${byFile.size} file(s), ${result.filesRead} searched:`,
+          blocks.join("\n\n"),
+          result.truncated ? "…more matched than are shown — narrow with `glob` or a longer query." : null,
+          result.scanLimited ? "The walk hit its own limit before covering everything." : null
+        ].filter(Boolean).join("\n\n"));
+      }
+    },
+    {
       name: "read_file",
       // A .docx IS A FILE THE USER WILL ASK ABOUT.
       //
@@ -5543,9 +6156,41 @@ export function buildToolset({
       // spreadsheet, deck or bank statement handed the model the raw bytes of a
       // zip archive. It read that as a corrupt file and said so — about a
       // document that opens perfectly in Word.
+      // A SOURCE FILE WAS UNREADABLE PAST ITS FIRST 150 LINES.
+      //
+      // This returned the whole file through `clip`, which cuts at 6,000
+      // characters — about 150 lines of code — and said only "[N more
+      // characters]". There was no argument that could reach line 200. So on any
+      // real repository the agent could read the top of a file and NOTHING else,
+      // and `search_code` telling it the interesting line was 6,326 was useless
+      // because nothing could then go and look at 6,326. That is the difference
+      // between an assistant that can open files and one that can work on code.
+      //
+      // LINE NUMBERS ARE THE OTHER HALF, AND THEY ARE NOT DECORATION.
+      //
+      // `search_code` reports hits as `6326: name: "edit_file",` and `edit_file`
+      // needs a snippet copied EXACTLY. Without numbers in the read, the model
+      // cannot tell which of four similar-looking blocks it is looking at, and
+      // cannot say where a window it just read sits in the file. Numbering the
+      // window is what makes the three code verbs compose.
+      //
+      // The numbers are stripped by nothing — `edit_file` matches on file
+      // content, so the model must copy the text AFTER the `\t`. That is stated
+      // in the result rather than the schema, where it is read at the moment it
+      // matters and costs nothing the rest of the time.
       description:
-        "Read a file's text. Handles Word, Excel, PowerPoint and PDF documents as well as plain text.",
-      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+        "Read a file's text, numbered by line. Handles Word, Excel, PowerPoint and PDF documents as " +
+        "well as plain text. Use `offset`/`limit` to read a window of a long file — the result says " +
+        "how to reach the rest.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          offset: { type: "number", description: "First line to read, 1-based. Default 1." },
+          limit: { type: "number", description: "How many lines. Default 400, up to 2000." }
+        },
+        required: ["path"]
+      },
       preview: (args) => args.path,
       acts: false,
       execute: async (args) => {
@@ -5553,11 +6198,31 @@ export function buildToolset({
         if (!isDocumentPath(filePath)) {
           const read = await runCapability("filesystem.read", { filePath });
           const body = String(read?.contents ?? read?.content ?? "");
+          // Split once, here, so the evidence sentence and the render agree
+          // about how many lines the file has. Two separate splits drifted
+          // apart the first time this was written.
+          const lines = body.split(/\r?\n/);
+          // A file ending in a newline splits to a trailing "" that is not a
+          // line anybody wrote. Counting it made "1,204 lines" out of 1,203 and
+          // put an empty numbered row at the end of every window.
+          if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+          const totalLines = lines.length;
+          const start = Math.max(1, Math.trunc(Number(args.offset)) || 1);
+          const limit = Math.min(2000, Math.max(1, Math.trunc(Number(args.limit)) || 400));
+          const window = lines.slice(start - 1, start - 1 + limit);
           return {
             ...read,
             filePath,
+            totalLines,
+            firstLine: start,
+            lastLine: start + window.length - 1,
+            windowText: window.map((line, index) => `${start + index}\t${line}`).join("\n"),
+            // The un-numbered text of this window, which is what the injection
+            // scan must see: a line number prefixed onto somebody else's
+            // instruction does not make it less of an instruction.
+            windowBody: window.join("\n"),
             evidence: evidence({
-              observed: `${filePath} holds ${body.length} characters`,
+              observed: `${filePath} holds ${totalLines} lines; read ${window.length} from line ${start}`,
               method: "filesystem.read",
               verdict: CONFIRMED
             })
@@ -5586,8 +6251,39 @@ export function buildToolset({
         // them reach here because the user asked what is IN them, which is
         // exactly the opening an instruction hidden in one is waiting for.
         const body = result.document ? result.text : (result.contents ?? result.content ?? "");
-        const notice = screenObservedContent(body, `the file ${result.filePath}`);
-        if (!result.document) return reported(result, [notice, clip(body ?? "")].filter(Boolean).join("\n\n"));
+        // Scanned on the window's OWN text, not the whole file: an instruction
+        // 4,000 lines below what was read is not something this reading handed
+        // to the model, and warning about it here would train the warning to be
+        // ignored. `windowBody` is that text without the line numbers.
+        const notice = screenObservedContent(
+          result.document ? body : (result.windowBody ?? body),
+          `the file ${result.filePath}`
+        );
+        if (!result.document) {
+          const total = Number(result.totalLines ?? 0);
+          const last = Number(result.lastLine ?? 0);
+          const first = Number(result.firstLine ?? 1);
+          // WHAT TO CALL NEXT, IN THE RESULT, WHERE IT IS READ AT THE MOMENT IT
+          // MATTERS. The old ending — "[N more characters]" — named a problem
+          // and no route out of it.
+          const more = total > last
+            ? `\n… lines ${last + 1}–${total} not shown. ` +
+              `Read them with read_file {path: "${result.filePath}", offset: ${last + 1}}.`
+            : "";
+          const heading = total > 0
+            ? `${result.filePath} — lines ${first}–${last} of ${total}:`
+            : `${result.filePath} is empty.`;
+          // NOTHING HERE EXPLAINS THE LINE NUMBERS, ON PURPOSE.
+          //
+          // The first version ended every read with a sentence saying the "N\t"
+          // prefix is not part of the file. That is ~25 tokens on every read of
+          // every file for the whole session, to prevent a mistake that has one
+          // obvious symptom — `edit_file` reporting the anchor is not in the
+          // file. So the warning lives in THAT failure instead, where it is read
+          // at the moment it matters and costs nothing the rest of the time.
+          return reported(result, [notice, heading, result.windowText || null, more || null]
+            .filter(Boolean).join("\n"));
+        }
         if (!result.text) {
           return refuted(result, `${result.filePath} could not be read as text: ${result.reason}.\n` +
             "If you need what is in it, open it in the application that owns it and read the screen.");
@@ -5922,19 +6618,51 @@ export function buildToolset({
       // Replacing a named piece is the operation that was missing, and it is also
       // the safe one: it fails when the text is not found or is ambiguous, so it
       // cannot silently write over the wrong part of the file.
+      // SEVERAL CHANGES TO ONE FILE ARE ONE DECISION, SO THEY ARE ONE CALL.
+      //
+      // Renaming a symbol, adding an import and using it, fixing three call
+      // sites — each of those was a separate round trip that re-read the file it
+      // had just written. A step on this endpoint costs ~7,000 billed tokens
+      // before it does anything, so a five-part refactor was ~35,000 tokens of
+      // overhead for about forty characters of change.
+      //
+      // ALL OR NOTHING, and that is the safety property rather than a nicety.
+      // Applied one at a time, edit 3 of 5 failing leaves the file half-migrated
+      // — compiling against neither the old shape nor the new one — and the
+      // model then has to work out which of its own edits landed. Every edit is
+      // resolved against the content as it stands before anything is written, so
+      // a failure changes no bytes at all.
       description:
         "Change part of a text file by replacing an exact snippet — use this rather than rewriting the " +
         "whole file. `old` must appear EXACTLY once; include surrounding lines to make it unique. To " +
-        "insert, make `old` the line to insert after and repeat it at the start of `new`.",
+        "insert, make `old` the line to insert after and repeat it at the start of `new`. Pass `edits` " +
+        "to make several changes to the same file in one call; they all apply or none do.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string" },
           old: { type: "string", description: "The exact text to replace, copied from the file" },
           new: { type: "string", description: "What to put in its place" },
-          all: { type: "boolean", description: "Replace every occurrence instead of requiring exactly one" }
+          all: { type: "boolean", description: "Replace every occurrence instead of requiring exactly one" },
+          edits: {
+            type: "array",
+            description: "Several changes to this file, applied in order. Use instead of old/new.",
+            items: {
+              type: "object",
+              properties: {
+                old: { type: "string" },
+                new: { type: "string" },
+                all: { type: "boolean" }
+              },
+              required: ["old", "new"]
+            }
+          }
         },
-        required: ["path", "old", "new"]
+        // `old` and `new` are no longer required, because `edits` replaces them.
+        // A schema cannot say "one of these two shapes", so the check is in
+        // execute() where it can say which one is missing — see the refusal
+        // there. Guidance in a description would not have held.
+        required: ["path"]
       },
       preview: (args) => args.path,
       acts: true,
@@ -5944,48 +6672,96 @@ export function buildToolset({
           .then((result) => String(result?.contents ?? result?.content ?? ""))
           .catch(() => null);
         if (current === null) throw new Error(`${filePath} could not be read — check the path.`);
-        const old = String(args.old ?? "");
-        if (!old) throw new Error("edit_file needs `old`: the exact text to replace.");
-        const occurrences = current.split(old).length - 1;
-        if (occurrences === 0) {
-          // A near miss is nearly always whitespace or a line the model
-          // reconstructed from memory rather than copied. Saying which line it
-          // got closest to turns a dead end into a correction.
-          // Ranked by how much of the anchor's first line they share, because a
-          // miss is almost always a small difference — one changed character, a
-          // reflowed argument, indentation — and a substring test finds none of
-          // those. What the model needs is the line it MEANT, printed exactly.
-          const firstLine = old.split(/\r?\n/)[0].trim();
-          const tokens = (value) => new Set(String(value).toLowerCase().match(/[a-z0-9_$]+/g) ?? []);
-          const wanted = tokens(firstLine);
-          const near = wanted.size === 0 ? [] : current.split(/\r?\n/)
-            .map((line, index) => {
-              const actual = tokens(line);
-              const shared = [...wanted].filter((token) => actual.has(token)).length;
-              return { line, index, overlap: shared / wanted.size };
-            })
-            .filter((entry) => entry.overlap >= 0.5 && entry.line.trim())
-            .sort((left, right) => right.overlap - left.overlap)
-            .slice(0, 3)
-            .map(({ line, index }) => `  line ${index + 1}: ${line.trim().slice(0, 120)}`);
+
+        const batched = Array.isArray(args.edits) && args.edits.length > 0;
+        const requested = batched
+          ? args.edits.map((edit) => ({
+            old: String(edit?.old ?? ""),
+            replacement: String(edit?.new ?? ""),
+            all: edit?.all === true
+          }))
+          : [{ old: String(args.old ?? ""), replacement: String(args.new ?? ""), all: args.all === true }];
+
+        if (!batched && !requested[0].old) {
           throw new Error(
-            `That text is not in ${filePath}, so nothing was changed.` +
-            (near.length
-              ? `\nThe closest lines actually in the file are:\n${near.join("\n")}\n` +
-                "Copy the text exactly as it appears — indentation and all."
-              : "\nRead the file again and copy the snippet exactly, including indentation.")
+            "edit_file needs either `old` and `new`, or an `edits` array of {old, new}. Nothing was changed."
           );
         }
-        if (occurrences > 1 && args.all !== true) {
-          throw new Error(
-            `That text appears ${occurrences} times in ${filePath}, so it is ambiguous and nothing was ` +
-            "changed. Include more of the surrounding lines to pick out the one you mean, or pass " +
-            "all: true to change every one."
-          );
+
+        // Resolved against the running content so an edit can legitimately
+        // depend on an earlier one, and so the near-miss ranker below reports
+        // the file as it will actually be when this edit is applied — not as it
+        // was before the batch started.
+        let next = current;
+        let firstAnchorOffset = null;
+        let replacements = 0;
+
+        for (const [index, edit] of requested.entries()) {
+          // Which edit, when there are several. "That text is not in the file"
+          // about one of five is a message the model cannot act on.
+          const which = batched ? ` (edit ${index + 1} of ${requested.length})` : "";
+          if (!edit.old) {
+            throw new Error(`Edit ${index + 1} has no \`old\` text to replace. Nothing was changed.`);
+          }
+          const occurrences = next.split(edit.old).length - 1;
+          if (occurrences === 0) {
+            // A near miss is nearly always whitespace or a line the model
+            // reconstructed from memory rather than copied. Saying which line it
+            // got closest to turns a dead end into a correction.
+            // Ranked by how much of the anchor's first line they share, because a
+            // miss is almost always a small difference — one changed character, a
+            // reflowed argument, indentation — and a substring test finds none of
+            // those. What the model needs is the line it MEANT, printed exactly.
+            const firstLine = edit.old.split(/\r?\n/)[0].trim();
+            const tokens = (value) => new Set(String(value).toLowerCase().match(/[a-z0-9_$]+/g) ?? []);
+            const wanted = tokens(firstLine);
+            const near = wanted.size === 0 ? [] : next.split(/\r?\n/)
+              .map((line, lineIndex) => {
+                const actual = tokens(line);
+                const shared = [...wanted].filter((token) => actual.has(token)).length;
+                return { line, index: lineIndex, overlap: shared / wanted.size };
+              })
+              .filter((entry) => entry.overlap >= 0.5 && entry.line.trim())
+              .sort((left, right) => right.overlap - left.overlap)
+              .slice(0, 3)
+              .map(({ line, index: lineIndex }) => `  line ${lineIndex + 1}: ${line.trim().slice(0, 120)}`);
+            // THE ANCHOR CARRIES THE LINE NUMBERS IT WAS READ WITH.
+            //
+            // `read_file` numbers its output `6326\tname: "edit_file",` so that
+            // search hits and reads can be correlated. An anchor copied straight
+            // out of that window includes the prefix, which is in no file — and
+            // the resulting "that text is not in the file" reads like a wrong
+            // snippet rather than a formatting slip, which is the expensive way
+            // to be told. Detected on the anchor itself so it is only ever said
+            // when it is true.
+            const numbered = /^\s*\d+\t/.test(edit.old) || /\n\s*\d+\t/.test(edit.old);
+            throw new Error(
+              `That text is not in ${filePath}${which}, so NOTHING was changed — ` +
+              `${batched ? "no edit in this call was applied" : "the file is untouched"}.` +
+              (numbered
+                ? "\nYour `old` still has read_file's line-number prefixes on it. Those are not in the " +
+                  "file — strip the leading digits and tab from every line and send it again."
+                : "") +
+              (near.length
+                ? `\nThe closest lines actually in the file are:\n${near.join("\n")}\n` +
+                  "Copy the text exactly as it appears — indentation and all."
+                : "\nRead the file again and copy the snippet exactly, including indentation.")
+            );
+          }
+          if (occurrences > 1 && !edit.all) {
+            throw new Error(
+              `That text appears ${occurrences} times in ${filePath}${which}, so it is ambiguous and ` +
+              `NOTHING was changed${batched ? " by this call" : ""}. Include more of the surrounding lines ` +
+              "to pick out the one you mean, or pass all: true to change every one."
+            );
+          }
+          if (firstAnchorOffset === null) firstAnchorOffset = next.indexOf(edit.old);
+          replacements += edit.all ? occurrences : 1;
+          next = edit.all
+            ? next.split(edit.old).join(edit.replacement)
+            : next.replace(edit.old, edit.replacement);
         }
-        const next = args.all === true
-          ? current.split(old).join(String(args.new ?? ""))
-          : current.replace(old, String(args.new ?? ""));
+
         // Same ordering as write_file, and for the same reason: the copy before
         // the write, the entry before the action. An edit is the case where
         // undo matters most — the file had contents somebody wanted.
@@ -5998,14 +6774,21 @@ export function buildToolset({
         });
         await runCapability("filesystem.write", { filePath, content: next });
         state.ownedPaths.add(filePath.toLowerCase());
-        // Where the change landed, so the next step does not need to re-read the
-        // whole file to know it worked.
-        const lineNumber = current.slice(0, current.indexOf(old)).split(/\r?\n/).length;
+        // Where the FIRST change landed, so the next step does not need to
+        // re-read the whole file to know it worked. Measured against the
+        // original content, because that is the file the model has in front of
+        // it — a line number counted after four earlier edits had shifted the
+        // file would point at the wrong place in the copy it is reading.
+        const lineNumber = firstAnchorOffset == null
+          ? 1
+          : current.slice(0, Math.max(0, current.indexOf(requested[0].old))).split(/\r?\n/).length;
         // The file as it actually is now, not as the replacement was computed to
         // be. The two differ whenever the write did not take — a locked file, a
         // path that resolved somewhere else, an encoding round trip.
         const onDisk = await fileNow(filePath);
-        const wanted = String(args.new ?? "");
+        // Every piece of new text, so the REFUTED sentence can say the change is
+        // missing whichever of a batch failed to land.
+        const wanted = requested.map((edit) => edit.replacement).filter(Boolean);
         const editEvidence = onDisk == null
           ? evidence({
               observed: `${filePath} could not be read back after the edit`,
@@ -6013,9 +6796,10 @@ export function buildToolset({
             })
           : evidence({
               observed: onDisk === next
-                ? `${filePath} now reads back as the edited ${next.length} characters`
+                ? `${filePath} now reads back as the edited ${next.length} characters` +
+                  `${requested.length > 1 ? `, with all ${requested.length} edits in it` : ""}`
                 : `${filePath} reads back as ${onDisk.length} characters, which is not the edit that was written` +
-                  `${wanted && !onDisk.includes(wanted) ? " — the new text is not in it" : ""}`,
+                  `${wanted.some((text) => !onDisk.includes(text)) ? " — the new text is not in it" : ""}`,
               method: "filesystem.read",
               actedVia: "filesystem.write",
               verdict: onDisk === next ? CONFIRMED : REFUTED
@@ -6023,7 +6807,8 @@ export function buildToolset({
         state.journal.settle(entryId, editEvidence);
         return {
           filePath,
-          occurrences: args.all === true ? occurrences : 1,
+          occurrences: replacements,
+          edits: requested.length,
           lineNumber,
           bytes: next.length,
           evidence: editEvidence
@@ -6035,8 +6820,10 @@ export function buildToolset({
           return refuted(result, `${result.filePath} was NOT changed — ${result.evidence?.observed}. ` +
             "Read the file and check what is actually in it before editing again.");
         }
-        const where = `${result.filePath} at line ${result.lineNumber}` +
-          `${result.occurrences > 1 ? ` and ${result.occurrences - 1} other place(s)` : ""}`;
+        const where = (result.edits ?? 1) > 1
+          ? `${result.filePath} in ${result.edits} places, the first at line ${result.lineNumber}`
+          : `${result.filePath} at line ${result.lineNumber}` +
+            `${result.occurrences > 1 ? ` and ${result.occurrences - 1} other place(s)` : ""}`;
         if (verdictOf(result) === UNCONFIRMED) {
           return unconfirmed(result, `The edit to ${where} was written, but the file could not be read back ` +
             "to check it. UNCONFIRMED — read it before relying on it.");
@@ -7124,8 +7911,8 @@ export function buildToolset({
           const notice = screenObservedContent(result.text ?? "", `the file ${where}`);
           return confirmed(result, [
             notice,
-            `${where} (${result.bytes.toLocaleString()} bytes` +
-              `${result.truncated ? `, showing the first ${MAX_FILE_CHARS.toLocaleString()} characters` : ""}):`,
+            `${where} (${result.bytes.toLocaleString(DISPLAY_LOCALE)} bytes` +
+              `${result.truncated ? `, showing the first ${MAX_FILE_CHARS.toLocaleString(DISPLAY_LOCALE)} characters` : ""}):`,
             result.text
           ].filter(Boolean).join("\n\n"));
         }
@@ -7135,7 +7922,7 @@ export function buildToolset({
         lines.push([
           repo.language && `language ${repo.language}`,
           repo.license && `licence ${repo.license}`,
-          Number.isFinite(repo.stars) && `${repo.stars.toLocaleString()} stars`,
+          Number.isFinite(repo.stars) && `${repo.stars.toLocaleString(DISPLAY_LOCALE)} stars`,
           `default branch ${repo.defaultBranch}`,
           repo.updatedAt && `last pushed ${String(repo.updatedAt).slice(0, 10)}`
         ].filter(Boolean).join(" · "));
@@ -7143,13 +7930,13 @@ export function buildToolset({
 
         if (result.tree) {
           const tree = result.tree;
-          lines.push("", `${tree.fileCount.toLocaleString()} files on ${tree.ref}` +
+          lines.push("", `${tree.fileCount.toLocaleString(DISPLAY_LOCALE)} files on ${tree.ref}` +
             (tree.mostly.length ? ` — mostly ${tree.mostly.map((k) => `.${k.extension} × ${k.count}`).join(", ")}` : "") + ".");
           // Said out loud, for the same reason the composer says it: the model
           // must be able to tell "there is no test folder" from "the test folder
           // was not shown to you".
           if (tree.machinery) {
-            lines.push(`${tree.machinery.toLocaleString()} generated or vendored files are not listed.`);
+            lines.push(`${tree.machinery.toLocaleString(DISPLAY_LOCALE)} generated or vendored files are not listed.`);
           }
           if (tree.truncated) lines.push("GitHub truncated this tree — the repository is larger than one request.");
           lines.push(...tree.entries.map((entry) => `  ${entry.path}`));
@@ -8241,8 +9028,24 @@ export function buildToolset({
   // Trimmed again 16 Aug: still 7,080 of 22,167 schema characters, 32% of
   // everything said about the tools, for two sentences repeated thirty times.
   // The full guidance and its examples live in the system prompt.
-  const SAW_PARAMETER = { type: "string", description: "Quoted from the last result: backward-looking, never a plan." };
-  const SAY_PARAMETER = { type: "string", description: "What you are doing, one short sentence." };
+  // TRIMMED A THIRD TIME, 2 Sep 2026, AND `say` LOSES ITS DESCRIPTION ENTIRELY.
+  //
+  // These two objects are attached to all 39 tools, so every character here is
+  // paid 39 times on every step of every task — measured at 6,513 characters,
+  // 23% of the whole tool schema, for two sentences repeated thirty-nine times.
+  //
+  // WHAT MAKES IT SAFE TO CUT IS THE FIELD NAME, WHICH WAS ALWAYS THE DESIGN.
+  // "A field NAMED for the backward reference cannot be filled in with a plan" —
+  // that is why there are two fields rather than one, and it is a property of
+  // the name, not of the sentence beside it. The full guidance and its examples
+  // live in the system prompt, where they cost one copy.
+  //
+  // `saw` keeps a short description because its DIRECTION is the one thing a
+  // name alone does not fully pin, and getting that wrong is what turned the
+  // narration into captions. `say` keeps none: "say" plus one short sentence in
+  // the prompt is not ambiguous, and the description was restating the name.
+  const SAW_PARAMETER = { type: "string", description: "What you just saw; backward-looking." };
+  const SAY_PARAMETER = { type: "string" };
 
   const toolIsVisible = (tool) =>
     (!/^(?:run|run_jobs)$/.test(tool.name) || state.accessPolicy.developerMode === true) &&
@@ -8345,6 +9148,36 @@ export function buildToolset({
     // model has not been given are not neutral — they are a suggestion.
     //
     // Empty on an ordinary turn, which is almost all of them.
+    // HOW TO DRAW WELL — ONLY WHEN SOMETHING IS ACTUALLY BEING DRAWN.
+    //
+    // The same argument as androidGuidance, and a bigger bill. Two paragraphs
+    // about Paint's shape tools, tracing closed paths, choosing a colour before
+    // a group rather than after, and proportion on the canvas sat in the fixed
+    // system prompt — so `hi`, `is python installed?` and every WhatsApp message
+    // in the product paid ~430 tokens per STEP to be told how to draw an oval.
+    // At the measured p90 of 21 steps that is ~9,000 tokens a request for advice
+    // about a task nobody asked for.
+    //
+    // The guidance itself is good and was expensive to learn (a traced closed
+    // path draws nothing; a shape tool takes the drag's bounding box), which is
+    // exactly why it is kept rather than trimmed — it is moved to the turns
+    // where it is worth anything.
+    //
+    // GATED ON THE REQUEST, NOT ON A TOOL CALL, because it has to be in front of
+    // the model for the FIRST decision: advice that arrives after the shape is
+    // on the canvas has arrived too late to change it.
+    drawingGuidance() {
+      if (!/\b(?:draw|drawing|sketch|paint|painting|doodle|illustrate|picture of|canvas|logo|diagram)\b/i
+        .test(state.userRequest ?? "")) return "";
+      return "DRAWING: pick the tool first, then READ THE SCREEN, then draw — the reading names the active tool, "
+        + "and that is what `draw` needs to send the right motion (a shape tool's own ellipse, or a pencil's traced "
+        + "path). Build the picture out of the application's real shapes rather than sketching outlines by hand: an "
+        + "oval for a wheel, a rectangle for a carriage, a line for a rail. One `draw` with `strokes` for a whole "
+        + "figure, not a call per part. Choose a colour BEFORE each group of shapes, never after. Give the parts "
+        + "sizes in proportion to each other and to the canvas before you start. Never spell a curve out as a "
+        + "series of drags — the button comes up between them, so you get disconnected straight lines.";
+    },
+
     androidGuidance() {
       if (!state.androidActive) return "";
       return "ANDROID: `android_devices` already knows the exact adb executable even when it is not on PATH — never go "
@@ -8362,7 +9195,30 @@ export function buildToolset({
     // used to be. Everything else — the working window, the windows we opened,
     // the terminal's directory — is still true, and is what makes "now write a
     // poem in it" mean anything.
-    beginTurn(userText = "") {
+    beginTurn(userText = "", { conversationKey = null } = {}) {
+      // WHICH CONVERSATION THIS IS, AND WHAT IT INVALIDATES.
+      //
+      // The toolset is shared by every chat in the process, so anything the user
+      // consented to must be bounded by something. The shell allowlist is the
+      // only such thing today: "yes, and stop asking about `npm run`" is an
+      // answer about the piece of work in front of them, not a standing setting
+      // — carrying it into an unrelated request an hour later would be consent
+      // they never gave.
+      //
+      // FAILS CLOSED, AND THE NULL CASE IS THE WHOLE REASON THIS IS SPELT OUT.
+      //
+      // A caller that passes no key gets NO allowlist at all — it is cleared on
+      // every turn. The tempting version of this line is `if (key !== state.key)`,
+      // which looks equivalent and is the opposite: with `null` on both sides it
+      // never fires, so a surface that had not been updated would accumulate
+      // remembered commands for the life of the process and carry them into
+      // every conversation. Absence of a scope must mean no memory, never
+      // unbounded memory.
+      const key = conversationKey == null ? null : String(conversationKey);
+      if (key === null || key !== state.conversationKey) {
+        state.shellAllowlist.clear();
+        state.conversationKey = key;
+      }
       state.elements = [];
       state.lastCanvas = null;
       state.lastTool = null;

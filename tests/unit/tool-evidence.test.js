@@ -137,6 +137,33 @@ function harness({ files = new Map(), overrides = {}, basePath } = {}) {
       files.set(String(inputs.filePath).toLowerCase(), String(inputs.content ?? ""));
       return { filePath: inputs.filePath, existed: false };
     },
+    // Reading the tree, not changing it. Both answer with the real result shape
+    // — the counters included — because the renders quote them, and a stub that
+    // omits a field would let a render that never reads it pass.
+    "filesystem.findFiles": async (inputs) => ({
+      root: inputs.rootDirectory,
+      glob: inputs.glob,
+      files: [{ path: "C:\\work\\src\\server.js", relative: "src/server.js", size: 42, modified: null }],
+      filesScanned: 3,
+      unreadableDirectories: 0,
+      truncated: false,
+      scanLimited: false
+    }),
+    "filesystem.searchCode": async (inputs) => ({
+      root: inputs.rootDirectory,
+      query: inputs.query,
+      regex: false,
+      glob: inputs.glob ?? null,
+      matches: [{ relative: "src/server.js", path: "C:\\work\\src\\server.js", line: 2, column: 3, text: "  return listen(4317);" }],
+      fileCount: 1,
+      filesRead: 3,
+      filesScanned: 3,
+      skippedBinary: 0,
+      skippedLarge: 0,
+      unreadableDirectories: 0,
+      truncated: false,
+      scanLimited: false
+    }),
     // Stateful, because the point of the write path is that it reads back what
     // it put there: a clipboard stub that always answers the same thing would
     // make the readback prove nothing.
@@ -201,6 +228,24 @@ const SUCCESS_CALLS = [
   { tool: "windows", args: {} },
   { tool: "focus", args: { windowId: "9" } },
   { tool: "window_state", args: { state: "maximize", windowId: "9" } },
+  // `root` is passed because the harness attaches no folder. Both tools refuse
+  // rather than defaulting to the home directory, which is the behaviour that
+  // stops a code search walking somebody's whole profile.
+  // `inspect` reads the manifest and runs nothing, which is the only branch of
+  // this tool that is safe to exercise in a unit suite. The repository's own
+  // package.json is the fixture, and it is read-only.
+  // `readOnly` because `inspect` is the branch that reads the manifest and runs
+  // nothing. The tool is declared as acting because its other actions do — a
+  // build writes files — and that declaration is what the repeat guard and the
+  // outcome memory key on.
+  { tool: "project", args: { action: "inspect", root: process.cwd() }, readOnly: true },
+  // This repository IS a git repository, so `status` is a real, read-only
+  // exercise of the whole path — the .git check, the command table, the shell
+  // floor and the receipt. `readOnly` because nothing here can change the tree:
+  // the tool has no action that writes, which is the point of it.
+  { tool: "git", args: { action: "status", root: process.cwd() }, readOnly: true },
+  { tool: "find_files", args: { root: "C:\\work", glob: "**/*.js" } },
+  { tool: "search_code", args: { root: "C:\\work", query: "listen" } },
   { tool: "read_file", args: { path: "C:\\notes.txt" }, file: ["c:\\notes.txt", "a line"] },
   { tool: "write_file", args: { path: "C:\\fresh.txt", contents: "written body" } },
   { tool: "edit_file", args: { path: "C:\\edit.txt", old: "before", new: "after" }, file: ["c:\\edit.txt", "before\n"] },

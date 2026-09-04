@@ -1168,6 +1168,149 @@ export function createDefaultCapabilityRegistry(adapter, options = {}) {
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
+  // filesystem.findFiles (real, read-only) - where is the file named like this.
+  //
+  // `filesystem.search` above already existed and NO TOOL EVER EXPOSED IT, so
+  // the only route to "find me the file" was PowerShell — which is off by
+  // default. It is also `Get-ChildItem -Recurse -Filter`, which cannot express
+  // `src/**/*.test.js` and happily walks node_modules. This one is Node, takes a
+  // real glob, and skips what a repository already says to skip.
+  registry.register({
+    name: "filesystem.findFiles",
+    version: "1.0.0",
+    description:
+      "Find files by name or glob under a directory, skipping node_modules, build output and " +
+      "anything the project's .gitignore excludes.",
+    aliases: ["filesystem.glob", "code.findFiles"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        rootDirectory: { type: "string" },
+        glob: { type: "string" },
+        max: { type: "number" },
+        maxDepth: { type: "number" },
+        includeHidden: { type: "boolean" }
+      },
+      required: ["glob"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["WORKSPACE"], type: "READ" },
+    security: {
+      filesystem: "READ", registry: "NONE", network: "NONE", browser: "NONE",
+      clipboard: "NONE", windowAutomation: "NONE", externalProcesses: "NONE"
+    },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.glob === "string" && args.glob.trim() !== "",
+    execute: async (args) => adapter.findFiles(args.rootDirectory, {
+      glob: args.glob,
+      max: args.max,
+      maxDepth: args.maxDepth,
+      includeHidden: args.includeHidden === true
+    }),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "filesystem.findFiles",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: [],
+      confidence: 1,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      // FINDING NOTHING IS A REAL ANSWER AND MUST VERIFY. "There is no file
+      // called that" is the correct result of a correct search, and reporting it
+      // as FAILED is how a working tool teaches the model to try another route.
+      // What fails is a search that could not run at all.
+      return Array.isArray(result.files)
+        ? {
+          status: "VERIFIED",
+          message: `${result.files.length} file(s) match ${result.glob} under ${result.root}` +
+            (result.truncated ? " (more were not returned)" : ""),
+          evidence: { count: result.files.length, truncated: result.truncated },
+          confidence: 1
+        }
+        : { status: "FAILED", message: "The search did not run", evidence: {}, confidence: 0 };
+    },
+    timeout: 60000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // filesystem.searchCode (real, read-only) - which lines contain this.
+  //
+  // The verb that was missing entirely. Nothing in the tree could answer "where
+  // is this function defined" without a terminal, which is the single most
+  // common question anybody has about a codebase.
+  registry.register({
+    name: "filesystem.searchCode",
+    version: "1.0.0",
+    description:
+      "Search file contents under a directory and return matching lines with their file and line number.",
+    aliases: ["filesystem.grep", "code.search"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        rootDirectory: { type: "string" },
+        query: { type: "string" },
+        regex: { type: "boolean" },
+        glob: { type: "string" },
+        ignoreCase: { type: "boolean" },
+        max: { type: "number" },
+        context: { type: "number" }
+      },
+      required: ["query"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.LOW },
+    permissionModel: { scope: ["WORKSPACE"], type: "READ" },
+    security: {
+      filesystem: "READ", registry: "NONE", network: "NONE", browser: "NONE",
+      clipboard: "NONE", windowAutomation: "NONE", externalProcesses: "NONE"
+    },
+    reversibility: "NOT_REQUIRED",
+    // The empty needle, refused at the boundary as well as inside the module.
+    // A check that can search for nothing is not a check.
+    preconditions: (args) => typeof args?.query === "string" && args.query.trim() !== "",
+    execute: async (args) => adapter.searchCode(args.rootDirectory, {
+      query: args.query,
+      regex: args.regex === true,
+      glob: args.glob ?? null,
+      ignoreCase: args.ignoreCase !== false,
+      max: args.max,
+      context: args.context
+    }),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "filesystem.searchCode",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: [],
+      confidence: 1,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      return Array.isArray(result.matches)
+        ? {
+          status: "VERIFIED",
+          message: `${result.matches.length} match(es) in ${result.fileCount} file(s), ` +
+            `${result.filesRead} file(s) read`,
+          evidence: { matches: result.matches.length, filesRead: result.filesRead, truncated: result.truncated },
+          confidence: 1
+        }
+        : { status: "FAILED", message: "The search did not run", evidence: {}, confidence: 0 };
+    },
+    timeout: 60000,
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
   // filesystem.list (real, read-only) - what is IN a directory.
   //
   // `filesystem.search` answers "where is the file called X". This answers "what

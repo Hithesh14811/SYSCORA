@@ -8,6 +8,7 @@ import { classifyShellCommand, ShellVerdict } from "../../../packages/policy-eng
 import { accessibilityLaunchArgs } from "./webview-windows.js";
 import { executeInWindowsSandbox } from "./windows-sandbox.js";
 import { isCanonicalPathInside } from "../../../packages/shared-types/src/canonical-path.js";
+import { findFiles as findFilesUnder, searchCode as searchCodeUnder } from "../../../packages/code-intel/src/index.js";
 
 function pathIsInside(candidate, root) {
   return isCanonicalPathInside(candidate, root, { allowMissingCandidate: false });
@@ -583,7 +584,31 @@ export class WindowsAdapter {
     // keep their existing path. A free-form command written by the model must
     // explicitly identify itself, and is refused closed if the caller forgot
     // either the developer opt-in or the final ASK callback.
-    if (options.shellOrigin === "model") {
+    // A TYPED READ-ONLY VERB IS NOT ARBITRARY TERMINAL ACCESS.
+    //
+    // `shellOrigin: "readonly-verb"` says two things about this command: the
+    // model did not compose it — it picked an action and a fixed table supplied
+    // the string — and it cannot change anything. Both halves are REQUIRED and
+    // the second is re-derived here rather than trusted: the floor must
+    // independently classify it ALLOW, which is the verdict reserved for
+    // commands that only read. A caller that mislabels a mutating command gets
+    // the ordinary model path, because this check does not believe the label.
+    //
+    // WHY THIS EXISTS. `git status` is how the agent finds out what it just
+    // changed, and it was refused on any machine without Developer terminal
+    // access — which is the default. So the one question a coding assistant asks
+    // most often needed the most dangerous switch in the product turned on. The
+    // DENY floor, the CONFIRM table and the approval card are all still above
+    // this; what is skipped is only the developer opt-in, and only for commands
+    // that cannot write.
+    //
+    // DELIBERATELY NOT EXTENDED TO `project`. `npm test` runs whatever the
+    // repository's manifest says, which is arbitrary code with the user's
+    // permissions — finite and enumerable, but not read-only. That stays behind
+    // the developer switch. See docs/state-of-the-world.md.
+    if (options.shellOrigin === "readonly-verb" && spawnVerdict.verdict === ShellVerdict.ALLOW) {
+      // Falls through to the ordinary spawn below, with no policy requirement.
+    } else if (options.shellOrigin === "model" || options.shellOrigin === "readonly-verb") {
       const policy = options.accessPolicy ?? {};
       if (policy.developerMode !== true || policy.shellExecutionMode === "none") {
         return blockedCommand(
@@ -1520,6 +1545,24 @@ export class WindowsAdapter {
   // the one Windows almost never redirects.
   getDownloadsPath() {
     return path.join(os.homedir(), "Downloads");
+  }
+
+  // WHERE IS THE FILE WHOSE NAME LOOKS LIKE THIS, and WHICH LINES CONTAIN THIS.
+  //
+  // Both delegate to `packages/code-intel`, which is plain Node and knows
+  // nothing about Windows. That is on purpose: finding code is not an operating
+  // system question, and a second adapter should inherit it rather than
+  // reimplement it. What stays here is only the default root.
+  //
+  // NEITHER OF THESE GOES NEAR POWERSHELL, which is the whole reason they exist.
+  // `searchFiles` below shells out, so it needs the terminal the user has
+  // switched off, cannot express `src/**/*.test.js`, and walks node_modules.
+  async findFiles(rootDirectory, options = {}) {
+    return findFilesUnder(rootDirectory ?? this.getDownloadsPath(), options);
+  }
+
+  async searchCode(rootDirectory, options = {}) {
+    return searchCodeUnder(rootDirectory ?? this.getDownloadsPath(), options);
   }
 
   async searchFiles(rootDirectory, pattern, maxResults = 50) {
@@ -2516,7 +2559,25 @@ public static class SyscoraAudio {
     const text = String(query ?? "").trim();
     if (!text) throw new Error("A Spotify track query is required");
     const readyTimeoutMs = clampInt(options.readyTimeoutMs, 500, 20000, 8000);
-    const playDeadlineMs = clampInt(options.playDeadlineMs, 500, 15000, 6000);
+    // 6,000ms WAS A COLD SEARCH'S RENDER TIME, NOT A BUDGET.
+    //
+    // Measured live, 3 Sep 2026, `node scripts/probe-spotify-play.mjs "Apsara Ali"`
+    // against a WARM Spotify — results already on screen: attempt 3 matched in
+    // 1,042ms and the track played. The same request in the product, against a
+    // Spotify that had just been launched, spent 14.4s and returned "no track
+    // started" — and the very next `screen` reading contained
+    // `dataitem "Play" @924,362` beside "Apsara Aali". The control was there and
+    // correctly named; it simply had not been published to the tree yet when the
+    // last attempt gave up.
+    //
+    // So the budget is raised rather than the selector changed, because the
+    // selector was never wrong. The asymmetry is what decides the number: three
+    // more seconds INSIDE this call against the alternative that was actually
+    // paid — screen, click, a refused click, a second refused click, a coordinate
+    // click and another screen, which cost 6 extra steps, 31.4s and 102,528
+    // tokens for one song. A cold render is the common case for the first music
+    // request of a session, which is exactly when this is most likely to be asked.
+    const playDeadlineMs = clampInt(options.playDeadlineMs, 500, 15000, 9000);
     const steps = [];
 
     // 1. Reuse a ready client. Starting Spotify again when it is already open
@@ -2710,7 +2771,14 @@ public static class SyscoraAudio {
       // costs the agent four more steps, four more model round trips and a
       // ~9-second detour through screen-read-and-click, on every music request.
       // Still bounded by `limit`, so a Spotify that never renders cannot hang.
-      const remainingMs = Math.min(3500, Math.max(0, limit - (Date.now() - startedAt)));
+      // ALL OF WHAT IS LEFT, NOT AN ARBITRARY SLICE OF IT.
+      //
+      // The 3,500ms sub-cap meant the enclosing budget could not be spent by the
+      // only attempt able to match what Spotify actually publishes. Attempts 1
+      // and 2 are measured at 713ms and 146ms, so this now gets ~8s of the 9s
+      // deadline instead of 3.5s of 6s. Still bounded by `limit`, so a Spotify
+      // that never renders cannot hang the call.
+      const remainingMs = Math.max(0, limit - (Date.now() - startedAt));
       if (remainingMs >= 50) {
         try {
           const selector = {

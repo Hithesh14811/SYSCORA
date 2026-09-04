@@ -112,12 +112,22 @@ test("an ordinary request is untouched by the ceiling", async () => {
     }
   };
   // The shipped default, not a test-sized one: the point of this test is that
-  // 150,000 does not fire on real work.
+  // the ceiling does not fire on real work.
   const agent = new FastAgent({ provider, toolset: busyToolset() });
 
   const outcome = await agent.run("is python installed");
 
   assert.equal(outcome.status, "COMPLETED");
   assert.equal(outcome.message, "Python 3.12.1 is installed.");
-  assert.equal(agent.maxFreshTokens, 150000);
+  // 150,000 UNTIL 2 Sep 2026, WHEN THE REAL SESSIONS SAID IT WAS TOO LOW.
+  //
+  // It had been derived from the eval suite ("the most expensive passing eval
+  // task is ~35,000") rather than from what people ask for. Over 143 real
+  // sessions it fired on 8% of them, including a run that had made no repeated
+  // call and seen no unchanged screen — and this product's most expensive
+  // PASSING run cost 152,064, above the ceiling meant to be well clear of it.
+  //
+  // Pinned as a number rather than left implicit because raising a budget is
+  // exactly the change that should be hard to make by accident.
+  assert.equal(agent.maxFreshTokens, 400000);
 });

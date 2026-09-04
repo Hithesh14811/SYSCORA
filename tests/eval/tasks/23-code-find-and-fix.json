@@ -1,0 +1,20 @@
+{
+  "id": "code-find-and-fix",
+  "category": "code",
+  "prompt": "In {workspace}, a function is returning the wrong answer and the tests fail. Find it, fix it, and run the project's tests to prove it passes.",
+  "why": "THE EDIT-RUN-READ LOOP, END TO END, WHICH IS THE WHOLE OF CODING. Nothing in the suite exercised search_code, read_file or project before this — the coding capability was measured by nothing at all while being compared to tools that are measured on nothing else. The bug is deliberately NOT in the file the prompt names, because it does not name one: the only route to it is searching for what the failing test complains about. Passing requires four separate things to work in order — find the file, read the right part of it, change one line without touching the rest, and run the project's own checks to find out whether it worked.",
+  "timeoutMs": 300000,
+  "setup": [
+    { "run": "New-Item -ItemType Directory -Force -Path '{workspace}\\calc' | Out-Null" },
+    { "run": "Set-Content '{workspace}\\calc\\package.json' -Value '{ \"name\": \"calc\", \"version\": \"1.0.0\", \"scripts\": { \"test\": \"node --test test.js\" } }'" },
+    { "run": "Set-Content '{workspace}\\calc\\total.js' @('export function total(items) {','  let sum = 0;','  for (const item of items) sum -= item;','  return sum;','}')" },
+    { "run": "Set-Content '{workspace}\\calc\\test.js' @('import test from \"node:test\";','import assert from \"node:assert/strict\";','import { total } from \"./total.js\";','test(\"total adds the numbers\", () => {','  assert.equal(total([1, 2, 3]), 6);','});')" },
+    { "run": "Set-Content '{workspace}\\calc\\readme.md' -Value 'total() returns the sum of a list of numbers.'" }
+  ],
+  "verify": [
+    { "run": "Get-Content '{workspace}\\calc\\total.js' -Raw -ErrorAction SilentlyContinue", "expect": "sum += item" },
+    { "run": "Get-Content '{workspace}\\calc\\total.js' -Raw -ErrorAction SilentlyContinue", "expectNot": "sum -= item" },
+    { "run": "Get-Content '{workspace}\\calc\\test.js' -Raw -ErrorAction SilentlyContinue", "expect": "total([1, 2, 3]), 6" },
+    { "run": "Push-Location '{workspace}\\calc'; node --test test.js 2>&1 | Out-Null; $code = $LASTEXITCODE; Pop-Location; if ($code -eq 0) { 'TESTS-PASS' } else { 'TESTS-FAIL' }", "expect": "TESTS-PASS" }
+  ]
+}
