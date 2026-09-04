@@ -1418,3 +1418,96 @@ test("\"volume is now **20%**\" with no tool call is chased, then actually done"
   assert.deepEqual(calls, [{ percent: 20 }], "the endpoint must actually be set");
   assert.equal(outcome.status, "COMPLETED");
 });
+
+// THE HONESTY LAYER LAPSED THE MOMENT A RUN DID ANYTHING.
+//
+// Every tool result carries a typed receipt and a tool's success sentence is
+// reachable only through `confirmed()`. Then the run ends and the product prints
+// `lastText` — free prose from the model, checked by nothing. Both call sites of
+// `claimsWithoutEvidence` were guarded by `toolCalls === 0`, so the guarantee
+// covered a run that did nothing and lapsed for every run that did something.
+//
+// Five tool calls, all REFUTED, closing on "I've sent the message" was published
+// under a green tick: the original defect of this project — a message reported
+// sent while the text sat unsent in a search box — with steps in front of it.
+function actingToolset(results) {
+  let index = 0;
+  return {
+    definitions: [{ type: "function", function: { name: "key", description: "", parameters: {} } }],
+    has: () => true,
+    previewOf: () => "",
+    isActingTool: () => true,
+    async execute() {
+      const next = results[Math.min(index, results.length - 1)];
+      index += 1;
+      return next;
+    }
+  };
+}
+
+const refutedResult = {
+  ok: false,
+  text: "the message is not in the conversation",
+  raw: { evidence: { verdict: "REFUTED", observed: "not found", method: "screen.read" } }
+};
+const confirmedResult = {
+  ok: true,
+  text: "sent",
+  raw: { evidence: { verdict: "CONFIRMED", observed: "found in the conversation", method: "screen.read" } }
+};
+
+test("a claim of having acted, on a run where nothing was confirmed, is not published as COMPLETED", async () => {
+  const agent = new FastAgent({
+    provider: scriptedProvider([
+      { text: "Sending it.", toolCalls: [{ name: "key", args: { keys: "enter" } }] },
+      { text: "I've sent the message." }
+    ]),
+    toolset: actingToolset([refutedResult]),
+    maxSteps: 6
+  });
+
+  const outcome = await agent.run("send it");
+
+  assert.equal(outcome.status, "PARTIALLY_COMPLETED");
+  assert.match(outcome.message, /I've sent the message\./, "the model's words must still be shown");
+  assert.match(outcome.message, /reported that it did NOT work/i);
+  assert.match(outcome.message, /none of them confirmed/i);
+});
+
+// THE OTHER HALF, AND IT IS WHY THIS COUNTS RECEIPTS RATHER THAN TOOL CALLS.
+// After real work the model says "I've saved it" and it is TRUE, because an
+// acting tool confirmed it. A guard that fires on that is one that gets switched
+// off — the defect class this codebase has paid for seven times.
+test("the same sentence goes through untouched when an acting tool confirmed it", async () => {
+  const agent = new FastAgent({
+    provider: scriptedProvider([
+      { text: "Sending it.", toolCalls: [{ name: "key", args: { keys: "enter" } }] },
+      { text: "I've sent the message." }
+    ]),
+    toolset: actingToolset([confirmedResult]),
+    maxSteps: 6
+  });
+
+  const outcome = await agent.run("send it");
+
+  assert.equal(outcome.status, "COMPLETED");
+  assert.equal(outcome.message, "I've sent the message.");
+});
+
+// An ordinary answer that claims nothing must not be touched either, however
+// little was confirmed — a lookup confirms nothing and is not claiming anything.
+test("a run that claims nothing is unaffected by the receipt check", async () => {
+  const agent = new FastAgent({
+    provider: scriptedProvider([
+      { text: "Looking.", toolCalls: [{ name: "key", args: {} }] },
+      { text: "There are four windows open at the moment." }
+    ]),
+    toolset: actingToolset([refutedResult]),
+    maxSteps: 6
+  });
+
+  const outcome = await agent.run("what is open");
+
+  assert.equal(outcome.status, "COMPLETED");
+  assert.equal(outcome.message, "There are four windows open at the moment.");
+});

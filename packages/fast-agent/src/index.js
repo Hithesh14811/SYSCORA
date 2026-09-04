@@ -26,6 +26,7 @@ import { CONFIRMED } from "./evidence.js";
 import { describeHandover, matchSkill, replaySkill } from "./skill-replay.js";
 import { verifyReplayStep } from "./skill-verify.js";
 import { buildSkillFromRun } from "./skill-recorder.js";
+import { conversationLimits, messageChars, trimConversation } from "./context-budget.js";
 
 export { buildToolset };
 
@@ -42,10 +43,53 @@ export { buildToolset };
 // "continue" and the agent to re-read everything it had just been looking at.
 // Filling a form is a dozen steps before anything interesting happens.
 //
-// The wall clock is the real budget and it is unchanged: this is a guard against
-// a loop that has stopped making progress, and six minutes bounds that already.
-const DEFAULT_MAX_STEPS = 80;
-const DEFAULT_MAX_ELAPSED_MS = 6 * 60 * 1000;
+// AND THE CEILING IS NOW OFF, BECAUSE A CEILING WAS NEVER WHAT CAUGHT A RUNAWAY.
+//
+// 80 steps and six minutes were the last two numbers in this file that could end
+// a run which was still making progress. They were raised repeatedly for exactly
+// that reason — 24 to 80 here, 2,048 to 4,096 to 8,192 on the output ceiling —
+// and every raise was preceded by a live session that got cut off mid-task. That
+// is the shape of a limit that is measuring the wrong thing.
+//
+// The thing they were meant to catch is a loop that has stopped making progress,
+// and TWO GUARDS ALREADY CATCH IT ON BEHAVIOUR, further down this file:
+//
+//   the repeat guard         the same call, with the same arguments, again
+//   unchangedReadings >= 8   eight readings in a row of a screen that never moved
+//
+// Both fire after about eight steps. Neither can be reached by a run that is
+// working. The 692,000-token emoji hunt that justified the cost ceiling is the
+// second guard's case, not this one's — it was forty-eight steps of an unchanged
+// screen, and it is caught now at eight whatever the budgets say.
+//
+// What replaces the ceilings is a CHECKPOINT rather than a wall: at each
+// threshold the run says what it has spent, on its own event channel and once in
+// the conversation, and carries on. See BUDGET_CHECKPOINTS. A person watching can
+// stop it; a model that is going nowhere is told it is going nowhere. Neither
+// throws away work that was about to finish.
+//
+// An hour of real coding is the case this is for. Measured over 169 real sessions
+// on this machine (28 Aug - 4 Sep 2026, read out of the session store): p50 4
+// steps / 18s / 27,155 billed tokens, p90 19 steps / 90s / 122,123. The old
+// ceilings sat just above p90, which is to say they fired on the top decile of
+// ordinary work and on every long task by construction.
+//
+// Every one is still settable — by the caller, or by the environment for a
+// session somebody wants bounded. `SYSCORA_MAX_STEPS=200`,
+// `SYSCORA_MAX_ELAPSED_MS=3600000`, `SYSCORA_MAX_FRESH_TOKENS=500000`.
+const UNBOUNDED = Number.POSITIVE_INFINITY;
+
+/** A budget from the environment, or unbounded. Zero and "off" mean unbounded. */
+export function budgetFromEnv(name, fallback = UNBOUNDED) {
+  const raw = String(process.env[name] ?? "").trim().toLowerCase();
+  if (!raw) return fallback;
+  if (raw === "off" || raw === "none" || raw === "0" || raw === "infinity") return UNBOUNDED;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const DEFAULT_MAX_STEPS = budgetFromEnv("SYSCORA_MAX_STEPS");
+const DEFAULT_MAX_ELAPSED_MS = budgetFromEnv("SYSCORA_MAX_ELAPSED_MS");
 // AND A CEILING ON WHAT A SINGLE REQUEST MAY COST.
 //
 // There was none. `maxSteps` bounds decisions and `maxElapsedMs` bounds the wall
@@ -96,12 +140,48 @@ const DEFAULT_MAX_ELAPSED_MS = 6 * 60 * 1000;
 // real use, so roughly 3,700 billed tokens per step buys nothing. Twenty-five
 // steps of honest GUI work is ~92,000 tokens before a single tool result. The
 // way to lower this ceiling is to lower that number, not to move this one.
-const DEFAULT_MAX_FRESH_TOKENS = 400000;
-// Beyond this the conversation is trimmed from the oldest tool output forward.
-// Generous — a long task is a long conversation — but not unbounded, because an
-// unbounded prompt is how this codebase previously reached four million
-// characters for a request whose answer was one number.
-const MAX_CONVERSATION_CHARS = 60000;
+// AND IT IS NOW OFF FOR THE SAME REASON AS THE OTHER TWO. This number was raised
+// from 150,000 nine days after it was written, because it fired on 8% of real
+// sessions and sat BELOW this product's own most expensive passing run. A budget
+// that has to be raised every time somebody does real work is not protecting
+// anything; it is the wall clock in a different unit. What money needs is to be
+// VISIBLE and INTERRUPTIBLE, not silently capped — see BUDGET_CHECKPOINTS.
+const DEFAULT_MAX_FRESH_TOKENS = budgetFromEnv("SYSCORA_MAX_FRESH_TOKENS");
+
+// SAY WHAT IT HAS SPENT, RATHER THAN STOPPING IT SPENDING.
+//
+// Each of these fires once, in ascending order, on whichever of the three
+// dimensions crosses first. It emits an event the surface can render, and puts
+// ONE line into the conversation — the model is the only thing that can decide
+// whether it is converging, and it cannot decide that without being told what it
+// has cost. A run that is going fine reads the line and carries on.
+//
+// The thresholds are derived from the measured distribution rather than chosen:
+// p90 of a real session is 19 steps / 90s / 122,123 billed tokens, so the first
+// checkpoint sits just above ordinary work and each one after it is roughly 3x
+// the last. An hour-long coding session crosses four of them and pays about
+// forty tokens for the privilege.
+const BUDGET_CHECKPOINTS = Object.freeze([
+  { steps: 40, elapsedMs: 5 * 60 * 1000, freshTokens: 150_000 },
+  { steps: 120, elapsedMs: 15 * 60 * 1000, freshTokens: 500_000 },
+  { steps: 300, elapsedMs: 40 * 60 * 1000, freshTokens: 1_500_000 },
+  { steps: 700, elapsedMs: 90 * 60 * 1000, freshTokens: 4_000_000 }
+]);
+
+// A SINGLE REQUEST STILL HAS TO COME BACK, AND `setTimeout(Infinity)` DOES NOT.
+//
+// The per-request bound used to be derived from what was left of the run's wall
+// clock (`Math.max(15000, remainingMs)`). With the wall clock unbounded that
+// expression is Infinity, and Node's timer clamps a non-finite delay to 1ms with
+// a warning — so removing the run ceiling would have made every model request
+// time out instantly. The two bounds are different questions and now have
+// different answers: the RUN may take an hour, one REQUEST may not.
+//
+// Fifteen minutes is far above any turn this has ever produced — the 16,384-token
+// retry needs ~153s at the measured ~107 tokens/s — and the real protection is
+// the transport's idle timer (STREAM_IDLE_TIMEOUT_MS, 45s), which can tell a
+// silent socket from a slow one. This is the backstop under that.
+const MODEL_REQUEST_CEILING_MS = 15 * 60 * 1000;
 // How long the first turn of a cold process will wait for the machine profile
 // before starting without it. See _machineFacts.
 const MACHINE_FACTS_DEADLINE_MS = 2500;
@@ -383,10 +463,29 @@ const MODEL_OUTPUT_CEILING_RETRY = 16384;
 // unknown key is ignored by the stack that does not know it. Sending only the
 // spelling this month's deployment happens to honour is how this quietly stops
 // working after somebody else's upgrade.
-const THINKING_OFF = Object.freeze({
+// ------------------------------------------------------------------------
+// AND THE SPELLING IS THE PROVIDER'S, NOT OURS.
+//
+// This object was sent to whatever endpoint happened to be configured. It is
+// DeepSeek's vocabulary: Anthropic rejects unknown top-level body fields with an
+// HTTP 400, so the correct decision on an ordinary step — do not deliberate —
+// would have failed every ordinary step the moment somebody pointed this at
+// Claude. The loop knows WHETHER this turn should think; only the provider knows
+// HOW to say it.
+//
+// Kept as the fallback for a provider that does not answer, because that is what
+// every endpoint this has actually run against accepts, and because a provider
+// object built by a test has no opinion. See `LanguageModelProvider.reasoningBody`.
+const THINKING_OFF_FALLBACK = Object.freeze({
   chat_template_kwargs: { thinking: false, enable_thinking: false },
   reasoning_effort: "none"
 });
+
+/** How THIS endpoint is told whether to deliberate. Null means "send nothing". */
+function reasoningBodyFor(provider, deliberate) {
+  if (typeof provider?.reasoningBody === "function") return provider.reasoningBody(deliberate);
+  return deliberate ? null : THINKING_OFF_FALLBACK;
+}
 
 // `SYSCORA_MODEL_THINKING=always` restores the old behaviour, `never` refuses it
 // even on a retry, and anything else is the measured default. An escape hatch,
@@ -557,14 +656,33 @@ const SUPERSEDED = "… [an earlier reading of this window, now out of date — 
 // settings across the whole task set — a default should be reversible by a
 // number, not by an argument. P4 (delta perception, append-only history) replaces
 // both paths with something strictly better and this seam goes away.
-const COLLAPSES_HISTORY = process.env.SYSCORA_COLLAPSE_HISTORY === "1";
+//
+// ------------------------------------------------------------------------
+// AND IT IS NOW ON FOR LONG RUNS, WHICH IS NOT THE SAME AS OVERTURNING THAT.
+//
+// Read what the measurement above actually covers: SIX-STEP runs. It is right
+// about them, and it says nothing whatever about a two-hundred-step session,
+// because there had never been one — eighty steps and six minutes made sure of
+// that. With those ceilings gone, the alternative to collapsing is carrying forty
+// full readings of windows that have all since changed, re-sent on every step for
+// the rest of an hour. The cache argument inverts long before that: a prefix you
+// cannot afford to send at all is not cheaper for being cached.
+//
+// So the rule is the measurement's own boundary. Below the threshold the collapse
+// stays off exactly where it was measured to lose; above it — where nothing was
+// measured and the arithmetic is no longer close — it comes on. The environment
+// variable still forces it on everywhere, for the paired runs the eval does.
+//
+// The threshold is a FRACTION OF THE MODEL'S WINDOW rather than a constant, so it
+// scales with whatever this is pointed at. See COLLAPSE_ABOVE_FRACTION.
+const COLLAPSES_HISTORY_ALWAYS = process.env.SYSCORA_COLLAPSE_HISTORY === "1";
 
 // `SYSCORA_TRACE_USAGE=1` prints what each step sent and how much of it the
 // endpoint served from cache. See the call site for what the two shapes mean.
 const TRACES_USAGE = process.env.SYSCORA_TRACE_USAGE === "1";
 
-function supersedeEarlierReading(messages, toolName, windowId) {
-  if (!COLLAPSES_HISTORY) return;
+function supersedeEarlierReading(messages, toolName, windowId, { enabled = COLLAPSES_HISTORY_ALWAYS } = {}) {
+  if (!enabled) return;
   if (toolName !== "screen" || !windowId) return;
   const tag = `(windowId ${windowId})`;
   for (let index = messages.length - 2; index >= 0; index -= 1) {
@@ -946,7 +1064,7 @@ HOW YOU WORK
 - ONE DECISION, MANY ACTIONS. The moment the next few steps are already decided, put them in a single \`batch\` — digits into a calculator, a form, a menu path, a keyboard sequence. Deciding costs seconds; acting costs milliseconds.
 - Reach for the keyboard before the mouse. Calculator, editors, browsers and dialogs all take typed input: \`type {text: "45*6664533365="}\` is one action where clicking is twelve, and it cannot land on the wrong button.
 - When the job is done, say what is now true in one or two sentences. If you found something out, give the answer itself — not a description of how you found it.
-- YOU CANNOT SEE ICONS. A reading is text and control names; a button that is only a picture — an emoji react, a paperclip, an unlabelled three-dot menu — does not appear in it at all, and hovering will not help. If what you need is one of those, try the keyboard or a menu, and if neither works say plainly that you cannot see that control and ask the user to click it.
+- A READING DOES NOT CONTAIN ICONS. It is text and control names; a button that is only a picture — an emoji react, a paperclip, an unlabelled three-dot menu — does not appear in it at all, and hovering will not help. When what you need is one of those, ask to SEE the window: \`screen {application: "...", vision: true}\` returns the same reading plus a picture of it. Use it only for that — a picture costs several times what a reading costs and cannot be clicked by name, so read first, look second, and go back to the reading's labels to act. If the model running you cannot see images the result will say so plainly; then try the keyboard or a menu, and if neither works say you cannot see that control and ask the user to click it.
 - SENDING IS NOT TYPING. Words on the screen do not mean a message was sent — text sitting unsent in the box looks exactly the same. It is sent when the box is EMPTY and the message is in the conversation with a timestamp. Check both before you say it went.
 - WHEN YOU ARE STUCK, ASK. If you have tried the same idea twice and you are no closer, the answer is not a third variation — it is a question. Say what you looked for, what you actually found, and what you need, and stop.
 - YOU HAVE NOT DONE IT UNTIL A TOOL HAS DONE IT, AND YOU DO NOT KNOW IT UNTIL A TOOL HAS TOLD YOU. Asked to pause, open, close, send, install or delete something, you call a tool — saying "Paused it" without one is a lie, and the user finds out immediately. The same goes for facts about THIS machine: a version number, a path, whether something is installed, what is in a file. Never state one from memory.
@@ -1010,60 +1128,24 @@ DO THE WHOLE THING, THE WAY A PERSON WOULD
 - Typing into a box with a suggestion list under it is half the job. Pick the suggestion — an airport, a contact, a city — or the field holds text the application never accepted.
 - A name you guessed is not a name you know. A URL built from a channel, account or product name lands on whatever happens to own it; read the page and confirm it is the one asked for before doing anything else with it.`;
 
-function messageChars(messages) {
-  let total = 0;
-  for (const message of messages) total += String(message.content ?? "").length;
-  return total;
-}
-
-// Trim from the oldest tool output forward, in place. Tool results are the bulk
-// of a long conversation and the oldest are the least likely to matter; the
-// user's request and the model's own reasoning are never trimmed, because those
-// are what keep it on task.
+// THE CONVERSATION IS BOUNDED BY THE MODEL, NOT BY A CONSTANT.
 //
-// TRIM IN ONE BITE, RARELY, RATHER THAN A LITTLE ON EVERY STEP.
+// This used to be `pruneConversation`, gated on `SYSCORA_COLLAPSE_HISTORY` and
+// therefore OFF, against a fixed 60,000-character ceiling. Both halves were
+// wrong once the run ceilings came off:
 //
-// Rewriting a message changes the prompt PREFIX, and every provider-side prefix
-// cache keys on the prefix being identical to last time. Trimming just enough to
-// get under the ceiling meant trimming one more message on every step from then
-// on — so from the moment a task got long, every single step re-sent a prompt
-// that differed from the previous one near its start, and nothing after that
-// point could be reused. Cutting down to well under the ceiling in one pass
-// makes this an occasional event instead of a permanent one.
+//   OFF        meant the conversation had no bound at all on the default path.
+//              Six minutes and eighty steps were doing the context management by
+//              accident. Take those away and a long run walks into the
+//              provider's context window and gets an HTTP error about token
+//              counts, which is not something the loop can recover from.
+//   60,000     is ~15,000 tokens. Every model this runs against holds between
+//              128,000 and 1,000,000. The old ceiling threw away five sixths of
+//              a DeepSeek window and 98% of a Gemini one.
 //
-// The most recent results are never trimmed: they are what the next decision is
-// actually made from.
-const PRUNE_TARGET_FRACTION = 0.6;
-const NEVER_TRIM_RECENT_TOOL_RESULTS = 4;
-
-function pruneConversation(messages) {
-  // Same seam, same reason: trimming an early message moves the prefix. Note the
-  // comment above already knew that trimming a little on every step destroyed
-  // prefix reuse — this makes the whole behaviour measurable rather than only
-  // the frequency of it.
-  //
-  // OFF BY DEFAULT WITH THE COLLAPSE, and this half is the safer of the two to
-  // disable: MAX_CONVERSATION_CHARS is 60,000 and almost no run reaches it, so
-  // for ordinary work this changes nothing at all. What it does change is the
-  // long run — the one that was already expensive — where it stops turning every
-  // remaining step into a full-price re-read.
-  if (!COLLAPSES_HISTORY) return;
-  if (messageChars(messages) <= MAX_CONVERSATION_CHARS) return;
-  const target = Math.floor(MAX_CONVERSATION_CHARS * PRUNE_TARGET_FRACTION);
-  // The tail that stays whatever happens.
-  let protectedFrom = messages.length;
-  let recent = 0;
-  for (let index = messages.length - 1; index >= 0 && recent < NEVER_TRIM_RECENT_TOOL_RESULTS; index -= 1) {
-    if (messages[index].role !== "tool") continue;
-    recent += 1;
-    protectedFrom = index;
-  }
-  for (let index = 0; index < protectedFrom && messageChars(messages) > target; index += 1) {
-    const message = messages[index];
-    if (message.role !== "tool" || String(message.content ?? "").length < 400) continue;
-    messages[index] = { ...message, content: `${String(message.content).slice(0, 300)}\n… [earlier output trimmed]` };
-  }
-}
+// See context-budget.js: the limit is now derived from the configured model, the
+// trim is always available, and it announces itself in the text it leaves behind.
+// The call site is at the bottom of the loop, beside the reading collapse.
 
 export class FastAgent {
   constructor({
@@ -1411,6 +1493,16 @@ export class FastAgent {
     // number they named themselves is theirs, however many times it also appears
     // in a message on screen. See content-boundary.js.
     this.toolset.beginTurn?.(userText, { conversationKey: conversationKeyFor(userText, history) });
+    // WHETHER THE CONFIGURED MODEL HAS EYES, told to the toolset once.
+    //
+    // The loop is the only thing that holds the provider, and `screen {vision}`
+    // is the only thing that needs the answer. A tool that reached for the model
+    // itself would be a tool that cannot be tested without one.
+    //
+    // Unknown means no. A model with no vision, sent an image, fails the whole
+    // request rather than the look — so `screen {vision: true}` refuses and says
+    // why, which is a step wasted; sending it anyway is the task lost.
+    this.toolset.setVisionAvailable?.(this.provider?.supportsVision?.() === true);
     // And the attempt reaches the transcript. A defence the user cannot see is
     // one they cannot judge — the plan's requirement is that an injection is
     // refused AND surfaced, not just refused.
@@ -1569,6 +1661,21 @@ export class FastAgent {
     // DECLINED, not COMPLETED — see the settle at the end of the no-tool-call
     // branch.
     let declinedActions = 0;
+    // WHAT THIS MODEL CAN HOLD. Resolved once per run rather than per step: it is
+    // a table lookup on the configured model name and it cannot change mid-run.
+    // See context-budget.js — with the step, time and cost ceilings gone this is
+    // the only hard bound left on a conversation, so it has to be the real one.
+    const limits = conversationLimits(this.provider);
+    // How many of BUDGET_CHECKPOINTS have already been announced. Each fires once
+    // and never stops the run.
+    let checkpointsPassed = 0;
+    // How many ACTING tools came back CONFIRMED. See the settle: a closing
+    // sentence claiming something was done, on a run where nothing was confirmed
+    // done, is the same lie the zero-tool-call backstop catches — with steps in
+    // front of it.
+    let confirmedActions = 0;
+    // And how many said, in a receipt, that they did NOT work.
+    let refutedActions = 0;
 
     while (steps < this.maxSteps) {
       if (this.signal?.aborted) {
@@ -1621,6 +1728,44 @@ export class FastAgent {
           { steps, toolCalls, startedAt, failureReason: FailureReason.BUDGET }
         );
       }
+
+      // THE CHECKPOINT, WHICH IS WHAT THE THREE CEILINGS BECAME.
+      //
+      // A ceiling ends a run that was about to finish; that is what every one of
+      // them was measured doing, and it is why all three had to be raised. What
+      // the ceilings were really for is the case where nobody knows what is
+      // happening — so say what is happening, to both audiences, and let the run
+      // continue.
+      //
+      // The user gets an event they can act on, because the only correct response
+      // to "this is costing more than I expected" is a person deciding, and they
+      // cannot decide without the number. The MODEL gets one line, because it is
+      // the only thing that knows whether it is converging — and it has never
+      // been told what it has spent. A run that is going fine reads it and
+      // carries on; a run that is stuck now has the one fact that would tell it.
+      //
+      // Fires at most once per threshold and costs ~40 tokens each time.
+      while (
+        checkpointsPassed < BUDGET_CHECKPOINTS.length
+        && (steps >= BUDGET_CHECKPOINTS[checkpointsPassed].steps
+          || elapsed >= BUDGET_CHECKPOINTS[checkpointsPassed].elapsedMs
+          || freshSoFar >= BUDGET_CHECKPOINTS[checkpointsPassed].freshTokens)
+      ) {
+        checkpointsPassed += 1;
+        const minutes = Math.round(elapsed / 60000);
+        this._emit({
+          type: "BUDGET_CHECKPOINT",
+          details: { checkpoint: checkpointsPassed, steps, elapsedMs: elapsed, freshTokens: freshSoFar }
+        });
+        messages.push({
+          role: "user",
+          content: `[SYSTEM] Progress check, not a stop: ${steps} steps, ${minutes} minute(s), ` +
+            `${freshSoFar.toLocaleString(DISPLAY_LOCALE)} billed tokens so far. Carry on if you are ` +
+            "getting closer. If you are not — if you have been trying variations of the same idea — stop " +
+            "now, say what you have done, what is left and what is blocking you, and ask."
+        });
+      }
+
       steps += 1;
 
       let turn;
@@ -2077,6 +2222,61 @@ export class FastAgent {
             { steps, toolCalls, startedAt, failureReason: FailureReason.MODEL_MALFORMED }
           );
         }
+        // THE HONESTY LAYER STOPPED AT THE ONE SENTENCE THE USER ACTUALLY READS.
+        //
+        // Everything above is real: every tool result carries a typed receipt,
+        // and a tool's success sentence is reachable only through `confirmed()`,
+        // which throws without a CONFIRMED verdict. And then the run ends, and
+        // the headline the product prints is `lastText` — free prose from the
+        // model, checked by nothing.
+        //
+        // `claimsWithoutEvidence` was the backstop for exactly this and BOTH its
+        // call sites are guarded by `toolCalls === 0`. So the guarantee held for
+        // a run that did nothing and lapsed the moment a run did anything: five
+        // tool calls, every one REFUTED, and a closing "I've sent the message" is
+        // published under a green tick. That is the original defect — a message
+        // reported sent while the text sat unsent in a search box — with steps in
+        // front of it.
+        //
+        // THE CHECK IS NOT "DID IT CALL A TOOL", BECAUSE THAT IS WHAT LAPSED.
+        // It is: does a past-tense claim have a CONFIRMED ACTING receipt anywhere
+        // behind it? After real work the model says "I've saved the file" and it
+        // is TRUE — `write_file` confirmed it by reading the file back — and that
+        // must go through untouched, which is why this counts receipts rather
+        // than tool calls.
+        //
+        // AND IT NEEDS A REFUTATION, NOT MERELY AN ABSENCE.
+        //
+        // The first version fired on `confirmedActions === 0` — "nothing proved
+        // it worked". That is also true of every tool whose honest receipt is
+        // UNCONFIRMED, and of every tool that records no receipt at all, and it
+        // turned six passing tests red including "an empty turn AFTER real work
+        // still reports what was done" — the exact case the guard beside it
+        // exists to protect. `Unconfirmed is not failed` is a house rule in this
+        // file and the first version broke it.
+        //
+        // So it takes a POSITIVE statement that something did not work: at least
+        // one acting tool came back REFUTED or reported failure, AND nothing at
+        // all came back CONFIRMED. That is the shape of the real defect — five
+        // calls, every one refuted, closing on "I've sent the message" — and it
+        // is silent everywhere else.
+        //
+        // Deliberately narrow beyond that too: a run that confirmed one thing and
+        // overclaims about a second is not caught here. Pretending otherwise
+        // would make this the kind of guard that fires on correct work and gets
+        // switched off — the defect class this codebase has paid for seven times.
+        if (toolCalls > 0 && confirmedActions === 0 && refutedActions > 0
+          && claimsWithoutEvidence(lastText)) {
+          return this._settle(
+            "PARTIALLY_COMPLETED",
+            `${lastText}\n\n[SYSCORA] Take that last sentence with caution: ` +
+            `${refutedActions} of the ${toolCalls} tool call${toolCalls === 1 ? "" : "s"} I made this turn ` +
+            "reported that it did NOT work, and none of them confirmed that anything did. So nothing here " +
+            "verified what I just told you. Ask me to check and I will read it back off the machine rather " +
+            "than telling you again.",
+            { steps, toolCalls, startedAt, failureReason: FailureReason.NO_EVIDENCE }
+          );
+        }
         return this._settle("COMPLETED", lastText || "Done.", { steps, toolCalls, startedAt });
       }
 
@@ -2283,6 +2483,22 @@ export class FastAgent {
             ? true
             : (result.raw?.evidence?.verdict === "REFUTED" ? false : null)
         });
+        // DID ANYTHING THIS RUN ACTUALLY CHANGE THE MACHINE, WITH A RECEIPT?
+        //
+        // Counted off the receipt rather than off the sentence, and only for
+        // tools that ACT — a `screen` read confirms that it read, which is true
+        // and is not the question. See the settle at the end of the
+        // no-tool-calls branch for what this is for.
+        if (this.toolset.isActingTool?.(call.name) === true) {
+          if (result.raw?.evidence?.verdict === CONFIRMED) confirmedActions += 1;
+          // REFUTED, or the tool itself reporting failure. NOT "UNCONFIRMED" and
+          // not "no receipt at all": unconfirmed is not failed is a house rule
+          // here, and a tool that recorded nothing is silent rather than
+          // negative. Only a positive statement that it did not work counts.
+          else if (result.raw?.evidence?.verdict === "REFUTED" || result.ok === false) {
+            refutedActions += 1;
+          }
+        }
         await this._emit({
           type: "TOOL_FINISHED",
           details: {
@@ -2301,6 +2517,36 @@ export class FastAgent {
           }
         });
         messages.push({ role: "tool", tool_call_id: call.id, content: result.text || "(no output)" });
+
+        // THE PICTURE GOES IN AS A MESSAGE OF ITS OWN, NOT INSIDE THE RESULT.
+        //
+        // A tool result must stay a string. OpenAI's wire format has no way to
+        // put an image in one — images live in `user` turns there — and building
+        // a second, provider-shaped path through the tool-result plumbing to
+        // work around that is how a codebase ends up with a different agent per
+        // vendor. A separate user turn is understood by every provider and by
+        // every guard in this file that reads tool results.
+        //
+        // The block is deliberately vendor-NEUTRAL (`input_image`); each
+        // transport spells it its own way, exactly as `reasoningBody` does for
+        // deliberation. See toAnthropicMessages and openAiCompatibleChat.
+        if (result.raw?.imageAttachment) {
+          messages.push({
+            role: "user",
+            content: [
+              { type: "text", text: `[the window you asked to see — ${call.name}]` },
+              {
+                type: "input_image",
+                mediaType: result.raw.imageAttachment.mediaType,
+                data: result.raw.imageAttachment.data
+              }
+            ]
+          });
+          await this._emit({
+            type: "SCREEN_IMAGE_ATTACHED",
+            details: { tool: call.name, bytes: result.raw.imageAttachment.bytes ?? null }
+          });
+        }
 
         // NOTHING IS CHANGING, AND IT HAS NOT NOTICED.
         //
@@ -2368,10 +2614,31 @@ export class FastAgent {
         //
         // Only ever the same window: a reading of Notepad does not supersede a
         // reading of WhatsApp.
-        supersedeEarlierReading(messages, call.name, result.raw?.windowId);
+        supersedeEarlierReading(messages, call.name, result.raw?.windowId, {
+          // Off for a short run, where it was measured to lose; on once the
+          // conversation is a serious fraction of the window, where it was never
+          // measured and is the only thing keeping the run inside it. See
+          // COLLAPSES_HISTORY_ALWAYS.
+          enabled: COLLAPSES_HISTORY_ALWAYS || messageChars(messages) > limits.collapseAtChars
+        });
       }
 
-      pruneConversation(messages);
+      // AND THE LAST BOUND THERE IS. Announced rather than silent: a conversation
+      // that quietly lost two thirds of its evidence is indistinguishable from
+      // one that never had it, which is the same argument as the 256 KB row cap
+      // in SessionStore and the same argument as every other trim in this file.
+      const trim = trimConversation(messages, limits);
+      if (trim.trimmed) {
+        this._emit({
+          type: "CONVERSATION_TRIMMED",
+          details: {
+            messages: trim.messages,
+            charsBefore: trim.before,
+            charsAfter: trim.after,
+            contextTokens: limits.contextTokens
+          }
+        });
+      }
     }
 
     return this._settle(
@@ -2432,9 +2699,15 @@ export class FastAgent {
           messages,
           tools: this.toolset.definitions,
           temperature: 0.2,
-          // See THINKING_OFF. Absent on a deliberating turn, so the endpoint's
-          // own default applies and nothing has to know what that default is.
-          ...(thinks ? {} : { extraBody: THINKING_OFF }),
+          // See reasoningBodyFor. The loop decides WHETHER; the provider decides
+          // HOW to spell it, because a vendor's field names must not be in the
+          // one file that is supposed to be vendor-neutral. Null means send
+          // nothing at all — which is how "do not deliberate" is expressed on an
+          // endpoint that does not deliberate unless asked.
+          ...(() => {
+            const extraBody = reasoningBodyFor(this.provider, thinks);
+            return extraBody ? { extraBody } : {};
+          })(),
           // See MODEL_OUTPUT_CEILING. Raised twice now for the same reason and
           // measured both times: 2,048 cut off a final answer mid-sentence, and
           // 4,096 sat below the median of the reasoning distribution it had to
@@ -2448,7 +2721,12 @@ export class FastAgent {
           // and the fix would have measured as no fix at all. The transport now
           // distinguishes a silent socket from a slow one (STREAM_IDLE_TIMEOUT_MS),
           // so the only honest total bound left is the run's own budget.
-          timeoutMs: Math.max(15000, remainingMs),
+          // CLAMPED, BECAUSE THE RUN'S BUDGET AND ONE REQUEST'S ARE NOT THE SAME
+          // QUESTION. `remainingMs` is Infinity whenever the wall clock is
+          // unbounded, and Node clamps a non-finite timer delay to 1ms with a
+          // warning — so without this the first model call of every default run
+          // would time out immediately. See MODEL_REQUEST_CEILING_MS.
+          timeoutMs: Math.min(MODEL_REQUEST_CEILING_MS, Math.max(15000, remainingMs)),
           signal: this.signal,
           onTextDelta: (delta) => { this._emit({ type: "AGENT_DELTA", details: { text: delta } }); },
           // THE MODEL'S SCRATCH WORK, ON ITS OWN CHANNEL AND UNDER ITS OWN NAME.

@@ -314,6 +314,26 @@ export class VisionProvider {
           // The OCR/UIA snapshot still has value when the image cannot be re-read.
           .catch(() => null)
       ]);
+      // THE CAPTURE IS A SCREENSHOT OF THE USER'S SCREEN, AND NOTHING DELETED IT.
+      //
+      // Found on 4 Sep 2026 while probing the vision path: SEVENTY-SIX PNGs in
+      // %TEMP%\syscora-m4 going back weeks, most ~13 KB and three of them 11.4 MB
+      // — full-desktop captures, with whatever was on screen at the time. This is
+      // where they came from. Every look that pays for pixels writes one here,
+      // reads it twice, and walks away.
+      //
+      // By the time this line runs both readers are finished: the OCR has the
+      // text and the hash has the bytes. Nothing downstream opens the file —
+      // `capturePath` is carried for provenance and only ever printed. So it is
+      // deleted, unless the CALLER supplied the path, in which case the file is
+      // theirs and removing it would be taking something they asked to keep.
+      //
+      // Failure is swallowed on purpose: a locked temp file must not fail the
+      // look it belongs to. That would trade a privacy leak for a broken
+      // capability, which is a worse trade than the one being fixed.
+      if (!request.capturePath && request.retainCapture !== true) {
+        await fs.rm(capture.path, { force: true }).catch(() => {});
+      }
       return { capture, ocr, pixelHash };
     })();
     const [{ capture, ocr, pixelHash }, ui] = await Promise.all([

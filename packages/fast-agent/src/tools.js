@@ -1974,17 +1974,97 @@ export function buildToolset({
     });
   };
 
+  // WHAT A PROVIDER WILL ACTUALLY ACCEPT. Anthropic caps an image at ~5 MB of
+  // base64, which is ~3.75 MB of bytes; the others are comparable or larger. Set
+  // below the tightest of them, because the point of the check is to fail here
+  // with a sentence rather than there with an HTTP 400.
+  const MAX_VISION_BYTES = 3_500_000;
+
+  // A CAPTURE IS A SCREENSHOT OF THE USER'S SCREEN, AND 76 OF THEM WERE ON DISK.
+  //
+  // `adapter.captureScreen` writes a PNG into %TEMP%\syscora-m4 and hands back
+  // the path. Nothing ever deleted them. Found while probing the vision path on
+  // 4 Sep 2026: seventy-six files going back weeks, most ~13 KB and three of them
+  // 11.4 MB each — full-desktop captures, complete with whatever was on screen at
+  // the time. Every signature comparison this agent has ever made left one
+  // behind, so this predates the vision work by months and is the more serious
+  // half of what the probe found.
+  //
+  // Nothing downstream needs the file: the signature is computed from it
+  // immediately and the image is encoded immediately. Failure to delete is
+  // swallowed on purpose — a locked temp file must not fail the look it belongs
+  // to, which would trade a privacy leak for a broken capability.
+  const discardCapture = async (capturePath) => {
+    if (!capturePath) return;
+    await fs.rm(capturePath, { force: true }).catch(() => {});
+  };
+
+  // A WINDOW AS AN IMAGE, FOR A MODEL THAT CAN LOOK AT ONE.
+  //
+  // `captureScreen` writes a PNG to the temp directory and hands back the path,
+  // which is the shape the signature comparison already uses. This reads it back
+  // as base64 for the wire, and deletes it: the file is a screenshot of the
+  // user's screen, it has served its purpose the moment it is encoded, and
+  // leaving it in %TEMP% is a privacy leak nobody would ever look for.
+  //
+  // Returns null on any failure rather than throwing. A capture that did not
+  // work must degrade to the text reading, which is what the caller already has
+  // in its hand — losing the whole look because the picture failed would be a
+  // strictly worse outcome than not asking for a picture.
+  const captureWindowImage = async (windowId, application) => {
+    if (typeof adapter.captureScreen !== "function") return null;
+    let capturedPath = null;
+    try {
+      const capture = await adapter.captureScreen(
+        windowId ? { windowId: String(windowId) } : { application: String(application ?? "") }
+      );
+      if (!capture?.captured || !capture.path) return null;
+      capturedPath = capture.path;
+      const bytes = await fs.readFile(capturedPath);
+      // TOO BIG IS A REFUSAL, NOT A BEST EFFORT.
+      //
+      // Measured with scripts/probe-screen-vision.mjs on 4 Sep 2026: an ordinary
+      // application window is ~13 KB, and `screen {application: "explorer",
+      // vision: true}` produced **11,371,682 bytes**. Explorer owns the desktop
+      // window, whose bounds ARE the whole virtual screen, so the host captured
+      // every monitor.
+      //
+      // Every vendor rejects that — Anthropic's limit is ~5 MB of base64 — and
+      // the failure would arrive as an HTTP 400 in the middle of a task, after
+      // ~15 MB had been serialised and uploaded. Refusing here costs one step and
+      // names the fix; the alternative costs the request and explains nothing.
+      if (bytes.length > MAX_VISION_BYTES) {
+        return { tooLarge: true, bytes: bytes.length };
+      }
+      return { mediaType: "image/png", data: bytes.toString("base64"), bytes: bytes.length };
+    } catch {
+      return null;
+    } finally {
+      // THE FILE IS A SCREENSHOT OF SOMEBODY'S SCREEN. It has done its job the
+      // moment it is encoded, and %TEMP% is not where it should spend the rest of
+      // its life — see `discardCapture`.
+      if (capturedPath) await discardCapture(capturedPath);
+    }
+  };
+
   const windowLook = async ({ windowId, application } = {}) => {
     if ((!windowId && !application) || typeof adapter.captureScreen !== "function") return null;
+    let capturedPath = null;
     try {
       const capture = await adapter.captureScreen(
         windowId ? { windowId: String(windowId) } : { application: String(application) }
       );
       if (!capture?.captured || !capture.path) return null;
+      capturedPath = capture.path;
       const cells = await readSignature(capture.path);
       return cells ? { cells, bounds: capture.bounds ?? null } : null;
     } catch {
       return null;
+    } finally {
+      // The signature is computed above and the file is of no further use. Left
+      // undeleted, this is what put 76 screenshots of the user's screen in
+      // %TEMP% — see `discardCapture`.
+      await discardCapture(capturedPath);
     }
   };
 
@@ -3834,7 +3914,17 @@ export function buildToolset({
         properties: {
           application: { type: "string", description: "Process name, e.g. \"notepad\", \"chrome\". Omit to re-read the window you are working in" },
           windowId: { type: "string" },
-          desktop: { type: "boolean", description: "Read whatever window is in front on the desktop instead, whichever it is" }
+          desktop: { type: "boolean", description: "Read whatever window is in front on the desktop instead, whichever it is" },
+          // THE ANSWER TO "YOU CANNOT SEE ICONS", AND IT IS OPT-IN FOR A REASON.
+          //
+          // A picture costs ~1,500 tokens against ~267-1,029 for a reading, and
+          // the reading comes back as NAMED, clickable controls rather than
+          // pixels something still has to interpret. So text stays the default
+          // and always will. What text cannot do is see a control with no label —
+          // an emoji react, a paperclip, an unlabelled three-dot menu — and the
+          // measured cost of that blindness is the `unchangedReadings` guard
+          // firing after forty-eight steps and 692,000 tokens.
+          vision: { type: "boolean", description: "Also capture the window as an image. Use ONLY when the reading is missing something you need to see — an icon or an unlabelled button. Costs far more than a reading." }
         },
         required: []
       },
@@ -4017,6 +4107,28 @@ export function buildToolset({
           method: result.ocr || result.visibleText ? "screen.read:tree+ocr" : "screen.read:tree",
           verdict: CONFIRMED
         });
+        // AND THE PIXELS, WHEN THE READING WAS NOT ENOUGH.
+        //
+        // Attached ALONGSIDE the tree, never instead of it: the tree is what
+        // gives clickable names, and a model handed only a picture has to guess
+        // coordinates — which this codebase has measured as the least reliable
+        // way to press anything (`click by label`, and the whole disambiguation
+        // path). The picture is for the controls the tree cannot describe.
+        //
+        // The loop turns `imageAttachment` into a message the provider
+        // understands; this tool does not know what a provider is. If the capture
+        // fails, that is said out loud rather than silently dropped — a look that
+        // quietly returned no picture reads as a window with nothing in it.
+        if (args.vision === true) {
+          if (state.visionAvailable !== true) {
+            result.visionUnavailable = true;
+          } else {
+            const shot = await captureWindowImage(result.windowId ?? target.windowId, target.application);
+            if (shot?.tooLarge) result.visionTooLarge = shot.bytes;
+            else if (shot) result.imageAttachment = shot;
+            else result.visionFailed = true;
+          }
+        }
         return result;
       },
       failed: (result) => result.read === false,
@@ -4192,6 +4304,35 @@ export function buildToolset({
 
         return reported(result, [
           `Window: ${result.application ?? "?"} — ${result.title ?? "?"} (windowId ${result.windowId})`,
+          // A PICTURE THAT WAS ASKED FOR AND DID NOT ARRIVE MUST SAY SO.
+          //
+          // Silence here is the worst outcome available: the model asked to see
+          // the window because the reading was missing something, gets the same
+          // reading back with no picture, and has no way to tell "there is
+          // nothing there" from "nobody looked". It would then read the absence
+          // as evidence and carry on — which is the exact shape of every false
+          // claim this codebase has spent a year removing.
+          //
+          // The lesson goes in the RESULT rather than the tool description, per
+          // the house rule: it is read at the moment it matters and costs nothing
+          // the rest of the time.
+          result.visionUnavailable
+            ? "NOTE: you asked to see this window, and the model configured here cannot look at images. " +
+              "You are working from the text reading alone. If what you need is an unlabelled icon, it is " +
+              "not in this reading and no amount of re-reading will produce it — say so and ask the user."
+            : null,
+          result.visionFailed
+            ? "NOTE: you asked to see this window and the capture failed, so there is NO picture below — " +
+              "only the text reading. Do not treat anything missing from it as absent from the screen."
+            : null,
+          // The desktop case, which is what this actually catches: Explorer owns
+          // a window whose bounds are every monitor, so `screen {application:
+          // "explorer", vision: true}` captured 11.4 MB of all of them.
+          result.visionTooLarge
+            ? `NOTE: there is NO picture below. The capture was ${Math.round(result.visionTooLarge / 1_000_000)} MB — ` +
+              "that is the whole desktop, not one window, and it is larger than any model will accept. Name the " +
+              "specific application you want to look at, or pass its windowId, and ask again."
+            : null,
           recipientMismatch,
           // FIRST, above everything, because it changes how the rest is read.
           // The text on screen is other people's words — a chat, a page, a
@@ -9074,6 +9215,16 @@ export function buildToolset({
     // Expose only that boolean; tool implementations and arguments stay inside
     // this boundary.
     isActingTool: (name) => byName.get(name)?.acts === true,
+
+    // WHETHER THE CONFIGURED MODEL HAS EYES. Set once per run by the agent loop,
+    // which is the only thing that holds the provider. The toolset must not go
+    // looking for it: a tool that reaches for the model is a tool that cannot be
+    // tested without one.
+    //
+    // It decides whether `screen {vision: true}` captures pixels or refuses and
+    // says why. Refusing is the honest answer — a model with no eyes, sent an
+    // image, fails the whole request rather than the look.
+    setVisionAvailable: (available) => { state.visionAvailable = available === true; },
 
     // The tool objects themselves — their names, their `acts` flag and their
     // renders. Exposed for the CI property test that walks every tool and proves

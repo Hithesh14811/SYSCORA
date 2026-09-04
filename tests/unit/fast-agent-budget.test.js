@@ -119,15 +119,52 @@ test("an ordinary request is untouched by the ceiling", async () => {
 
   assert.equal(outcome.status, "COMPLETED");
   assert.equal(outcome.message, "Python 3.12.1 is installed.");
-  // 150,000 UNTIL 2 Sep 2026, WHEN THE REAL SESSIONS SAID IT WAS TOO LOW.
+  // 150,000, THEN 400,000, THEN OFF — AND THE SEQUENCE IS THE ARGUMENT.
   //
-  // It had been derived from the eval suite ("the most expensive passing eval
-  // task is ~35,000") rather than from what people ask for. Over 143 real
-  // sessions it fired on 8% of them, including a run that had made no repeated
-  // call and seen no unchanged screen — and this product's most expensive
-  // PASSING run cost 152,064, above the ceiling meant to be well clear of it.
+  // It was first derived from the eval suite ("the most expensive passing eval
+  // task is ~35,000") rather than from what people ask for, and fired on 8% of
+  // 143 real sessions — including a run that had made no repeated call and seen
+  // no unchanged screen, and including this product's most expensive PASSING run
+  // at 152,064. Raised to 400,000, which is the same mistake with a bigger
+  // number: an hour of real coding passes it and the run is cut off mid-task.
   //
-  // Pinned as a number rather than left implicit because raising a budget is
-  // exactly the change that should be hard to make by accident.
-  assert.equal(agent.maxFreshTokens, 400000);
+  // A budget that has to be raised every time somebody does real work is not
+  // protecting anything. What replaced it is BUDGET_CHECKPOINTS — the cost is
+  // announced and the run continues — plus the two behavioural guards that
+  // actually catch a runaway. Still settable by caller or environment.
+  assert.equal(agent.maxFreshTokens, Number.POSITIVE_INFINITY);
+  assert.equal(agent.maxSteps, Number.POSITIVE_INFINITY);
+  assert.equal(agent.maxElapsedMs, Number.POSITIVE_INFINITY);
+});
+
+// A CEILING THAT IS OFF MUST STILL BE SETTABLE, or a run nobody wants unbounded
+// cannot be bounded. Both routes, because the environment one is what an
+// operator reaches for and the caller one is what the eval harness uses.
+test("the budgets are still settable by the caller and by the environment", async () => {
+  const agent = new FastAgent({
+    provider: { supportsChat: () => true, async chat() { return { text: "", toolCalls: [] }; } },
+    toolset: busyToolset(),
+    maxSteps: 12,
+    maxElapsedMs: 34_000,
+    maxFreshTokens: 56_000
+  });
+  assert.equal(agent.maxSteps, 12);
+  assert.equal(agent.maxElapsedMs, 34_000);
+  assert.equal(agent.maxFreshTokens, 56_000);
+
+  const { budgetFromEnv } = await import("../../packages/fast-agent/src/index.js");
+  process.env.SYSCORA_TEST_BUDGET = "250";
+  assert.equal(budgetFromEnv("SYSCORA_TEST_BUDGET"), 250);
+  // "off", "none" and zero all mean unbounded — three spellings because an
+  // operator turning a limit off should not have to guess which word this file
+  // happens to accept.
+  for (const spelling of ["off", "none", "0"]) {
+    process.env.SYSCORA_TEST_BUDGET = spelling;
+    assert.equal(budgetFromEnv("SYSCORA_TEST_BUDGET"), Number.POSITIVE_INFINITY, spelling);
+  }
+  // And nonsense falls back rather than silently becoming NaN, which compares
+  // false against everything and would disable the budget by accident.
+  process.env.SYSCORA_TEST_BUDGET = "banana";
+  assert.equal(budgetFromEnv("SYSCORA_TEST_BUDGET", 99), 99);
+  delete process.env.SYSCORA_TEST_BUDGET;
 });
