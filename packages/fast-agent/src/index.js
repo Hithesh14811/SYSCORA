@@ -1124,17 +1124,38 @@ export class FastAgent {
     const hardFailure = result?.ok !== true || verdict === "REFUTED";
     const acts = this.toolset.isActingTool?.(tool) === true;
     if (hardFailure) {
+      // The policy floor, the approval card and this loop's own repeat guard all
+      // arrive here looking exactly like a tool that would not work. None of
+      // them is a technique to be got around. See NOT_A_TECHNIQUE_FAILURE.
+      if (!isLearnableFailure(result)) return;
       if (run.pending.length < 4) {
         run.pending.push({
           tool,
           application: adaptiveApplication(tool, args, result),
           failureClass: adaptiveFailureClass(result),
-          recoverySequence: []
+          recoverySequence: [],
+          // WHEN DID IT FIRST GO WRONG. The gap between this and the recovery is
+          // what separates "you did it too early" from "you did the wrong
+          // thing", and nothing was recording it.
+          failedAt: Date.now()
         });
       }
       return;
     }
     for (const pending of run.pending) {
+      // THE MOST GENERALISABLE LESSON THERE IS: IT NEEDED TIME.
+      //
+      // Eighteen of this machine's 113 recorded failures are "no track started"
+      // against a window that was open — the app had not finished getting ready.
+      // The recovery for that is not a different button, it is waiting, and a
+      // recovery recorded only as a list of tool names cannot express it.
+      //
+      // Two independent signals, and the second is the strong one:
+      //   an explicit `wait` in the recovery, or
+      //   THE SAME TOOL SUCCEEDING ON A LATER ATTEMPT — nothing else changed, so
+      //   the only variable was time.
+      if (tool === "wait") pending.neededTime = true;
+      if (tool === pending.tool && Date.now() - (pending.failedAt ?? 0) > 1500) pending.neededTime = true;
       if (pending.recoverySequence.at(-1) !== tool) pending.recoverySequence.push(tool);
     }
     // A capability-confirmed acting result is enough evidence to close the
@@ -1157,10 +1178,15 @@ export class FastAgent {
     }
     const unique = new Map();
     for (const pattern of run.learned.slice(0, 8)) {
-      const key = [pattern.tool, pattern.application, pattern.failureClass, pattern.recoverySequence.join(">"), pattern.recovered].join("|");
+      const key = [pattern.tool, pattern.application, pattern.failureClass, pattern.recoverySequence.join(">"), pattern.recovered, pattern.neededTime === true].join("|");
       unique.set(key, pattern);
     }
-    for (const pattern of unique.values()) await this.memory.recordAdaptivePattern(pattern);
+    for (const pattern of unique.values()) {
+      // `failedAt` is only a clock for this live run. Persisting it would leak
+      // meaningless wall-clock state into a reusable outcome pattern.
+      const { failedAt, ...persistedPattern } = pattern;
+      await this.memory.recordAdaptivePattern(persistedPattern);
+    }
     if (unique.size) {
       await this._emit({ type: "OUTCOME_MEMORY_UPDATED", details: { patterns: unique.size } });
     }
