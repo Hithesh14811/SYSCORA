@@ -205,7 +205,18 @@ export async function openAiCompatibleChat({
     : value);
   const wireMessages = (messages ?? []).map((message) => ({
     ...message,
-    ...(typeof message.content === "string" ? { content: wellFormed(message.content) } : {})
+    ...(typeof message.content === "string" ? { content: wellFormed(message.content) } : {}),
+    // A LOOK AT THE ACTUAL PIXELS, in this wire format's spelling. The loop emits
+    // a vendor-neutral `{type: "input_image", mediaType, data}` block; OpenAI's
+    // shape is a data URL under `image_url`. Same argument as `reasoningBody`:
+    // the vendor's spelling lives in the vendor's transport, never in the loop.
+    ...(Array.isArray(message.content)
+      ? {
+          content: message.content.map((block) => (block?.type === "input_image"
+            ? { type: "image_url", image_url: { url: `data:${block.mediaType};base64,${block.data}` } }
+            : { type: "text", text: wellFormed(String(block?.text ?? "")) }))
+        }
+      : {})
   })).map((message) => (Array.isArray(message.tool_calls)
     ? {
         ...message,
@@ -494,6 +505,29 @@ function sleepUnlessAborted(ms, signal) {
   });
 }
 
+// CAN THIS MODEL ACTUALLY LOOK AT A PICTURE?
+//
+// The agent's oldest and most expensive blindness is stated in its own system
+// prompt: "YOU CANNOT SEE ICONS." A reading is text and control names, so an
+// emoji react, a paperclip or an unlabelled three-dot menu does not appear in it
+// at all — and the measured consequence is the `unchangedReadings >= 8` guard
+// firing after forty-eight steps and 692,000 tokens spent hunting for a button
+// that was never going to be in the tree.
+//
+// Pixels fix that, and only on a model that has eyes. Asked of the MODEL NAME
+// rather than the provider, because one provider class serves many models here:
+// `AgentRouterModelProvider` is the transport for DeepSeek — which cannot see —
+// and for AgentRouter, which will happily serve Claude, which can.
+//
+// Unknown means NO. A model that cannot see, sent an image, answers with an HTTP
+// 400 mid-task; a model that can see and was not offered one is merely no worse
+// off than it is today.
+const VISION_MODELS = /gpt[-_. ]?(?:4o|4\.1|5|6)|^o[34]\b|astra|sol\b|claude|opus|sonnet|haiku|fable|gemini|qwen.*vl|llava|pixtral|internvl|molmo/i;
+
+export function modelSupportsVision(model) {
+  return VISION_MODELS.test(String(model ?? ""));
+}
+
 export function isRetryableProviderError(error) {
   if (error?.name === "AbortError" || error?.name === "TypeError") return true;
   const status = String(error?.message ?? "").match(/HTTP\s+(\d{3})/i)?.[1];
@@ -535,6 +569,37 @@ export class LanguageModelProvider {
 
   supportsChat() {
     return false;
+  }
+
+  // HOW *THIS* ENDPOINT IS TOLD WHETHER TO DELIBERATE.
+  //
+  // The agent loop knows WHETHER this turn should think — it is off for an
+  // ordinary step and on for one that has already been cut off or arrived
+  // malformed, which was measured to be both faster and more accurate. It cannot
+  // know HOW to say so, because that is a vendor's spelling, and the loop had
+  // one vendor's hard-coded: `chat_template_kwargs` plus `reasoning_effort`,
+  // sent to every provider. Anthropic rejects unknown top-level body fields with
+  // an HTTP 400, so the correct behaviour on an ordinary step would have failed
+  // every ordinary step.
+  //
+  // The default is the OpenAI-compatible spelling because that is what every
+  // endpoint this has run against so far accepts. ALL THREE SPELLINGS ARE SENT
+  // for the same measured reason as before: the base URL fronts several serving
+  // stacks, they do not all read the same field, and an unknown key is ignored by
+  // the stack that does not know it. Sending only the one this month's deployment
+  // honours is how this quietly stops working after somebody else's upgrade.
+  reasoningBody(deliberate) {
+    return deliberate
+      ? null
+      : { chat_template_kwargs: { thinking: false, enable_thinking: false }, reasoning_effort: "none" };
+  }
+
+  // WHETHER THIS MODEL CAN BE SHOWN A SCREENSHOT. See `modelSupportsVision`:
+  // asked of the model name, because one provider class here serves several
+  // models and only some of them have eyes. Unknown means no — a model that
+  // cannot see, sent an image, fails the request rather than the look.
+  supportsVision() {
+    return modelSupportsVision(this.model);
   }
 
   // Legacy name kept for backward compatibility.
@@ -1101,14 +1166,423 @@ export class OpenAIModelProvider extends LanguageModelProvider {
   }
 }
 
+// ANTHROPIC COULD NOT DRIVE THIS AGENT AT ALL, AND NOTHING SAID SO.
+//
+// `AgentRuntime._canRunFastAgent` requires `provider.chat` AND
+// `provider.supportsChat() === true`. This class had neither, so the base class
+// answered false — and configuring Claude, the strongest model the README
+// advertises support for, silently routed every request into the ~15,000-line
+// staged pipeline that the eval reports is reached zero times. Not a degraded
+// mode: a different product, one that cannot do GUI work.
+//
+// Nothing failed loudly, because falling back to the offline pipeline is a
+// legitimate path — it is what happens when there is no model at all. So the
+// symptom was "Claude is much worse at this than DeepSeek", which is the
+// eleventh instance of this codebase's signature defect: the machinery is
+// correct and something above it makes it unreachable.
+//
+// THE TRANSLATION IS THE WHOLE OF THIS FUNCTION, and it goes in one direction
+// only. The agent loop speaks OpenAI's shape — one flat message list, `tool_calls`
+// on an assistant message, a `tool` role carrying the result — because that is
+// what it has always spoken and rewriting the loop per vendor is how a codebase
+// ends up with a different agent per provider. Anthropic wants the system prompt
+// hoisted out, content as typed blocks, and tool results posted back as `user`
+// turns. That difference lives here and nowhere else.
+const ANTHROPIC_STOP_REASONS = Object.freeze({
+  tool_use: "tool_calls",
+  max_tokens: "length",
+  end_turn: "stop",
+  stop_sequence: "stop",
+  // Anthropic's word for "I stopped because a guardrail fired". Mapped to the
+  // OpenAI spelling the loop's `wasTruncated` already understands, because a
+  // turn that was cut off is a turn that was cut off however it is spelled.
+  refusal: "content_filter",
+  pause_turn: "stop"
+});
+
+/**
+ * The loop's OpenAI-shaped conversation, as Anthropic Messages wants it.
+ *
+ * @returns {{system: Array, messages: Array}}
+ */
+export function toAnthropicMessages(messages = []) {
+  const system = [];
+  const out = [];
+
+  // CONSECUTIVE SAME-ROLE TURNS ARE MERGED, NOT SENT AS THEY ARE.
+  //
+  // The loop legitimately produces several `user` messages in a row — the
+  // conversation history, then the request, then a `[SYSTEM]` nudge — and
+  // Anthropic expects turns to alternate. Merging into one turn with several
+  // content blocks is always valid and loses nothing; sending them as they are
+  // is an HTTP 400 on an ordinary conversation.
+  const push = (role, blocks) => {
+    if (blocks.length === 0) return;
+    const last = out[out.length - 1];
+    if (last?.role === role) last.content.push(...blocks);
+    else out.push({ role, content: blocks });
+  };
+
+  for (const message of messages) {
+    const role = String(message?.role ?? "user");
+    const content = message?.content;
+
+    if (role === "system") {
+      if (content) system.push({ type: "text", text: String(content) });
+      continue;
+    }
+
+    if (role === "tool") {
+      // A tool result is a `user` turn here. The id has to survive: Anthropic
+      // rejects a result whose `tool_use_id` matches no call, exactly as OpenAI
+      // rejects an orphaned `tool_call_id`.
+      push("user", [{
+        type: "tool_result",
+        tool_use_id: String(message.tool_call_id ?? ""),
+        content: String(content ?? "")
+      }]);
+      continue;
+    }
+
+    if (role === "assistant") {
+      const blocks = [];
+      if (typeof content === "string" && content.trim()) blocks.push({ type: "text", text: content });
+      for (const call of message.tool_calls ?? []) {
+        let input = {};
+        try {
+          input = JSON.parse(call.function?.arguments || "{}");
+        } catch {
+          // A call whose arguments did not parse is one the loop already
+          // discarded; sending `{}` keeps the pairing intact so the result that
+          // follows it is not orphaned, which is the thing that would 400.
+          input = {};
+        }
+        blocks.push({ type: "tool_use", id: String(call.id ?? ""), name: String(call.function?.name ?? ""), input });
+      }
+      push("assistant", blocks);
+      continue;
+    }
+
+    // A LOOK AT THE ACTUAL PIXELS. The loop emits a vendor-neutral
+    // `{type: "input_image", mediaType, data}` block for the same reason it does
+    // not know how to spell "do not deliberate": the shape is this vendor's and
+    // belongs in this file. Anthropic wants a base64 source object.
+    if (Array.isArray(content)) {
+      push("user", content.map((block) => (block?.type === "input_image"
+        ? { type: "image", source: { type: "base64", media_type: block.mediaType, data: block.data } }
+        : { type: "text", text: String(block?.text ?? "") })).filter((block) => block.type !== "text" || block.text));
+      continue;
+    }
+
+    if (typeof content === "string" && content) push("user", [{ type: "text", text: content }]);
+  }
+
+  // Anthropic requires the first turn to be `user`. A conversation that opens on
+  // an assistant turn is possible here after a replay handover, and it is a 400.
+  if (out.length > 0 && out[0].role === "assistant") {
+    out.unshift({ role: "user", content: [{ type: "text", text: "(continuing)" }] });
+  }
+  return { system, messages: out };
+}
+
+/** The loop's OpenAI tool schema, as Anthropic wants it. */
+export function toAnthropicTools(tools = []) {
+  return (tools ?? [])
+    .map((tool) => tool?.function ?? tool)
+    .filter((fn) => fn?.name)
+    .map((fn) => ({
+      name: fn.name,
+      description: fn.description ?? "",
+      input_schema: fn.parameters ?? { type: "object", properties: {} }
+    }));
+}
+
+/**
+ * One streaming tool-calling turn against the Anthropic Messages API.
+ *
+ * Returns the SAME shape `openAiCompatibleChat` returns — `{text, reasoning,
+ * toolCalls, finishReason, usage}` with OpenAI's usage spelling — because the
+ * agent loop reads that shape and must not learn a second one. Translating twice
+ * here is cheaper than translating everywhere.
+ */
+export async function anthropicChat({
+  baseUrl, apiKey, model, version = "2023-06-01", headers = {},
+  messages = [], tools = [], temperature = 0.2, maxTokens = 4096,
+  timeoutMs = 60000, idleTimeoutMs = STREAM_IDLE_TIMEOUT_MS, signal = null,
+  onTextDelta = null, onReasoningDelta = null, onToolCallDelta = null,
+  // Anthropic's own body fields — `thinking: {type, budget_tokens}` and friends.
+  // Same passthrough contract as the OpenAI transport: the spelling is the
+  // vendor's, so it does not get a name in the neutral layer.
+  extraBody = null
+}) {
+  const controller = new AbortController();
+  const deadline = Date.now() + timeoutMs;
+  // Same two-timer rule as the OpenAI transport, for the same measured reason: a
+  // total-duration timer cannot tell a model that is thinking from a socket that
+  // died, and Claude's extended thinking streams for a long time before the first
+  // tool call. Silence is what separates them.
+  const hardTimer = setTimeout(() => controller.abort(), Math.max(1000, deadline - Date.now()));
+  let idleTimer = null;
+  const armIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  };
+  const clearTimers = () => { clearTimeout(hardTimer); clearTimeout(idleTimer); };
+  const onOuterAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+
+  const { system, messages: wire } = toAnthropicMessages(messages);
+  const wireTools = toAnthropicTools(tools);
+
+  // PROMPT CACHING IS EXPLICIT HERE, AND THE ECONOMICS OF THIS PRODUCT DEPEND ON
+  // IT. The DeepSeek endpoint caches prefixes on its own; Anthropic caches only
+  // what is marked. Without these two breakpoints every step would re-buy the
+  // whole ~9,600-token fixed prefix at full price — see the cache note in the
+  // agent loop, where 8,320 of 8,613 fixed tokens come back cached per step.
+  //
+  // Marked on the LAST tool and the LAST system block, because a breakpoint
+  // caches everything before it.
+  if (wireTools.length > 0) {
+    wireTools[wireTools.length - 1] = {
+      ...wireTools[wireTools.length - 1],
+      cache_control: { type: "ephemeral" }
+    };
+  }
+  if (system.length > 0) {
+    system[system.length - 1] = { ...system[system.length - 1], cache_control: { type: "ephemeral" } };
+  }
+
+  // EXTENDED THINKING HAS TWO RULES THIS API ENFORCES WITH A 400, AND THE CALLER
+  // CANNOT KNOW EITHER OF THEM.
+  //
+  //   budget_tokens must be >= 1024 AND strictly less than max_tokens
+  //   temperature must be 1 while thinking is enabled
+  //
+  // `reasoningBody` asks for a fixed 8,000-token budget because it does not know
+  // what `max_tokens` will be — the loop sends 8,192 on an ordinary turn and
+  // 16,384 on a retry — so the clamp belongs here, which is the only place that
+  // has both numbers. Without it, asking Claude to deliberate on an ordinary
+  // turn is a 400 rather than a slower answer.
+  let body = { ...(extraBody ?? {}) };
+  let wireTemperature = temperature;
+  if (body.thinking?.type === "enabled") {
+    const budget = Math.min(Number(body.thinking.budget_tokens ?? 0), maxTokens - 1024);
+    if (budget < 1024) {
+      // No room to think in. Drop it rather than fail the turn: a turn that
+      // answers without deliberating is worth far more than an HTTP 400.
+      delete body.thinking;
+    } else {
+      body = { ...body, thinking: { ...body.thinking, budget_tokens: budget } };
+      wireTemperature = 1;
+    }
+  }
+
+  let emitted = false;
+  try {
+    const response = await fetch(`${String(baseUrl).replace(/\/$/, "")}/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": version,
+        ...headers
+      },
+      body: JSON.stringify({
+        model,
+        // REQUIRED by this API, unlike OpenAI's, where it is optional. A missing
+        // one is an HTTP 400 rather than a default.
+        max_tokens: maxTokens,
+        temperature: wireTemperature,
+        ...(system.length > 0 ? { system } : {}),
+        messages: wire,
+        ...(wireTools.length > 0 ? { tools: wireTools } : {}),
+        stream: true,
+        // Last, so a caller's field can override a default above it rather than
+        // being silently dropped by it.
+        ...body
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const body = await response.text();
+        detail = body ? `: ${body.slice(0, 300)}` : "";
+      } catch { /* the status alone identifies the failure */ }
+      const error = new Error(`HTTP ${response.status}${detail}`);
+      error.status = response.status;
+      error.retryAfterMs = Number(response.headers.get("retry-after")) * 1000 || null;
+      throw error;
+    }
+
+    let text = "";
+    let reasoning = "";
+    let stopReason = null;
+    const usage = { prompt_tokens: 0, completion_tokens: 0, prompt_tokens_details: { cached_tokens: 0 } };
+    // Tool calls arrive as blocks identified by their stream index, and their
+    // arguments arrive as JSON fragments that only parse once the block closes.
+    const blocks = new Map();
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    armIdle();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      armIdle();
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        let event;
+        try { event = JSON.parse(payload); } catch { continue; }
+
+        switch (event.type) {
+          case "message_start": {
+            const started = event.message?.usage ?? {};
+            // `input_tokens` EXCLUDES what was served from cache, so a run whose
+            // prefix all cached would report almost no input and the loop's cost
+            // accounting would read as free. The OpenAI shape this returns says
+            // prompt_tokens is the TOTAL with `cached_tokens` a subset of it, and
+            // that is the arithmetic every surface here does.
+            const cached = Number(started.cache_read_input_tokens ?? 0);
+            usage.prompt_tokens = Number(started.input_tokens ?? 0)
+              + cached + Number(started.cache_creation_input_tokens ?? 0);
+            usage.prompt_tokens_details.cached_tokens = cached;
+            usage.completion_tokens = Number(started.output_tokens ?? 0);
+            break;
+          }
+          case "content_block_start": {
+            const block = event.content_block ?? {};
+            if (block.type === "tool_use") {
+              blocks.set(event.index, { id: block.id, name: block.name, json: "" });
+              onToolCallDelta?.({ name: block.name, argumentsFragment: "" });
+            }
+            break;
+          }
+          case "content_block_delta": {
+            const delta = event.delta ?? {};
+            if (delta.type === "text_delta") {
+              text += delta.text ?? "";
+              emitted = true;
+              onTextDelta?.(delta.text ?? "");
+            } else if (delta.type === "thinking_delta") {
+              reasoning += delta.thinking ?? "";
+              emitted = true;
+              onReasoningDelta?.(delta.thinking ?? "");
+            } else if (delta.type === "input_json_delta") {
+              const pending = blocks.get(event.index);
+              if (pending) {
+                pending.json += delta.partial_json ?? "";
+                onToolCallDelta?.({ name: pending.name, argumentsFragment: delta.partial_json ?? "" });
+              }
+            }
+            break;
+          }
+          case "message_delta": {
+            stopReason = event.delta?.stop_reason ?? stopReason;
+            if (event.usage?.output_tokens != null) usage.completion_tokens = Number(event.usage.output_tokens);
+            break;
+          }
+          case "error": {
+            const error = new Error(event.error?.message ?? "the model stream reported an error");
+            error.status = 502;
+            error.emitted = emitted;
+            throw error;
+          }
+          default:
+            break;
+        }
+      }
+    }
+    await reader.cancel().catch(() => {});
+
+    // A CUT CONNECTION IS NOT A FINISHED ANSWER — the same rule as the OpenAI
+    // transport, and it exists for the same reason: without it the loop reads a
+    // truncated turn with no tool calls as the model having finished, and reports
+    // an interrupted task as complete in the model's own half-sentence.
+    if (!stopReason) {
+      const error = new Error("The model stream ended before the turn was complete (connection dropped).");
+      error.status = 503;
+      error.emitted = emitted;
+      throw error;
+    }
+
+    const toolCalls = [...blocks.entries()]
+      .sort(([left], [right]) => Number(left) - Number(right))
+      .map(([index, call]) => ({
+        id: call.id ?? `call_${index}`,
+        name: call.name,
+        // An empty block means a call with no arguments, which is `{}` and not
+        // the empty string — the loop JSON.parses this.
+        arguments: call.json || "{}"
+      }))
+      .filter((call) => call.name);
+
+    return {
+      text,
+      reasoning,
+      toolCalls,
+      finishReason: ANTHROPIC_STOP_REASONS[stopReason] ?? stopReason,
+      usage
+    };
+  } finally {
+    clearTimers();
+    if (signal) signal.removeEventListener?.("abort", onOuterAbort);
+  }
+}
+
 export class AnthropicModelProvider extends LanguageModelProvider {
   constructor(config = {}) {
     super(config);
+    // The same OS trust union as every other remote provider: which vendor is
+    // configured must not decide whether the machine's CA store works.
+    enableSystemCaTrust();
     this.apiKey = config.apiKey || process.env.ANTHROPIC_API_KEY;
     this.model = config.model || "claude-sonnet-5";
     this.baseUrl = config.baseUrl || "https://api.anthropic.com/v1";
     this.version = config.version || "2023-06-01";
     this.name = "anthropic";
+  }
+
+  // WITHOUT THESE TWO THE AGENT LOOP IS UNREACHABLE. See the note above
+  // `toAnthropicMessages`: `_canRunFastAgent` checks both, the base class
+  // answered false for `supportsChat`, and every Claude request went to the
+  // offline pipeline instead of the loop.
+  supportsChat() { return Boolean(this.apiKey); }
+
+  // ANTHROPIC DOES NOT DELIBERATE UNLESS ASKED, so "off" is silence and there is
+  // nothing to send — which is the opposite of the DeepSeek default the base
+  // class is written for. Sending that endpoint's field names here is an HTTP
+  // 400 on an unknown body field, on every ordinary step.
+  //
+  // Asked to think, extended thinking is switched on explicitly. The budget is
+  // clamped against `max_tokens` inside the transport, because it is the only
+  // place that knows what `max_tokens` ended up being.
+  reasoningBody(deliberate) {
+    return deliberate ? { thinking: { type: "enabled", budget_tokens: 8_000 } } : null;
+  }
+
+  async chat(request = {}) {
+    this._usage.calls += 1;
+    const result = await anthropicChat({
+      baseUrl: this.baseUrl,
+      apiKey: this.apiKey,
+      version: this.version,
+      model: request.model || this.model,
+      ...request
+    });
+    this._usage.tokensIn += result.usage?.prompt_tokens ?? 0;
+    this._usage.tokensOut += result.usage?.completion_tokens ?? 0;
+    return result;
   }
 
   async healthCheck({ timeoutMs = 5000 } = {}) {
@@ -1131,7 +1605,14 @@ export class AnthropicModelProvider extends LanguageModelProvider {
   }
 
   capabilities() {
-    return { name: this.name, structured: true, text: true, streaming: false, model: this.model, remote: true };
+    return {
+      name: this.name, structured: true, text: true, streaming: true, tools: true,
+      model: this.model, remote: true,
+      // Read by context-budget.js to size the conversation. Declared rather than
+      // guessed from the model name, because a provider that knows its own limit
+      // is always right and the table there is always an estimate.
+      contextTokens: 200_000
+    };
   }
 
   // Anthropic has no strict json_schema response format, so we instruct the
