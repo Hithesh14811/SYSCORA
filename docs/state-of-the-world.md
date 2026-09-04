@@ -941,6 +941,111 @@ those is the expensive way to learn it twice.
 
 `npm test`: **1,663 tests, 1,661 pass, 0 fail, 2 skipped** (was 1,659 / 1,657).
 
+### Fixed 3 Sep 2026: it was recording failures, not learning from them
+
+**The user's objection, and it was right.** A saved skill replays a route
+verbatim, so it is useless the moment the task differs slightly — and the
+outcome memory underneath it was not making up the difference. What it should be
+learning is the kind of thing a person learns: *that button was not the one*,
+*the click did not take*, *it was not ready yet, wait longer*.
+
+**What it had actually learned in a week**, read off the real store — 39
+patterns, of which the strongest was:
+
+```
+  [21 observations, confidence 0.98]
+  spotify: play_music / tool-failed; recovery screen -> click
+```
+
+That is not a lesson. It says a tool failed and the agent then read the screen
+and clicked, which is the shape of every GUI recovery there is. Nothing in it
+changes what happens next time.
+
+**THREE DEFECTS, ALL MEASURED AGAINST THE 113 REAL FAILURES IN THE STORE.**
+
+**1. The taxonomy was written from imagination and mostly never fired.** Replayed
+through the classifier — `node scripts/probe-failure-taxonomy.mjs`:
+
+```
+  BEFORE                              AFTER  (15 excluded as boundaries)
+    89  79%  tool-failed                21  19%  ambiguous-target
+    18  16%  ambiguous-target           18  16%  nothing-started
+     3   3%  unavailable                15  13%  click-did-not-land
+     3   3%  document-occupied          12  11%  not-what-was-asked
+                                        10   9%  tool-failed
+                                         9   8%  target-not-found
+                                         4   4%  wrong-window
+                                         4   4%  wrong-tool-for-target
+```
+
+**Failures that taught nothing: 79% → 9%.** The new classes are derived from the
+failure shapes the machine actually produces, not invented: `nothing-started`
+(18) is "no track started" against a window that was already open;
+`click-did-not-land` (15) is the user's own "the click didn't work";
+`not-what-was-asked` (12) is "still playing X, which is not what was asked" —
+the action succeeded and hit the wrong thing.
+
+**2. IT WAS LEARNING FROM REFUSALS, AND THAT IS A SAFETY DEFECT.** Fifteen of the
+113 were not the machine resisting a technique: seven were the policy floor
+refusing a command, one was the user answering no to a card, and five were this
+loop's own repeat guard. Recording those as "the tool failed, here is what
+worked afterwards" teaches exactly one thing — how to get past the thing that
+said no — and makes it permanent across runs. `shell-rules.js` already records a
+live session where one refusal produced four attempts to route around it, two of
+them successful, and concludes that *a gate that refuses arbitrary things trains
+the thing it is gating to evade it*. `NOT_A_TECHNIQUE_FAILURE` now excludes them.
+**A boundary is not a defect, and the user saying no is an answer, not an
+obstacle.**
+
+**3. Two thirds of what it learned could never be retrieved.** Relevance was the
+overlap between the user's typed words and `application + tool`. A pattern that
+cannot name its application is filed under `general`, and no request contains the
+word "general" — so **20 of the 39 patterns, including the four-observation
+`click / ambiguous-target` lesson, were written and never read.** A lesson about
+a tool is not a lesson about a topic: "when a click matches several things, read
+the screen and click by label" is true of every GUI task, and requiring the user
+to type "click" to hear it asks them to know the answer in order to be told it.
+General lessons with **three or more observations and a verified recovery** are
+now standing advice; an application's lessons never become standing, because
+Spotify's quirks are not advice about writing a document. **The silence is the
+half worth keeping** and it is held by a test.
+
+**And the lesson the user actually asked for: it needed TIME.** The commonest
+failure this machine produces is an action against an app that had not finished
+getting ready, and a recovery stored as a list of tool names cannot express that.
+`neededTime` is now recorded from two signals — an explicit `wait` in the
+recovery, or **the same tool succeeding on a later attempt**, where nothing
+changed but the clock. When most observations of a pattern were resolved that
+way the guidance says so and says it first: *"what fixed it was TIME, in 3/4
+local observations. The app was not ready yet."* — instead of reciting a route.
+
+It is **counted, not hashed into the pattern's identity**: putting it in the id
+would have orphaned all 39 existing patterns, the 21-observation one included,
+and restarted them at one. "Needed time in 18 of 21" is also a better sentence
+than a boolean.
+
+**Cost.** Nothing new is sent per step. The guidance sits after the fixed prompt
+in the system message, so the large cached prefix is unaffected; it is capped at
+four lines and only appears when something matches. A run that has learned
+nothing relevant pays zero.
+
+**Model-agnostic by construction**, which is what the user asked for: the lessons
+live in SYSCORA's own store and arrive as text, so they apply to whatever model
+is configured and survive changing it.
+
+**Known limits, stated.** The 39 patterns already on disk keep their old
+`tool-failed` class — the failure TEXT is deliberately never stored, so they
+cannot be reclassified, only aged out by new observations. And several existing
+`general: run / tool-failed` patterns were almost certainly learned from terminal
+refusals before this fix; they are the user's data and were left alone rather
+than deleted, but they are the ones worth pruning by hand.
+
+Seven new tests across `fast-agent.test.js` and `memory.test.js`, **proven able
+to fail**: removing the boundary guard, the `nothing-started` class and the
+standing retrieval turns 4 of them red.
+
+`npm test`: **1,670 tests, 1,668 pass, 0 fail, 2 skipped** (was 1,663 / 1,661).
+
 ### Still open
 
 - **`project` cannot run on a default install.** Its own comment says it "does
