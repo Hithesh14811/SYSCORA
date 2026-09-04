@@ -54,6 +54,9 @@ import { EnvironmentModel } from "../../context-engine/src/environment-model.js"
 // on why the loop stopped any more, because every reason now keeps the loop's
 // own sentence. The loop still records it, and the session still carries it.
 import { FastAgent, buildToolset } from "../../fast-agent/src/index.js";
+// Replaying a saved route with nobody watching — see `runSkillUnattended`.
+import { replaySkill } from "../../fast-agent/src/skill-replay.js";
+import { verifyReplayStep } from "../../fast-agent/src/skill-verify.js";
 import { deleteSkill, readSkills, recordSkillRun, writeSkill } from "../../fast-agent/src/skills.js";
 import {
   canAutoApprove,
@@ -358,6 +361,86 @@ export class AgentRuntime {
    * is accepted by the user through the surface. A route that drives somebody's
    * machine should not appear on their disk because a task happened to succeed.
    */
+  /**
+   * Replay a saved route with nobody watching.
+   *
+   * THE ONLY CALLER IS THE TRIGGER RUNNER, and everything unusual about this
+   * method follows from that: there is no user, so nothing may wait for one.
+   *
+   * IT IS SAFE BY CONSTRUCTION RATHER THAN BY CARE. The shared toolset is built
+   * with no `confirm`, and `askPermission` in tools.js returns
+   * `{approved: false, asked: false}` when there is no confirmer — so a gated
+   * step is REFUSED rather than approved, and refused immediately rather than
+   * after a two-minute timeout that nobody is there to beat. That behaviour
+   * predates triggers and is what makes this method a small one.
+   *
+   * The refusal is then read back off the tool's OWN typed receipt
+   * (`refusedByUser`), never by matching English in a message — the same rule
+   * the loop follows when it settles DECLINED. `needsApproval` is what the
+   * runner turns into "Stopped part-way: it reached a step that needed your
+   * approval", which is the sentence the user reads in the morning.
+   *
+   * @returns {Promise<{ok: boolean, detail: string, needsApproval?: boolean}>}
+   */
+  async runSkillUnattended(skill, parameters = {}) {
+    const toolset = this._ensureToolset();
+    let refused = null;
+    const outcome = await replaySkill({
+      skill,
+      parameters,
+      execute: async (tool, args) => {
+        const result = await toolset.execute(tool, args);
+        // Captured on the way past: `replaySkill` reports a failed step as a
+        // handover with the step's text, and "the user said no" has to be told
+        // apart from "the button was not there" — they need different sentences
+        // and only one of them is worth retrying tomorrow.
+        if (result?.raw?.refusedByUser === true && !refused) {
+          refused = `${tool}${args?.text ? ` "${args.text}"` : ""}`;
+        }
+        return result;
+      },
+      verifyStep: (check, context) => verifyReplayStep(check, {
+        execute: (tool, args) => toolset.execute(tool, args),
+        focusedValue: toolset.focusedValue ? () => toolset.focusedValue() : null,
+        lastResult: context?.result
+      })
+    });
+    if (refused) {
+      return { ok: false, needsApproval: true, detail: refused };
+    }
+    if (outcome.replayed) {
+      return { ok: true, detail: `${outcome.steps} step(s) in ${(outcome.elapsedMs / 1000).toFixed(1)}s, no model calls` };
+    }
+    // `handover` carries the context; `handover.failure` is what went wrong. A
+    // first version read the outer object and reported every failure as
+    // "stopped at step ?: it could not be verified" — which is the shape of an
+    // error message that has lost its error, and it hid a real defect for a
+    // whole run of the end-to-end proof.
+    const failure = outcome.handover?.failure ?? {};
+    return {
+      ok: false,
+      detail: `stopped at step ${failure.step ?? "?"}${failure.tool ? ` (${failure.tool})` : ""}: ` +
+        `${String(failure.reason ?? "it could not be verified").slice(0, 200)}`
+    };
+  }
+
+  /**
+   * Where this runtime keeps its state.
+   *
+   * Exposed because the trigger store needs it and reaching into `_basePath`
+   * from the daemon would make a private field part of the HTTP layer's
+   * contract — which is how it stops being changeable.
+   */
+  get basePath() {
+    return this._basePath ?? process.cwd();
+  }
+
+  /** One saved route by id, or null. */
+  async readSkill(id) {
+    const skills = await this.listSkills();
+    return skills.find((skill) => skill.id === String(id ?? "").toLowerCase()) ?? null;
+  }
+
   /** Every saved route. The surface lists these beside the chats. */
   async listSkills() {
     this._ensureToolset();

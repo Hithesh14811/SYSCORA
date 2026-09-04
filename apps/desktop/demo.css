@@ -6402,4 +6402,37 @@ body {
 .skill-row-health { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
 .skill-row-health.ok { color: var(--ok); }
 .skill-row-health.bad { color: var(--danger); }
+
+/* Scheduling a route. The status of an existing trigger is the loudest thing
+   here on purpose: a trigger that has quietly stopped working is the failure
+   this whole feature is built to avoid, so "FAILING" must not look like a hint. */
+.skill-schedule { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.skill-trigger { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; }
+.skill-trigger-when { font-family: var(--mono, monospace); color: var(--muted); white-space: nowrap; }
+.skill-trigger-says { color: var(--muted); flex: 1; }
+.skill-trigger.failing .skill-trigger-says { color: var(--danger); font-weight: 600; }
+.skill-trigger.ok .skill-trigger-says { color: var(--ok); }
+.skill-trigger.off .skill-trigger-says { opacity: 0.6; }
+.skill-trigger-delete {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 11px; text-decoration: underline; padding: 0;
+}
+.skill-schedule-add {
+  align-self: flex-start; background: none; border: none; padding: 0;
+  color: var(--accent, #7c5cff); font-size: 11.5px; cursor: pointer; text-decoration: underline;
+}
+.skill-schedule-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.skill-schedule-form select, .skill-schedule-form input {
+  font-size: 11.5px; padding: 3px 6px; border-radius: 6px;
+  border: 1px solid var(--border, #d4d4d8); background: var(--surface, #fff); color: inherit;
+}
+.skill-schedule-form input { font-family: var(--mono, monospace); width: 110px; }
+.skill-schedule-save {
+  font-size: 11.5px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border, #d4d4d8); background: var(--surface, #fff); color: inherit;
+}
+.skill-schedule-problem { flex-basis: 100%; color: var(--danger); font-size: 11.5px; }
+/* Not a warning colour: being unable to automate a route that sends a message is
+   the system working, not an error the user should try to clear. */
+.skill-schedule-blocked { font-size: 11.5px; color: var(--muted); font-style: italic; }
 .skill-row-delete { flex: none; }

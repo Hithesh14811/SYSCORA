@@ -33,6 +33,10 @@ import { extractDocumentText, isDocumentPath } from "../../../packages/fast-agen
 // Mail. Reachable only from the compose card, never from the agent loop — the
 // reason is the long note at the top of this module.
 import { connectGmail, disconnectGmail, gmailStatus, sendGmail, setDefaultGmailAddress } from "./gmail.js";
+// Triggers: a saved route plus a schedule. See docs/trust-and-triggers.md §4.
+import { deleteTrigger, readTriggers, writeTrigger } from "../../../packages/triggers/src/store.js";
+import { runDueTriggers, triggerHealth } from "../../../packages/triggers/src/runner.js";
+import { whyNotSchedulable } from "../../../packages/policy-engine/src/unattended.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1000,7 +1004,25 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
       // cannot remove is one they cannot correct.
       if (request.method === "GET" && requestUrl.pathname === "/api/skills") {
         const skills = await runtime.listSkills();
-        sendJson(response, 200, { envelope: buildEnvelope("skills_response", { skills }), skills });
+        // WHY A SKILL CANNOT BE SCHEDULED, ANSWERED BEFORE IT IS ASKED.
+        //
+        // The rule lives on this side because it is a safety rule, and the
+        // surface must not carry a second copy of it. Sending the verdict with
+        // the skill lets the panel disable the control AND say why, instead of
+        // offering it and refusing after the click — which reads as a bug rather
+        // than as a decision.
+        const triggers = await readTriggers(runtime.basePath);
+        const enriched = skills.map((skill) => {
+          const blockers = whyNotSchedulable(skill);
+          const mine = triggers.filter((trigger) => trigger.skill === skill.id);
+          return {
+            ...skill,
+            schedulable: blockers.length === 0,
+            blockers,
+            triggers: mine.map((trigger) => ({ ...trigger, ...triggerHealth(trigger) }))
+          };
+        });
+        sendJson(response, 200, { envelope: buildEnvelope("skills_response", { skills: enriched }), skills: enriched });
         return;
       }
 
@@ -1019,6 +1041,60 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         const id = decodeURIComponent(requestUrl.pathname.slice("/api/skills/".length));
         const removed = await runtime.deleteSkill(id);
         sendJson(response, 200, { envelope: buildEnvelope("skill_delete_response", removed), ...removed });
+        return;
+      }
+
+      // TRIGGERS — a saved route plus a schedule. See docs/trust-and-triggers.md.
+      //
+      // Creation is where the safety decision is made, ONCE and LOUDLY: a skill
+      // containing a step that would raise a confirmation card cannot be
+      // scheduled, because a scheduled run has nobody to answer it. The refusal
+      // names the step and the rule, so the answer to "why can't I automate
+      // this?" is on screen rather than in a log.
+      if (request.method === "GET" && requestUrl.pathname === "/api/triggers") {
+        const triggers = await readTriggers(runtime.basePath ?? process.cwd());
+        sendJson(response, 200, {
+          envelope: buildEnvelope("triggers_response", { triggers }),
+          triggers: triggers.map((trigger) => ({ ...trigger, ...triggerHealth(trigger) }))
+        });
+        return;
+      }
+
+      if (request.method === "POST" && requestUrl.pathname === "/api/triggers") {
+        const body = await readJsonBody(request);
+        const parsed = parseRequestBodyWithEnvelope(body, "trigger_save_request");
+        const trigger = parsed.payload?.trigger ?? {};
+        const basePath = runtime.basePath ?? process.cwd();
+        // The skill has to exist and has to be automatable. Both are checked
+        // here rather than at firing time, so the user finds out while they are
+        // looking at the screen instead of at 3am.
+        const skill = await runtime.readSkill?.(trigger.skill) ?? null;
+        if (!skill) {
+          sendJson(response, 400, { saved: false, problems: [`there is no saved skill called "${trigger.skill}"`] });
+          return;
+        }
+        const blockers = whyNotSchedulable(skill);
+        if (blockers.length) {
+          sendJson(response, 400, {
+            saved: false,
+            problems: blockers,
+            because: "A scheduled run has nobody to answer a confirmation card, so a route containing one cannot be automated."
+          });
+          return;
+        }
+        const saved = await writeTrigger(basePath, trigger);
+        sendJson(response, saved.ok ? 200 : 400, {
+          envelope: buildEnvelope("trigger_save_response", saved, parsed.requestId),
+          saved: saved.ok,
+          ...saved
+        });
+        return;
+      }
+
+      if (request.method === "DELETE" && requestUrl.pathname.startsWith("/api/triggers/")) {
+        const id = decodeURIComponent(requestUrl.pathname.slice("/api/triggers/".length));
+        const removed = await deleteTrigger(runtime.basePath ?? process.cwd(), id);
+        sendJson(response, 200, { envelope: buildEnvelope("trigger_delete_response", { removed }), removed });
         return;
       }
 
@@ -1426,6 +1502,45 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
       });
     }
   });
+
+  // THE TICK.
+  //
+  // Once a minute, because that is the resolution of a cron expression and
+  // anything finer would be checking for work that cannot exist yet. It reads
+  // the trigger directory each time rather than caching: the files are the
+  // user's, meant to be edited, and a scheduler running yesterday's copy of a
+  // schedule the user has since changed is its own kind of quiet failure.
+  //
+  // `isBusy` IS THE SAME CLAIM THE HTTP ROUTE TAKES. There is one physical
+  // mouse, and a trigger firing while somebody is typing would interleave two
+  // agents on it. Not a second lock — the same one — because two locks that are
+  // supposed to agree are one bug away from not agreeing.
+  //
+  // `unref()` so a pending tick never holds the process open: the eval runner
+  // and the tests both exit by letting the loop drain, and an undead timer is
+  // the same defect as the undead PowerShell host that made `npm run eval` hang
+  // forever (see W1 in docs/state-of-the-world.md).
+  const TRIGGER_TICK_MS = 60_000;
+  const triggerTimer = setInterval(() => {
+    void runDueTriggers({
+      basePath: runtime.basePath,
+      loadSkill: (id) => runtime.readSkill(id),
+      runSkill: (skill, parameters) => runtime.runSkillUnattended(skill, parameters),
+      isBusy: () => activeIntent !== null,
+      onEvent: (event) => {
+        // Loud, and on the daemon's own stream rather than a file nobody opens.
+        // A trigger that has quietly stopped working is the failure this feature
+        // exists to avoid, so every outcome that is not a plain success says so.
+        if (event.type !== "TRIGGER_FIRED" && event.type !== "TRIGGER_SUCCEEDED") {
+          console.warn(`SYSCORA trigger ${event.details?.trigger}: ${event.type} ${JSON.stringify(event.details ?? {})}`);
+        }
+      }
+    }).catch((error) => {
+      // A scheduler that dies takes every future firing with it, silently.
+      process.emitWarning(`SYSCORA could not run scheduled triggers: ${error?.message ?? error}`);
+    });
+  }, TRIGGER_TICK_MS);
+  triggerTimer.unref?.();
 
   server.listen(port, "127.0.0.1", () => {
     console.log(`SYSCORA daemon listening at http://127.0.0.1:${port}`);

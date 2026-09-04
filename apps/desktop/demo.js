@@ -429,6 +429,95 @@ function describeSkillHealth(stats = {}) {
   };
 }
 
+// A few schedules in the words people actually use, so the common cases need no
+// cron at all. The expression is still shown and still editable — a schedule the
+// user cannot read is one they cannot check, and "why did it run at 3am" has to
+// be answerable from the screen.
+const SCHEDULE_PRESETS = [
+  { label: "Every weekday, 9am", cron: "0 9 * * 1-5" },
+  { label: "Every day, 9am", cron: "0 9 * * *" },
+  { label: "Every Monday, 9am", cron: "0 9 * * 1" },
+  { label: "Every hour", cron: "0 * * * *" }
+];
+
+/** The schedule control for one skill: its triggers, and a way to add one. */
+function scheduleControl(skill) {
+  const wrap = el("div", "skill-schedule");
+
+  for (const trigger of skill.triggers ?? []) {
+    const row = el("div", `skill-trigger ${trigger.health ?? ""}`.trim());
+    row.appendChild(el("span", "skill-trigger-when", trigger.when?.cron ?? "—"));
+    // THE STATUS IS THE PRODUCT. "A trigger that silently stops working is worse
+    // than no trigger — the user believes the work is happening."
+    row.appendChild(el("span", "skill-trigger-says", trigger.says ?? ""));
+    const off = el("button", "skill-trigger-delete", "Remove");
+    off.type = "button";
+    off.addEventListener("click", async () => {
+      off.disabled = true;
+      await fetch(`/api/triggers/${encodeURIComponent(trigger.id)}`, { method: "DELETE" });
+      await refreshSkills();
+    });
+    row.appendChild(off);
+    wrap.appendChild(row);
+  }
+
+  if (!skill.schedulable) {
+    const why = el("div", "skill-schedule-blocked",
+      `Cannot run on a schedule: ${skill.blockers?.[0] ?? "it needs someone present"}`);
+    wrap.appendChild(why);
+    return wrap;
+  }
+
+  const add = el("button", "skill-schedule-add", "Run this on a schedule…");
+  add.type = "button";
+  const form = el("div", "skill-schedule-form");
+  form.hidden = true;
+
+  const choose = document.createElement("select");
+  for (const preset of SCHEDULE_PRESETS) {
+    const option = document.createElement("option");
+    option.value = preset.cron;
+    option.textContent = preset.label;
+    choose.appendChild(option);
+  }
+  const cron = document.createElement("input");
+  cron.type = "text";
+  cron.value = SCHEDULE_PRESETS[0].cron;
+  cron.setAttribute("aria-label", "Schedule, as cron");
+  choose.addEventListener("change", () => { cron.value = choose.value; });
+
+  const save = el("button", "skill-schedule-save", "Schedule it");
+  save.type = "button";
+  const problem = el("div", "skill-schedule-problem");
+  problem.hidden = true;
+
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    problem.hidden = true;
+    try {
+      const response = await fetch("/api/triggers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          trigger: { id: `${skill.id}-${Date.now().toString(36)}`, skill: skill.id, when: { kind: "schedule", cron: cron.value } }
+        })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error((body.problems ?? []).join("; ") || `The daemon answered ${response.status}.`);
+      await refreshSkills();
+    } catch (error) {
+      problem.textContent = error?.message ?? String(error);
+      problem.hidden = false;
+      save.disabled = false;
+    }
+  });
+
+  add.addEventListener("click", () => { form.hidden = !form.hidden; });
+  form.append(choose, cron, save, problem);
+  wrap.append(add, form);
+  return wrap;
+}
+
 async function refreshSkills() {
   if (!skillsList) return;
   try {
@@ -477,6 +566,18 @@ async function refreshSkills() {
           remove.disabled = false;
         }
       });
+      // A ROUTE THAT WORKS IS A ROUTE WORTH REPEATING ON ITS OWN.
+      //
+      // The schedule control lives on the skill rather than in a panel of its
+      // own, because a trigger IS a skill plus a schedule and this is where the
+      // user already is when they think "this should just happen every
+      // morning". A separate panel would mean finding the skill twice.
+      //
+      // AND IT SAYS NO BEFORE IT IS PRESSED. The daemon sends `schedulable` and
+      // the reasons with each skill, so a route containing a Send or a delete
+      // shows the reason in place of the control. Offering it and refusing after
+      // the click reads as a bug; refusing up front reads as the decision it is.
+      main.appendChild(scheduleControl(skill));
       row.append(main, remove);
       skillsList.appendChild(row);
     }
