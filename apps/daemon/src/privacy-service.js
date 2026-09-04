@@ -93,7 +93,20 @@ export async function applyRetentionPolicy(runtime, basePath = process.cwd(), { 
     runtime?.memory?.pruneBefore?.(cutoff, { vacuum }),
     runtime?.semanticState?.pruneBefore?.(cutoff, { vacuum })
   ]);
-  const result = { ...settings, cutoff: cutoff.toISOString(), sessions, memory, semantic };
+  // AND GIVE THE DISK BACK, WHEN THAT IS CHEAP.
+  //
+  // The sweep above deletes rows and SQLite keeps the pages. Measured on the real
+  // installation: 169 sessions, 3.5 MB live, an 86 MB file, 95.7% of it free
+  // pages. Retention had been running correctly at every start for weeks and the
+  // file had never once got smaller.
+  //
+  // `reclaim` decides for itself and refuses when the rewrite would be expensive
+  // — see the note on it — so this is safe on the startup path, which is where it
+  // matters: a user who never opens the privacy screen still gets their disk
+  // back. An explicit `vacuum: true` from that screen still forces the full
+  // rewrite through `pruneBefore` above.
+  const reclaimed = vacuum ? null : await runtime?.sessionStore?.reclaim?.().catch(() => null);
+  const result = { ...settings, cutoff: cutoff.toISOString(), sessions, memory, semantic, reclaimed };
   await runtime?.auditRepository?.append?.("privacy", "RETENTION_APPLIED", result).catch?.(() => {});
   return result;
 }

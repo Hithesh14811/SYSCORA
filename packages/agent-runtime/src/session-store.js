@@ -312,6 +312,55 @@ export class SessionStore {
     }
   }
 
+  // A DELETE THAT NEVER GIVES THE DISK BACK IS NOT A RETENTION POLICY.
+  //
+  // Measured on the real installation, 4 Sep 2026: 169 sessions, 3.5 MB of live
+  // JSON, and an 86 MB file — 21,017 of its 21,967 pages FREE. The seven-day
+  // retention sweep had been running at every daemon start and doing its job
+  // perfectly; it deletes rows, SQLite keeps the pages on its freelist, and the
+  // file sits at its high-water mark forever. So the store looked unbounded to
+  // anyone reading `du`, and the 256 KB per-row cap that was added to bound it
+  // was being judged against a number it does not control.
+  //
+  // VACUUM is not made the default of `prune`/`pruneBefore`, and that is
+  // deliberate: it rewrites the entire file, and on the 1.4 GB store this
+  // codebase used to have that is minutes of blocking I/O at startup. What is
+  // safe is to rewrite it only when doing so is both WORTH IT and CHEAP, which
+  // is a measurement, not a policy — so this asks the database first.
+  //
+  // Returns what it decided and why, because a reclaim that silently does
+  // nothing and a reclaim that silently runs for a minute look identical from
+  // outside.
+  async reclaim({ minFreeFraction = 0.5, maxLiveBytes = 256 * 1024 * 1024 } = {}) {
+    await this.ensureSchema();
+    const db = new DatabaseSync(this.databasePath);
+    try {
+      const pageSize = Number(Object.values(db.prepare("PRAGMA page_size").get())[0] ?? 0);
+      const pageCount = Number(Object.values(db.prepare("PRAGMA page_count").get())[0] ?? 0);
+      const freeCount = Number(Object.values(db.prepare("PRAGMA freelist_count").get())[0] ?? 0);
+      const fileBytes = pageSize * pageCount;
+      const liveBytes = pageSize * Math.max(0, pageCount - freeCount);
+      const freeFraction = pageCount > 0 ? freeCount / pageCount : 0;
+
+      if (freeFraction < minFreeFraction) {
+        return { vacuumed: false, reason: "not enough free space to be worth rewriting the file", freeFraction, fileBytes };
+      }
+      // The cost of a VACUUM is the size of what SURVIVES, not the size of the
+      // file: it writes the live pages into a new one. So a mostly-empty 4 GB
+      // file is cheap to reclaim and a full 4 GB file is not, and this is the
+      // number that separates them.
+      if (liveBytes > maxLiveBytes) {
+        return { vacuumed: false, reason: "too much live data to rewrite cheaply", liveBytes, fileBytes };
+      }
+      db.exec("VACUUM");
+      let afterBytes = fileBytes;
+      try { afterBytes = (await fs.stat(this.databasePath)).size; } catch { /* the numbers above still hold */ }
+      return { vacuumed: true, freeFraction, beforeBytes: fileBytes, afterBytes, reclaimedBytes: fileBytes - afterBytes };
+    } finally {
+      db.close();
+    }
+  }
+
   /** File size and row count, for the probe and for anyone asking "is it bounded". */
   async stats() {
     await this.ensureSchema();

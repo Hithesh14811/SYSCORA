@@ -860,6 +860,23 @@ export class AgentRuntime {
       status: outcome.status,
       message: outcome.message,
       rawText,
+      // WHY IT ENDED THAT WAY, AND IT WAS BEING THROWN AWAY HERE.
+      //
+      // `_settle` computes `failureReason` on every failing path and carries a
+      // paragraph explaining why inferring it from the message was wrong — the
+      // runtime used to decide whether the model was reachable by running a regex
+      // over the sentence, and spent ninety seconds in the offline pipeline when
+      // it guessed wrong. Then this object was built without the field, and
+      // `AGENT_DONE` is an event the session store does not keep.
+      //
+      // Measured on the real store, 4 Sep 2026, over the 169 sessions of the last
+      // seven days: 167 carry events, ZERO carry an AGENT_DONE, and not one holds
+      // a failureReason anywhere. So "why do requests fail" — the first question
+      // anyone asks of a week of use — was unanswerable, and every improvement to
+      // failure handling has been argued from transcripts read by hand.
+      //
+      // Null on a run that worked, which is the same convention `_settle` uses.
+      failureReason: outcome.failureReason ?? null,
       metrics: {
         steps: outcome.steps,
         toolCalls: outcome.toolCalls,
