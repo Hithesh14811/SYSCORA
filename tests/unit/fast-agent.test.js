@@ -1252,6 +1252,42 @@ test("a discarded turn twice is reported, never settled COMPLETED on old prose",
   );
 });
 
+test("an empty turn that did nothing never reports Done", async () => {
+  // OBSERVED LIVE, 4 SEP 2026, in the real UI. "create a file at ...
+  // daily-note.txt" settled COMPLETED with the single word "Done." — 1 step,
+  // zero tool calls, and no file on disk. The model had returned an empty turn,
+  // and `lastText || "Done."` supplied the word out of thin air. The evidence
+  // backstop could not catch it: it reads the MODEL's text, and the model had
+  // not said anything. The claim was the loop's own.
+  const provider = scriptedProvider([{ text: "", toolCalls: [] }]);
+  const outcome = await new FastAgent({ provider, toolset: stubToolset(), maxSteps: 3 })
+    .run("create a file at C:/tmp/note.txt saying hello");
+
+  assert.notEqual(outcome.status, "COMPLETED", "nothing ran, so the run did not complete");
+  assert.equal(/^\s*done\.?\s*$/i.test(outcome.message), false,
+    `a run that called no tool and said nothing must not answer "Done." — got ${JSON.stringify(outcome.message)}`);
+  assert.match(outcome.message, /did nothing/i);
+});
+
+test("an empty turn AFTER real work still reports what was done", async () => {
+  // The other half, and why this is not just "refuse empty turns". A model that
+  // ran the tools and simply had no closing remark has receipts in the
+  // transcript; "Done." is true there, and removing it would turn every quiet
+  // success into a failure.
+  const provider = scriptedProvider([
+    { text: "", toolCalls: [{ name: "run", args: {} }] },
+    { text: "", toolCalls: [] }
+  ]);
+  const outcome = await new FastAgent({
+    provider,
+    toolset: stubToolset({ run: async () => ({ ok: true, text: "wrote it" }) }),
+    maxSteps: 4
+  }).run("write the file");
+
+  assert.equal(outcome.status, "COMPLETED");
+  assert.match(outcome.message, /done/i);
+});
+
 test("an ordinary finish reason is not mistaken for truncation", () => {
   for (const reason of ["stop", "tool_calls", "STOP", null, undefined, ""]) {
     assert.equal(wasTruncated({ finishReason: reason }), false, String(reason));

@@ -2048,6 +2048,35 @@ export class FastAgent {
           );
         }
         await this._offerSkill(userText, performed, malformedTurns);
+        // "Done." WAS A HARDCODED FALLBACK, AND IT SHIPPED A LIE.
+        //
+        // Observed live, 4 Sep 2026, driving the real UI: "create a file at
+        // C:\...\daily-note.txt containing the words daily standup note". The
+        // run settled COMPLETED with the single word "Done." — 1 step, ZERO
+        // tool calls, and no file on disk. The session recorded
+        // `SKILL_NOT_OFFERED {"reasons":["no tool did anything, so there is
+        // nothing to replay"]}`, which is the system saying plainly that
+        // nothing happened, one line above it telling the user it was done.
+        //
+        // The model had returned an EMPTY turn: no text and no tool call, 144
+        // output tokens of reasoning and nothing else. So `lastText` was ""
+        // and `lastText || "Done."` supplied the word "Done." out of thin air.
+        // Nothing in the evidence layer could catch it — `claimsWithoutEvidence`
+        // does match "Done." and never ran, because it is checked against the
+        // MODEL'S text and the model had not said anything. The lie was ours.
+        //
+        // A tool having run makes "Done." defensible: the receipts are in the
+        // transcript and the model simply had no closing remark. Nothing having
+        // run makes it the exact failure this whole codebase is built to
+        // prevent, so the two cases stop sharing a sentence.
+        if (toolCalls === 0 && !lastText) {
+          return this._settle(
+            "FAILED",
+            "I did nothing, and I have nothing to tell you: the model returned an empty turn — no answer and " +
+            "no tool call. Nothing on your machine was touched. Ask me again; this usually clears.",
+            { steps, toolCalls, startedAt, failureReason: FailureReason.MODEL_MALFORMED }
+          );
+        }
         return this._settle("COMPLETED", lastText || "Done.", { steps, toolCalls, startedAt });
       }
 
