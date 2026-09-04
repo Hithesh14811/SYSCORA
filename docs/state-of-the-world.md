@@ -1213,8 +1213,309 @@ written down beside it so the next person knows what the real number is.
 Note the shape: the tests run at `--test-concurrency=1` deliberately — they share
 one machine, one mouse and one automation host — so this number only ever grows.
 
+### Done 4 Sep 2026: the ceilings came off, and the wall clock turned out to be doing the context management
+
+The user asked for the hard caps to be removed — an hour of real coding costs far
+more than any of them allowed. Taking them off exposed what had been hiding
+behind them, which is why this entry is long.
+
+**1. THE THREE CEILINGS ARE OFF, AND THEY WERE NEVER WHAT CAUGHT A RUNAWAY.**
+
+`maxSteps` (80), `maxElapsedMs` (6 min) and `maxFreshTokens` (400,000) now default
+to unbounded, settable by the caller or by `SYSCORA_MAX_STEPS`,
+`SYSCORA_MAX_ELAPSED_MS`, `SYSCORA_MAX_FRESH_TOKENS`. Every one had already been
+raised at least once — 24 to 80, 150,000 to 400,000 — each time after a live
+session was cut off mid-task, which is the signature of a limit measuring the
+wrong thing.
+
+What actually catches a runaway is behavioural and unchanged: the repeat guard,
+and `unchangedReadings >= 8`. Both fire after about eight steps and neither can be
+reached by a run that is working. **The 692,000-token emoji hunt the cost ceiling
+was written for is the second guard's case, not the ceiling's** — it was
+forty-eight steps of an unchanged screen.
+
+They are replaced by `BUDGET_CHECKPOINTS`: at 40/120/300/700 steps, 5/15/40/90
+minutes, or 150k/500k/1.5M/4M billed tokens, whichever comes first, the run emits
+an event the surface can render AND puts one line into the conversation saying
+what it has spent. The user can stop it; the model — the only thing that knows
+whether it is converging, and which had never been told what it cost — can stop
+itself. About 40 tokens per checkpoint.
+
+Derived from the measured distribution rather than chosen. Read out of the session
+store, 169 real sessions, 28 Aug – 4 Sep: **p50 4 steps / 18s / 27,155 billed
+tokens; p90 19 steps / 90s / 122,123; max 38 steps / 213s / 166,997.** The old
+ceilings sat just above p90 — they fired on the top decile of ordinary work, and
+on every long task by construction.
+
+**2. AND THE FIRST THING THAT BROKE WAS THE TIMEOUT.**
+
+`timeoutMs: Math.max(15000, remainingMs)` derives the per-request bound from what
+is left of the run's wall clock. With the wall clock unbounded that expression is
+`Infinity`, and **Node clamps a non-finite timer delay to 1ms with a warning** —
+so removing the ceiling would have made the first model request of every default
+run time out instantly. The run's budget and one request's budget are different
+questions and now have different answers: `MODEL_REQUEST_CEILING_MS` is fifteen
+minutes, well above the ~153s the 16,384-token retry needs at the measured ~107
+tokens/s, with the transport's 45s idle timer as the real protection under it.
+
+**3. THE CONVERSATION HAD NO BOUND AT ALL, AND THE WALL CLOCK WAS HIDING IT.**
+
+`pruneConversation` and `supersedeEarlierReading` were **both** behind
+`SYSCORA_COLLAPSE_HISTORY=1`, which is off. So on the default path nothing trimmed
+the conversation, ever: a run accumulated every screen reading it had taken and
+re-sent all of them on every step. That was survivable only because six minutes
+and eighty steps stopped the run first. **Eighty steps and six minutes were doing
+the context management, by accident, and nothing said so.**
+
+Take them away and the failure moves to the provider — past its context window the
+endpoint answers with an HTTP error about token counts, which is not something the
+loop can recover from. The old ceiling was also wrong in the other direction:
+60,000 characters is ~15,000 tokens, against a window of 128,000 to 1,000,000.
+
+`packages/fast-agent/src/context-budget.js` replaces both. The limit is derived
+from the CONFIGURED MODEL — asked of the provider first, then a name table, with
+`SYSCORA_MODEL_CONTEXT_TOKENS` overriding both — minus a reserve for the system
+prompt, the tool schema, the output ceiling and a margin. **The reserve is
+measured, not guessed:** the first version assumed 4,400 + 5,200 tokens and
+`node scripts/measure-prompt-cost.mjs` says 4,483 + 6,818, so it was 1,600 tokens
+under on the schema alone — in the direction that fails at the endpoint.
+
+```
+  deepseek-chat    128,000 ctx     92,315 usable tokens of conversation
+  claude-opus-5    200,000        164,315
+  gpt-6-astra      400,000        364,315
+  gemini-3-pro   1,000,000        964,315
+```
+
+Against the old 60,000-character ceiling that is **6.2x more room on the smallest
+window**, and derived rather than picked.
+
+The trim shrinks content and **never removes a message**, because a `tool` reply
+answers an assistant `tool_call` by id and every provider — OpenAI, Anthropic,
+Gemini — rejects a conversation where that pairing is broken. It announces itself
+in the text it leaves behind, for the same reason the 256 KB row cap does. Three
+passes, and the second exists because the first version was caught by its own test
+leaving the conversation still over the limit whenever the protected tail alone
+exceeded the budget — the silent failure this module exists to prevent, reached by
+a different road.
+
+`supersedeEarlierReading` now comes on above 45% of the window and stays off below
+it. That is not the old flag re-enabled by the back door: the measurement that
+turned it off (24,725 billed tokens with the collapse against 16,623 and 16,196
+without) is **six-step runs**, and says nothing about a two-hundred-step session,
+where the alternative is carrying forty full readings of windows that have all
+since changed.
+
+### Done 4 Sep 2026: configuring Claude silently turned the agent off
+
+`AgentRuntime._canRunFastAgent` requires `provider.chat` AND
+`provider.supportsChat() === true`. **`AnthropicModelProvider` had neither.** The
+base class answers false, so pointing this product at the strongest model its own
+README advertises support for routed every request into the ~15,000-line staged
+pipeline the eval reports is reached zero times — not a degraded mode, a different
+product, one that cannot drive a GUI.
+
+Nothing failed loudly, because falling back to that pipeline is a legitimate path:
+it is what happens when there is no model at all. **So the symptom was "Claude is
+worse at this than DeepSeek."** Eleventh instance of this codebase's signature
+defect — the machinery is correct and something above it makes it unreachable.
+
+Built: `anthropicChat`, a streaming tool-calling transport returning the SAME
+`{text, reasoning, toolCalls, finishReason, usage}` shape as
+`openAiCompatibleChat`, so the loop never learns a second shape. The translation
+is the whole of it — the loop speaks OpenAI's flat message list, and Anthropic
+wants the system prompt hoisted out, typed content blocks, and tool results posted
+back as `user` turns. Consecutive same-role turns are merged, because the loop
+legitimately emits history, then the request, then a `[SYSTEM]` nudge, and sending
+those as they are is an HTTP 400 on an ordinary conversation.
+
+**Prompt caching is explicit there, and this product's economics depend on it.**
+DeepSeek caches prefixes unprompted; Anthropic caches only what is marked, so
+without a `cache_control` breakpoint on the last tool and the last system block
+every step would re-buy the whole ~11,300-token fixed prefix at full price.
+
+**And the reasoning control was one vendor's spelling sent to all of them.**
+`THINKING_OFF` — `chat_template_kwargs` plus `reasoning_effort` — was hard-coded in
+the loop. Anthropic rejects unknown top-level body fields with a 400, so the
+CORRECT decision on an ordinary step (do not deliberate) would have failed every
+ordinary step. The loop now asks `provider.reasoningBody(deliberate)`: it knows
+WHETHER, the provider knows HOW. Anthropic returns null for "off" — it does not
+deliberate unless asked — and enables extended thinking for "on", with
+`budget_tokens` clamped against `max_tokens` and temperature forced to 1 inside
+the transport, because those are two more rules the API enforces with a 400 that
+the caller cannot know.
+
+18 tests in `tests/unit/anthropic-chat.test.js`.
+
+### Done 4 Sep 2026: it can see icons now, and finding that out found two other things
+
+The system prompt said, and had always said, `YOU CANNOT SEE ICONS`. A reading is
+text and control names, so an emoji react, a paperclip or an unlabelled three-dot
+menu is not in it at all — and the measured cost of that blindness is the
+`unchangedReadings >= 8` guard firing after forty-eight steps and 692,000 tokens.
+
+`screen {vision: true}` now returns the reading AND a picture of the window. It is
+opt-in and stays that way: a picture is ~1,500 tokens against ~267–1,029 for a
+reading, and the reading comes back as NAMED, clickable controls rather than
+pixels something still has to interpret. Text first; pixels for what text cannot
+describe.
+
+It only engages on a model that can see — asked of the MODEL NAME, because
+`AgentRouterModelProvider` is the transport for DeepSeek, which cannot, and for
+AgentRouter, which will serve Claude, which can. **Unknown means no:** a model with
+no eyes, sent an image, fails the whole request rather than the look. A model that
+cannot see is told so in the result, in words, because silence there would be read
+as "there is nothing to see" and acted on.
+
+The image reaches the model as its own `user` turn carrying a vendor-neutral
+`input_image` block, spelled by each transport — a tool result has to stay a
+string, since OpenAI has no way to put an image in one.
+
+**Measured on a real window, `node scripts/probe-screen-vision.mjs chrome`:**
+
+```
+  text reading      1,378ms   ~879 tokens
+  with a picture      818ms   ~2,379 tokens   204,890-byte PNG, valid header,
+                                              base64 round trip exact
+  temp files left   none
+```
+
+**And the probe found two defects a unit test never could.**
+
+**76 SCREENSHOTS OF THE USER'S SCREEN WERE SITTING IN %TEMP%.**
+`adapter.captureScreen` writes a PNG into `%TEMP%\syscora-m4` and hands back the
+path, and **nothing had ever deleted one**. `VisionProvider.collect` OCRs it,
+hashes it and walks away; `windowLook` computes a signature and walks away. Files
+going back weeks, most ~13 KB and three of them 11.4 MB. Every look that paid for
+pixels left one behind. This predates the vision work by months and is the more
+serious half of what the probe found. Both sites now delete, with failure
+swallowed on purpose — a locked temp file must not fail the look it belongs to,
+which would trade a privacy leak for a broken capability.
+
+**`screen {application: "explorer", vision: true}` CAPTURED 11,371,682 BYTES.**
+Explorer owns the desktop window, whose bounds are every monitor. Anthropic's
+limit is ~5 MB of base64, so that would have arrived as an HTTP 400 in the middle
+of a task after ~15 MB had been serialised and uploaded. Capped at 3.5 MB, and
+over it the result says what happened and names the fix — pass a specific
+application — rather than failing at the endpoint with nothing to act on.
+
+**The prompt was updated in the same change, and that is not a detail.** This
+codebase recorded on 3 Sep that when a refusal and the system prompt disagree,
+*the prompt wins silently*. Leaving `YOU CANNOT SEE ICONS` in place beside a
+working `vision` argument would have made the whole capability unreachable — the
+twelfth instance of the class, self-inflicted. Prompt cost went 11,157 →
+**11,302 tokens/step** (+145, inside the cached prefix).
+
+### Done 4 Sep 2026: four things found by reading the product rather than running it
+
+**1. THE HONESTY LAYER LAPSED THE MOMENT A RUN DID ANYTHING.** Every tool result
+carries a typed receipt, and a tool's success sentence is reachable only through
+`confirmed()`. Then the run ends and the product prints `lastText` — free prose
+from the model, checked by nothing. **Both call sites of `claimsWithoutEvidence`
+are guarded by `toolCalls === 0`**, so the guarantee covered a run that did
+nothing and lapsed for every run that did something: five tool calls, all REFUTED,
+closing on "I've sent the message", published under a green tick. That is this
+project's founding defect with steps in front of it.
+
+The settle now checks receipts, not tool calls: it fires only when at least one
+ACTING tool came back REFUTED **and** nothing came back CONFIRMED. The first
+version fired on "nothing confirmed", which is also true of every UNCONFIRMED
+receipt — it turned six passing tests red, including *"an empty turn AFTER real
+work still reports what was done"*, and **broke `unconfirmed is not failed`, a
+house rule in the same file**. Caught by the suite, which is what it is for.
+
+**2. `failureReason` WAS COMPUTED ON EVERY FAILING PATH AND PERSISTED NOWHERE.**
+`_settle` carries a paragraph explaining why inferring it from the message was
+wrong — the runtime used to decide whether the model was reachable by running a
+regex over the sentence, and spent ninety seconds in the offline pipeline when it
+guessed wrong. Then `_submitFastIntent` built `finalResponse` without the field.
+Read off the real store: **169 sessions, 167 carrying events, ZERO carrying an
+`AGENT_DONE`, and not one holding a `failureReason` anywhere.** "Why do requests
+fail" was unanswerable over a week of use.
+
+**3. THE SHELL ALLOW LIST WAS RUNNING MUTATIONS WITH NO APPROVAL.**
+`shell-rules.js` states its own contract: ALLOW means the command only READS, and
+"only ALLOW is unrecoverable, so only ALLOW is an explicit list". Run against its
+own classifier, sixteen mutating command lines came back ALLOW:
+
+```
+  gh repo delete <owner>/<repo> --yes    a repository, gone
+  gh pr merge 5 --squash                 published, on somebody else's repo
+  gh api --method DELETE /repos/o/r      any GitHub mutation there is
+  git stash                              the working tree, silently
+  git config --global user.email <x>     the author of every later commit
+  npm config set registry <x>            every later install
+  kubectl config set-credentials ...
+  curl -X POST / -X DELETE / --data ...
+```
+
+The cause is grammatical, and it is **the same bug as `recursive-root-delete`**,
+which matched the verb and the target in one expression and let a pipe separate
+them. This table allow-lists the first non-flag token, and for `gh`, `kubectl` and
+`docker` that token is a NOUN — `repo`, `config`, `pr` — while the verb that
+decides everything comes after it. `repo` was on the list, so `repo delete` was on
+the list. Fixed the same way: the noun must be allow-listed AND no writing verb may
+follow it. `stash`, `tag` and the three `config` entries are removed outright. An
+HTTP method is a verb too, which is what `curl` was hiding.
+
+**Verified both ways — 16 mutations now ASK, 24 ordinary reads still ALLOW.** The
+second half matters as much: a gate that fires on ordinary reads is one that gets
+switched off, and this codebase has paid for that twice (`Format-Table` read as
+disk formatting, `git --version` needing approval). **There was no test coverage
+for any of it.** There are now 46.
+
+**4. TWO DATABASES HAD NO BOUND, AND ONE OF THEM COULD NOT SIMPLY BE PRUNED.**
+
+`sessions.sqlite` was **86 MB holding 3.89 MB** — 21,017 of 21,967 pages free. The
+seven-day retention sweep runs at every daemon start and works perfectly; SQLite
+keeps the pages on its freelist and the file never leaves its high-water mark.
+`SessionStore.reclaim()` now vacuums, but only when it is both worth it (>50% free)
+and cheap — **the cost of a VACUUM is the size of what SURVIVES**, not of the file
+— so it is safe on the startup path, which is where it matters: a user who never
+opens the privacy screen still gets their disk back.
+
+`audit.sqlite` is **402 MB over 378,680 rows, 242 MB of it payload, zero free
+pages** — all live, and the largest file this product writes. Same distribution the
+session store had: `OBSERVATION_COLLECTED` is 1,034 rows and 42 MB,
+`FAILURE_DIAGNOSED` 351 rows and 35 MB. **Retention is not available here and
+would be wrong:** it is a hash chain with an anchor, so deleting from the middle
+breaks `verifyChain` by design, and truncating the tail is what the anchor exists
+to detect. What may be forgotten from a tamper-evident record is a decision for
+whoever owns the security model, not a side effect of a size fix.
+
+A 32 KB per-row cap is available and costs the integrity guarantee nothing: the
+entry hash is computed over the payload AS STORED, so capping before hashing
+leaves the chain exactly as verifiable. Proven — a 200,011-byte payload stores as
+32,954 bytes and `verifyChain` returns `{valid: true}`. **Existing rows are
+untouched;** this bounds growth from here.
+
 ### Still open
 
+- **76 screenshots of the user's screen are still in `%TEMP%\syscora-m4`.** The
+  leak is fixed at both sites (4 Sep 2026) and nothing new accumulates, but the
+  existing files are the user's and were left rather than deleted — some are
+  weeks old and three are 11.4 MB full-desktop captures. Deleting them is one
+  command and it is their call. `ls %TEMP%\syscora-m4` is the whole of it.
+- **`audit.sqlite` is 402 MB and nothing will make it smaller.** The 32 KB
+  per-row cap added 4 Sep bounds GROWTH; it cannot touch the 378,680 rows already
+  written. Shrinking it means deciding what a tamper-evident record may forget,
+  which is a security-model decision — see the entry above for why retention and
+  truncation are both wrong answers here. A defensible option nobody has chosen:
+  archive the existing chain to a file, verify it, and start a new one.
+- **The failover chain is one endpoint and one model.** `config.json` on this
+  machine has `model.baseUrl` and `fallbackProviderConfigs[0].baseUrl` both
+  pointing at `inference.baseten.co/v1` with the same model, differing only by
+  key. That survives a revoked key and nothing else — not an endpoint outage, not
+  a bad model release. `FailoverModelProvider` works; this is ten lines of JSON
+  and a second vendor's account, and the Anthropic transport built on 4 Sep means
+  there is now somewhere real to point it.
+- **Vision is built and has never run against a live model.** `screen {vision:
+  true}` is proven end to end on a real window — a 204,890-byte PNG of Chrome,
+  valid header, exact round trip, temp file cleaned up — and proven through both
+  transports by unit test. What has NOT happened is one real request to a
+  vision-capable endpoint, because the configured model (DeepSeek-V4-Flash)
+  cannot see and no second vendor is configured. Until that run happens the
+  capability is measured, not demonstrated.
 - **`project` cannot run on a default install.** Its own comment says it "does
   not need Developer terminal access"; it passes `shellOrigin: "model"`, which
   the adapter refuses unless `developerMode === true`. Measured 3 Sep 2026. So
