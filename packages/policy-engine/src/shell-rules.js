@@ -208,17 +208,46 @@ const READ_ONLY_VERBS = new Set([
 // For tools whose safety depends entirely on the subcommand, the allow-list is
 // on the subcommand rather than the tool. `git status` reads; `git push` does
 // not, and both start with `git`.
+// A SUBCOMMAND THAT IS A NOUN SAYS NOTHING ABOUT WHETHER THE COMMAND WRITES.
+//
+// Measured against this file's own classifier on 4 Sep 2026, every one of these
+// came back ALLOW — which is to say it ran with no approval card at all:
+//
+//   gh repo delete Hithesh14811/SYSCORA --yes     a repository, gone
+//   gh pr merge 5 --squash                        published, on somebody's repo
+//   gh api --method DELETE /repos/o/r             any GitHub mutation there is
+//   gh issue close 12
+//   git stash                                     the working tree, silently
+//   git config --global user.email <anything>
+//   npm config set registry http://evil.test      every later install
+//   kubectl config set-credentials x --token=y
+//
+// The cause is grammatical. This table allow-lists the FIRST non-flag token, and
+// for `gh`, `kubectl` and `docker` that token is a NOUN — `repo`, `config`, `pr`
+// — while the verb that decides everything comes after it. `repo` was on the
+// list, so `repo delete` was on the list.
+//
+// The fix is the same shape as `recursive-root-delete` in the DENY rules above,
+// which had the identical bug for the identical reason: MATCH THE VERB AND THE
+// TARGET INDEPENDENTLY rather than hoping one position holds both. The noun still
+// has to be allow-listed, and separately no writing verb may appear after it.
+//
+// And three entries are simply removed, because no flag combination makes them
+// read: `git stash` moves uncommitted work, `git tag` deletes tags with `-d`, and
+// `git config`/`npm config`/`kubectl config` write unless carefully flagged. They
+// fall to ASK, which costs one click on the rare occasion they are wanted. None
+// of them is reachable from the `git` tool, whose action table is fixed.
 const READ_ONLY_SUBCOMMANDS = Object.freeze({
   git: new Set(["status", "log", "diff", "show", "branch", "remote", "rev-parse",
-    "describe", "config", "blame", "shortlog", "ls-files", "ls-remote", "tag",
-    "stash", "count-objects", "check-ignore", "whatchanged", "reflog", "version"]),
-  npm: new Set(["ls", "list", "view", "info", "show", "outdated", "config",
+    "describe", "blame", "shortlog", "ls-files", "ls-remote",
+    "count-objects", "check-ignore", "whatchanged", "reflog", "version"]),
+  npm: new Set(["ls", "list", "view", "info", "show", "outdated",
     "root", "prefix", "bin", "search", "ping", "why", "version", "-v", "--version"]),
-  pip: new Set(["list", "show", "freeze", "check", "config", "--version", "-V"]),
+  pip: new Set(["list", "show", "freeze", "check", "--version", "-V"]),
   dotnet: new Set(["--info", "--version", "--list-sdks", "--list-runtimes"]),
   docker: new Set(["ps", "images", "info", "version", "inspect", "logs", "stats",
     "port", "top", "history", "diff"]),
-  kubectl: new Set(["get", "describe", "logs", "explain", "version", "config",
+  kubectl: new Set(["get", "describe", "logs", "explain", "version",
     "cluster-info", "api-resources", "top"]),
   winget: new Set(["search", "show", "list", "source", "--version", "-v"]),
   go: new Set(["version", "env", "list", "vet"]),
@@ -249,6 +278,54 @@ const VERSION_ONLY_VERBS = new Set([
 
 // Flags that turn an otherwise-reading command into one that writes.
 const WRITE_FLAGS = /(?:^|\s)(?:-o|--output|-O|--remote-name|>>?|--write|--in-place|-i\b)/i;
+
+// AN HTTP METHOD IS A VERB TOO, AND `curl` HID ONE.
+//
+// `curl` has no subcommand list — a bare fetch to stdout reads, which is true and
+// was the whole check. `curl -X DELETE https://api/thing` and
+// `curl --data @payload https://api/thing` are the same executable with the same
+// shape and are not reads at all; both classified ALLOW. The method is where the
+// verb lives for an HTTP client, so that is where it is read from.
+//
+// GET and HEAD are the two that only read. Anything else, or a request body, is
+// ASK — which is also what catches `gh api --method DELETE`, by a different route.
+const NON_READING_HTTP = /(?:^|\s)(?:-X|--request|--method)\s+(?!(?:GET|HEAD)\b)[A-Za-z]+|(?:^|\s)(?:-d|--data(?:-raw|-binary|-urlencode)?|-F|--form|-T|--upload-file)\b/i;
+
+// SOME TOOLS SPELL THE NOUN FIRST AND THE VERB SECOND.
+//
+// `gh repo delete`, `kubectl config set-credentials`, `docker container rm`. The
+// noun is what the table above allow-lists, so the verb has to be refused
+// separately — see the long note on READ_ONLY_SUBCOMMANDS for the eight real
+// commands this was letting through with no approval.
+//
+// Deliberately a list of WRITING verbs rather than an allow-list of reading ones:
+// an unknown verb after an allow-listed noun should read as unknown, and unknown
+// is ASK by this file's whole design. The asymmetry is stated at the top — a
+// wrong ASK costs a click, a wrong ALLOW runs something unseen.
+const WRITE_SUBVERB = new Set([
+  "delete", "del", "remove", "rm", "create", "add", "edit", "merge", "close",
+  "reopen", "rename", "transfer", "archive", "unarchive", "fork", "sync", "clone",
+  "push", "pull", "apply", "patch", "post", "put", "publish", "release", "restore",
+  "revoke", "disable", "enable", "install", "uninstall", "update", "upgrade",
+  "set", "unset", "set-credentials", "set-context", "set-cluster", "use-context",
+  "start", "stop", "restart", "kill", "exec", "attach", "cp", "mv", "prune",
+  "drain", "cordon", "uncordon", "scale", "rollout", "taint", "label", "annotate",
+  "replace", "expose", "cancel", "rerun", "login", "logout", "refresh", "setup-git",
+  "import", "export", "init", "new", "destroy", "download", "upload", "commit",
+  "checkout", "reset", "revert", "rebase", "cherry-pick", "am", "mirror"
+]);
+
+// The tools whose grammar is `<tool> <noun> <verb>`. Checking every tool this way
+// would refuse `docker logs delete-worker-1` — a container that happens to be
+// named after a verb — so it is scoped to the three where the shape is real.
+const NOUN_THEN_VERB = new Set(["gh", "kubectl", "docker"]);
+
+/** The tokens after the subcommand, flags and their values included. */
+function argumentsAfterSubcommand(segment) {
+  const parts = String(segment ?? "").trim().split(/\s+/).slice(1);
+  const at = parts.findIndex((part) => !part.startsWith("-"));
+  return at < 0 ? [] : parts.slice(at + 1);
+}
 
 // Interpreters given inline code are unbounded: `node -e "<anything>"` can do
 // whatever the argument says, so the verb tells us nothing about what runs.
@@ -381,6 +458,15 @@ export function classifyShellCommand(command, args = []) {
         reason: `\`${segment.trim()}\` writes its output to a file.`
       };
     }
+    // An HTTP client's verb is its method. See NON_READING_HTTP.
+    if (NON_READING_HTTP.test(segment)) {
+      return {
+        verdict: ShellVerdict.ASK,
+        rule: "http-write-method",
+        reason: `\`${verb}\` is sending a request that is not a plain read — it names a method other than ` +
+          "GET or HEAD, or carries a body — so what it changes cannot be read from the command name."
+      };
+    }
     const allowedSubcommands = READ_ONLY_SUBCOMMANDS[verb];
     // Asking a tool its version or its help text reads, whatever the tool is,
     // and every tool spells it differently (`git --version`, `docker -v`,
@@ -403,6 +489,21 @@ export function classifyShellCommand(command, args = []) {
           rule: "not-a-known-read-subcommand",
           reason: `\`${verb} ${subcommand}\` is not one of the ${verb} subcommands known to only read, so it needs your approval.`
         };
+      }
+      // AND THE NOUN BEING ALLOWED DOES NOT ALLOW THE VERB AFTER IT.
+      // `gh repo` reads; `gh repo delete` does not. See WRITE_SUBVERB.
+      if (NOUN_THEN_VERB.has(verb)) {
+        const writing = argumentsAfterSubcommand(segment)
+          .map((part) => part.replace(/^-+/, "").toLowerCase())
+          .find((part) => WRITE_SUBVERB.has(part));
+        if (writing) {
+          return {
+            verdict: ShellVerdict.ASK,
+            rule: "write-subcommand-verb",
+            reason: `\`${verb} ${subcommand} ${writing}\` changes something — \`${subcommand}\` only says what it ` +
+              `acts on, and \`${writing}\` is what it does to it — so it needs your approval.`
+          };
+        }
       }
     }
   }
