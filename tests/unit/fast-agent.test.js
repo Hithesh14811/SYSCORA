@@ -142,8 +142,118 @@ test("a failed action followed by a confirmed recovery becomes generalized outco
     recoverySequence: ["click"],
     recovered: true
   });
+  // `failedAt` is the run's own clock, used to tell "too early" from "wrong
+  // thing" while the run is happening. It must not reach the store: a wall-clock
+  // reading from one afternoon means nothing to a pattern meant to be reused.
+  assert.equal("failedAt" in recorded[0], false,
+    "live-run timing is a signal, not a fact worth persisting");
   assert.equal(JSON.stringify(recorded).includes("private song title"), false,
     "adaptive memory must not retain queries, message text or other user content");
+});
+
+// ---- Learning from mistakes, not memorising routes -------------------------
+//
+// The taxonomy below is derived from all 113 failed tool calls in the 178 real
+// sessions on this machine. Before this, 38% of them classified as the catch-all
+// `tool-failed`, which is why 30 of the 39 patterns the store had learned said
+// `tool-failed` and taught nothing.
+
+test("a boundary is never learned as a technique to get around", async () => {
+  // THE SAFETY HALF. The policy floor, the approval card and this loop's own
+  // repeat guard all arrive looking exactly like a tool that would not work.
+  // Recording them as "it failed, here is what worked afterwards" teaches one
+  // thing only: how to get past the thing that said no. shell-rules.js records a
+  // live session where a refusal produced four attempts to route around it, two
+  // of them successful.
+  for (const refusal of [
+    "This command can change the system, so workspace terminal access needs your approval.",
+    "The command was not approved, so no process was spawned.",
+    "This is the 3rd time you have run exactly this in one request, and it has not got you anywhere.",
+    "You already ran exactly this and it failed: the command needs Developer terminal access."
+  ]) {
+    const recorded = [];
+    const provider = scriptedProvider([
+      { text: "", toolCalls: [{ name: "run", args: { command: "x" } }] },
+      { text: "", toolCalls: [{ name: "click", args: {} }] },
+      { text: "Done." }
+    ]);
+    const toolset = stubToolset({
+      run: async () => ({ ok: false, text: refusal, raw: { reason: refusal } }),
+      click: async () => ({ ok: true, text: "Clicked.", raw: { evidence: { verdict: "CONFIRMED", observed: "focus moved" } } })
+    });
+    toolset.isActingTool = (name) => ["run", "click"].includes(name);
+    await new FastAgent({
+      provider, toolset, memory: { retrieveAdaptiveGuidance: async () => [], recordAdaptivePattern: async (p) => recorded.push(p) }
+    }).run("do the thing");
+
+    assert.equal(recorded.length, 0, `a boundary must not become a lesson: ${JSON.stringify(refusal)}`);
+  }
+});
+
+test("a failure that only needed time is learned as needing time", async () => {
+  // The user's own example, and this machine's commonest failure: eighteen of
+  // its 113 recorded failures are "no track started" against a window that was
+  // already open. The app had not finished getting ready. A recovery stored as a
+  // list of tool names cannot say that; `neededTime` can.
+  const recorded = [];
+  const provider = scriptedProvider([
+    { text: "", toolCalls: [{ name: "play_music", args: {} }] },
+    { text: "", toolCalls: [{ name: "wait", args: { until: "appears" } }] },
+    { text: "", toolCalls: [{ name: "play_music", args: {} }] },
+    { text: "Playing." }
+  ]);
+  let attempts = 0;
+  const toolset = stubToolset({
+    play_music: async () => {
+      attempts += 1;
+      return attempts === 1
+        ? { ok: false, text: "Spotify is not playing: no track started. The window is open.", raw: { reason: "no track started" } }
+        : { ok: true, text: "Playing.", raw: { evidence: { verdict: "CONFIRMED", observed: "the transport shows it playing" } } };
+    },
+    wait: async () => ({ ok: true, text: "It appeared.", raw: { evidence: { verdict: "CONFIRMED", observed: "the control appeared" } } })
+  });
+  toolset.isActingTool = (name) => name === "play_music";
+  await new FastAgent({
+    provider, toolset, memory: { retrieveAdaptiveGuidance: async () => [], recordAdaptivePattern: async (p) => recorded.push(p) }
+  }).run("play something");
+
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].failureClass, "nothing-started",
+    "\"no track started\" used to classify as the catch-all, 18 times on this machine");
+  assert.equal(recorded[0].neededTime, true,
+    "an explicit wait, and the same tool succeeding afterwards, both mean the lesson is TIME");
+});
+
+test("the commonest real failures no longer collapse into the catch-all", async () => {
+  // Every string here is a real failure shape counted in the session store, with
+  // the content stripped. Each one used to classify as `tool-failed`.
+  const cases = [
+    ["Spotify is not playing: no track started. The window is open.", "nothing-started"],
+    ["The click did not land on Sign in: the element could not be clicked.", "click-did-not-land"],
+    ["Spotify is still playing Peaches, which is not what was asked for.", "not-what-was-asked"],
+    ["open_url failed: only http(s) urls can be opened. That looks like a local file.", "wrong-tool-for-target"],
+    ["Not focused. The window in front is Notepad (windowId 4), which is not the one asked for.", "wrong-window"],
+    ["web_type failed: no field on this page matches Email.", "target-not-found"],
+    ["click failed: Play matches 3 things on screen, and they are not the same control.", "ambiguous-target"]
+  ];
+  for (const [text, expected] of cases) {
+    const recorded = [];
+    const provider = scriptedProvider([
+      { text: "", toolCalls: [{ name: "click", args: {} }] },
+      { text: "", toolCalls: [{ name: "type", args: {} }] },
+      { text: "Done." }
+    ]);
+    const toolset = stubToolset({
+      click: async () => ({ ok: false, text, raw: { reason: text } }),
+      type: async () => ({ ok: true, text: "Typed.", raw: { evidence: { verdict: "CONFIRMED", observed: "the field holds it" } } })
+    });
+    toolset.isActingTool = (name) => ["click", "type"].includes(name);
+    await new FastAgent({
+      provider, toolset, memory: { retrieveAdaptiveGuidance: async () => [], recordAdaptivePattern: async (p) => recorded.push(p) }
+    }).run("do the thing");
+
+    assert.equal(recorded[0]?.failureClass, expected, `${JSON.stringify(text)} should classify as ${expected}`);
+  }
 });
 
 test("relevant adaptive guidance is present before the model's first decision", async () => {
@@ -159,9 +269,33 @@ test("relevant adaptive guidance is present before the model's first decision", 
 
   await agent.run("play music on spotify");
 
-  assert.match(provider.seen[0][0].content, /LEARNED LOCAL OUTCOME GUIDANCE/);
+  assert.match(provider.seen[0][0].content, /WHAT HAS GONE WRONG ON THIS MACHINE BEFORE/);
   assert.match(provider.seen[0][0].content, /screen -> click/);
-  assert.match(provider.seen[0][0].content, /never authorization/);
+  assert.match(provider.seen[0][0].content, /not permission/);
+});
+
+test("a lesson whose fix was time says so, instead of reciting the route", async () => {
+  // The same record, differing only in `counts.neededTime`. A route is what was
+  // done last time; "it was not ready yet" is what to do differently this time,
+  // and only the second one changes the next action.
+  const provider = scriptedProvider([{ text: "Done." }]);
+  await new FastAgent({
+    provider,
+    toolset: stubToolset(),
+    memory: {
+      recordAdaptivePattern: async () => {},
+      retrieveAdaptiveGuidance: async () => [{ content: {
+        application: "spotify", tool: "play_music", failureClass: "nothing-started",
+        recoverySequence: ["wait", "play_music"],
+        counts: { observations: 4, recoveries: 4, neededTime: 3 }
+      } }]
+    }
+  }).run("play music on spotify");
+
+  const system = provider.seen[0][0].content;
+  assert.match(system, /what fixed it was TIME/);
+  assert.match(system, /3\/4/, "the evidence for a lesson is part of the lesson");
+  assert.match(system, /wait \{until, text\}/, "it must name the tool that does the waiting");
 });
 
 test("an invented tool name is answered with the real list instead of ending the run", async () => {

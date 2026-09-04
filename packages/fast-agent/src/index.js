@@ -182,15 +182,36 @@ const ADAPTIVE_FAILURE_CLASSES = [
 const NOT_A_TECHNIQUE_FAILURE =
   /terminal access|developer mode|not approved|said no|was not approved|refused by|needs your approval|policy|this is the \d+(?:st|nd|rd|th) time you have run|already ran exactly this/i;
 
+function adaptiveFailureText(result) {
+  return [result?.raw?.reason, result?.raw?.evidence?.observed, result?.text].filter(Boolean).join(" ");
+}
+
+/**
+ * What, if anything, this failure teaches.
+ *
+ * Exported so `scripts/probe-failure-taxonomy.mjs` can replay the whole failure
+ * history through the REAL classifier rather than a copy of it. A probe holding
+ * its own copy of the rules measures the copy, and this codebase has shipped
+ * that mistake before — three copies of one verb list that had already drifted.
+ *
+ * @returns {{learnable: boolean, failureClass: string}}
+ */
+export function classifyFailureForLearning(result) {
+  const text = adaptiveFailureText(result);
+  if (NOT_A_TECHNIQUE_FAILURE.test(text)) return { learnable: false, failureClass: "boundary" };
+  return {
+    learnable: true,
+    failureClass: ADAPTIVE_FAILURE_CLASSES.find(([pattern]) => pattern.test(text))?.[1] ?? "tool-failed"
+  };
+}
+
 function adaptiveFailureClass(result) {
-  const text = [result?.raw?.reason, result?.raw?.evidence?.observed, result?.text].filter(Boolean).join(" ");
-  return ADAPTIVE_FAILURE_CLASSES.find(([pattern]) => pattern.test(text))?.[1] ?? "tool-failed";
+  return classifyFailureForLearning(result).failureClass;
 }
 
 /** Is this failure the machine resisting, or something that said no on purpose? */
 function isLearnableFailure(result) {
-  const text = [result?.raw?.reason, result?.raw?.evidence?.observed, result?.text].filter(Boolean).join(" ");
-  return !NOT_A_TECHNIQUE_FAILURE.test(text);
+  return classifyFailureForLearning(result).learnable;
 }
 
 function adaptiveApplication(tool, args, result) {
@@ -1099,16 +1120,33 @@ export class FastAgent {
         const content = record.content ?? {};
         const counts = content.counts ?? {};
         const recovery = (content.recoverySequence ?? []).join(" -> ");
+        const where = content.application === "general" ? "" : `In ${content.application}, `;
+        const seen = `${counts.recoveries ?? 0}/${counts.observations ?? 0}`;
+        // IT NEEDED TIME, AND THAT IS A DIFFERENT INSTRUCTION FROM A ROUTE.
+        //
+        // A recovery written as `screen -> click` tells the model to read and
+        // click, and on the commonest failure this machine has ever recorded —
+        // "no track started", eighteen times — reading and clicking is not the
+        // lesson. Waiting is. When most observations of a pattern were resolved
+        // by time, say THAT, and say it first, because it changes the next
+        // action rather than describing the last one.
+        const timely = Number(counts.neededTime ?? 0);
+        if (timely > 0 && timely >= Math.ceil(Number(counts.observations ?? 1) / 2)) {
+          return `- ${where}${content.tool} hit "${content.failureClass}" and what fixed it was TIME, in ` +
+            `${timely}/${counts.observations ?? 0} local observations. The app was not ready yet. ` +
+            "Wait for the thing you need — `wait {until, text}` — instead of acting again immediately.";
+        }
         return recovery
-          ? `- In ${content.application}, ${content.tool} failed as ${content.failureClass}; ${recovery} ` +
-            `then succeeded in ${counts.recoveries ?? 0}/${counts.observations ?? 0} local observations.`
-          : `- In ${content.application}, ${content.tool} failed as ${content.failureClass} ` +
-            `${counts.unresolved ?? counts.observations ?? 1} time(s) with no verified recovery; do not repeat it unchanged.`;
+          ? `- ${where}${content.tool} hit "${content.failureClass}"; ${recovery} then worked, ${seen} locally.`
+          : `- ${where}${content.tool} hit "${content.failureClass}" ` +
+            `${counts.unresolved ?? counts.observations ?? 1} time(s) and nothing was found that fixed it. ` +
+            "Do not repeat it unchanged — try a different route.";
       });
       return [
-        "LEARNED LOCAL OUTCOME GUIDANCE (advisory, never authorization and never a substitute for live evidence):",
+        "WHAT HAS GONE WRONG ON THIS MACHINE BEFORE (advisory — it is not permission, and it never replaces",
+        "reading the screen now):",
         ...lines,
-        "Use the pattern only when the current screen agrees. Verify the result normally."
+        "These are tendencies, not facts about this moment. Use one only when what you can see agrees with it."
       ].join("\n");
     } catch {
       return "";

@@ -156,10 +156,63 @@ test("Memory - adaptive outcomes aggregate without retaining task content", asyn
   const records = (await memory.list({ type: "FAILURE_PATTERN" }))
     .filter((record) => record.provenance === "outcome_learning");
   assert.equal(records.length, 1, "the same generalized pattern is evidence, not duplicate memories");
-  assert.deepEqual(records[0].content.counts, { observations: 2, recoveries: 2, unresolved: 0 });
+  assert.deepEqual(records[0].content.counts, { observations: 2, recoveries: 2, unresolved: 0, neededTime: 0 });
   assert.equal(JSON.stringify(records[0]).includes("Justin Bieber"), false);
 
   const relevant = await memory.retrieveAdaptiveGuidance("play music on spotify");
   assert.equal(relevant.length, 1);
+  // THE SILENCE IS THE HALF WORTH KEEPING. An application's quirks are not
+  // advice about writing a document, however many times they have been seen.
   assert.equal((await memory.retrieveAdaptiveGuidance("write a document")).length, 0);
+});
+
+test("Memory - a lesson resolved by waiting is counted as needing time", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-test-"));
+  const memory = new Memory(tempDir);
+  const pattern = {
+    tool: "play_music", application: "Spotify", failureClass: "nothing-started",
+    recoverySequence: ["wait", "play_music"], recovered: true
+  };
+  await memory.recordAdaptivePattern({ ...pattern, neededTime: true });
+  await memory.recordAdaptivePattern({ ...pattern, neededTime: true });
+  await memory.recordAdaptivePattern({ ...pattern, neededTime: false });
+
+  const [record] = (await memory.list({ type: "FAILURE_PATTERN" }))
+    .filter((entry) => entry.provenance === "outcome_learning");
+  // COUNTED, NOT PART OF THE IDENTITY. Hashing it would have split this into two
+  // patterns of one and two observations, and orphaned every pattern the real
+  // store had already learned — the 21-observation Spotify one included.
+  assert.equal(record.content.counts.observations, 3, "one pattern, not two");
+  assert.equal(record.content.counts.neededTime, 2, "\"needed time in 2 of 3\" beats a boolean");
+});
+
+test("Memory - a general lesson with real evidence is reachable without being named", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-test-"));
+  const memory = new Memory(tempDir);
+  // MEASURED ON THE REAL STORE, 3 SEP 2026: 20 of 39 learned patterns were filed
+  // under `general`, whose token appears in no request anybody has ever typed,
+  // so not one of them could ever be retrieved. They were written and never read.
+  const general = {
+    tool: "click", application: "general", failureClass: "ambiguous-target",
+    recoverySequence: ["screen", "click"], recovered: true
+  };
+  for (let seen = 0; seen < 3; seen += 1) await memory.recordAdaptivePattern(general);
+
+  const unrelated = await memory.retrieveAdaptiveGuidance("summarise this pdf for me");
+  assert.equal(unrelated.length, 1, "a tool lesson is not about a topic — it applies wherever that tool is used");
+  assert.equal(unrelated[0].content.failureClass, "ambiguous-target");
+});
+
+test("Memory - a thin general lesson stays quiet", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-test-"));
+  const memory = new Memory(tempDir);
+  // One sighting, and nothing that fixed it. Carrying this into every unrelated
+  // request is how a memory becomes noise and then gets switched off.
+  await memory.recordAdaptivePattern({
+    tool: "key", application: "general", failureClass: "input-blocked",
+    recoverySequence: [], recovered: false
+  });
+
+  assert.equal((await memory.retrieveAdaptiveGuidance("summarise this pdf for me")).length, 0,
+    "standing lessons need three observations AND a verified recovery");
 });
