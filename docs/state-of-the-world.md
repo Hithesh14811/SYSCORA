@@ -1046,6 +1046,173 @@ standing retrieval turns 4 of them red.
 
 `npm test`: **1,670 tests, 1,668 pass, 0 fail, 2 skipped** (was 1,663 / 1,661).
 
+### Built 4 Sep 2026: triggers — a saved route, on a schedule, with nobody watching
+
+Phase 3 §4. `packages/triggers/`, `packages/policy-engine/src/unattended.js`, a
+tick in the daemon, and a schedule control on each row of the Skills panel.
+
+**THE WHOLE DESIGN IS ONE SENTENCE FROM THE SPEC:** *"An unattended run cannot
+answer a confirmation card."* Every gate in this product — the CONFIRM tables,
+the click gate, the send gate, the shell ASK path — ends in a card put in front
+of a person, and at 3am there is no person.
+
+**The decision is made once, loudly, at creation.** `whyNotSchedulable(skill)`
+walks a route's steps and refuses to schedule it if any of them would raise a
+card, naming the step and the rule. Measured through the real daemon:
+
+```
+  daily-note  schedulable=true    scheduled, next run Mon 9:00am
+  send-it     schedulable=false   HTTP 400
+              step 1 (click) clicks "Send", which would send this —
+              once it has gone to somebody else it cannot be taken back
+```
+
+**The rules are CALLED, not restated.** `requiresClickConfirmation`,
+`requiresSendConfirmation`, `requiresConfirmation` and `classifyShellCommand`
+are the same functions the tool boundary uses. A second copy of "which clicks
+are irreversible" is how this file and `shell-rules.js` would come to disagree,
+and the one that disagrees silently would be the one guarding the unattended
+path. This codebase has already paid for that once — three copies of one verb
+list, which had drifted before anyone noticed.
+
+**Four defences, because the first one cannot be complete.** A skill's arguments
+are fixed but the screen is not, so a click that was safe when recorded can land
+on something gated today:
+
+1. **Refused at creation**, above.
+2. **Re-checked at every firing.** Skills are plain JSON the user is meant to
+   edit; a route that was safe in March can have a Send click added in April.
+3. **Safe by construction if both are bypassed.** The shared toolset is built
+   with no `confirm`, and `askPermission` returns `{approved: false, asked:
+   false}` when there is no confirmer — so a gated step is REFUSED, immediately,
+   not approved and not waited on. That behaviour predates triggers.
+4. **A card mid-run aborts the run.** Read off the tool's own `refusedByUser`
+   receipt, never by matching English. **Waiting is the one thing that must not
+   happen**: 120 seconds of silence timing out to "no" is exactly the quiet
+   failure the feature exists to prevent.
+
+**Failure is loud, and it is the product.** *"A trigger that silently stops
+working is worse than no trigger — the user believes the work is happening."*
+Every firing writes `lastRun` including the failures, still schedules the next
+one, and the panel colours on `triggerHealth`. A run that throws, a skill that
+was deleted, a route that became ungated — each gets its own sentence.
+
+**One mouse.** `isBusy` is the daemon's existing `activeIntent` claim, not a
+second lock: two locks that are supposed to agree are one bug away from not
+agreeing. A trigger due while the user is typing stays due and retries next
+tick — bounded by a **one-hour lateness rule**, because a nightly cleanup
+running at lunchtime is a surprise, not the job that was scheduled.
+
+**Measured end to end against the real daemon, 4 Sep 2026:**
+
+```
+  scheduled every minute            HTTP 200, nextFireAt 08:04:00Z
+  the tick fired it unattended      FILE ON DISK: "written by a scheduled trigger"
+  status afterwards                 [ok] Last ran 1:34:58 pm and it worked.
+```
+
+and the failure path, from the run before the fixture was corrected:
+
+```
+  [failing] FAILING since 1:31:25 pm — stopped at step 1 (write_file):
+            ENOENT: no such file or directory
+```
+
+**Two defects found by that proof, and one was mine.** `runSkillUnattended` read
+`outcome.handover` where the failure lives at `outcome.handover.failure`, so
+every failure reported as *"stopped at step ?: it could not be verified"* — an
+error message that has lost its error, and it hid the real cause for a whole
+run. The second was the probe's own fixture: a heredoc collapsed `\\` to `\`, so
+the path was parsed as JS escapes and `\t` became a tab. **The product was
+correct both times; the reporting and the fixture were not.** Recorded because
+"the test was wrong" is the conclusion it is easiest to reach for wrongly.
+
+**Cron is scanned, not calculated.** Next-firing is found by walking forward a
+minute at a time, bounded at a year. Closed-form date arithmetic over cron is
+where every implementation hides its bugs, and the scan is obviously correct by
+construction at about 1,440 iterations for a daily job. The
+day-of-month/day-of-week OR rule is implemented and tested both ways, because
+getting it backwards silently makes a weekday schedule fire on weekends.
+
+**Not built, and named rather than implied:** `hotkey` and `file-appears` are in
+the spec and are not written — `validateTrigger` says so in those words instead
+of refusing with "invalid kind". No `webhook`, per the spec: that is a server
+product and a different company.
+
+21 tests in `tests/unit/triggers.test.js`, **proven able to fail** — neutering
+the schedulability rule, the busy check and the strictly-after clause in
+`nextFireAfter` turns 7 of them red.
+
+`npm test`: **1,691 tests, 1,689 pass, 0 fail, 2 skipped** (was 1,670 / 1,668).
+
+### Fixed 4 Sep 2026: the product said "Done." over a file that was never written
+
+**Found by driving the real UI to demonstrate triggers, which is the only reason
+it was found at all.** First request of the session:
+
+```
+  create a file at C:\Users\hithe\SYSCORA\daily-note.txt containing the words
+  daily standup note
+
+  -> "Done."     COMPLETED, 1 step, ZERO tool calls, 3.3s
+```
+
+There was no file. The session recorded, one line above the answer:
+
+```
+  SKILL_NOT_OFFERED {"reasons":["no tool did anything, so there is nothing to replay"]}
+  AGENT_DONE       {"status":"COMPLETED","message":"Done.","toolCalls":0}
+```
+
+The system said plainly that nothing had happened and told the user it was done.
+
+**THE LIE WAS OURS, NOT THE MODEL'S — WHICH IS WHY NOTHING CAUGHT IT.** The model
+returned an EMPTY turn: no text, no tool call, 144 output tokens of reasoning and
+nothing else. So `lastText` was `""`, and the settle line read
+`_settle("COMPLETED", lastText || "Done.")`. **The word "Done." was supplied by
+the loop, out of thin air.**
+
+Every guard in the evidence architecture reads what the MODEL said.
+`claimsWithoutEvidence("Done.")` returns `true` and would have caught it — it
+never ran, because the model had not said anything to check. `wasDiscarded`
+(added the day before) did not fire either, correctly: the endpoint reported
+`finish_reason: "stop"`, so the turn ended normally, it was simply empty. Four
+layers of honesty enforcement, all of them looking the other way, because none of
+them was watching the product's own fallback string.
+
+**The fix separates the two cases that were sharing a sentence.** A run that
+called tools and has no closing remark may say "Done." — the receipts are in the
+transcript. A run that called NOTHING and said NOTHING now settles FAILED with
+"I did nothing, and I have nothing to tell you: the model returned an empty turn
+— no answer and no tool call. Nothing on your machine was touched."
+
+Two tests, and the second one is the one that keeps this honest: an empty turn
+*after* real work must still report success, or every quiet success becomes a
+failure. **Proven able to fail** — removing the guard turns the first red.
+
+**The general lesson, and it is not about this constant.** The invariant is
+"never claim something happened without evidence", and it has been enforced for a
+year against everything the MODEL emits. This was a claim the SCAFFOLDING made.
+Every default string a settle can fall back on is an unaudited assertion, and
+this was the only one.
+
+### Fixed 4 Sep 2026: `npm test` failed a suite with nothing failing in it
+
+`scripts/run-tests-bounded.js` killed the run at a hard ten minutes. Measured the
+same day: **1,693 tests, 1,691 passing, 0 failing, 630.9 seconds** — thirty
+seconds over. So `npm test` exited 124 on a green suite, which is the worst kind
+of red, the kind people learn to ignore.
+
+The bound exists to catch a suite that has HUNG — the same defect as `npm run
+eval` sitting at 0% CPU for ninety minutes behind an undead PowerShell host. It
+was never a performance budget, and ten minutes was set when the suite took about
+nine. That margin disappeared without anyone noticing, because the failure looks
+identical to a real one. Raised to twenty minutes, with the measured duration
+written down beside it so the next person knows what the real number is.
+
+Note the shape: the tests run at `--test-concurrency=1` deliberately — they share
+one machine, one mouse and one automation host — so this number only ever grows.
+
 ### Still open
 
 - **`project` cannot run on a default install.** Its own comment says it "does

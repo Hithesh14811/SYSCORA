@@ -54,3 +54,15 @@ release/build-info.json
 *.pem
 *.key
 logo syscora1.png
+
+# Local presentation material: the seminar deck, its generator, and the diagram
+# it embeds. Talk assets, not product, and the deck is a ten-megabyte binary.
+*.pptx
+scripts/make-seminar-deck*.mjs
+syscora-architecture.png
+syscora-architecture.svg
+
+# One-shot editing scratch: scripts/rewrite-system-prompt.mjs says in its own
+# header that it is safe to delete once the prompt has landed.
+scripts/rewrite-system-prompt.mjs
+scripts/system-prompt.txt
