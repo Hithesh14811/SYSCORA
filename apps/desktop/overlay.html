@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>SYSCORA</title>
+    <link rel="icon" href="/icon.ico" />
+    <link rel="stylesheet" href="/overlay.css" />
+  </head>
+  <!-- THE PILL.
+       SYSCORA opens as a text box floating over whatever the user is already
+       working in, not as an application they have to switch to. The measured
+       median request is four steps and eighteen seconds; a 1200x800 chat window
+       is the wrong shape for that, and the right one is a command bar.
+
+       IT GROWS UPWARDS, in three layers, and the window is anchored to its
+       bottom edge so the text box never moves out from under the pointer:
+
+         the log        every tool call so far, opened from the arrow, expandable
+         the tool box   what is running RIGHT NOW; stacks down, leaves upwards
+         the pill       the narration it is streaming, and the box you type in
+
+       EVERYTHING OUTSIDE `.pill-shell` AND THE TWO BOXES ABOVE IT IS A HOLE. The
+       window is transparent and covers other applications, so the body must
+       never paint and never take a click — see setIgnoreMouseEvents in the shell
+       and the pointer tracking in overlay.js. -->
+  <body>
+    <div id="stage" class="stage">
+      <!-- EVERYTHING THAT HAS RUN, on request. Opened by the arrow on the tool
+           box; each row expands to its own output. This is the only place on
+           this surface where finished work can be read back without opening the
+           chat. -->
+      <div id="log" class="log" hidden>
+        <header>
+          <span id="logTitle">Everything that has run</span>
+          <button id="logClose" class="log-close" type="button" aria-label="Close the list">×</button>
+        </header>
+        <div id="logList" class="log-list"></div>
+      </div>
+
+      <!-- WHAT IS RUNNING, NOW.
+           A separate box from the pill on purpose: it appears with the first
+           tool call and is gone the moment the work is, so its presence alone
+           says whether the machine is busy. -->
+      <div id="toolbox" class="toolbox" hidden>
+        <button id="logToggle" class="log-toggle" type="button"
+                aria-expanded="false" aria-controls="log"
+                aria-label="Show everything that has run" title="Everything that has run">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"
+               stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9.5 5.5l6 6.5-6 6.5" />
+          </svg>
+        </button>
+        <div id="running" class="running" aria-live="polite" aria-label="Running now"></div>
+      </div>
+
+      <div id="pill" class="pill-shell">
+        <!-- Only while the pointer is over the pill. An always-visible control
+             on a floating bar is one more thing covering the user's screen. -->
+        <button id="expandButton" class="pill-corner" type="button"
+                aria-label="Open the full chat" title="Open the full chat">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M14 4.6h5.4V10" /><path d="M10 19.4H4.6V14" /><path d="M19.4 4.6l-6.6 6.6" /><path d="M4.6 19.4l6.6-6.6" />
+          </svg>
+        </button>
+
+        <!-- THE BORDER IS THE STATUS. Idle it breathes; working it turns amber
+             and moves; refused it goes red. A separate spinner would be one more
+             thing to look at on a surface whose whole point is being small. -->
+        <form id="pillForm" class="pill" data-state="idle">
+          <!-- WHAT IT SAW AND WHAT IT IS DOING, streaming, above the box you
+               typed in — so the pill grows upward into roughly twice its height
+               and the newest line is always the one against the text box. It
+               scrolls itself while streaming and stops the moment the user
+               scrolls, because a view that yanks itself back to the bottom while
+               you are reading is worse than one that does not move. -->
+          <div id="narration" class="narration" hidden aria-live="polite"></div>
+
+          <div id="attachmentStrip" class="attachment-strip" hidden></div>
+
+          <div class="pill-row">
+            <input id="fileInput" type="file" multiple hidden />
+            <input id="imageInput" type="file" multiple hidden accept="image/*" />
+            <input id="folderInput" type="file" hidden webkitdirectory directory />
+            <div class="attach">
+              <button id="attachButton" class="pill-icon" type="button" aria-haspopup="menu"
+                      aria-expanded="false" aria-label="Attach" title="Attach files, images or a folder">
+                <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+                     stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+                  <path d="M12 5.5v13M5.5 12h13" />
+                </svg>
+              </button>
+              <div id="attachMenu" class="pill-menu" role="menu" hidden>
+                <button type="button" role="menuitem" data-pick="image">Photos &amp; images</button>
+                <button type="button" role="menuitem" data-pick="file">Files</button>
+                <button type="button" role="menuitem" data-pick="folder">Folder</button>
+              </div>
+            </div>
+
+            <textarea id="pillInput" rows="1" spellcheck="false"
+                      placeholder="Ask SYSCORA to do something…"></textarea>
+
+            <!-- A conversation carries into the next message, so there has to be
+                 a way to say "this is a new subject". Shared with the chat: both
+                 read and write the same stored conversation. -->
+            <button id="newChatButton" class="pill-icon" type="button"
+                    aria-label="Start a new chat" title="New chat">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20.2 11.4v4.2a2.6 2.6 0 0 1-2.6 2.6H9.2L4.4 21v-3.4a2.6 2.6 0 0 1-1-2V7.8a2.6 2.6 0 0 1 2.6-2.6h6" />
+                <path d="M17.6 3v5.2M20.2 5.6H15" />
+              </svg>
+            </button>
+
+            <!-- WIRED LATER, AND IT SAYS SO. The button exists, holds its own
+                 pressed state and announces itself; nothing behind it captures
+                 audio yet. A control that silently does nothing is worse than one
+                 that says it is not ready. -->
+            <button id="voiceButton" class="pill-icon" type="button" aria-pressed="false"
+                    aria-label="Voice input" title="Voice input">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="2.8" width="6" height="11" rx="3" />
+                <path d="M5.4 11.2a6.6 6.6 0 0 0 13.2 0" /><path d="M12 17.8V21" />
+              </svg>
+            </button>
+
+            <button id="thinkButton" class="pill-chip" type="button"
+                    aria-label="Thinking: automatic" title="Whether the model thinks before acting">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"
+                   stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3a5.6 5.6 0 0 0-3.4 10.1c.5.4.8 1 .8 1.6v.8h5.2v-.8c0-.6.3-1.2.8-1.6A5.6 5.6 0 0 0 12 3z" />
+                <path d="M9.4 18.6h5.2M10.2 21h3.6" />
+              </svg>
+              <span id="thinkLabel">Auto</span>
+            </button>
+
+            <div class="model-picker">
+              <button id="modelButton" class="pill-chip" type="button" aria-haspopup="menu"
+                      aria-expanded="false" title="Which model answers">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"
+                     stroke-width="1.7" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3.4l8.2 4.7v8.2L12 21l-8.2-4.7V8.1z" />
+                </svg>
+                <span id="modelLabel">Auto</span>
+              </button>
+              <div id="modelMenu" class="pill-menu pill-menu-right" role="menu" hidden></div>
+            </div>
+
+            <button id="sendButton" class="pill-send" type="submit" aria-label="Send" title="Send (Enter)">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                   stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 19V5.6M5.8 11.8L12 5.4l6.2 6.4" />
+              </svg>
+            </button>
+          </div>
+        </form>
+
+        <!-- BACKGROUND WORK GETS A BUTTON, NOT A ROW.
+             A deferred command can outlive the request that started it, so it
+             must not sit in the running stack where it would never clear. It
+             collapses to a count on the side and opens only when asked. -->
+        <button id="backgroundButton" class="background-button" type="button" hidden
+                aria-expanded="false" aria-controls="backgroundPanel">
+          <span id="backgroundCount">0</span>
+        </button>
+        <div id="backgroundPanel" class="background-panel" hidden></div>
+      </div>
+    </div>
+
+    <script src="/overlay.js" type="module"></script>
+  </body>
+</html>

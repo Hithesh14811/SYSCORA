@@ -14,7 +14,7 @@
 // No runtime bypass — every action flows through the canonical pipeline, and
 // this file only renders what the pipeline reports.
 
-import { readIntentSession } from "./intent-client.js";
+import { followIntentSession, readIntentSession } from "./intent-client.js";
 import { DISPLAY_LOCALE } from "./format.js";
 // THE MODEL WRITES MARKDOWN AND THIS FILE WAS SHOWING THE ASTERISKS. Every
 // answer went on screen through `textContent`, so headings, numbered steps,
@@ -3577,6 +3577,90 @@ async function submit(text, { attachments = [], routing = null, display = null }
   }
 }
 
+// WATCHING A RUN THIS WINDOW DID NOT START.
+//
+// SYSCORA opens as a floating text box, not as this chat, and a task typed there
+// can be expanded into this window halfway through. That is the only case in
+// this file where a run exists and this surface has no `Turn` for it, no POST
+// response, and no history — only an id.
+//
+// It works because the DAEMON is the source of truth, not either renderer: its
+// stream handler writes every event the run has already produced before it
+// attaches a new subscriber, so this reads the run from the beginning and then
+// continues live. Nothing is transferred between the two windows and neither can
+// drift from the other, because both are readers of the same stream.
+//
+// Guarded against attaching twice: expanding, collapsing and expanding again
+// during one long run must not stack three transcripts of it.
+let attachedSessionId = null;
+
+// Re-read what is on disk, discarding this window's in-memory copy.
+//
+// Only ever called when the pill hands over a session, which is the only moment
+// another surface can have written since this one loaded. Deliberately narrow:
+// doing it on every render would fight the user's own edits, and doing it never
+// is what lets the two views disagree about what was said.
+function refreshChatsFromStorage() {
+  const fresh = loadChats();
+  if (fresh.length === 0) return;
+  chats = fresh;
+  const stored = localStorage.getItem(ACTIVE_CHAT_KEY);
+  if (stored && chats.some((chat) => chat.id === stored)) activeChatId = stored;
+  else if (!chats.some((chat) => chat.id === activeChatId)) activeChatId = chats[0].id;
+  conversation.splice(0, conversation.length, ...(activeChat().conversation ?? []).slice(-24));
+  renderChatList();
+}
+
+async function attachToSession(sessionId) {
+  if (!sessionId || sessionId === attachedSessionId) return;
+  attachedSessionId = sessionId;
+  // THE PILL HAS BEEN WRITING TO THE SAME STORE WHILE THIS WINDOW SAT HIDDEN.
+  //
+  // Chats are held in memory here and saved whole, so a copy loaded at page load
+  // and saved an hour later would silently overwrite everything the pill did in
+  // between. Re-reading at the one moment the pill hands over closes that window
+  // — after this, only one of the two surfaces is being used at a time.
+  refreshChatsFromStorage();
+  const turn = new Turn();
+  runningTurn = turn;
+  setRunning(sessionId);
+  const streamed = [];
+  try {
+    const session = await followIntentSession(sessionId, {
+      onEvent: (event) => {
+        if (!TRANSIENT_EVENTS.has(event.type ?? event.eventType)) streamed.push(event);
+        handleEvent(turn, event);
+      },
+      onProgress: (status) => {
+        const type = status?.latestEvent?.eventType;
+        if (PHASE_STATUS[type]) turn.setStatus(PHASE_STATUS[type]);
+      }
+    });
+    renderFinal(turn, session);
+    // The visual transcript, so this run is here when the window is opened
+    // again. The user's own words come from the session rather than from a
+    // composer that never saw them.
+    //
+    // NOT `rememberInChat`. The pill already wrote both messages to the shared
+    // conversation before it sent the request — see chat-store.js — and writing
+    // them again here would put every pill-initiated exchange into the model's
+    // history twice.
+    const asked = session?.finalResponse?.rawText ?? "";
+    recordTurn(asked, streamed, session, [], asked, replyTextOf(session), newId(), activeChatId);
+  } catch (error) {
+    // A RUN THAT HAS ALREADY FINISHED AND AGED OUT IS NOT AN ERROR. The daemon
+    // keeps a settled run for a short while and then forgets it, so expanding
+    // long after the fact answers 404 — and the honest thing to show then is the
+    // conversation this window already has, not a red line about a session id
+    // the user never saw.
+    turn.settle();
+    turn.root.remove();
+  } finally {
+    attachedSessionId = null;
+    setRunning(null);
+  }
+}
+
 async function resume(sessionId, approve) {
   const turn = new Turn();
   turn.setStatus(approve ? "Approved — continuing…" : "Cancelling…");
@@ -4269,3 +4353,44 @@ suggestions.addEventListener("click", (e) => {
 // it. Now the transcript comes back with it.
 renderChatList();
 if (activeChat().turns.length > 0) renderStoredChat(activeChat());
+
+// ---- The other half of the product ---------------------------------------
+//
+// SYSCORA opens as a floating text box over the desktop; this window is what it
+// becomes when there is something worth reading. The two are views onto ONE run
+// — see `attachToSession` above and the note at the top of overlay.js — so
+// collapsing does not stop anything and expanding mid-task shows the work
+// already in progress.
+//
+// Both controls are hidden outside the desktop shell. In a plain browser there
+// is no second window to go back to, and a button that refers to something that
+// does not exist is worse than no button.
+const overlayBridge = globalThis.syscora?.overlay ?? null;
+if (overlayBridge) {
+  const collapseButton = document.getElementById("collapseButton");
+  if (collapseButton) {
+    collapseButton.hidden = false;
+    collapseButton.addEventListener("click", () => { void overlayBridge.collapse(); });
+  }
+  // The shell sends this BEFORE it shows the window, so a run that settles
+  // quickly is not attached to after it has already finished.
+  overlayBridge.onAttachSession((sessionId) => { void attachToSession(sessionId); });
+}
+
+// Voice, on this composer as on the pill's. The button is real and holds its
+// state; capture is not wired yet, and it says so rather than doing nothing.
+const voiceButton = document.getElementById("voiceButton");
+voiceButton?.addEventListener("click", () => {
+  const on = voiceButton.getAttribute("aria-pressed") === "true";
+  voiceButton.setAttribute("aria-pressed", String(!on));
+  // Said on the control itself rather than through a notification system this
+  // file does not have. The title reverts, so the admission is not permanent.
+  if (!on) {
+    const was = voiceButton.title;
+    voiceButton.title = "Voice input is not wired up yet — type it for now.";
+    setTimeout(() => {
+      voiceButton.title = was;
+      voiceButton.setAttribute("aria-pressed", "false");
+    }, 2000);
+  }
+});

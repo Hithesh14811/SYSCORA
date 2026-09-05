@@ -177,3 +177,61 @@ export async function readIntentSession(response, {
   }
   throw new Error("The runtime finished but did not return a session result.");
 }
+
+/**
+ * Follow a run that is ALREADY GOING, from its id alone.
+ *
+ * WHY THIS IS SEPARATE FROM `readIntentSession`. That one starts from the POST
+ * response, because the surface that submits a request is normally the surface
+ * that watches it. The floating pill breaks that assumption: a task can be
+ * started there and expanded into the chat halfway through, and the chat then
+ * has an id and no response.
+ *
+ * THE DAEMON IS WHAT MAKES IT POSSIBLE, and nothing here is clever. Its stream
+ * handler writes every event the run has already produced before it attaches the
+ * subscriber (`for (const event of run.events) writeSse(...)`), so a late reader
+ * gets the whole run from the beginning and then continues live. That is why a
+ * handover needs no state transfer between the two windows — neither of them is
+ * the source of truth, and both are readers.
+ *
+ * A run that has already SETTLED is not an error here: the stream replays it,
+ * ends, and the session is read from /status exactly as it would have been.
+ */
+export async function followIntentSession(sessionId, {
+  fetchImpl = globalThis.fetch,
+  pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  onEvent = () => {},
+  onProgress = () => {}
+} = {}) {
+  const id = encodeURIComponent(String(sessionId ?? ""));
+  if (!id) throw new Error("followIntentSession needs a session id.");
+  const statusUrl = `/api/intents/${id}/status`;
+  const streamUrl = `/api/intents/${id}/stream`;
+  const deadline = Date.now() + timeoutMs;
+
+  let stream = null;
+  try {
+    const streamResponse = await fetchImpl(streamUrl, { headers: { accept: "text/event-stream" } });
+    if (streamResponse.ok && streamResponse.body) stream = streamResponse;
+  } catch {
+    // Falls through to polling, same as the submit path.
+  }
+  if (!stream) return pollForSession(fetchImpl, statusUrl, { deadline, pollIntervalMs, onProgress });
+
+  let settled = false;
+  for await (const event of readEventStream(stream)) {
+    if (event?.type === "SESSION_SETTLED") {
+      settled = true;
+      if (event.error) throw new Error(event.error);
+      continue;
+    }
+    if (event?.type === "STREAM_END") break;
+    onEvent(event);
+  }
+
+  const session = await fetchSettledSession(fetchImpl, statusUrl, deadline);
+  if (session) return session;
+  if (!settled) return pollForSession(fetchImpl, statusUrl, { deadline, pollIntervalMs, onProgress });
+  throw new Error("The runtime finished but did not return a session result.");
+}

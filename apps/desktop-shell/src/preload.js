@@ -45,5 +45,64 @@ contextBridge.exposeInMainWorld("syscora", {
       return () => ipcRenderer.removeListener("syscora:update-status", handler);
     }
   }),
-  openLegal: (documentName) => ipcRenderer.invoke("syscora:open-legal", documentName)
+  openLegal: (documentName) => ipcRenderer.invoke("syscora:open-legal", documentName),
+
+  // THE OVERLAY, AND THE CHAT, AND THE ONE RUN THEY BOTH FOLLOW.
+  //
+  // Both surfaces are ordinary renderers loaded from the same daemon, so neither
+  // can resize a window, sit above other applications, or hand a session to the
+  // other. All three are the main process's to do, and this is the only way to
+  // ask. Every method is a request — nothing here changes anything by itself.
+  //
+  // Exposed to BOTH pages because the bridge is per-preload, not per-window, and
+  // the chat needs `collapse` and `onAttachSession` exactly as the overlay needs
+  // `expand` and `resize`. A page that never calls its half simply does not.
+  overlay: Object.freeze({
+    // Overlay → main: show the chat window on this run. The session id travels
+    // with it because the chat has to attach to a run that is ALREADY going —
+    // see the note on `attachToSession` in demo.js.
+    expand: (sessionId) => ipcRenderer.invoke("syscora:overlay-expand", sessionId ?? null),
+    // Chat → main: put the chat away and bring the pill back.
+    collapse: () => ipcRenderer.invoke("syscora:overlay-collapse"),
+    // HIDE, NEVER CLOSE. `window.close()` from the renderer DESTROYS the
+    // BrowserWindow, and the shortcut that is supposed to bring the pill back
+    // holds a reference to a window that no longer exists — so Escape would
+    // remove SYSCORA from the machine until it was restarted. Hiding keeps the
+    // window, the typed text and the running task.
+    hide: () => ipcRenderer.invoke("syscora:overlay-hide"),
+    // The overlay window is sized to its content: one pill, or a pill with a
+    // stack of running tools above it. The renderer is the only thing that knows
+    // how tall that is.
+    resize: (height) => ipcRenderer.invoke("syscora:overlay-resize", height),
+    // A TRANSPARENT WINDOW STILL SWALLOWS CLICKS, and this one floats over every
+    // other application. Outside the pill it must be as if it were not there —
+    // see setIgnoreMouseEvents in main.js.
+    setInteractive: (interactive) => ipcRenderer.invoke("syscora:overlay-interactive", interactive === true),
+    // MOVED BY DRAGGING THE PILL, AND THE ANSWER IS ABSOLUTE EVERY TIME.
+    //
+    // Not `-webkit-app-region: drag`: that CSS makes the element undraggable AND
+    // untypable, and a text box you cannot put the caret in is not a text box.
+    // And not a running sum of deltas either — see the note in main.js on why
+    // that could never have worked. `dragStart` records where the window is,
+    // then every `dragMove` carries the TOTAL offset from the pointer's starting
+    // position, so each message is independently correct.
+    dragStart: () => ipcRenderer.invoke("syscora:overlay-drag-start"),
+    dragMove: (dx, dy) => ipcRenderer.invoke("syscora:overlay-drag-move", { dx, dy }),
+    dragEnd: () => ipcRenderer.invoke("syscora:overlay-drag-end"),
+    // Main → chat: a run is already in flight, attach to it.
+    onAttachSession: (listener) => {
+      if (typeof listener !== "function") return () => {};
+      const handler = (_event, sessionId) => listener(sessionId);
+      ipcRenderer.on("syscora:attach-session", handler);
+      return () => ipcRenderer.removeListener("syscora:attach-session", handler);
+    },
+    // Main → overlay: the chat was collapsed or hidden, so the pill is live
+    // again and should take focus.
+    onRevealed: (listener) => {
+      if (typeof listener !== "function") return () => {};
+      const handler = () => listener();
+      ipcRenderer.on("syscora:overlay-revealed", handler);
+      return () => ipcRenderer.removeListener("syscora:overlay-revealed", handler);
+    }
+  })
 });

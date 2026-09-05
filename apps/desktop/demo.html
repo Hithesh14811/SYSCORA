@@ -30,6 +30,20 @@
              than in the menu below: a failure nobody can see until they open a
              menu is a failure nobody sees. -->
         <span id="healthPill" class="health-pill" hidden>Not connected</span>
+        <!-- BACK TO THE PILL.
+             The chat and the floating text box are two views onto the same
+             product, so this is the mirror of the expand control on the pill —
+             it puts the window away without ending anything. Hidden outside the
+             desktop shell, where there is no second window to go back to and the
+             button would refer to something that does not exist. -->
+        <button id="collapseButton" class="icon-button" type="button" hidden
+                aria-label="Collapse to the floating text box" title="Collapse (the run keeps going)">
+          <svg class="icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"
+               fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19.4 4.6l-6.2 6.2" /><path d="M13.6 10.8h5" /><path d="M13.2 10.4v-5" />
+            <path d="M4.6 19.4l6.2-6.2" /><path d="M10.4 13.2h-5" /><path d="M10.8 13.6v5" />
+          </svg>
+        </button>
         <!-- Conversations are kept in this client's own storage. There is no
              account yet, so "your chats" means the chats on this machine, in
              this browser or this desktop application.
@@ -576,6 +590,18 @@
             </button>
             <div id="modelMenu" class="model-menu" role="menu" hidden></div>
           </div>
+          <!-- WIRED LATER, AND IT SAYS SO WHEN PRESSED. The control exists and
+               holds its own pressed state; nothing behind it captures audio yet.
+               A button that silently does nothing is worse than one that admits
+               it is not ready — the same reasoning as the pill's. -->
+          <button id="voiceButton" class="composer-icon" type="button" aria-pressed="false"
+                  aria-label="Voice input" title="Voice input">
+            <svg class="icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"
+                 fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2.8" width="6" height="11" rx="3" />
+              <path d="M5.4 11.2a6.6 6.6 0 0 0 13.2 0" /><path d="M12 17.8V21" />
+            </svg>
+          </button>
           <button id="sendButton" type="submit" aria-label="Send message" title="Send (Enter)">
             <svg class="icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"
                  fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
