@@ -579,3 +579,43 @@ body.dragging, body.dragging .pill { cursor: grabbing; }
 .background-panel .job { padding: 5px 6px; display: flex; gap: 8px; align-items: center; }
 .background-panel .job strong { color: var(--text); font-weight: 600; }
 .background-panel .job em { font-style: normal; color: var(--muted); }
+
+/* ---- which conversation, and what it is doing ------------------------- */
+
+.pill-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 1px 4px 5px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+/* The pill carries a conversation forward between messages, so it has to say
+ * WHICH one is being added to. Same title the chat window lists it under. */
+.chat-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* "IS IT CONNECTING OR IS IT STUCK" is the question a bar this small cannot
+ * answer by being small. The border says whether it is working; this says what
+ * it is doing, in one word, and disappears when the answer is nothing. */
+.phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  color: var(--working);
+}
+
+.phase-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.1s ease-in-out infinite;
+}

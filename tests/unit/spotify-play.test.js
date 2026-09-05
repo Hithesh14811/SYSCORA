@@ -247,7 +247,17 @@ test("Spotify play uses a descriptive accessible action before the legacy tree w
   const result = await adapter._invokeSpotifyPlayButton("Good For You", 1000, 1234);
   assert.equal(result.invoked, true);
   assert.equal(result.name, target.name);
-  assert.deepEqual(requests.map((request) => request.operation), ["ui.find", "ui.action"]);
+  // THE TOP-RESULT CARD IS TRIED FIRST, so `ui.wait` leads.
+  //
+  // Spotify puts the best match in a card and publishes it as a bare "Play"
+  // DataItem beside the title; the list rows below it are named "Play <title>".
+  // The card matcher used to run THIRD, and live — asked for "Tum Se Hi" — the
+  // card sat on screen while nothing was clicked for 10.8s and the previous
+  // track kept playing. See _invokeSpotifyPlayButton.
+  // The card look goes first and finds nothing here (this stub only answers
+  // `ui.find`), so the descriptive row selector still wins — which is the thing
+  // this test is about, and it is unchanged.
+  assert.deepEqual(requests.map((request) => request.operation), ["ui.wait", "ui.find", "ui.action"]);
 });
 
 test("Spotify queue uses the matching options control and Add to queue menu item", async () => {

@@ -70,6 +70,9 @@ contextBridge.exposeInMainWorld("syscora", {
     // remove SYSCORA from the machine until it was restarted. Hiding keeps the
     // window, the typed text and the running task.
     hide: () => ipcRenderer.invoke("syscora:overlay-hide"),
+    // Which accelerator actually registered. Null when every candidate was
+    // already taken by something else on this machine.
+    shortcut: () => ipcRenderer.invoke("syscora:overlay-shortcut"),
     // The overlay window is sized to its content: one pill, or a pill with a
     // stack of running tools above it. The renderer is the only thing that knows
     // how tall that is.

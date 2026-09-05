@@ -279,6 +279,10 @@ function setupOverlayBridge() {
   });
   // Escape, and anything else that means "not now". Hides; never destroys —
   // see the note on `hide` in the preload.
+  // Which key actually took. The renderer shows it, because a shortcut nobody
+  // can discover is a shortcut nobody uses — and which one it is depends on what
+  // else on the machine had already claimed the others.
+  ipcMain.handle("syscora:overlay-shortcut", () => overlayShortcut);
   ipcMain.handle("syscora:overlay-hide", () => {
     overlayWindow?.hide();
     return true;
@@ -356,18 +360,52 @@ function setupOverlayBridge() {
 // pill is in the way. Failure is not fatal: another application may already own
 // the combination, and a shell that refuses to start over a hotkey clash would
 // be worse than one without the hotkey.
+// A LIST, NOT ONE KEY, BECAUSE A HOTKEY CLASH IS SILENT.
+//
+// `globalShortcut.register` returns false when another application already owns
+// the combination — it does not throw, and nothing on screen says so. A single
+// hard-coded accelerator therefore fails in exactly the way the user cannot
+// diagnose: the key does nothing and there is no error anywhere.
+//
+// So it tries in order and keeps the first that takes. Ctrl+Shift+Space is the
+// one to aim for (it is what most command bars use and Windows itself does not
+// claim it); the rest are progressively less likely to be contested. Whichever
+// wins is printed, because a shortcut nobody can discover is a shortcut nobody
+// uses. `SYSCORA_OVERLAY_SHORTCUT` overrides the whole list.
+const OVERLAY_SHORTCUTS = [
+  "CommandOrControl+Shift+Space",
+  "CommandOrControl+Alt+Space",
+  "CommandOrControl+Shift+K",
+  "Alt+Shift+S"
+];
+
+let overlayShortcut = null;
+
 function registerOverlayShortcut() {
-  const accelerator = process.env.SYSCORA_OVERLAY_SHORTCUT || "CommandOrControl+Shift+Space";
-  try {
-    const registered = globalShortcut.register(accelerator, () => {
-      if (!overlayWindow || overlayWindow.isDestroyed()) return;
-      if (overlayWindow.isVisible()) overlayWindow.hide();
-      else showOverlayWindow();
-    });
-    if (!registered) console.warn(`SYSCORA could not register ${accelerator}; another application holds it.`);
-  } catch (error) {
-    console.warn(`SYSCORA could not register the overlay shortcut: ${error?.message ?? error}`);
+  const wanted = process.env.SYSCORA_OVERLAY_SHORTCUT
+    ? [process.env.SYSCORA_OVERLAY_SHORTCUT]
+    : OVERLAY_SHORTCUTS;
+  const toggle = () => {
+    if (!overlayWindow || overlayWindow.isDestroyed()) return;
+    if (overlayWindow.isVisible()) overlayWindow.hide();
+    else showOverlayWindow();
+  };
+  for (const accelerator of wanted) {
+    try {
+      if (globalShortcut.register(accelerator, toggle)) {
+        overlayShortcut = accelerator;
+        console.log(`SYSCORA overlay shortcut: ${accelerator}`);
+        return accelerator;
+      }
+    } catch { /* an accelerator this build cannot parse is simply skipped */ }
   }
+  // Not fatal. The pill is still reachable — it is on screen unless it has been
+  // hidden, and Escape hides it — but the user needs to know the key is gone.
+  console.warn(
+    `SYSCORA could not register an overlay shortcut; every candidate is taken (${wanted.join(", ")}). ` +
+    "Set SYSCORA_OVERLAY_SHORTCUT to one that is free."
+  );
+  return null;
 }
 
 function setupAutoUpdates(window) {

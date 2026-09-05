@@ -117,3 +117,57 @@ export function startNewChat() {
   try { localStorage.setItem(ACTIVE_CHAT_KEY, fresh.id); } catch { /* not fatal */ }
   return fresh.id;
 }
+
+/**
+ * Record one finished exchange so the CHAT WINDOW shows it.
+ *
+ * THE CONVERSATION AND THE TRANSCRIPT ARE TWO DIFFERENT FIELDS, and the first
+ * version of this module only wrote one of them. `conversation` is what the
+ * model is sent as history; `turns` is what `renderStoredChat` draws. So a task
+ * run from the pill continued correctly in the next message and then appeared
+ * NOWHERE in the chat window — "the chat is not stored in the chat interface at
+ * all", which is exactly right.
+ *
+ * A turn from the pill carries no `events` and no `session`: the pill does not
+ * keep a transcript, and inventing one would put a different story in the chat
+ * from the one the daemon actually recorded. `renderStoredChat` handles both
+ * being absent — it draws the user's bubble, opens a Turn, replays nothing and
+ * settles it — so the exchange reads as a plain question and answer, which is
+ * what it was.
+ *
+ * The exception is a run the user EXPANDED: `attachToSession` in demo.js writes
+ * the full transcript for that one, and it is the writer for those.
+ */
+export function recordTurn(userText, replyText) {
+  const asked = String(userText ?? "").trim();
+  const answered = String(replyText ?? "").trim();
+  if (!asked && !answered) return;
+  const chats = readChats();
+  const chat = activeChat(chats);
+  chat.turns = Array.isArray(chat.turns) ? chat.turns : [];
+  chat.turns.push({
+    id: `turn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+    user: asked,
+    sent: asked,
+    reply: answered,
+    attachments: [],
+    at: Date.now(),
+    events: [],
+    // Enough for `renderFinal` to draw the answer. The daemon's own session is
+    // richer; this is the honest subset the pill actually has.
+    session: answered ? { finalResponse: { status: "COMPLETED", message: answered } } : null
+  });
+  // The chat trims to 40 and so does this, or a long pill session would push the
+  // store past what localStorage will hold.
+  if (chat.turns.length > 40) chat.turns.splice(0, chat.turns.length - 40);
+  chat.updatedAt = Date.now();
+  chats.sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0));
+  writeChats(chats);
+}
+
+/** Which conversation the pill is on, for the header that says so. */
+export function activeChatTitle() {
+  const chats = readChats();
+  if (chats.length === 0) return "New chat";
+  return String(activeChat(chats)?.title ?? "New chat") || "New chat";
+}

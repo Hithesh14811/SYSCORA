@@ -74,6 +74,17 @@
                scrolls itself while streaming and stops the moment the user
                scrolls, because a view that yanks itself back to the bottom while
                you are reading is worse than one that does not move. -->
+          <!-- WHICH CONVERSATION THIS IS, and what it is doing right now.
+               Both belong on one line above the narration: the pill carries a
+               conversation forward between messages, so the user has to be able
+               to see WHICH one they are adding to — and "is it connecting or is
+               it stuck" is the other question a floating bar cannot answer by
+               being small. The name is the same title the chat window lists. -->
+          <div class="pill-head">
+            <span id="chatName" class="chat-name" title="The conversation this belongs to">New chat</span>
+            <span id="phase" class="phase" hidden><span class="phase-dot"></span><span id="phaseLabel"></span></span>
+          </div>
+
           <div id="narration" class="narration" hidden aria-live="polite"></div>
 
           <div id="attachmentStrip" class="attachment-strip" hidden></div>

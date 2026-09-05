@@ -19,8 +19,9 @@
 import { readIntentSession } from "./intent-client.js";
 import { AUTO, checkAttachments, modelById, selectableModels } from "./models.js";
 import { describeAttachments, prepareAttachment, prepareFolder } from "./attachments.js";
-import { appendMessage, readHistory, startNewChat } from "./chat-store.js";
+import { activeChatTitle, appendMessage, readHistory, recordTurn, startNewChat } from "./chat-store.js";
 import { withApiToken } from "./api-fetch.js";
+import { STATUS, pendingVerbFor, runningVerbFor } from "./status-words.js";
 
 const bridge = globalThis.syscora?.overlay ?? null;
 
@@ -43,6 +44,9 @@ const stage = $("stage");
 const form = $("pillForm");
 const input = $("pillInput");
 const narration = $("narration");
+const chatName = $("chatName");
+const phase = $("phase");
+const phaseLabel = $("phaseLabel");
 const toolbox = $("toolbox");
 const running = $("running");
 const log = $("log");
@@ -289,6 +293,8 @@ newChatButton.addEventListener("click", () => {
   log.hidden = true;
   logToggle.setAttribute("aria-expanded", "false");
   setState("idle");
+  setPhase(null);
+  showChatName();
   note("New chat.");
   input.focus();
 });
@@ -329,26 +335,124 @@ function clearNarration() {
   narration.replaceChildren();
   narration.hidden = true;
   stickToBottom = true;
+  streaming = null;
+  streamed = "";
   syncHeight();
 }
 
-function narrate(saw, say) {
-  const line = el("div", "narration-line");
-  if (saw) line.append(el("span", "saw", saw));
-  if (say) line.append(el("span", "say", say));
-  if (!line.childNodes.length) return;
-  narration.hidden = false;
-  narration.append(line);
-  // Bounded: this is a floating bar, not a transcript. The whole run is in the
-  // chat, one click away, and the log below keeps every tool call.
-  while (narration.childElementCount > 60) narration.firstElementChild.remove();
+function scrollIfSticking() {
   if (stickToBottom) narration.scrollTop = narration.scrollHeight;
   syncHeight();
 }
 
-function narrateText(text) {
+// Bounded: this is a floating bar, not a transcript. The whole run is in the
+// chat, one click away, and the log keeps every tool call.
+function trimNarration() {
+  while (narration.childElementCount > 60) narration.firstElementChild.remove();
+}
+
+function narrate(saw, say) {
+  // DO NOT SAY IT AGAIN JUST BECAUSE IT ARRIVED TWICE.
+  //
+  // The answer reaches this surface on more than one channel: `AGENT_DELTA` as
+  // it is generated, `AGENT_SAYS` when the runtime publishes it, and the settle
+  // message at the end. All three carry the SAME words, and rendering each of
+  // them is the "everything twice or thrice" this fixes — measured against a
+  // local streaming endpoint, where the answer appeared once from the stream and
+  // once again from AGENT_SAYS, character for character.
+  //
+  // The guard is on the TEXT rather than on the channel, because which channel
+  // repeats depends on the runtime and would have to be rediscovered every time
+  // that changes.
+  if (!saw && alreadyStreamed(say)) return;
+  const line = el("div", "narration-line");
+  if (saw) line.append(el("span", "saw", saw));
+  if (say) line.append(el("span", "say", say));
+  if (!line.childNodes.length) return;
+  // A new line of its own ENDS the answer that was streaming: whatever comes
+  // next belongs after it, not appended to it.
+  streaming = null;
+  narration.hidden = false;
+  narration.append(line);
+  trimNarration();
+  scrollIfSticking();
+}
+
+// THE ANSWER ARRIVES A FRAGMENT AT A TIME, AND IT IS ONE ANSWER.
+//
+// `AGENT_DELTA` is the model's reply as it is generated — a few characters per
+// event, hundreds of them for a paragraph. The first version made a new
+// narration line out of EVERY fragment, so a two-sentence answer came out as
+// forty separate lines reading "I", "'m", "SYSCORA", "— the"... and then the
+// whole thing appeared AGAIN when the run settled and the final message was
+// added. That is the "everything twice or thrice" this fixes.
+//
+// So the fragments accumulate into ONE line, and what has accumulated is
+// remembered so the settle can tell whether it has already been shown.
+let streaming = null;
+let streamed = "";
+
+function narrateDelta(text) {
+  const fragment = String(text ?? "");
+  if (!fragment) return;
+  if (!streaming) {
+    streaming = el("div", "narration-line");
+    streaming.append(el("span", "say", ""));
+    narration.hidden = false;
+    narration.append(streaming);
+    trimNarration();
+  }
+  streamed += fragment;
+  streaming.firstElementChild.textContent = streamed.trim();
+  scrollIfSticking();
+}
+
+/** Has this text already reached the screen as a stream? */
+function alreadyStreamed(text) {
   const body = String(text ?? "").trim();
-  if (body) narrate(null, body);
+  if (!body || !streamed) return false;
+  const shown = streamed.trim();
+  if (shown === body) return true;
+  // Not ONLY equality: the settle message is sometimes the streamed answer with
+  // a trailing note bolted on, and a whitespace difference is not a new answer.
+  //
+  // But a prefix match needs a length floor, or a genuinely different short line
+  // gets swallowed — "Opening" would count as already-said against a streamed
+  // "Opening Spotify and searching." A repeat worth suppressing is a whole
+  // answer, and forty characters is well below the shortest of those and well
+  // above any one-word status line.
+  const overlap = Math.min(shown.length, body.length);
+  if (overlap < 40) return false;
+  return shown.startsWith(body) || body.startsWith(shown);
+}
+
+// ---------------------------------------------------------------------------
+// WHAT IT IS DOING RIGHT NOW, IN ONE WORD.
+//
+// The border says WHETHER it is working. It cannot say whether a request is
+// still on the wire, whether the model is generating, or whether a tool is
+// running — and on a bar with no transcript, "connecting" and "stuck" look
+// identical without this. Cleared the moment the run settles.
+//
+// Driven off events that have actually happened, never off a timer: the first
+// version of the chat's own status line said "Thinking…" from the instant the
+// request left the box, and measured against this endpoint the first byte comes
+// back at 631ms and the first reasoning token at 1,430ms. For a second and a
+// half that word described a request sitting on a wire.
+function setPhase(label) {
+  if (!label) {
+    phase.hidden = true;
+    phaseLabel.textContent = "";
+  } else {
+    phase.hidden = false;
+    phaseLabel.textContent = label;
+  }
+  syncHeight();
+}
+
+// The conversation this belongs to, by the same title the chat window lists.
+function showChatName() {
+  chatName.textContent = activeChatTitle();
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +652,17 @@ async function stop() {
 // EXPANDING IS NOT A HANDOVER. The chat attaches to the SAME session on the
 // daemon, which replays it from the beginning, and reads the SAME stored
 // conversation — so the window that opens is on the same thread, mid-flight.
-const expand = () => bridge?.expand(sessionId);
+//
+// ONE WRITER PER RUN, THOUGH. Once the chat has attached to a session it writes
+// the full transcript for it, so the pill must not also write its own thinner
+// copy or the exchange appears twice in the chat. Remembered by session id
+// rather than as a flag: expanding during one run says nothing about the next.
+let handedOver = null;
+
+function expand() {
+  if (sessionId) handedOver = sessionId;
+  bridge?.expand(sessionId);
+}
 
 expandButton.addEventListener("click", () => expand());
 bridge?.onRevealed(() => { input.focus(); syncHeight(); });
@@ -594,12 +708,16 @@ form.addEventListener("submit", async (event) => {
 
   const described = describeAttachments(attachments);
   const body = text ? (described ? `${text}\n\n${described}` : text) : described;
+  // What the USER said, for the chat transcript and its title — never the body
+  // with the attachment listing bolted on. Same rule as `rememberInChat`.
+  const shownText = text || attachments.map((file) => file.name).join(", ");
   const workspaceRoots = [...new Set(attachments
     .filter((attachment) => attachment?.kind === "folder" && attachment.path)
     .map((attachment) => attachment.path))];
   attachments = [];
   renderAttachments();
 
+  setPhase(STATUS.CONNECTING);
   // THE SAME CONVERSATION THE CHAT WINDOW IS ON. Read fresh from the shared
   // store, so a follow-up typed here continues what was said there.
   const history = readHistory();
@@ -629,8 +747,9 @@ form.addEventListener("submit", async (event) => {
       })
     });
 
+    let currentSession = null;
     const session = await readIntentSession(response, {
-      onStart: (id) => setRunning(id),
+      onStart: (id) => { currentSession = id; setRunning(id); setPhase(STATUS.CONNECTING); },
       onEvent: (streamEvent) => handleStreamEvent(streamEvent)
     });
 
@@ -640,8 +759,17 @@ form.addEventListener("submit", async (event) => {
     const good = status === "COMPLETED" || status === "ANSWERED" || status === "DECLINED";
     setState(good ? "done" : "error");
     if (message) {
+      // The chat's copy of the conversation gets the whole answer either way —
+      // it is what the model is sent as history next time.
       appendMessage("assistant", message);
-      note(message, good ? "reply" : "error");
+      // The TRANSCRIPT only if the chat did not attach to this run. See
+      // `handedOver`: two writers for one exchange is two of it in the chat.
+      if (handedOver !== currentSession) recordTurn(shownText, message);
+      // BUT THE SCREEN DOES NOT GET IT TWICE. On an ordinary answer this is the
+      // same text that just finished streaming into the line above, and adding
+      // it again is exactly the duplication this used to produce.
+      if (!alreadyStreamed(message)) note(message, good ? "reply" : "error");
+      else if (!good) setState("error");
     }
     // Back to breathing after a moment. A bar that stays green stops meaning
     // anything.
@@ -652,6 +780,10 @@ form.addEventListener("submit", async (event) => {
     note(`That did not run: ${error?.message ?? error}`, "error");
   } finally {
     setRunning(null);
+    setPhase(null);
+    // The title is minted from the first message of an untitled chat, so it is
+    // only knowable after the exchange has been written.
+    showChatName();
   }
 });
 
@@ -665,7 +797,20 @@ function handleStreamEvent(event) {
 
   // The model's own words, as they arrive.
   if (type === "AGENT_DELTA") {
-    narrateText(detail.text);
+    setPhase(STATUS.WRITING);
+    narrateDelta(detail.text);
+    return;
+  }
+  // The model deliberating, on its own channel. Never merged into the answer —
+  // a settle that took reasoning for an answer would publish the scratch work.
+  if (type === "AGENT_REASONING") {
+    setPhase(STATUS.THINKING);
+    return;
+  }
+  // The model is still WRITING the call — nothing has touched the machine yet,
+  // which is a different tense from running it. See TOOL_VERB_PENDING.
+  if (type === "TOOL_STREAMING") {
+    if (detail.tool) setPhase(pendingVerbFor(detail.tool));
     return;
   }
   // `saw` and `say` travel WITH the tool call, which is why they reach the
@@ -675,6 +820,7 @@ function handleStreamEvent(event) {
     return;
   }
   if (type === "TOOL_STARTED") {
+    setPhase(runningVerbFor(detail.tool));
     const args = detail.args ?? {};
     if (args.saw || args.say) narrate(args.saw, args.say);
     startTool(detail.callId ?? detail.tool, detail.tool, detail.preview);
@@ -682,6 +828,10 @@ function handleStreamEvent(event) {
   }
   if (type === "TOOL_FINISHED") {
     finishTool(detail.callId ?? detail.tool, { ok: detail.ok !== false, output: detail.output });
+    // The phase must not keep naming a tool that has finished. Whatever else is
+    // still in the stack takes over; if nothing is, the model is deciding again.
+    const stillRunning = entries.find((entry) => entry.ok === null);
+    setPhase(stillRunning ? runningVerbFor(stillRunning.tool) : STATUS.THINKING);
     // A deferred command keeps going after the run that started it. It leaves
     // the stack and becomes a count on the side.
     if (detail.card?.kind === "job" || detail.deferred === true) {
@@ -696,7 +846,10 @@ function handleStreamEvent(event) {
   // The agent stopped to ask about something it cannot take back. There is no
   // room to render an approval card here and no honest way to shrink one, so the
   // chat is opened on it — the decision belongs where the command can be read.
-  if (type === "APPROVAL_REQUIRED") expand();
+  if (type === "APPROVAL_REQUIRED") {
+    setPhase(STATUS.APPROVAL);
+    expand();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -704,6 +857,14 @@ function handleStreamEvent(event) {
 renderModelMenu();
 modelLabel.textContent = modelById(selectedModel)?.label ?? "Auto";
 setState("idle");
+showChatName();
+// SAY WHICH KEY HIDES IT. The accelerator is chosen at startup from a list —
+// whichever was not already claimed by something else — so it is not a constant
+// anybody could have read off this file.
+void (async () => {
+  const key = await bridge?.shortcut?.();
+  if (key) input.title = `${key} hides and shows SYSCORA · Esc hides it`;
+})();
 syncHeight();
 input.focus();
 

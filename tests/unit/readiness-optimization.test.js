@@ -40,7 +40,16 @@ test("Spotify waits for the Play control beside the requested row without a mode
 
   assert.equal(result.invoked, true);
   assert.equal(result.name, "Play");
-  assert.deepEqual(requests.map(({ operation }) => operation), ["ui.find", "ui.find", "ui.wait", "ui.invoke", "pointer.click"]);
+  // THE TOP-RESULT CARD IS TRIED FIRST, so `ui.wait` leads.
+  //
+  // Spotify puts the best match in a card and publishes it as a bare "Play"
+  // DataItem beside the title; the list rows below it are named "Play <title>".
+  // The card matcher used to run THIRD, and live — asked for "Tum Se Hi" — the
+  // card sat on screen while nothing was clicked for 10.8s and the previous
+  // track kept playing. See _invokeSpotifyPlayButton.
+  // Here the card is already in the tree, so the two row selectors never run at
+  // all — the warm path is now three host round trips instead of five.
+  assert.deepEqual(requests.map(({ operation }) => operation), ["ui.wait", "ui.invoke", "pointer.click"]);
   const wait = requests.find(({ operation }) => operation === "ui.wait");
   assert.equal(wait.params.selector.nearText, "baby justin bieber");
   assert.equal(wait.params.selector.minimumCoverage, 0.5);
@@ -120,7 +129,17 @@ test("a persistent-host selector miss resolves the Play control from one inspect
 
   assert.equal(result.invoked, true);
   assert.equal(result.recovery, "inspected-nearby-labels");
-  assert.deepEqual(requests, ["ui.find", "ui.find", "ui.wait", "ui.inspect", "ui.invoke", "pointer.click"]);
+  // THE TOP-RESULT CARD IS TRIED FIRST, so `ui.wait` leads.
+  //
+  // Spotify puts the best match in a card and publishes it as a bare "Play"
+  // DataItem beside the title; the list rows below it are named "Play <title>".
+  // The card matcher used to run THIRD, and live — asked for "Tum Se Hi" — the
+  // card sat on screen while nothing was clicked for 10.8s and the previous
+  // track kept playing. See _invokeSpotifyPlayButton.
+  // Nothing matches here, so every attempt runs: the short card look, the two row
+  // selectors, the card look again with the rest of the budget, then the local
+  // inspect. The total is still bounded by the same deadline.
+  assert.deepEqual(requests, ["ui.wait", "ui.find", "ui.find", "ui.wait", "ui.inspect", "ui.invoke", "pointer.click"]);
 });
 
 test("Spotify playback verification reuses the persistent host tree", async () => {

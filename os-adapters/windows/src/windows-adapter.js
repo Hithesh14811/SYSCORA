@@ -295,9 +295,37 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, n));
 }
 
+const SPOTIFY_STOPWORDS = new Set(["the", "a", "an", "by", "for", "on", "in", "of", "and", "to", "feat", "ft"]);
+
+function spotifyWords(value) {
+  return [...new Set(
+    String(value ?? "").toLowerCase().match(/[a-z0-9]{2,}/g)?.filter((token) => !SPOTIFY_STOPWORDS.has(token)) ?? []
+  )];
+}
+
+// THE QUERY, capped: eight words is more than any track title needs, and a user
+// who pastes a paragraph should not turn every row on screen into a match.
 function spotifyQueryTokens(value) {
-  const ignored = new Set(["the", "a", "an", "by", "for", "on", "in", "of", "and", "to", "feat", "ft"]);
-  return [...new Set(String(value ?? "").toLowerCase().match(/[a-z0-9]{2,}/g)?.filter((token) => !ignored.has(token)) ?? [])].slice(0, 8);
+  return spotifyWords(value).slice(0, 8);
+}
+
+// THE TEXT BEING SEARCHED, NOT CAPPED — AND THE CAP WAS SILENTLY LOSING SONGS.
+//
+// `spotifyQueryTokens` was used for both sides of the comparison. On the query
+// that is right; on the surrounding text it is a bug, because the eight-word
+// limit takes the FIRST eight words of everything near a row, and what sits
+// nearest a Spotify search row is the artist line above it.
+//
+// Measured on the real tree from a failing run: the row
+// "Play Agar Tum Mil Jao - Trending Version" had its neighbourhood truncated to
+// "song roop kumar rathod anu malik shreya ghoshal" — not one word of the query
+// — so it scored ZERO, was filtered out before ranking, and the wrong version
+// was played. The row's own title was never even reached.
+//
+// The haystack has no reason to be bounded: it is built per candidate from
+// elements already in hand.
+function spotifyTextTokens(value) {
+  return spotifyWords(value);
 }
 
 function spotifyTokenDistance(a, b) {
@@ -330,7 +358,10 @@ function uiBounds(target) {
 // as siblings rather than as one accessible control, so an exact-name lookup
 // alone cannot see that "Play" belongs to "Senorita". This is intentionally a
 // generic geometric/token match: it learns nothing about a particular song.
-function spotifyPlayCandidate(elements, query) {
+// Exported so the tie-break below can be tested against the REAL tree Spotify
+// published on a failing run, rather than against one somebody imagined. See
+// tests/unit/spotify-top-result.test.js.
+export function spotifyPlayCandidate(elements, query) {
   const expected = spotifyQueryTokens(query);
   if (expected.length === 0) return null;
   const visible = (elements ?? []).filter((element) => {
@@ -354,16 +385,54 @@ function spotifyPlayCandidate(elements, query) {
   };
   const scored = actions.map((action) => {
     const related = visible.filter((element) => element === action || near(action, element));
-    const words = spotifyQueryTokens(related.map((element) => element.name ?? element.text ?? "").join(" "));
+    const words = spotifyTextTokens(related.map((element) => element.name ?? element.text ?? "").join(" "));
     const hits = expected.filter((token) => words.some((word) =>
       word === token || spotifyTokenDistance(word, token) <= 1
     )).length;
     const label = related.map((element) => String(element.name ?? element.text ?? "")).join(" ");
     const episodePenalty = /\b(?:episode|podcast|your episodes)\b/i.test(label) ? 2 : 0;
-    return { action, hits, score: hits * 10 - episodePenalty };
+    // THE TOP-RESULT CARD, AND THE TIE IT BREAKS.
+    //
+    // Spotify publishes its best match as a card whose action is a BARE "Play"
+    // beside the title, and the list rows beneath it as "Play <title>". When a
+    // query matches several versions of one song — Female, Trending, Male, and a
+    // playlist of the same name — every row carries all of the query's tokens,
+    // they all score identically, and the tie-break below returned NULL. Live,
+    // asked for "agar tum mil jao", that is exactly what happened: nothing was
+    // clicked, a different song carried on playing, and the run took nine steps
+    // and 147,358 tokens to recover by hand.
+    //
+    // The card is the choice SPOTIFY made about which of those versions is the
+    // best match, and it is the one a person clicks. So a bare "Play" outranks a
+    // named row — but only by ONE point, so it can never beat a row that matches
+    // more of the query. And only when the query's words are actually beside it,
+    // which `hits` already requires: a bare "Play" belonging to some other card
+    // scores nothing and never reaches here.
+    const isTopResultCard = /^play$/i.test(String(action?.name ?? action?.text ?? "").trim()) ? 1 : 0;
+    // AND WHAT THE ROW CALLS ITSELF, WHICH THE NEIGHBOURS CANNOT DILUTE.
+    //
+    // `hits` counts the query's words anywhere NEAR the action, and Spotify's
+    // rows are 147px apart against a 220px window — so every row absorbs the
+    // titles above and below it and they all score the same. Asked for the
+    // "Trending Version" among four versions of one song, that is a four-way tie
+    // and the caller gives up.
+    //
+    // A row's OWN name cannot be diluted that way, so it settles ties the outer
+    // score cannot. Kept as a separate key rather than folded into the score:
+    // adding it there would let a well-named row outrank the top-result card,
+    // which is the thing this function was just taught to prefer.
+    const ownWords = spotifyTextTokens(String(action?.name ?? action?.text ?? ""));
+    const ownHits = expected.filter((token) => ownWords.some((word) =>
+      word === token || spotifyTokenDistance(word, token) <= 1
+    )).length;
+    return { action, hits, ownHits, score: hits * 10 - episodePenalty + isTopResultCard };
   }).filter((entry) => entry.hits >= Math.max(1, Math.ceil(expected.length * 0.5)))
-    .sort((left, right) => right.score - left.score);
-  if (!scored.length || (scored[1] && scored[1].score === scored[0].score)) return null;
+    .sort((left, right) => (right.score - left.score) || (right.ownHits - left.ownHits));
+  // Still a tie on BOTH keys means two candidates this cannot tell apart, and
+  // guessing between them is how the wrong song gets played. The caller falls
+  // back to letting the model read the screen and choose.
+  if (!scored.length) return null;
+  if (scored[1] && scored[1].score === scored[0].score && scored[1].ownHits === scored[0].ownHits) return null;
   return scored[0].action;
 }
 
@@ -2707,15 +2776,111 @@ public static class SyscoraAudio {
     const startedAt = Date.now();
     const tokens = spotifyQueryTokens(query);
     if (tokens.length === 0) return { found: false, invoked: false, name: null, reason: "invalid-track-query", commandResult: null };
-    // Modern Chromium accessibility trees often expose a result as one button
-    // named "Play <title> by <artist>" instead of a title label containing a
-    // nested generic Play button. Try the general compound-name selector first.
+    // TWO SHAPES, AND SPOTIFY USES BOTH. The "top result" card publishes a bare
+    // DataItem named "Play" beside text naming the song; the list rows below it
+    // publish one control named "Play <title> by <artist>". The card is the best
+    // match Spotify itself chose, so it is tried first — see below.
     if (this.automationHost) {
-      // Button first, because when a row IS a button that is the least ambiguous
-      // possible match. Then again with no control-type constraint at all: the
-      // rows in Spotify's search results are DataItems, not buttons, and a name
-      // that both starts with "Play " and contains the requested track is
-      // already specific enough to stand on its own.
+      // THE BIG CARD IS THE ANSWER, SO IT IS TRIED FIRST.
+      //
+      // Spotify puts the best match in a "top result" card and publishes it as
+      // a bare DataItem named "Play" beside text naming the song — a different
+      // shape from the list rows below it, which are named "Play <title>".
+      // This matcher is the only one that can hit the card, and it used to run
+      // THIRD, after two selectors aimed at the rows.
+      //
+      // Live, asked for "Tum Se Hi": nothing was clicked in 10.8s, the previous
+      // track carried on playing, and the run recovered only after the model
+      // read the screen and clicked the card itself — four extra steps. The
+      // card was on screen at index 64 the whole time.
+      //
+      // IT IS NOT SLOWER, WHICH IS THE CONSTRAINT. The card attempt is a WAIT,
+      // so running it first with the whole budget would starve the row
+      // selectors. It runs first with a short one — enough for a tree that is
+      // already rendered, which is the common case and now the fastest path —
+      // then the row selectors run, then the card attempt takes whatever is
+      // left, which is the cold-tree wait it always was. Total is still bounded
+      // by `limit`; the warm case gets FASTER because it no longer pays the
+      // measured 713ms + 146ms of row selectors before looking at the card.
+      const tryTopResultCard = async (budgetMs) => {
+      if (budgetMs >= 50) {
+        try {
+          const selector = {
+            nameStartsWith: "Play",
+            controlTypes: ["Button", "DataItem", "ListItem", "Hyperlink"],
+            nearText: spotifyQueryTokens(query).join(" "),
+            minimumCoverage: 0.5,
+            maxDistance: 1100,
+            sameRowTolerance: 140
+          };
+          const nearby = await this.waitForUiTarget({
+            application: "spotify",
+            windowId: windowHandle,
+            selector,
+            timeoutMs: budgetMs
+          });
+          if (nearby?.matched && nearby.target) {
+            const bounds = uiBounds(nearby.target);
+            const invoked = await this.invokeControl({
+              windowId: nearby.target.windowId ?? windowHandle,
+              name: nearby.target.name,
+              x: Number(bounds.x) + Number(bounds.width) / 2,
+              y: Number(bounds.y) + Number(bounds.height) / 2
+            });
+            if (invoked?.performed === true) {
+              return {
+                found: true,
+                invoked: true,
+                name: nearby.target.name ?? null,
+                matchedLabel: String(query).trim(),
+                matchedBounds: bounds,
+                reason: null,
+                readiness: nearby,
+                semantic: invoked
+              };
+            }
+            // Spotify exposes its row action as a DataItem without
+            // InvokePattern. The target is already grounded to the requested
+            // row and exact window, so deliver one ordinary click locally rather
+            // than throwing the result away and starting a new PowerShell scan.
+            const clicked = await this.pointerAction("click", {
+              windowId: String(nearby.target.windowId ?? windowHandle),
+              x: Number(bounds.x) + Number(bounds.width) / 2,
+              y: Number(bounds.y) + Number(bounds.height) / 2,
+              button: "left",
+              clicks: 1
+            }).catch(() => null);
+            if (clicked?.performed === true) {
+              return {
+                found: true,
+                invoked: true,
+                name: nearby.target.name ?? null,
+                matchedLabel: String(query).trim(),
+                matchedBounds: bounds,
+                reason: null,
+                readiness: nearby,
+                semantic: clicked
+              };
+            }
+          }
+        } catch {
+          // A bounded miss simply yields null; the caller falls through to the
+          // next attempt, and the last one returns the model-visible failure.
+        }
+        }
+        return null;
+      };
+
+      // Warm tree: the card is already there and this returns in a few hundred
+      // milliseconds. Cold: it misses cheaply and the real wait happens below.
+      const early = await tryTopResultCard(Math.min(900, Math.max(0, limit - (Date.now() - startedAt))));
+      if (early) return early;
+
+      // THEN THE LIST ROWS. Button first, because when a row IS a button that is
+      // the least ambiguous possible match; then with no control-type constraint
+      // at all, because Spotify's search rows are DataItems and a name that both
+      // starts with "Play " and contains the requested track is already specific
+      // enough to stand on its own.
       for (const controlType of ["Button", null]) {
         try {
           const semantic = await this.findAndInvokeSemanticControl({
@@ -2778,73 +2943,9 @@ public static class SyscoraAudio {
       // and 2 are measured at 713ms and 146ms, so this now gets ~8s of the 9s
       // deadline instead of 3.5s of 6s. Still bounded by `limit`, so a Spotify
       // that never renders cannot hang the call.
-      const remainingMs = Math.max(0, limit - (Date.now() - startedAt));
-      if (remainingMs >= 50) {
-        try {
-          const selector = {
-            nameStartsWith: "Play",
-            controlTypes: ["Button", "DataItem", "ListItem", "Hyperlink"],
-            nearText: spotifyQueryTokens(query).join(" "),
-            minimumCoverage: 0.5,
-            maxDistance: 1100,
-            sameRowTolerance: 140
-          };
-          const nearby = await this.waitForUiTarget({
-            application: "spotify",
-            windowId: windowHandle,
-            selector,
-            timeoutMs: remainingMs
-          });
-          if (nearby?.matched && nearby.target) {
-            const bounds = uiBounds(nearby.target);
-            const invoked = await this.invokeControl({
-              windowId: nearby.target.windowId ?? windowHandle,
-              name: nearby.target.name,
-              x: Number(bounds.x) + Number(bounds.width) / 2,
-              y: Number(bounds.y) + Number(bounds.height) / 2
-            });
-            if (invoked?.performed === true) {
-              return {
-                found: true,
-                invoked: true,
-                name: nearby.target.name ?? null,
-                matchedLabel: String(query).trim(),
-                matchedBounds: bounds,
-                reason: null,
-                readiness: nearby,
-                semantic: invoked
-              };
-            }
-            // Spotify exposes its row action as a DataItem without
-            // InvokePattern. The target is already grounded to the requested
-            // row and exact window, so deliver one ordinary click locally rather
-            // than throwing the result away and starting a new PowerShell scan.
-            const clicked = await this.pointerAction("click", {
-              windowId: String(nearby.target.windowId ?? windowHandle),
-              x: Number(bounds.x) + Number(bounds.width) / 2,
-              y: Number(bounds.y) + Number(bounds.height) / 2,
-              button: "left",
-              clicks: 1
-            }).catch(() => null);
-            if (clicked?.performed === true) {
-              return {
-                found: true,
-                invoked: true,
-                name: nearby.target.name ?? null,
-                matchedLabel: String(query).trim(),
-                matchedBounds: bounds,
-                reason: null,
-                readiness: nearby,
-                semantic: clicked
-              };
-            }
-          }
-        } catch {
-          // A bounded miss returns below so the model-visible screen fallback
-          // can act; only sessions without the persistent host use the legacy
-          // process-isolated matcher.
-        }
-      }
+      const late = await tryTopResultCard(Math.max(0, limit - (Date.now() - startedAt)));
+      if (late) return late;
+
       // If the provider cannot express the sibling relationship through its
       // selector, inspect once and resolve it locally from the same evidence the
       // model would otherwise need another full turn to read. This keeps the

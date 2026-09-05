@@ -31,6 +31,13 @@ const repoRoot = path.resolve(here, "..", "..");
 const read = (relative) => fs.readFileSync(path.join(repoRoot, relative), "utf8").replace(/\r\n/g, "\n");
 
 const demo = read("apps/desktop/demo.js");
+// THE VERB TABLES MOVED, AND THE REASON MATTERS TO THIS FILE.
+//
+// They were the chat's alone until the floating pill needed the same words; a
+// second copy would have let the two surfaces describe one run differently, so
+// they were extracted to status-words.js and demo.js now imports them. These
+// assertions are about the WORDS, not about which file holds them.
+const words = read("apps/desktop/status-words.js");
 const css = read("apps/desktop/demo.css");
 const markdown = read("apps/desktop/markdown.js");
 
@@ -155,7 +162,7 @@ test("the transport reports a tool call while its arguments are still arriving",
 });
 
 test("the pending row says what the MODEL is doing, never what the machine did", () => {
-  const table = /const TOOL_VERB_PENDING = \{([\s\S]*?)\};/.exec(demo)?.[1];
+  const table = /TOOL_VERB_PENDING = \{([\s\S]*?)\};/.exec(words)?.[1];
   assert.ok(table, "TOOL_VERB_PENDING is gone or was renamed");
   // Nothing has run when this row is drawn. A past tense here would be the same
   // class of claim as a message reported sent while it sits in a box.
@@ -165,7 +172,7 @@ test("the pending row says what the MODEL is doing, never what the machine did",
       `"${verb}" describes work on the machine, and the pending row is drawn before any of it happens`
     );
   }
-  assert.match(demo, /pendingVerbFor\(capability\)\s*\{\s*return TOOL_VERB_PENDING\[[^\]]+\] \?\? "Preparing"/);
+  assert.match(words, /pendingVerbFor\(capability\)\s*\{\s*return TOOL_VERB_PENDING\[[^\]]+\] \?\? "Preparing"/);
 });
 
 test("a pending row that was never claimed is removed rather than left on screen", () => {

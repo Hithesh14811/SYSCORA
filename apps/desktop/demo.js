@@ -15,6 +15,7 @@
 // this file only renders what the pipeline reports.
 
 import { followIntentSession, readIntentSession } from "./intent-client.js";
+import { STATUS, pendingVerbFor, runningVerbFor, verbFor } from "./status-words.js";
 import { DISPLAY_LOCALE } from "./format.js";
 // THE MODEL WRITES MARKDOWN AND THIS FILE WAS SHOWING THE ASTERISKS. Every
 // answer went on screen through `textContent`, so headings, numbered steps,
@@ -998,113 +999,6 @@ function renderSearchResults(text) {
 // runtime calls it; "Clicked" is what happened. The identifier is still shown
 // beside it in monospace, because seeing the actual tool is the point — this is
 // the label, not a replacement.
-const VERB = [
-  [/^command\.run$|^developer\.command\.run$/, "Ran"],
-  [/^screen\.(read|capture)$|^ocr\./, "Looked at the screen"],
-  [/^ui\.(inspect|find|extract|resolveTarget|verifyValue)$/, "Inspected the window"],
-  [/^ui\.action$/, "Used a control"],
-  [/^pointer\.(click|clickAt)$/, "Clicked"],
-  [/^pointer\.wheel$/, "Scrolled"],
-  [/^pointer\.(drag|move)$/, "Moved the pointer"],
-  [/^keyboard\.type$/, "Typed"],
-  [/^keyboard\.press$/, "Pressed a key"],
-  [/^clipboard\./, "Used the clipboard"],
-  [/^window\./, "Adjusted a window"],
-  [/^application\.launch$|^process\.launch$/, "Opened"],
-  [/^application\.close$/, "Closed"],
-  [/^filesystem\.(read|list|search)$/, "Read from disk"],
-  [/^filesystem\.(write|createDirectory|delete)$/, "Wrote to disk"],
-  [/^browser\.(navigate|launch|connect)$/, "Opened a page"],
-  [/^browser\.(read|extract|find|inspect|currentState|research|search)$/, "Read the page"],
-  [/^browser\./, "Used the browser"],
-  [/^system\./, "Checked the system"],
-  [/^package\./, "Checked packages"],
-  [/^spotify\./, "Used Spotify"]
-];
-
-// The agent loop's tools are already named the way a person would name them, so
-// these are just the past tense.
-// A TOOL MISSING FROM HERE IS RENDERED "Ran a step".
-//
-// Which is worse than it sounds: the transcript exists so the user can follow
-// what is happening, and four of the loop's verbs — including the two that draw
-// and the one that does everything at once — showed up as an anonymous row.
-// Every entry the loop adds needs a line here.
-const TOOL_VERB = {
-  run: "Ran",
-  run_jobs: "Checked a background command",
-  screen: "Looked at the screen",
-  click: "Clicked",
-  type: "Typed",
-  key: "Pressed",
-  scroll: "Scrolled",
-  drag: "Dragged",
-  draw: "Drew",
-  move_mouse: "Moved the pointer",
-  launch: "Opened",
-  new_document: "Started a new document",
-  open_url: "Opened a page",
-  windows: "Listed the windows",
-  focus: "Focused a window",
-  window_state: "Adjusted a window",
-  close_app: "Closed",
-  read_file: "Read a file",
-  write_file: "Wrote a file",
-  edit_file: "Edited a file",
-  clipboard: "Used the clipboard",
-  play_music: "Played",
-  volume: "Set the volume",
-  search: "Searched the web",
-  web_open: "Opened a page",
-  web_read: "Read the page",
-  web_click: "Clicked on the page",
-  web_type: "Typed on the page",
-  web_scroll: "Scrolled the page",
-  batch: "Ran several steps",
-  wait: "Waited",
-  github: "Read a repository",
-  capability: "Used a saved capability",
-  // "Prepared", never "Sent". The row is the transcript's record of what the
-  // tool did, and this tool draws a card — see email_draft in tools.js.
-  email_draft: "Prepared an email"
-};
-
-function verbFor(capability) {
-  const name = String(capability ?? "");
-  if (TOOL_VERB[name]) return TOOL_VERB[name];
-  for (const [pattern, verb] of VERB) if (pattern.test(name)) return verb;
-  return "Ran a step";
-}
-
-// WHAT IT IS DOING, IN THE PRESENT TENSE, WHILE IT IS DOING IT.
-//
-// Every row used to be written in the past tense the moment it opened — a search
-// that had not answered yet said "Searched the web", which is the same class of
-// claim as reporting a message sent while it sits in a box. The row is rewritten
-// to the past tense in finishStep, when it has actually finished.
-const TOOL_VERB_RUNNING = {
-  search: "Searching the web",
-  web_open: "Reading the page",
-  web_read: "Reading the page",
-  run: "Running",
-  run_jobs: "Checking a background command",
-  screen: "Looking at the screen",
-  read_file: "Reading the file",
-  write_file: "Writing the file",
-  launch: "Opening",
-  github: "Reading the repository",
-  capability: "Using a saved capability",
-  email_draft: "Writing an email"
-};
-
-// ---- What a tool LOOKS like --------------------------------------------------
-//
-// These were emoji — 🌐, 📄, 📁 — and emoji are the fastest way to make a
-// professional surface look like a hobby project: they are colour pictures from
-// a system font, at a different size and weight from everything around them,
-// and they cannot be tinted to say whether the step worked. These are line
-// icons on the same 24-unit grid as every other icon in this window, drawn in
-// `currentColor` so the row's state colours them.
 const ICON_PATHS = {
   terminal: '<path d="M5 7.5l4.2 4.5L5 16.5"/><path d="M12.4 16.6h6.4"/>',
   globe: '<circle cx="12" cy="12" r="8.3"/><path d="M3.7 12h16.6"/><path d="M12 3.7c2.1 2.3 3.2 5.2 3.2 8.3S14.1 18 12 20.3C9.9 18 8.8 15.1 8.8 12S9.9 6 12 3.7z"/>',
@@ -1237,32 +1131,8 @@ function setStepState(head, state) {
   head.appendChild(stateIcon(state));
 }
 
-function runningVerbFor(capability) {
-  return TOOL_VERB_RUNNING[String(capability ?? "")] ?? verbFor(capability);
-}
-
-// BEFORE IT RUNS IS A THIRD TENSE, AND IT IS NOT "RUNNING".
-//
-// A pending row is drawn while the model is still WRITING the call — nothing has
-// touched the machine, so "Writing the file" would be the same class of claim as
-// a message reported sent while it sits in a box. These say what is actually
-// happening, which is that the model is composing something.
-const TOOL_VERB_PENDING = {
-  write_file: "Composing the file",
-  edit_file: "Composing the edit",
-  new_document: "Composing the document",
-  email_draft: "Composing the email",
-  run: "Composing the command",
-  type: "Composing the text",
-  draw: "Composing the strokes",
-  batch: "Composing several steps"
-};
-
-function pendingVerbFor(capability) {
-  return TOOL_VERB_PENDING[String(capability ?? "")] ?? "Preparing";
-}
-
-/** How much of the call has been written so far. Bytes of JSON, said plainly. */
+// The verb vocabulary moved to status-words.js so the chat and the floating
+// pill describe one run with the same words. See the note at the top of it.
 function sizeSoFar(bytes) {
   const size = Number(bytes) || 0;
   return size >= 1024 ? `${(size / 1024).toFixed(1)} KB` : `${size} bytes`;
@@ -2319,7 +2189,20 @@ function renderFinal(turn, session) {
   // already on screen — it streamed there while the last tool was running.
   // Printing it a second time as an "answer" is the receipt this surface exists
   // to avoid.
-  const said = String(turn.lastSaid ?? "").trim();
+  // WHAT IS ALREADY ON SCREEN — FROM EITHER CHANNEL, NOT JUST ONE OF THEM.
+  //
+  // `lastSaid` is written by `say()`, which handles AGENT_SAYS. A purely
+  // conversational reply never produces one: it arrives as AGENT_DELTA and is
+  // painted by `streamDelta`, which sets `streamText` and leaves `lastSaid`
+  // empty. So the check below compared the closing message against "" — never
+  // equal — and printed the whole answer a second time under the copy that had
+  // just finished streaming.
+  //
+  // Live: "hi" answered "Hello. Tell me what you would like done on this
+  // machine…" and then said it again, word for word. The comment above already
+  // describes this as "the receipt this surface exists to avoid"; it was simply
+  // looking at the wrong field for the commonest kind of answer there is.
+  const said = String(turn.lastSaid ?? "").trim() || String(turn.streamText ?? "").trim();
   const closing = String(message).trim();
   if (closing === said) {
     renderCost(turn, fr.metrics);
@@ -3620,7 +3503,14 @@ async function attachToSession(sessionId) {
   // and saved an hour later would silently overwrite everything the pill did in
   // between. Re-reading at the one moment the pill hands over closes that window
   // — after this, only one of the two surfaces is being used at a time.
+  //
+  // AND THE TRANSCRIPT IS REDRAWN FROM IT, which is the half that was missing:
+  // refreshing the data without repainting left the window showing whatever was
+  // on screen when it was last hidden, so a conversation held entirely in the
+  // pill looked like it had never happened. The live turn below appends after
+  // this, in the right order.
   refreshChatsFromStorage();
+  renderStoredChat(activeChat(), { resumed: true });
   const turn = new Turn();
   runningTurn = turn;
   setRunning(sessionId);
@@ -4375,6 +4265,22 @@ if (overlayBridge) {
   // The shell sends this BEFORE it shows the window, so a run that settles
   // quickly is not attached to after it has already finished.
   overlayBridge.onAttachSession((sessionId) => { void attachToSession(sessionId); });
+
+  // EXPANDED WITH NOTHING RUNNING IS STILL AN EXPAND.
+  //
+  // `onAttachSession` fires with a session id, and the pill sends none when it
+  // has not run anything since it was opened — so a user who typed two things
+  // into the pill, waited, and then expanded got this window exactly as they
+  // had left it, with neither exchange in it. Repainting on show is what makes
+  // "the same chat exists in both" true in that case as well.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    // Never mid-run: redrawing the transcript under a turn that is still
+    // streaming into it would throw away the live one.
+    if (runningSessionId) return;
+    refreshChatsFromStorage();
+    renderStoredChat(activeChat(), { resumed: true });
+  });
 }
 
 // Voice, on this composer as on the pill's. The button is real and holds its
