@@ -934,8 +934,34 @@ function describeCanvas(elements) {
 // The windows a person would recognise as open: titled, and big enough to see.
 // Offered whenever a reading fails, because "could not read that" with no list
 // of what IS there leaves the model nothing to try but the same name again.
+// SYSCORA MUST NOT WORK ON SYSCORA.
+//
+// This was already the most expensive class of mistake here — the window in
+// front is usually this product's own, and the file records `launch WhatsApp`
+// coming back "already running (windowId 984410, SYSCORA)" after which the agent
+// read, clicked and typed into itself. Identity scoring fixed the targeting; the
+// window was still LISTED, so it remained something the model could name.
+//
+// The floating overlay makes that decisive rather than merely embarrassing. It
+// is always on top, over every application, and it is where the user types — so
+// an agent that can see it can click it, and an agent that clicks it is driving
+// its own input box while it believes it is driving Spotify.
+//
+// MATCHED NARROWLY, ON PURPOSE. `syscora` is the packaged process; `electron`
+// alone is not enough, because plenty of applications a user may legitimately
+// want automated are built on it, so the development build has to match its
+// title as well. Anything wider would quietly make some other Electron
+// application unreachable, which is a defect nobody would think to look for.
+function isOwnWindow(window) {
+  const process = String(window?.ProcessName ?? window?.processName ?? "").replace(/\.exe$/i, "").toLowerCase();
+  if (process === "syscora") return true;
+  const title = String(window?.MainWindowTitle ?? window?.title ?? "").trim();
+  return process === "electron" && /^syscora\b/i.test(title);
+}
+
 function describeWindows(windows) {
   return (windows ?? [])
+    .filter((window) => !isOwnWindow(window))
     .filter((window) => {
       const bounds = window.Bounds ?? window.bounds ?? {};
       return String(window.MainWindowTitle ?? window.title ?? "").trim()
@@ -1593,6 +1619,10 @@ export function buildToolset({
     if (!needle || typeof adapter.listWindows !== "function") return null;
     const windows = await adapter.listWindows().catch(() => []) ?? [];
     const usable = windows.filter((window) => {
+      // Never this product's own windows. See isOwnWindow: the overlay sits on
+      // top of everything, so without this `launch` can hand back the box the
+      // user is typing into and every later step drives SYSCORA.
+      if (isOwnWindow(window)) return false;
       const bounds = window.Bounds ?? window.bounds ?? {};
       return String(window.MainWindowTitle ?? window.title ?? "").trim()
         && Number(bounds.width ?? 0) > 10 && Number(bounds.height ?? 0) > 10;
@@ -5960,7 +5990,15 @@ export function buildToolset({
         };
       },
       render: (result) => {
-        const windows = (result.windows ?? []).filter((window) => String(window.MainWindowTitle ?? window.title ?? "").trim());
+        // NEVER THIS PRODUCT'S OWN WINDOWS. This is the primary list the model
+        // reads, and it does NOT go through `describeWindows` — it renders
+        // `window.enumerate` directly, so filtering there alone left the one
+        // listing that matters untouched. See isOwnWindow: the overlay floats
+        // above every application, and a window the model can see is a window it
+        // can click.
+        const windows = (result.windows ?? [])
+          .filter((window) => !isOwnWindow(window))
+          .filter((window) => String(window.MainWindowTitle ?? window.title ?? "").trim());
         if (windows.length === 0) return reported(result, "No titled windows are open.");
         return reported(result, windows.slice(0, 25).map((window) => {
           const bounds = window.Bounds ?? window.bounds ?? {};
