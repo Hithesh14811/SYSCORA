@@ -40,6 +40,7 @@ import {
 // user's request. See content-boundary.js.
 import {
   describeInjectedInstruction,
+  extractTargets,
   findInjectedInstruction,
   requiresInjectionConfirmation
 } from "../../policy-engine/src/content-boundary.js";
@@ -1120,6 +1121,10 @@ export function buildToolset({
     // happens later, by which time nothing else remembers where the phone number
     // came from. Cleared by beginTurn — a new request is a new context.
     observedInstructions: [],
+    // EVERY DESTINATION THIS TURN HAS READ, flagged or not. Keyed `kind:value`
+    // so one number read from five re-readings of the same chat is one entry.
+    // See screenObservedContent and ALWAYS_GATED_KINDS.
+    observedTargets: new Map(),
     // The last page reading rendered, so a re-read that produced identical
     // characters can say so. See web_read's render.
     lastWebReading: null,
@@ -1331,6 +1336,27 @@ export function buildToolset({
   // and the attempt is surfaced to the user, because a defence they cannot see
   // is one they cannot judge.
   const screenObservedContent = (text, source) => {
+    // EVERY DESTINATION READ, NOT ONLY THE ONES BESIDE A DETECTED INSTRUCTION.
+    //
+    // The enforcement tier used to see only what Tier 1 had already flagged, so
+    // an injection phrased outside its seven patterns named its destination in
+    // complete safety — the half of the boundary documented as "the one that
+    // actually holds" was sitting behind the half documented as "best-effort and
+    // always wrong at the margins".
+    //
+    // Recorded for every reading, and graded where it is used: a wallet, phone
+    // number or email address the agent read and the user never named is gated
+    // on its own; a URL still needs Tier 1, because acting on links read off a
+    // page is ordinary work. See ALWAYS_GATED_KINDS.
+    //
+    // Bounded per turn — `beginTurn` clears it — and deduplicated by value, so
+    // re-reading one chat five times records each number once.
+    for (const target of extractTargets(text)) {
+      const key = `${target.kind}:${target.value}`;
+      if (state.observedTargets.has(key)) continue;
+      if (state.observedTargets.size >= 400) break;
+      state.observedTargets.set(key, { ...target, source });
+    }
     const finding = findInjectedInstruction(text, { source });
     if (!finding.found) return null;
     // Kept per SOURCE and quote, so re-reading the same chat five times does not
@@ -9449,6 +9475,7 @@ export function buildToolset({
       // the last turn must not gate this turn's actions — the user has spoken
       // since, and they may have asked for exactly that thing.
       state.observedInstructions = [];
+      state.observedTargets.clear();
       state.approvedThisTurn.clear();
     },
 
@@ -9583,7 +9610,8 @@ export function buildToolset({
         // the user did not name that destination themselves. On a run where
         // nothing suspicious was read it cannot fire at all.
         const injected = requiresInjectionConfirmation(
-          { tool: name, args: inputs }, state.observedInstructions, state.userRequest
+          { tool: name, args: inputs }, state.observedInstructions, state.userRequest,
+          [...state.observedTargets.values()]
         );
         if (injected.confirm) {
           const { approved } = await askPermission({

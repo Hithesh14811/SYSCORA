@@ -164,19 +164,56 @@ export function findInjectedInstruction(text, { source = "observed content" } = 
   };
 }
 
+// TIER 2 WAS NOT INDEPENDENT, AND IT WAS DOCUMENTED AS THOUGH IT WERE.
+//
+// The comment at the top of this file calls the destination check "the one that
+// actually holds" and "not a heuristic — it is the attack, caught in the act".
+// That was true of what it CATCHES and false about when it RUNS: the enforcement
+// only ever looked at destinations gathered by Tier 1, so an injection phrased
+// outside the seven patterns above named its destination in complete safety.
+// Detection is admitted to be "best-effort and always wrong at the margins", and
+// the tier that was supposed to hold regardless was sitting behind it.
+//
+// THE FIX IS GRADED, BECAUSE A BLANKET RULE HERE IS UNUSABLE AND THIS FILE
+// ALREADY SAYS SO. Gating every destination ever read would fire on a whole
+// WhatsApp window of innocent numbers, and "a boundary that fires on normal
+// content gets switched off" is the second half of the red-team suite.
+//
+// So the independence is bought where being wrong is cheap and being right is
+// decisive:
+//
+//   wallet         ALWAYS gated. There is no innocent reason to send crypto to
+//                  an address the user never named, and it is the single most
+//                  profitable thing an injection can achieve.
+//   phone, email   ALWAYS gated. This is the exfiltration shape — the OTP, the
+//                  verification code, the forwarded thread. The innocent case
+//                  ("forward that to papa") names a CONTACT, so the raw number
+//                  never appears in the action's arguments; the attack types the
+//                  digits it read off a screen.
+//   url            Tier-1-coupled, as before. "Open the link she sent me" is
+//                  ordinary work, the agent legitimately acts on URLs it read,
+//                  and gating them all is the case this file warns about. A URL
+//                  beside a detected instruction is still caught.
+//
+// A gate here asks; it does not refuse. The cost of a false positive is one
+// click, and the cost of a false negative is the user's one-time code.
+const ALWAYS_GATED_KINDS = new Set(["wallet", "phone", "email"]);
+
 /**
  * Is this action carrying out an instruction that came from content?
  *
- * `observed` is what findInjectedInstruction has turned up so far this run, and
+ * `observed` is what findInjectedInstruction has turned up so far this run,
  * `trusted` is everything the USER actually said — because a phone number the
  * user typed themselves is the user's, however many times it also appears in a
- * message on screen.
+ * message on screen — and `seenTargets` is every destination read this turn,
+ * whether or not anything about the text looked like an instruction.
  *
- * Returns `{ confirm: false }` for the overwhelming majority of actions,
- * including every action during a run where nothing suspicious was ever read.
+ * Returns `{ confirm: false }` for the overwhelming majority of actions.
  */
-export function requiresInjectionConfirmation({ tool, args } = {}, observed = [], trusted = "") {
-  if (!Array.isArray(observed) || observed.length === 0) return { confirm: false };
+export function requiresInjectionConfirmation({ tool, args } = {}, observed = [], trusted = "", seenTargets = []) {
+  const hasObserved = Array.isArray(observed) && observed.length > 0;
+  const hasSeen = Array.isArray(seenTargets) && seenTargets.length > 0;
+  if (!hasObserved && !hasSeen) return { confirm: false };
   // Only actions that reach OUT. Reading the screen again, or looking at a file,
   // cannot carry out anybody's instruction.
   if (!ACTS_OUTWARD.test(String(tool ?? ""))) return { confirm: false };
@@ -211,13 +248,52 @@ export function requiresInjectionConfirmation({ tool, args } = {}, observed = []
       };
     }
   }
+
+  // AND THE SAME CHECK WITH NO DETECTION BEHIND IT AT ALL.
+  //
+  // Reached only when Tier 1 found nothing, which is the case this tier exists
+  // for: the injection that is phrased in a way no pattern here recognises. The
+  // destination is still a destination, and a wallet, a phone number or an email
+  // address that the agent READ and the user never mentioned is the shape of the
+  // attack whatever prose surrounded it.
+  for (const target of seenTargets) {
+    if (!ALWAYS_GATED_KINDS.has(target?.kind)) continue;
+    const key = `${target.kind}:${target.value}`;
+    if (userTargets.has(key)) continue;
+    const match = inPayload.find((candidate) => candidate.kind === target.kind
+      && (candidate.value === target.value
+        || candidate.value.includes(target.value)
+        || target.value.includes(candidate.value)));
+    if (!match) continue;
+    return {
+      confirm: true,
+      rule: "content-derived-destination",
+      summary: `send something to ${target.raw}, which came from ${target.source ?? "something this agent read"} and not from you`,
+      reason:
+        `That ${target.kind} was not in your request — this agent read it off ` +
+        `${target.source ?? "the screen"}. Nothing about the surrounding text looked like an attack, which ` +
+        "is exactly why this is asked rather than assumed: a destination you did not name is one only you " +
+        "can approve.",
+      quote: target.raw,
+      target
+    };
+  }
   return { confirm: false };
 }
 
 // The tools that push something out of this machine or change it irreversibly.
 // A `screen` or a `read_file` cannot carry out an instruction, so a run that
 // only looks is never gated.
-const ACTS_OUTWARD = /^(?:type|key|run|web_type|web_click|open_url|web_open|write_file|edit_file|clipboard|launch|batch|android_devices|android_tap|android_type|android_act|android_many)$/;
+//
+// `email_draft` IS ON THIS LIST, AND THE HUMAN SEND BUTTON IS NOT A REASON TO
+// LEAVE IT OFF. Drafting does not send — a person presses Send — which is why it
+// was omitted. But the thing the attacker wants is the ADDRESS in the "to"
+// field, and a card that arrives pre-addressed is a card most people send
+// without re-reading the recipient. Measured: it was the only one of eight
+// evasion cases this boundary still missed
+// (`node scripts/probe-injection-tiers.mjs`). The gate asks; the draft is still
+// drafted; the user is simply told where it was about to go and who chose that.
+const ACTS_OUTWARD = /^(?:type|key|run|web_type|web_click|open_url|web_open|write_file|edit_file|clipboard|launch|batch|email_draft|android_devices|android_tap|android_type|android_act|android_many)$/;
 
 /**
  * The line put in front of content that was found to contain an instruction.
