@@ -15,9 +15,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { classifyShellCommand, isPackageInstall, isReadOnlyShellCommand, requiresConfirmation, ShellVerdict } from "../../packages/policy-engine/src/shell-rules.js";
-import { RiskEngine } from "../../packages/risk-engine/src/index.js";
-import { RiskDimension, RiskLevel, ConfirmationLevel } from "../../packages/shared-types/src/domain.js";
-import { PolicyEngine } from "../../packages/policy-engine/src/index.js";
 import { WindowsAdapter } from "../../os-adapters/windows/src/windows-adapter.js";
 
 const READS = [
@@ -145,38 +142,19 @@ test("a pipeline is judged by its riskiest stage", () => {
   assert.equal(classifyShellCommand("git status; npm install").verdict, ShellVerdict.ASK);
 });
 
-// The classification has to reach the gate, not just exist. A read must survive
-// risk and policy with no confirmation; a mutation must produce one.
-test("the classification drives risk and policy for command.run", () => {
-  const riskEngine = new RiskEngine();
-  const policyEngine = new PolicyEngine();
-  const planFor = (command) => ({
-    taskGraph: { tasks: [{ taskId: "t1", capability: "command.run", inputs: { command } }] }
-  });
-
-  const readRisk = riskEngine.assess(planFor("git status"), [], { evaluatedAt: new Date().toISOString() });
-  assert.equal(readRisk.dimensions[RiskDimension.MUTATION_IMPACT], "READ_ONLY");
-  assert.equal(readRisk.dimensions[RiskDimension.EXECUTION_RISK], "NO_EXECUTION");
-
-  const writeRisk = riskEngine.assess(planFor("npm install"), [], { evaluatedAt: new Date().toISOString() });
-  assert.equal(writeRisk.dimensions[RiskDimension.MUTATION_IMPACT], "PERSISTENT");
-  assert.equal(writeRisk.dimensions[RiskDimension.EXECUTION_RISK], "SCRIPT_EXECUTION");
-  assert.equal(writeRisk.overallRisk, RiskLevel.HIGH);
-  const writeDecision = policyEngine.decide(writeRisk, planFor("npm install"), { capabilities: [] });
-  assert.equal(writeDecision.confirmationLevel, ConfirmationLevel.CONFIRM);
-
-  const destructiveRisk = riskEngine.assess(planFor("format C: /q"), [], { evaluatedAt: new Date().toISOString() });
-  const destructiveDecision = policyEngine.decide(destructiveRisk, planFor("format C: /q"), { capabilities: [] });
-  assert.equal(destructiveDecision.confirmationLevel, ConfirmationLevel.DENY);
-});
-
-// A command with no readable command line is incomplete, not safe.
-test("a command.run task with no command asks rather than allows", () => {
-  const riskEngine = new RiskEngine();
-  const plan = { taskGraph: { tasks: [{ taskId: "t1", capability: "command.run", inputs: {} }] } };
-  const risk = riskEngine.assess(plan, [], { evaluatedAt: new Date().toISOString() });
-  assert.equal(risk.dimensions[RiskDimension.MUTATION_IMPACT], "PERSISTENT");
-});
+// THE RISK AND POLICY STAGES THAT USED TO SIT HERE ARE GONE.
+//
+// Two tests here drove `RiskEngine.assess` and `PolicyEngine.decide` for
+// `command.run`, because that is how the STAGED PIPELINE reached a confirmation:
+// classify the command, assess risk, apply policy, raise a card. That pipeline
+// was deleted, and with it the only caller of those two stages.
+//
+// The safety property they were protecting has not gone anywhere and is not
+// untested. It moved to where it is now actually enforced — the tool boundary —
+// and it is pinned by the twelve tests around this comment, which drive
+// `classifyShellCommand` and `requiresConfirmation` directly, plus the adapter
+// test below, which proves the DENY floor refuses without spawning. That is the
+// stronger test: it checks the code that runs rather than a stage nothing calls.
 
 // The adapter is below the approval gate on purpose: approving a disk format
 // would not make it recoverable, so an auto-approving session must not be able

@@ -21,7 +21,6 @@ import os from "node:os";
 import fs from "node:fs/promises";
 
 import { startServer } from "../../apps/daemon/src/server.js";
-import { AgentRuntime } from "../../packages/agent-runtime/src/index.js";
 
 const TOKEN = "async-intent-token-0123456789";
 // A read-only request that produces a non-empty task graph and reaches
@@ -299,52 +298,46 @@ describe("Legacy synchronous intent shape (real pipeline)", () => {
     await fs.rm(basePath, { recursive: true, force: true });
   });
 
+  // THE CONTRACT IS THE SHAPE, NOT THE VERDICT.
+  //
+  // This asserted `finalResponse.status === "COMPLETED"`, which only held because
+  // a mock provider fell through to the STAGED PIPELINE and that pipeline planned
+  // the request from typed capabilities with no model. It is deleted, so with no
+  // model configured the run now settles FAILED and says why — which is the
+  // honest answer and is asserted below.
+  //
+  // What `?sync=true` promises is unchanged and is what this test is for: ONE
+  // response carrying the whole finished session and the protocol envelope, with
+  // no polling. That property is independent of whether the run succeeded, and
+  // pinning it to a verdict is what made this test measure the wrong thing.
   it("still serves the blocking single-response shape on explicit opt-in", async () => {
     const response = await api(port, "POST", "/api/intents?sync=true", {
       body: { text: REAL_INTENT_TEXT, autoApprove: true },
       timeoutMs: 240000
     });
     assert.equal(response.status, 200);
-    // The pre-change contract: ONE response carrying the whole finished
-    // session, with no polling required.
     assert.ok(response.json.session, "sync callers must still receive the full session");
     assert.ok(response.json.session.sessionId);
-    assert.equal(response.json.session.finalResponse.status, "COMPLETED");
+    assert.ok(response.json.session.finalResponse, "the session must carry a terminal response");
+    assert.ok(
+      typeof response.json.session.finalResponse.message === "string"
+        && response.json.session.finalResponse.message.length > 0,
+      "a terminal response must say something, whichever way it went"
+    );
     assert.ok(response.json.envelope, "sync callers must still receive the protocol envelope");
     assert.equal(response.json.envelope.type, "intent_response");
   });
 });
 
-describe("Session wall-clock timeout", () => {
-  it("resolves to a clean timeout status rather than running past its deadline", async () => {
-    // A runtime whose intent classification never settles. Without a top-level
-    // deadline this hangs forever; the test's own wall-clock assertion below is
-    // what proves the deadline is real (a status check alone would hang too).
-    let persisted = null;
-    const runtime = new AgentRuntime({
-      sessionStore: { save: async (session) => { persisted = structuredClone(session); }, list: async () => [], load: async () => persisted },
-      auditRepository: { append: async () => {} },
-      intentEngine: { classify: () => new Promise(() => {}) },
-      capabilityRegistry: { get: () => null, getCatalog: () => [] }
-    });
+// THE WALL-CLOCK TIMEOUT TEST WENT WITH THE THING IT WAS TESTING.
+//
+// It built an AgentRuntime whose `intentEngine.classify` returned a promise that
+// never settles, then proved `submitIntent` still returned at its deadline. Both
+// halves are gone: there is no intent engine, and `submitIntent` no longer races
+// a timer because the branch it guarded (`_submitIntent`) now completes
+// immediately instead of being able to hang.
+//
+// `maxElapsedTime` itself is NOT gone and is still honoured — `_submitFastIntent`
+// passes it to the loop as `maxElapsedMs`, and the loop's budget handling is
+// covered by tests/unit/fast-agent-budget.test.js.
 
-    const timeoutMs = 1200;
-    const startedAt = Date.now();
-    const session = await runtime.submitIntent("a request that never classifies", {
-      maxElapsedTime: timeoutMs
-    });
-    const elapsedMs = Date.now() - startedAt;
-
-    assert.equal(session.finalResponse.status, "TIMED_OUT");
-    assert.equal(session.currentState, "TIMED_OUT");
-    assert.equal(session.finalResponse.timeoutMs, timeoutMs);
-    assert.equal(session.deadlineExceeded, true);
-    assert.ok(
-      elapsedMs < timeoutMs + 2000,
-      `submitIntent must return at its deadline; took ${elapsedMs}ms for a ${timeoutMs}ms budget`
-    );
-    assert.equal(persisted?.finalResponse?.status, "TIMED_OUT");
-    assert.equal(persisted?.currentState, "TIMED_OUT");
-    assert.equal(persisted?.events?.at(-1)?.eventType, "SESSION_TIMED_OUT");
-  });
-});

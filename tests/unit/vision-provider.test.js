@@ -6,7 +6,6 @@ import {
   diffScreenSnapshots
 } from "../../packages/perception/src/vision-provider.js";
 import { CapabilityRegistry } from "../../packages/capability-registry/src/index.js";
-import { InteractiveAgentController } from "../../packages/agent-runtime/src/interactive-agent-controller.js";
 import { containsVisionContext } from "../../packages/reasoning-engine/src/index.js";
 
 function availableRegistry() {
@@ -175,88 +174,3 @@ test("diffScreenSnapshots reports deterministic visual changes without volatile 
   assert.equal(diff.added.length, 1);
 });
 
-test("interactive UI actions capture durable before/after snapshots and use their diff as progress evidence", async () => {
-  const registry = new CapabilityRegistry();
-  registry.register({
-    name: "ui.action",
-    version: "1.0.0",
-    description: "test UI action",
-    inputSchema: {
-      type: "object",
-      properties: { target: { type: "object" }, action: { type: "string" } },
-      required: ["target", "action"]
-    },
-    outputSchema: { type: "object" },
-    requiredContext: [],
-    riskMetadata: { level: "LOW" },
-    permissions: [],
-    reversibility: "NOT_REQUIRED",
-    preconditions: () => true,
-    execute: async () => ({ performed: true }),
-    observe: async (result) => ({ structuredState: result }),
-    verify: async () => ({ status: "PARTIALLY_VERIFIED" }),
-    rollback: null,
-    timeout: 1_000,
-    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
-    lifecycleStatus: "VERIFIED"
-  });
-  const target = {
-    targetId: "submit",
-    source: "UIA",
-    windowId: "42",
-    automationId: "submit",
-    name: "Submit",
-    controlType: "ControlType.Button",
-    supportedPatterns: ["InvokePatternIdentifiers.Pattern"]
-  };
-  const phases = [];
-  let modelCalls = 0;
-  const controller = new InteractiveAgentController({
-    capabilityRegistry: registry,
-    reasoningEngine: { async decideInteractiveAction() {
-      modelCalls += 1;
-      if (modelCalls === 1) {
-        return {
-          ok: true,
-          data: {
-            goalStatus: "IN_PROGRESS",
-            action: { capability: "ui.action", inputs: { target, action: "invoke" } }
-          }
-        };
-      }
-      return {
-        ok: true,
-        data: {
-          goalStatus: "COMPLETE",
-          result: { summary: "Submit was clicked" },
-          verification: {
-            allCriteriaSatisfied: true,
-            satisfiedCriteria: [{ criterion: "Submit is clicked", evidence: "The durable screen snapshot changed after invoking Submit." }]
-          }
-        }
-      };
-    } },
-    perceive: async () => ({ relevantControls: [target] }),
-    captureScreenSnapshot: async ({ phase }) => {
-      phases.push(phase);
-      return {
-        snapshotId: `snapshot-${phases.length}`,
-        windowId: "42",
-        ocrText: phase === "before" ? "Ready" : "Submitted",
-        elements: [{ source: "UIA", automationId: "submit", role: "button", text: "Submit", bbox: { x: 1, y: 1, width: 10, height: 10 } }]
-      };
-    },
-    executeAction: async () => ({
-      executionResult: { performed: true, target },
-      observation: { structuredState: { performed: true, target } },
-      verification: { status: "PARTIALLY_VERIFIED", confidence: 0.8 }
-    })
-  });
-
-  const result = await controller.run('click the "Submit" button', { successCriteria: ["Submit is clicked"] });
-  assert.equal(result.status, "COMPLETE");
-  assert.equal(phases.length, result.recentActions.length * 2);
-  assert.ok(phases.every((phase, index) => phase === (index % 2 === 0 ? "before" : "after")));
-  assert.ok(result.recentActions.every((action) => action.screenDiff.changed === true));
-  assert.ok(result.recentActions.every((action) => action.progressMeasurement.evidence === "durable-screen-snapshot-diff"));
-});

@@ -7,7 +7,6 @@ import { DatabaseSync } from "node:sqlite";
 import { SessionStore } from "../../packages/agent-runtime/src/session-store.js";
 import { AuditRepository } from "../../packages/audit/src/index.js";
 import { Memory } from "../../packages/memory/src/index.js";
-import { SemanticState } from "../../packages/semantic-state/src/index.js";
 import {
   applyRetentionPolicy,
   createPrivacyExport,
@@ -23,13 +22,16 @@ async function fixture(t) {
   const runtime = {
     sessionStore: new SessionStore(path.join(state, "sessions")),
     auditRepository: new AuditRepository(path.join(state, "audit")),
-    memory: new Memory(path.join(state, "memory")),
-    semanticState: new SemanticState(path.join(state, "semantic-state"))
+    memory: new Memory(path.join(state, "memory"))
   };
   return { base, state, runtime };
 }
 
-test("configured retention prunes old sessions, memory, and semantic state", async (t) => {
+// The semantic-state half of this went with the staged pipeline that wrote it:
+// nothing populates that database any more, so there is nothing for retention to
+// age out of it. Sessions and memory are still written on every turn and are
+// still swept, which is what this test now pins.
+test("configured retention prunes old sessions and memory", async (t) => {
   const { base, runtime } = await fixture(t);
   const old = "2020-01-01T00:00:00.000Z";
   const recent = "2026-08-26T00:00:00.000Z";
@@ -41,14 +43,11 @@ test("configured retention prunes old sessions, memory, and semantic state", asy
   sessionsDb.close();
   await runtime.memory.store({ id: "old", type: "EPISODIC", content: {}, provenance: "test", createdAt: old, updatedAt: old });
   await runtime.memory.store({ id: "new", type: "EPISODIC", content: {}, provenance: "test", createdAt: recent, updatedAt: recent });
-  await runtime.semanticState.upsertEntity({ id: "old", type: "File", canonicalKey: "old", properties: {}, firstSeenAt: old, lastSeenAt: old, provenance: "test" });
-  await runtime.semanticState.upsertEntity({ id: "new", type: "File", canonicalKey: "new", properties: {}, firstSeenAt: recent, lastSeenAt: recent, provenance: "test" });
   await savePrivacySettings(base, { retentionDays: 30 });
 
   const result = await applyRetentionPolicy(runtime, base, { now: Date.parse("2026-08-27T00:00:00.000Z") });
   assert.equal(result.sessions.removed, 1);
   assert.equal(result.memory.removed, 1);
-  assert.equal(result.semantic.removed.entities, 1);
   assert.equal((await runtime.sessionStore.list()).length, 1);
   assert.equal((await runtime.memory.list()).length, 1);
 });

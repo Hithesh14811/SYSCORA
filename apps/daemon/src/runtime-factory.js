@@ -7,10 +7,7 @@ import {
   loadTrustedKeys
 } from "../../../packages/capability-registry/src/index.js";
 import { PolicyEngine } from "../../../packages/policy-engine/src/index.js";
-import { RiskEngine } from "../../../packages/risk-engine/src/index.js";
 import { AuditRepository } from "../../../packages/audit/src/index.js";
-import { RecoveryEngine } from "../../../packages/recovery-engine/src/index.js";
-import { TroubleshootingEngine } from "../../../packages/troubleshooting-engine/src/index.js";
 import { AgentRuntime } from "../../../packages/agent-runtime/src/index.js";
 import { SessionStore } from "../../../packages/agent-runtime/src/session-store.js";
 import { PermissionBroker } from "../../../packages/permission-broker/src/index.js";
@@ -19,7 +16,6 @@ import { CapabilityGrantStore } from "../../../packages/permission-broker/src/ca
 import { DeveloperIntelligenceEngine } from "../../../packages/developer-intelligence/src/index.js";
 import { WindowsAdapter } from "../../../os-adapters/windows/src/windows-adapter.js";
 import { AndroidAdapter } from "../../../os-adapters/android/src/android-adapter.js";
-import { SemanticState } from "../../../packages/semantic-state/src/index.js";
 import { Memory } from "../../../packages/memory/src/index.js";
 import { WindowsSecretBroker } from "../../../packages/secrets/src/index.js";
 import { ReasoningEngine } from "../../../packages/reasoning-engine/src/index.js";
@@ -97,7 +93,6 @@ export function createRuntime(basePath = process.cwd()) {
   const sessionStore = new SessionStore(path.join(stateDirectory, "sessions"));
   const approvalTokenStore = new ApprovalTokenStore(path.join(stateDirectory, "permission-broker"));
   const capabilityGrantStore = new CapabilityGrantStore(path.join(stateDirectory, "permission-broker"));
-  const semanticState = new SemanticState(path.join(stateDirectory, "semantic-state"));
   const memory = new Memory(path.join(stateDirectory, "memory"));
   const adapter = new WindowsAdapter();
   // A separate, bounded ADB transport. It is only reached by `android.*`
@@ -156,8 +151,6 @@ export function createRuntime(basePath = process.cwd()) {
     auditRepository
   });
   const capabilityRegistry = createDefaultCapabilityRegistry(adapter, { privilegedHelper, androidAdapter });
-  const recoveryEngine = new RecoveryEngine();
-  const troubleshootingEngine = new TroubleshootingEngine();
   const secretBroker = new WindowsSecretBroker(path.join(stateDirectory, "secrets"));
 
   // Provider selection is configuration-driven via loadModelConfig: env vars,
@@ -188,9 +181,6 @@ export function createRuntime(basePath = process.cwd()) {
     sessionStore,
     auditRepository,
     capabilityRegistry,
-    // The RiskEngine reads the authoritative per-capability risk floor from the
-    // registry; runtime context may only raise those dimensions.
-    riskEngine: new RiskEngine({ capabilityRegistry }),
     // ELEVATE availability must reflect whether elevation can ACTUALLY happen,
     // not merely that a helper object was constructed. The helper always
     // exists; its elevated host is null whenever elevation is disabled in
@@ -202,13 +192,10 @@ export function createRuntime(basePath = process.cwd()) {
     }),
     permissionBroker,
     elevationService,
-    recoveryEngine,
-    troubleshootingEngine,
     adapter,
     modelProvider,
     reasoningEngine,
     secretBroker,
-    semanticState,
     memory
   });
   runtime.setDeveloperIntelligence(new DeveloperIntelligenceEngine());

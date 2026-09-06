@@ -79,7 +79,11 @@ export async function privacySummary(basePath = process.cwd()) {
     stateDirectory,
     bytes: usage.bytes,
     files: usage.files,
-    includes: ["conversations", "audit events", "memory", "semantic state", "permissions", "integration settings"],
+    // "semantic state" was here and is gone with the pipeline that wrote it. This
+    // list is shown to the user as what an export CONTAINS, so leaving a section
+    // in it that the export no longer writes is the same class of defect this
+    // whole codebase is built against: a claim with nothing behind it.
+    includes: ["conversations", "audit events", "memory", "permissions", "integration settings"],
     credentialsIncludedInExport: false
   };
 }
@@ -88,10 +92,13 @@ export async function applyRetentionPolicy(runtime, basePath = process.cwd(), { 
   const settings = await readPrivacySettings(basePath);
   if (settings.retentionDays === 0) return { ...settings, skipped: true, reason: "keep-until-deleted" };
   const cutoff = new Date(now - settings.retentionDays * 24 * 60 * 60 * 1000);
-  const [sessions, memory, semantic] = await Promise.all([
+  // `semanticState` was swept here too. It belonged to the staged pipeline's
+  // world model, which is deleted — nothing writes that database any more, so
+  // there is nothing here to age out. Any existing file on disk is the user's
+  // and is left alone rather than silently removed by a retention sweep.
+  const [sessions, memory] = await Promise.all([
     runtime?.sessionStore?.pruneBefore?.(cutoff, { vacuum }),
-    runtime?.memory?.pruneBefore?.(cutoff, { vacuum }),
-    runtime?.semanticState?.pruneBefore?.(cutoff, { vacuum })
+    runtime?.memory?.pruneBefore?.(cutoff, { vacuum })
   ]);
   // AND GIVE THE DISK BACK, WHEN THAT IS CHEAP.
   //
@@ -106,7 +113,7 @@ export async function applyRetentionPolicy(runtime, basePath = process.cwd(), { 
   // back. An explicit `vacuum: true` from that screen still forces the full
   // rewrite through `pruneBefore` above.
   const reclaimed = vacuum ? null : await runtime?.sessionStore?.reclaim?.().catch(() => null);
-  const result = { ...settings, cutoff: cutoff.toISOString(), sessions, memory, semantic, reclaimed };
+  const result = { ...settings, cutoff: cutoff.toISOString(), sessions, memory, reclaimed };
   await runtime?.auditRepository?.append?.("privacy", "RETENTION_APPLIED", result).catch?.(() => {});
   return result;
 }
@@ -155,8 +162,7 @@ export async function createPrivacyExport(runtime, basePath = process.cwd(), { b
   await Promise.all([
     runtime.sessionStore.ensureSchema(),
     runtime.auditRepository.ensureSchema(),
-    runtime.memory.ensureSchema(),
-    runtime.semanticState.ensureSchema()
+    runtime.memory.ensureSchema()
   ]);
   const downloads = outputDirectory ? path.resolve(outputDirectory) : path.join(os.homedir(), "Downloads");
   await fs.mkdir(downloads, { recursive: true });
@@ -198,9 +204,10 @@ export async function createPrivacyExport(runtime, basePath = process.cwd(), { b
       content: parse(row.content, {}),
       related_entities: parse(row.related_entities, [])
     }));
-    counts.semanticEntities = await exportTable(stream, runtime.semanticState.dbPath, "SELECT * FROM semantic_entities ORDER BY last_seen_at ASC", "semanticEntity", (row) => ({ ...row, properties: parse(row.properties, {}) }));
-    counts.semanticRelationships = await exportTable(stream, runtime.semanticState.dbPath, "SELECT * FROM semantic_relationships ORDER BY last_seen_at ASC", "semanticRelationship", (row) => ({ ...row, properties: parse(row.properties, {}) }));
-    counts.semanticSnapshots = await exportTable(stream, runtime.semanticState.dbPath, "SELECT * FROM system_snapshots ORDER BY timestamp ASC", "semanticSnapshot");
+    // The three `semantic*` sections are gone with the staged pipeline that wrote
+    // them. An export is a promise about the data this product HOLDS, so it must
+    // not claim a section it can no longer read — and it must not fail either,
+    // which is what an un-guarded `runtime.semanticState.dbPath` would now do.
     await writeLine(stream, { section: "complete", data: { counts } });
   } catch (error) {
     stream.destroy();

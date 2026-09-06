@@ -14,20 +14,33 @@ import os from "node:os";
 import path from "node:path";
 import { createRuntime } from "../../apps/daemon/src/runtime-factory.js";
 
+// A NON-TERMINAL SESSION, BUILT DIRECTLY RATHER THAN PLANNED INTO EXISTENCE.
+//
+// This used to call `runSetProjectEnvVariable(..., {autoApprove: false})` and rely
+// on the STAGED PIPELINE parking the session in AWAITING_APPROVAL — plan, assess
+// risk, apply policy, stop and wait. That pipeline is deleted, so the call now
+// settles FAILED, which is TERMINAL, and `decideControl` correctly refuses to
+// pause a terminal session. These tests then failed for a reason that had nothing
+// to do with what they are testing.
+//
+// What they ARE testing is entirely live and unchanged: `submitControlIntent`,
+// `policyEngine.decideControl`, the CONTROL_INTENT_EVALUATED audit record, the
+// hash chain, and the persisted transition. All of that needs exactly one thing
+// from this fixture — a session in a NON-TERMINAL state — so it now produces that
+// and nothing else. Building it directly also drops a dependency on which
+// capabilities happen to require approval this month, which is what made the old
+// fixture fragile enough to need the .env comment above it.
 async function awaitingConfirmationSession(runtime, workspace, key) {
-  // Under the autonomous-execution policy, approval is required only for the three
-  // risky classes — one of which is EDITING AN EXISTING FILE. Setting a project env
-  // var edits the workspace .env, so pre-create it to make this a genuine edit that
-  // parks in AWAITING_APPROVAL (the state these control-lane tests need to exercise
-  // pause/cancel). Creating a brand-new .env would now be autonomous.
-  await fs.writeFile(path.join(workspace, ".env"), "EXISTING=preexisting\n", "utf8");
-  return runtime.runSetProjectEnvVariable(
-    {
-      rawText: `Set ${key} for the current project`,
-      entities: { workspacePath: workspace, key, value: "1" }
-    },
-    { autoApprove: false }
-  );
+  const session = runtime._createSession({});
+  session.currentState = "REQUEST_CONFIRMATION_IF_REQUIRED";
+  session.intent = {
+    intentType: "SET_PROJECT_ENV",
+    rawText: `Set ${key} for the current project`,
+    entities: { workspacePath: workspace, key, value: "1" }
+  };
+  session.finalResponse = { status: "AWAITING_APPROVAL", reason: "Approval required." };
+  await runtime.persistSession(session);
+  return session;
 }
 
 async function eventTypesFor(runtime, sessionId) {

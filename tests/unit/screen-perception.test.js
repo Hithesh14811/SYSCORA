@@ -5,7 +5,6 @@ import {
   normalizeVisualText,
   scoreVisualMatch
 } from "../../packages/capability-registry/src/index.js";
-import { createDefaultProviders } from "../../packages/perception/src/providers.js";
 import { VisionProvider } from "../../packages/perception/src/vision-provider.js";
 
 // A window the adapter can describe, capture, OCR and inspect — enough for the
@@ -49,11 +48,6 @@ function fakeAdapter({
   };
 }
 
-test("the default perception providers include vision, so the world model can see", () => {
-  const providers = createDefaultProviders(fakeAdapter(), null, { capabilityRegistry: null });
-  const vision = providers.find((provider) => provider.name === "vision");
-  assert.ok(vision instanceof VisionProvider, "VisionProvider must be registered by default");
-});
 
 test("vision resolves a window by application name instead of grabbing the foreground", async () => {
   const adapter = fakeAdapter();
@@ -210,108 +204,9 @@ test("keyboard.type says it cannot tell when nothing can be read back", async ()
   assert.match(verification.message, /could not be read back/);
 });
 
-test("a session stays on the window it grounded even when the model names only an app", async () => {
-  const { AgentRuntime } = await import("../../packages/agent-runtime/src/index.js");
-  const pin = AgentRuntime.prototype._pinActionToGroundedWindow;
-  const grounded = { WindowHandle: 11, ProcessName: "Notepad", MainWindowTitle: "notes - Notepad" };
-  const context = { currentPerception: { groundedWindow: grounded } };
 
-  // Three Notepad windows are open; "Notepad" alone cannot say which.
-  const pinned = pin.call({}, { capability: "keyboard.type", inputs: { application: "Notepad", text: "hi" } }, context);
-  assert.equal(pinned.inputs.windowId, "11");
-  assert.equal(pinned.inputs.application, "Notepad", "the application name is kept, not replaced");
 
-  // A session-pinned launch result wins over a later ambient perception of a
-  // different document from the same application.
-  const sessionPinned = pin.call({},
-    { capability: "keyboard.type", inputs: { application: "Notepad", text: "hi" } },
-    {
-      groundedWindow: { WindowHandle: 22, ProcessName: "Notepad", MainWindowTitle: "new document - Notepad" },
-      currentPerception: { groundedWindow: grounded }
-    }
-  );
-  assert.equal(sessionPinned.inputs.windowId, "22");
 
-  // An explicit window the model chose is authoritative and must not be rewritten.
-  const explicit = pin.call({}, { capability: "keyboard.type", inputs: { application: "Notepad", windowId: "99" } }, context);
-  assert.equal(explicit.inputs.windowId, "99");
-
-  // A different application must never be pinned to this window.
-  const other = pin.call({}, { capability: "keyboard.type", inputs: { application: "Chrome" } }, context);
-  assert.equal(other.inputs.windowId, undefined);
-
-  // Nothing grounded yet: leave the action exactly as the model wrote it.
-  const ungrounded = pin.call({}, { capability: "keyboard.type", inputs: { application: "Notepad" } }, {});
-  assert.equal(ungrounded.inputs.windowId, undefined);
-});
-
-test("the catalog shown to the model keeps capability aliases", async () => {
-  const { InteractiveAgentController } = await import("../../packages/agent-runtime/src/index.js");
-  const registry = createDefaultCapabilityRegistry(fakeAdapter(), {});
-  const controller = new InteractiveAgentController({ capabilityRegistry: registry });
-  const catalog = controller._catalog("open notepad and type hello");
-
-  const typing = catalog.find((entry) => entry.name === "keyboard.type");
-  assert.ok(typing, "keyboard.type must be offered for a typing goal");
-  assert.ok(
-    typing.aliases.includes("keyboard.typeText"),
-    "aliases must reach the model's catalog or alias resolution can never fire"
-  );
-
-  // The resolver the decision path uses must now accept the synonym.
-  const { resolveCapabilityId, CapabilityResolutionKind } =
-    await import("../../packages/shared-types/src/capability-resolution.js");
-  const resolved = resolveCapabilityId("keyboard.typeText", catalog);
-  assert.equal(resolved.kind, CapabilityResolutionKind.CANONICAL_ALIAS);
-  assert.equal(resolved.canonicalId, "keyboard.type");
-});
-
-test("a decision the model wrote wrongly is re-asked, not fatal", async () => {
-  const { InteractiveAgentController } = await import("../../packages/agent-runtime/src/index.js");
-  const registry = createDefaultCapabilityRegistry(fakeAdapter(), {});
-  let calls = 0;
-  const controller = new InteractiveAgentController({
-    capabilityRegistry: registry,
-    reasoningEngine: {
-      async decideInteractiveAction() {
-        calls += 1;
-        // The model answered; the answer was malformed. That is recoverable.
-        return { ok: false, error: "localSteps[0] uses unknown capability: nope.nope", recoverable: true };
-      }
-    },
-    perceive: async () => ({ windows: [], relevantControls: [] }),
-    executeAction: async () => assert.fail("nothing valid was ever proposed"),
-    budgets: { maxMalformedProposals: 3, maxModelCalls: 20, maxElapsedTime: 20000 }
-  });
-
-  const result = await controller.run("open notepad and type hello");
-  assert.equal(result.status, "FAILED");
-  assert.equal(result.reason, "max-malformed-proposals");
-  assert.equal(calls, 3, "the loop must re-ask up to its malformed-proposal budget");
-});
-
-test("a provider that never answered ends the run instead of re-asking", async () => {
-  const { InteractiveAgentController } = await import("../../packages/agent-runtime/src/index.js");
-  const registry = createDefaultCapabilityRegistry(fakeAdapter(), {});
-  let calls = 0;
-  const controller = new InteractiveAgentController({
-    capabilityRegistry: registry,
-    reasoningEngine: {
-      async decideInteractiveAction() {
-        calls += 1;
-        return { ok: false, error: "provider-unhealthy", recoverable: false };
-      }
-    },
-    perceive: async () => ({ windows: [], relevantControls: [] }),
-    executeAction: async () => assert.fail("nothing was proposed"),
-    budgets: { maxMalformedProposals: 3, maxModelCalls: 20, maxElapsedTime: 20000 }
-  });
-
-  const result = await controller.run("open notepad and type hello");
-  assert.equal(result.status, "FAILED");
-  assert.equal(result.reason, "provider-unhealthy");
-  assert.equal(calls, 1, "an unreachable provider must not be asked again in the same loop");
-});
 
 test("a reasoning call cannot outlive the session budget that asked for it", async () => {
   const { ReasoningEngine } = await import("../../packages/reasoning-engine/src/index.js");
@@ -364,30 +259,6 @@ test("without a budget a reasoning call keeps its configured timeout", async () 
   assert.equal(attempts[0], 70000);
 });
 
-test("a screen reading is taken once per step, but never reused after acting", async () => {
-  const { AgentRuntime } = await import("../../packages/agent-runtime/src/index.js");
-  const adapter = fakeAdapter();
-  const runtime = Object.create(AgentRuntime.prototype);
-  runtime.adapter = adapter;
-  runtime.perception = null; // exercise the direct-adapter path
-
-  const captures = () => adapter.calls.filter(([name]) => name === "captureScreen").length;
-
-  await runtime._captureScreenEvidence({ windowId: "11" });
-  assert.equal(captures(), 1);
-
-  // The controller's "before" reading for the same window in the same step.
-  await runtime._captureScreenEvidence({ windowId: "11", phase: "before", force: true });
-  assert.equal(captures(), 1, "the before-reading must reuse the reading just taken");
-
-  // The "after" reading is what proves the action did something. Never cached.
-  await runtime._captureScreenEvidence({ windowId: "11", phase: "after", force: true });
-  assert.equal(captures(), 2, "the after-reading must be a genuinely fresh look");
-
-  // A different window is a different picture.
-  await runtime._captureScreenEvidence({ windowId: "22" });
-  assert.equal(captures(), 3);
-});
 
 test("the automation host can be warmed, and a host that will not start is not fatal", async () => {
   const { WindowsAutomationHostClient } = await import("../../os-adapters/windows-host/src/client.js");
@@ -440,27 +311,3 @@ test("a postcondition that cannot be checked does not discard an action's eviden
   assert.equal(wipes(held), false);
 });
 
-test("compacting a screen reading keeps the text, not just the bookkeeping", async () => {
-  const { compactObservationForModel } =
-    await import("../../packages/agent-runtime/src/interactive-agent-controller.js");
-
-  // A realistic screen.read: a modest transcript and a very large element list.
-  const reading = {
-    read: true,
-    windowId: "1772940",
-    title: "notes - Notepad",
-    visibleText: "Ultron aka Jarvis is ready sir. Ln 1, Col 32 31 characters",
-    elements: Array.from({ length: 240 }, (_, index) => ({
-      targetId: `element-${index}`,
-      text: `control number ${index} with a reasonably long accessible name`,
-      bounds: { x: index, y: index, width: 100, height: 20 },
-      center: { x: index + 50, y: index + 10 }
-    }))
-  };
-
-  const compacted = compactObservationForModel(reading);
-  assert.ok(compacted.truncated, "an oversized reading must still be compacted");
-  assert.equal(compacted.visibleText, reading.visibleText, "the screen text is the one field that must survive");
-  assert.equal(compacted.title, "notes - Notepad");
-  assert.ok(!compacted.elements, "the element list is what made it oversized");
-});
