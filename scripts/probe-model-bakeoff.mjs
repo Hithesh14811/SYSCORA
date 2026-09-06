@@ -52,6 +52,7 @@
 
 import { loadModelConfig } from "../apps/daemon/src/model-config.js";
 import { buildToolset } from "../packages/fast-agent/src/tools.js";
+import { pathToFileURL } from "node:url";
 import { FastAgent } from "../packages/fast-agent/src/index.js";
 import { createDefaultCapabilityRegistry } from "../packages/capability-registry/src/index.js";
 import { WindowsAdapter } from "../os-adapters/windows/src/windows-adapter.js";
@@ -99,7 +100,7 @@ const SCREEN_READING = `Window: WhatsApp — Amma (windowId w-4821)
   button "Attach" @1042,1284 [under "Footer"]`;
 
 // tool: the call the prompt asks for. null means "answer without calling one".
-const CASES = [
+export const CASES = [
   {
     id: "open-an-app",
     ask: "open notepad",
@@ -153,7 +154,7 @@ const CASES = [
   }
 ];
 
-function buildRealToolset() {
+export function buildRealToolset() {
   const adapter = new WindowsAdapter();
   // No host, no machine. Every case is graded on the CALL, never on its result,
   // so nothing below ever has to succeed — but a tool whose execute throws on
@@ -162,7 +163,7 @@ function buildRealToolset() {
   return buildToolset({ registry: createDefaultCapabilityRegistry(adapter), adapter });
 }
 
-async function askOnce({ baseUrl, apiKey, model, systemPrompt, tools, testCase, thinkingOff }) {
+export async function askOnce({ baseUrl, apiKey, model, systemPrompt, tools, testCase, thinkingOff }) {
   const messages = [{ role: "system", content: systemPrompt }];
   if (testCase.priorTool) {
     messages.push({ role: "user", content: "read the screen" });
@@ -341,4 +342,10 @@ async function main() {
   console.log("column is expected to be low and says nothing about a real run's bill.");
 }
 
-await main();
+// ONLY WHEN RUN DIRECTLY. `scripts/probe-prompt-ablation.mjs` imports CASES and
+// askOnce from here rather than keeping a second copy of them — this codebase has
+// already paid for three copies of one verb list that had silently drifted — and
+// a bare top-level `await main()` would run the whole bake-off on import.
+// `process.argv[1]` is undefined under `node -e`, and pathToFileURL throws on it.
+const invokedAs = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;
+if (invokedAs && import.meta.url === invokedAs) await main();
