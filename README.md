@@ -130,7 +130,8 @@ apps/daemon               authenticated loopback API and runtime lifecycle
 packages/fast-agent       current model/tool loop
 packages/permission-broker authorization and approval state
 packages/policy-engine    content and shell policy
-packages/perception       accessibility/OCR perception
+packages/perception       accessibility/OCR perception (fused, on the hot path)
+packages/capability-registry the typed capabilities every tool executes through
 packages/audit            append-only local audit trail
 os-adapters/windows       Windows actions and Sandbox execution
 os-adapters/browser       dedicated Chromium/CDP automation
@@ -138,14 +139,19 @@ os-adapters/browser       dedicated Chromium/CDP automation
 
 A request goes from the renderer to the authenticated daemon, through the agent
 loop and visible tools, then through policy and the OS adapter. Results stream
-back into the same conversation. A legacy typed pipeline remains for offline
-fallback and migration work; it should not be confused with the primary path.
+back into the same conversation. There is one route: the staged typed pipeline
+that used to answer when no model was reachable was removed once instrumentation
+recorded it running zero times across 335 evaluated runs and 143 real sessions.
+Without a configured model the runtime reports that rather than planning without
+one.
 
 ## Known limits
 
 - Windows 11 x64 only; see the precise support matrix.
 - One active task, screen, pointer and focused window at a time.
-- Tasks are bounded at 80 steps or six minutes.
+- A task is not capped at a fixed number of steps or minutes. It reports what it
+  has spent at widening checkpoints, and a backstop far above any observed run
+  stops one that is looping rather than converging.
 - Accessibility, OCR and DOM representations can be incomplete, stale, or
   adversarial.
 - Many GUI actions cannot be transactionally rolled back.

@@ -58,3 +58,53 @@ console.log("Largest tools");
 for (const [name, size] of sizes.slice(0, 8)) {
   console.log(`  ${name.padEnd(14)} ${pad(size, 6)} chars  ~${pad(tokens(size), 5)} tokens`);
 }
+
+// ---- WHERE THE SYSTEM PROMPT'S TOKENS ACTUALLY GO ---------------------------
+//
+// The prompt is ~4,400 tokens and about seventy-five directives, every one added
+// after a specific observed defect and NOT ONE ever measured for whether it
+// still earns its place. `docs/state-of-the-world.md` has listed that as an open
+// item since 3 Sep 2026 under "the system prompt has never been ablated".
+//
+// An ablation needs a model and a task suite. This does not: it prints the
+// standing cost of each SECTION, per step and over a run, which is the half of
+// the question that can be answered for nothing and is where an ablation would
+// have to start. A section costing 40 tokens a step is not worth an experiment;
+// one costing 900 is.
+//
+// The rule this serves is already in CLAUDE.md — prose in the prompt and in tool
+// descriptions is re-sent on every step — and nothing was measuring the prompt
+// side of it.
+console.log("");
+console.log("System prompt, by section");
+
+// Sections are the ALL-CAPS headings the prompt is written in.
+const lines = systemPrompt.split("\n");
+const sections = [];
+let current = { name: "(preamble)", chars: 0, directives: 0 };
+for (const line of lines) {
+  // A heading is a whole line of capitals — no leading dash, no sentence case.
+  if (/^[A-Z][A-Z ,'’\-()/]{6,}$/.test(line.trim()) && !line.trim().startsWith("-")) {
+    sections.push(current);
+    current = { name: line.trim(), chars: 0, directives: 0 };
+    continue;
+  }
+  current.chars += line.length + 1;
+  if (line.trim().startsWith("- ")) current.directives += 1;
+}
+sections.push(current);
+
+const ranked = sections.filter((section) => section.chars > 0)
+  .sort((left, right) => right.chars - left.chars);
+let totalDirectives = 0;
+for (const section of ranked) {
+  totalDirectives += section.directives;
+  const perStep = tokens(section.chars);
+  console.log(`  ${section.name.slice(0, 46).padEnd(46)} ${pad(perStep, 5)} tok  ${pad(section.directives, 3)} rules  `
+    + `${pad(perStep * 25, 7)} over 25 steps`);
+}
+console.log(`  ${"".padEnd(46)} ${pad(tokens(systemPrompt.length), 5)} tok  ${pad(totalDirectives, 3)} rules  total`);
+console.log("");
+console.log("  A section's cost is paid on EVERY step, cached or not: the endpoint");
+console.log("  serves a cached prefix at roughly a tenth of the price, so read these");
+console.log("  as a tenth of the money and all of the context window.");
