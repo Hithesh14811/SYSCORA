@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, dialog, globalShortcut, ipcMain, screen, shell } from "electron";
+import { app, BrowserWindow, Menu, Notification, dialog, globalShortcut, ipcMain, screen, shell } from "electron";
 import electronUpdater from "electron-updater";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -265,6 +265,65 @@ function showOverlayWindow({ focus = true } = {}) {
   overlayWindow.show();
   if (focus) overlayWindow.focus();
   overlayWindow.webContents.send("syscora:overlay-revealed");
+}
+
+// A TASK CAN OUTLAST THE USER'S ATTENTION, AND NOTHING TOLD THEM IT WAS OVER.
+//
+// The whole point of this product is that you ask for something and go and do
+// something else. A run takes 20-80 seconds of real work; the chat window is
+// usually hidden behind whatever the user went off to do, and the pill is a
+// small dot on their own screen. So the finish was only visible to somebody
+// already looking at it, which is the one person who did not need telling.
+//
+// A Windows toast is the right shape: the OS already owns "this finished while
+// you were elsewhere", it survives in the Action Centre if it is missed, and it
+// costs nothing when nobody is away.
+//
+// NOT A WEB NOTIFICATION. The renderers deny every permission on purpose
+// (`setPermissionRequestHandler` → false), and notifications are in that set.
+// Weakening it so a page could raise a toast would open the same door to any
+// page the daemon ever serves; the main process already has the privilege and
+// needs no permission at all.
+const NOTIFICATION_ICON = path.join(__dirname, "../../desktop/icon.ico");
+
+/** Is the user already looking at the answer? Then say nothing. */
+function chatIsInFront() {
+  if (!chatWindow || chatWindow.isDestroyed()) return false;
+  return chatWindow.isVisible() && !chatWindow.isMinimized() && chatWindow.isFocused();
+}
+
+function setupNotificationBridge() {
+  ipcMain.handle("syscora:notify", (_event, payload) => {
+    // A renderer asking to notify is a REQUEST, like everything else on this
+    // bridge. The main process decides whether it is wanted, so a page cannot
+    // spam the desktop by calling this in a loop while the user is watching.
+    if (!Notification.isSupported()) return false;
+    if (chatIsInFront()) return false;
+    const title = String(payload?.title ?? "").trim().slice(0, 80) || "SYSCORA";
+    // ONE LINE. A toast is glanced at, not read: Windows truncates the body at
+    // about two lines anyway, and a paragraph there is a paragraph nobody sees.
+    const body = String(payload?.body ?? "").replace(/\s+/g, " ").trim().slice(0, 160);
+    if (!body) return false;
+    const sessionId = typeof payload?.sessionId === "string" ? payload.sessionId : null;
+    try {
+      const toast = new Notification({
+        title,
+        body,
+        icon: NOTIFICATION_ICON,
+        // Silent: this fires on every finished task, and a machine that pings
+        // each time an agent does its job is one whose notifications get turned
+        // off within a day.
+        silent: true
+      });
+      // Clicking it is the natural "show me" — the same thing the pill does.
+      toast.on("click", () => { showChatWindow(sessionId); });
+      toast.show();
+      return true;
+    } catch {
+      // A toast that cannot be raised is not a failed task. Never surfaced.
+      return false;
+    }
+  });
 }
 
 function setupOverlayBridge() {
@@ -536,6 +595,15 @@ function removeMenuBarKeepingItsShortcuts(window) {
 }
 
 app.whenReady().then(async () => {
+  // WINDOWS ATTRIBUTES A TOAST TO AN APPLICATION USER MODEL ID, NOT TO A PROCESS.
+  //
+  // Without this a notification is filed under Electron's default id, so it
+  // shows somebody else's name — or, on a machine where that id was never
+  // registered, does not appear at all. It matches `build.appId` in package.json
+  // deliberately: the installed application and the running one must claim the
+  // same identity, or a packaged build and a `npm run desktop:dev` build would
+  // notify as two different products.
+  app.setAppUserModelId("com.syscora.desktop");
   setupLegalDocuments();
   const daemon = startDaemon();
   await waitForDaemon(daemon.port);
@@ -560,6 +628,7 @@ app.whenReady().then(async () => {
   });
 
   setupOverlayBridge();
+  setupNotificationBridge();
   try {
     overlayWindow = createOverlayWindow(daemon);
     removeMenuBarKeepingItsShortcuts(overlayWindow);

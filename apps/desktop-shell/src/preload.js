@@ -47,6 +47,22 @@ contextBridge.exposeInMainWorld("syscora", {
   }),
   openLegal: (documentName) => ipcRenderer.invoke("syscora:open-legal", documentName),
 
+  // "IT FINISHED WHILE YOU WERE ELSEWHERE."
+  //
+  // A REQUEST, not a command: the main process decides whether a toast is
+  // wanted, and says no when the chat window is already in front. See
+  // `setupNotificationBridge`. It resolves false in a plain browser, where there
+  // is no bridge at all, so the caller needs no special case.
+  //
+  // The renderer cannot raise a Web Notification — every renderer permission is
+  // denied on purpose — and this is deliberately not a way around that: the
+  // shape of what may be shown is fixed here and bounded there.
+  notify: (payload) => ipcRenderer.invoke("syscora:notify", {
+    title: payload?.title ?? null,
+    body: payload?.body ?? null,
+    sessionId: payload?.sessionId ?? null
+  }),
+
   // THE OVERLAY, AND THE CHAT, AND THE ONE RUN THEY BOTH FOLLOW.
   //
   // Both surfaces are ordinary renderers loaded from the same daemon, so neither

@@ -3276,6 +3276,55 @@ function replyTextOf(session) {
   return fr.summary?.summary || fr.summary?.text || fr.message || fr.status || "";
 }
 
+// A WINDOWS TOAST WHEN A RUN ENDS AND NOBODY IS WATCHING.
+//
+// This product's premise is that you ask for something and go and do something
+// else, and until now the finish was visible only to somebody already looking at
+// the window — the one person who did not need telling. A run is 20-80 seconds
+// of real work; that is long enough to switch away and forget.
+//
+// The MAIN PROCESS decides whether to show it (see `setupNotificationBridge`):
+// it stays silent whenever the chat window is already in front, so this is not a
+// second copy of something on screen. In a plain browser there is no bridge and
+// this does nothing at all.
+//
+// THE HEADLINE IS THE STATUS, NOT A CLAIM. It is taken from the same
+// `GOOD_STATUS` set the transcript uses, so a toast can never say "Done" over a
+// run this surface is about to draw as failed. The body is the model's own
+// closing sentence — never a summary this file invents, which would be an
+// unaudited assertion of exactly the kind the evidence layer exists to prevent.
+const NOTIFY_TITLE = {
+  COMPLETED: "Done",
+  COMPLETED_WITH_WARNINGS: "Done, with warnings",
+  ANSWERED: "Answered",
+  VERIFIED: "Done",
+  ROLLED_BACK: "Rolled back",
+  PARTIALLY_COMPLETED: "Partly done",
+  DECLINED: "Not done — you declined it",
+  CANCELLED: "Stopped",
+  AWAITING_APPROVAL: "Waiting for you",
+  TIMED_OUT: "Ran out of time",
+  FAILED: "Didn't work"
+};
+
+function notifyRunFinished(session) {
+  const notify = window.syscora?.notify;
+  if (typeof notify !== "function") return;
+  const fr = session?.finalResponse ?? {};
+  const status = String(fr.status ?? "");
+  const body = String(replyTextOf(session) ?? "").trim();
+  if (!body) return;
+  try {
+    notify({
+      title: `SYSCORA — ${NOTIFY_TITLE[status] ?? (GOOD_STATUS.has(status) ? "Done" : "Finished")}`,
+      body,
+      sessionId: session?.sessionId ?? null
+    });
+  } catch {
+    // A toast is never worth failing a finished run over.
+  }
+}
+
 // ---- Submitting --------------------------------------------------------------
 
 // ---- Running / stopping ------------------------------------------------------
@@ -3434,6 +3483,8 @@ async function submit(text, { attachments = [], routing = null, display = null }
       }
     });
     renderFinal(turn, session);
+    // The main process stays silent when this window is in front; see notifyRunFinished.
+    notifyRunFinished(session);
     rememberInChat(submittedChatId, "assistant", replyTextOf(session));
     recordTurn(shown, streamed, session, attachments, text, replyTextOf(session), turnId, submittedChatId);
   } catch (err) {
@@ -3527,6 +3578,7 @@ async function attachToSession(sessionId) {
       }
     });
     renderFinal(turn, session);
+    notifyRunFinished(session);
     // The visual transcript, so this run is here when the window is opened
     // again. The user's own words come from the session rather than from a
     // composer that never saw them.
@@ -3572,6 +3624,7 @@ async function resume(sessionId, approve) {
     const session = getPayload(json).session ?? json.session;
     for (const event of session?.events ?? []) handleEvent(turn, event);
     if (session) renderFinal(turn, session);
+    if (session) notifyRunFinished(session);
   } catch (err) {
     turn.settle();
     turn.append(el("div", "agent-answer", `I couldn't continue: ${debug ? err.message : "please retry."}`));
