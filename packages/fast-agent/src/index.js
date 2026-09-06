@@ -1183,6 +1183,62 @@ DO THE WHOLE THING, THE WAY A PERSON WOULD
 - Typing into a box with a suggestion list under it is half the job. Pick the suggestion — an airport, a contact, a city — or the field holds text the application never accepted.
 - A name you guessed is not a name you know. A URL built from a channel, account or product name lands on whatever happens to own it; read the page and confirm it is the one asked for before doing anything else with it.`;
 
+// A PROMPT SECTION, REMOVABLE BY NAME — FOR THE EXPERIMENT, NOT FOR THE DEFAULT.
+//
+// `SYSCORA_PROMPT_WITHOUT="CHOOSING A TOOL,WHEN SOMETHING FAILS"` drops those
+// sections. Unset — which is the shipped default — the prompt is returned byte
+// for byte, so nothing about ordinary behaviour depends on this existing.
+//
+// WHY IT EXISTS, AND WHY THE DEFAULT DOES NOT CHANGE YET.
+//
+// `docs/state-of-the-world.md` has carried "the system prompt has never been
+// ablated" since 3 Sep 2026. It has now, with `scripts/probe-prompt-ablation.mjs`
+// over the bake-off's seven graded decisions — every one drawn from a defect this
+// project actually paid for. Measured against the live endpoint, thinking off:
+//
+//   n=5  (35 trials)   baseline 31/35    without CHOOSING A TOOL 33/35   +2
+//   n=12 (84 trials)   baseline 71/84    without CHOOSING A TOOL 80/84   +9
+//
+// The largest section of the prompt — 1,918 tokens a step, 44% of it, ~48,000
+// tokens over a 25-step run — makes tool choice WORSE on these cases, replicated,
+// and removing it recovers `relayed-instruction` both times. That is the same
+// shape as the reasoning-budget result already recorded here: more room produces
+// more attempts rather than better ones, and more instruction produces less
+// adherence.
+//
+// AND IT IS STILL NOT ENOUGH TO CUT IT. Seven SINGLE decisions cannot fail the
+// way that section's most expensive rules fail. "MAKING A DOCUMENT IS ONE CALL"
+// exists because the other way cost 13 tool calls and 227,584 tokens; "ASK
+// EVERYTHING IN ONE CALL" because twenty separate searches cost 154,590; "USE
+// winget" because driving the Store cost 21 steps. Every one of those is a
+// multi-step cost that a one-shot tool-choice test scores as a pass. This
+// codebase has already paid once for generalising a measurement past what it
+// measured — a per-turn ceiling raised globally on good evidence, and the eval
+// came back 100% -> 91%.
+//
+// So the finding is recorded and the experiment is one variable away. The eval is
+// what can answer it, by running both arms over whole tasks.
+const PROMPT_SECTION_HEADING = /^[A-Z][A-Z ,'’\-()/]{6,}$/;
+
+export function promptWithoutSections(prompt, names = []) {
+  const wanted = names.map((name) => String(name).trim().toUpperCase()).filter(Boolean);
+  if (wanted.length === 0) return prompt;
+  const kept = [];
+  let dropping = false;
+  for (const line of String(prompt).split("\n")) {
+    const heading = line.trim();
+    if (PROMPT_SECTION_HEADING.test(heading) && !heading.startsWith("-")) {
+      dropping = wanted.includes(heading.toUpperCase());
+      if (dropping) continue;
+    }
+    if (!dropping) kept.push(line);
+  }
+  return kept.join("\n");
+}
+
+const PROMPT_WITHOUT = String(process.env.SYSCORA_PROMPT_WITHOUT ?? "")
+  .split(",").map((name) => name.trim()).filter(Boolean);
+
 // THE CONVERSATION IS BOUNDED BY THE MODEL, NOT BY A CONSTANT.
 //
 // This used to be `pruneConversation`, gated on `SYSCORA_COLLAPSE_HISTORY` and
@@ -1211,7 +1267,9 @@ export class FastAgent {
     maxElapsedMs = DEFAULT_MAX_ELAPSED_MS,
     maxFreshTokens = DEFAULT_MAX_FRESH_TOKENS,
     signal = null,
-    systemPrompt = SYSTEM_PROMPT,
+    // Unset `SYSCORA_PROMPT_WITHOUT` returns SYSTEM_PROMPT unchanged, which is
+    // every ordinary run. See promptWithoutSections.
+    systemPrompt = promptWithoutSections(SYSTEM_PROMPT, PROMPT_WITHOUT),
     // The saved routes, or nothing. DEFAULTS TO NOTHING ON PURPOSE: with no
     // store wired, not one line of the loop below behaves differently, so a
     // surface that has not opted in cannot be broken by this and neither can
@@ -1557,7 +1615,10 @@ export class FastAgent {
     // Unknown means no. A model with no vision, sent an image, fails the whole
     // request rather than the look — so `screen {vision: true}` refuses and says
     // why, which is a step wasted; sending it anyway is the task lost.
-    this.toolset.setVisionAvailable?.(this.provider?.supportsVision?.() === true);
+    // Kept in the loop too, not only handed to the toolset: the no-progress guard
+    // escalates to a picture, and it can only offer that to a model with eyes.
+    const canSee = this.provider?.supportsVision?.() === true;
+    this.toolset.setVisionAvailable?.(canSee);
     // And the attempt reaches the transcript. A defence the user cannot see is
     // one they cannot judge — the plan's requirement is that an injection is
     // refused AND surfaced, not just refused.
@@ -2650,15 +2711,53 @@ export class FastAgent {
           // hovering and waiting are what the loop above is made of.
           unchangedReadings = 0;
         }
+        // AND WHEN IT CANNOT SEE THE THING, THE ANSWER IS TO LOOK AT IT.
+        //
+        // This nudge used to say "Stop. Do not try another position. Tell the
+        // user you cannot see it and ask." That was the only honest answer while
+        // the agent was blind — and it stopped being the only answer on 4 Sep
+        // 2026, when `screen {vision: true}` was built. The guard went on ending
+        // the run anyway, so the capability that exists precisely for this case
+        // was never reached from the one place that detects it. Thirteenth
+        // instance of this codebase's signature defect.
+        //
+        // THE TRIGGER IS THE MEASUREMENT, NOT A GUESS. Three consecutive readings
+        // of a screen that did not move is the machine saying, in its own terms,
+        // that the text tree does not contain what is being aimed at. That is
+        // exactly and only when pixels are worth their price — which is why this
+        // escalates HERE rather than making vision the default: a picture is
+        // ~1,500 tokens against ~267-1,029 for a reading, and text comes back as
+        // named, clickable controls rather than pixels something must interpret.
+        //
+        // AND IT HAS TO SAY THAT A MEASURED COORDINATE IS NOT A GUESSED ONE.
+        // The system prompt says of clicking: "never an index or a coordinate you
+        // made up". On 3 Sep this codebase recorded what happens when a refusal
+        // and the prompt disagree — the prompt wins, silently, and the model
+        // routes around the help it was just given. A coordinate read off a
+        // picture is measured, and this says so in the same breath as offering
+        // the picture.
+        //
+        // A model with no eyes gets the message it always got, unchanged: telling
+        // it to look at something it cannot see would waste a step and end in the
+        // same place.
         if (unchangedReadings >= 3 && !nudgedForProgress) {
           nudgedForProgress = true;
           messages.push({
             role: "user",
-            content: "[SYSTEM] The last three readings found the screen completely unchanged. Whatever you " +
-              "are aiming at is not responding, and it is very likely something a text reading CANNOT see " +
-              "— an icon with no label, which no amount of hovering or guessing at coordinates will reveal. " +
-              "Stop. Do not try another position. Tell the user what you were trying to click, that you " +
-              "cannot see it, and ask them how they would like to proceed — then end your turn."
+            content: canSee
+              ? "[SYSTEM] The last three readings found the screen completely unchanged. What you are aiming " +
+                "at is very likely something a TEXT reading cannot see — an icon with no label — and no " +
+                "amount of hovering or guessing at coordinates will reveal it.\nSo LOOK at it: call " +
+                "`screen {application: \"…\", vision: true}`, which returns the same reading plus a picture " +
+                "of the window. A coordinate you take off that picture is MEASURED, not invented, so " +
+                "`click {x, y}` from it is the right call here — this is the one case the prompt's rule " +
+                "about never making up coordinates does not cover.\nIf the picture does not show it either, " +
+                "say what you were looking for, that you cannot see it, and ask the user."
+              : "[SYSTEM] The last three readings found the screen completely unchanged. Whatever you " +
+                "are aiming at is not responding, and it is very likely something a text reading CANNOT see " +
+                "— an icon with no label, which no amount of hovering or guessing at coordinates will reveal. " +
+                "Stop. Do not try another position. Tell the user what you were trying to click, that you " +
+                "cannot see it, and ask them how they would like to proceed — then end your turn."
           });
         }
         // And if it carries on regardless, end it. Eight readings in a row of an

@@ -179,3 +179,103 @@ test("dropping images is idempotent, so a long run does not keep re-announcing",
   assert.equal(dropStaleImages(messages), 0, "the only image is the newest and must be kept");
   assert.equal(dropStaleImages(messages), 0);
 });
+
+// ---- 5. Escalation: the guard that detects blindness now answers it ---------
+//
+// THE CAPABILITY EXISTED AND THE ONE PLACE THAT DETECTS ITS CASE ENDED THE RUN.
+//
+// `unchangedReadings >= 3` is the machine saying, in its own terms, that the text
+// tree does not contain what is being aimed at — three consecutive readings of a
+// screen that did not move. That is precisely when pixels are worth their price.
+// The guard's answer was "Stop. Do not try another position. Tell the user you
+// cannot see it and ask", which was the only honest answer while the agent was
+// blind and stopped being so on 4 Sep 2026 when `screen {vision: true}` was
+// built. It went on ending the run for two more days.
+//
+// This is also why vision stays OPT-IN rather than becoming the default: a
+// picture is ~1,500 tokens against ~267-1,029 for a reading, and a reading comes
+// back as named, clickable controls. Text first; pixels when text has been
+// MEASURED to be insufficient.
+
+// A toolset whose screen never changes, which is the shape of the 692,000-token
+// emoji hunt this guard was written for.
+function stuckToolset() {
+  return {
+    definitions: [{ type: "function", function: { name: "screen", description: "", parameters: {} } }],
+    has: () => true,
+    previewOf: () => "",
+    isActingTool: () => false,
+    setVisionAvailable() {},
+    async execute() {
+      return { ok: true, text: "Window: WhatsApp", durationMs: 1, raw: { screenUnchanged: true } };
+    }
+  };
+}
+
+// Four reads, so the guard fires on the third, then a plain reply to settle.
+const fourReads = () => ([
+  { toolCalls: [{ name: "screen", args: { application: "whatsapp" } }] },
+  { toolCalls: [{ name: "screen", args: { application: "whatsapp" } }] },
+  { toolCalls: [{ name: "screen", args: { application: "whatsapp" } }] },
+  { toolCalls: [{ name: "screen", args: { application: "whatsapp" } }] },
+  { text: "I cannot see that control." }
+]);
+
+const systemLines = (provider) =>
+  provider.sent.at(-1).filter((message) => String(message.content ?? "").startsWith("[SYSTEM]"))
+    .map((message) => message.content);
+
+test("a model with eyes is told to LOOK, not to give up", async () => {
+  const provider = visionProvider(fourReads());
+  await new FastAgent({ provider, toolset: stuckToolset(), maxSteps: 6 }).run("react to that message");
+
+  const nudge = systemLines(provider).find((line) => line.includes("completely unchanged"));
+  assert.ok(nudge, "the no-progress guard must still fire on three unchanged readings");
+  assert.match(nudge, /vision: true/, "the answer to 'a text reading cannot see it' is a picture");
+  assert.doesNotMatch(nudge, /Do not try another position/, "that was the blind-agent message");
+});
+
+// THE PROMPT SAYS "NEVER A COORDINATE YOU MADE UP", AND THE PROMPT WINS.
+//
+// Recorded 3 Sep 2026: when a refusal and the system prompt disagree, the model
+// obeys the prompt and routes around the help. Offering a picture without saying
+// that a coordinate read OFF it is measured rather than invented would reproduce
+// that exactly — the model would look, and then refuse to act on what it saw.
+test("the escalation says a measured coordinate is not a guessed one", async () => {
+  const provider = visionProvider(fourReads());
+  await new FastAgent({ provider, toolset: stuckToolset(), maxSteps: 6 }).run("react to that message");
+
+  const nudge = systemLines(provider).find((line) => line.includes("completely unchanged"));
+  assert.match(nudge, /MEASURED, not invented/);
+  assert.match(nudge, /click \{x, y\}/, "it has to name the call it is authorising");
+});
+
+// A model with no eyes must get exactly what it got before. Telling it to look at
+// something it cannot see wastes a step and ends in the same place.
+test("a blind model still gets the stop-and-ask message, unchanged", async () => {
+  const provider = visionProvider(fourReads(), { vision: false });
+  await new FastAgent({ provider, toolset: stuckToolset(), maxSteps: 6 }).run("react to that message");
+
+  const nudge = systemLines(provider).find((line) => line.includes("completely unchanged"));
+  assert.ok(nudge);
+  assert.match(nudge, /Do not try another position/);
+  assert.doesNotMatch(nudge, /vision: true/, "offering eyes to something blind is a wasted step");
+});
+
+// The escalation is one nudge, not a habit: it fires once per run, and a run
+// whose screen is moving never sees it at all.
+test("a run that is making progress is never told any of this", async () => {
+  const moving = {
+    definitions: [{ type: "function", function: { name: "screen", description: "", parameters: {} } }],
+    has: () => true,
+    previewOf: () => "",
+    isActingTool: () => false,
+    setVisionAvailable() {},
+    async execute() {
+      return { ok: true, text: "Window: WhatsApp", durationMs: 1, raw: { screenUnchanged: false } };
+    }
+  };
+  const provider = visionProvider(fourReads());
+  await new FastAgent({ provider, toolset: moving, maxSteps: 6 }).run("read the chat");
+  assert.equal(systemLines(provider).filter((line) => line.includes("completely unchanged")).length, 0);
+});
