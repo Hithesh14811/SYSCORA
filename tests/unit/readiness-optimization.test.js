@@ -21,6 +21,14 @@ test("Spotify waits for the Play control beside the requested row without a mode
       async request(operation, params) {
         requests.push({ operation, params });
         if (operation === "ui.find") return { found: false, reason: "target-not-found" };
+        // The local row ranker now looks first, and this tree gives it nothing to
+        // work with — no "Search results" container, so it returns null in one
+        // round trip and the selector below is still what matches. See
+        // `spotifyResultRows`.
+        if (operation === "ui.inspect") return {
+          window: { windowId: "1234", processName: "Spotify", title: "Spotify" },
+          targets: []
+        };
         if (operation === "ui.wait") return {
           matched: true,
           elapsedMs: 84,
@@ -40,16 +48,19 @@ test("Spotify waits for the Play control beside the requested row without a mode
 
   assert.equal(result.invoked, true);
   assert.equal(result.name, "Play");
-  // THE TOP-RESULT CARD IS TRIED FIRST, so `ui.wait` leads.
+  // THE LOCAL ROW RANKER LOOKS FIRST, THEN THE CARD SELECTOR.
   //
-  // Spotify puts the best match in a card and publishes it as a bare "Play"
-  // DataItem beside the title; the list rows below it are named "Play <title>".
-  // The card matcher used to run THIRD, and live — asked for "Tum Se Hi" — the
-  // card sat on screen while nothing was clicked for 10.8s and the previous
-  // track kept playing. See _invokeSpotifyPlayButton.
-  // Here the card is already in the tree, so the two row selectors never run at
-  // all — the warm path is now three host round trips instead of five.
-  assert.deepEqual(requests.map(({ operation }) => operation), ["ui.wait", "ui.invoke", "pointer.click"]);
+  // `ui.inspect` leads because it is the only attempt that can tell a Song row
+  // from an Episode row, and it used to run LAST. Live, 6 Sep 2026: asked for
+  // "Tumhi Ho Bandhu Pritam Neeraj Shridhar Kavita Seth", the `ui.wait` selector
+  // below matched a PODCAST EPISODE of nearly the same name and played it, and
+  // the episode-aware code never ran. See spotifyPlayCandidate.
+  //
+  // Here the inspected tree has no result containers, so the ranker returns null
+  // in one round trip and the card selector still does the matching — the two row
+  // selectors are skipped exactly as before.
+  assert.deepEqual(requests.map(({ operation }) => operation),
+    ["ui.inspect", "ui.wait", "ui.invoke", "pointer.click"]);
   const wait = requests.find(({ operation }) => operation === "ui.wait");
   assert.equal(wait.params.selector.nearText, "baby justin bieber");
   assert.equal(wait.params.selector.minimumCoverage, 0.5);
@@ -128,18 +139,18 @@ test("a persistent-host selector miss resolves the Play control from one inspect
   const result = await adapter._invokeSpotifyPlayButton("Baby", 6000, 1234);
 
   assert.equal(result.invoked, true);
-  assert.equal(result.recovery, "inspected-nearby-labels");
-  // THE TOP-RESULT CARD IS TRIED FIRST, so `ui.wait` leads.
+  assert.equal(result.recovery, "inspected-row-containers");
+  // SEVEN HOST ROUND TRIPS BECAME THREE, and that is the point of the reorder.
   //
-  // Spotify puts the best match in a card and publishes it as a bare "Play"
-  // DataItem beside the title; the list rows below it are named "Play <title>".
-  // The card matcher used to run THIRD, and live — asked for "Tum Se Hi" — the
-  // card sat on screen while nothing was clicked for 10.8s and the previous
-  // track kept playing. See _invokeSpotifyPlayButton.
-  // Nothing matches here, so every attempt runs: the short card look, the two row
-  // selectors, the card look again with the rest of the budget, then the local
-  // inspect. The total is still bounded by the same deadline.
-  assert.deepEqual(requests, ["ui.wait", "ui.find", "ui.find", "ui.wait", "ui.inspect", "ui.invoke", "pointer.click"]);
+  // This tree publishes a bare "Play" beside "Baby" — exactly the shape the local
+  // ranker resolves — and the old order reached it only after the short card
+  // look, both row selectors and the long card look had all missed. The ranker
+  // now looks first and answers immediately, so the four selector round trips
+  // never happen.
+  //
+  // The waits are still there and still bounded; they are what handles a tree
+  // that has not rendered yet, which a single snapshot cannot wait for.
+  assert.deepEqual(requests, ["ui.inspect", "ui.invoke", "pointer.click"]);
 });
 
 test("Spotify playback verification reuses the persistent host tree", async () => {

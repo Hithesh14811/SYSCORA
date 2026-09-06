@@ -361,6 +361,83 @@ function uiBounds(target) {
 // Exported so the tie-break below can be tested against the REAL tree Spotify
 // published on a failing run, rather than against one somebody imagined. See
 // tests/unit/spotify-top-result.test.js.
+// WHAT SPOTIFY ACTUALLY PUBLISHES, AND IT IS BETTER THAN ANY DISTANCE RULE.
+//
+// Measured on the real tree, 6 Sep 2026 (`node scripts/probe-spotify-rows.mjs`),
+// every search result is its own NAMED CONTAINER with exact bounds:
+//
+//   DataGrid "Search results"                      x=210 y=258  w=794 h=7575
+//     Group  "Tum Hi Ho Bandhu"                    x=210 y=258  w=794 h=222
+//     Group  "Bandhu 2.0 (From \"Cocktail 2\")"    x=210 y=512  w=794 h=128
+//     Group  "Tum Hi Ho Bandhu - Neeraj Shridhar"  x=210 y=640  w=794 h=220
+//   Group    "Now playing bar"                     x=18  y=1114 w=1594 h=144
+//   Group    "Main"                                x=18  y=130  w=144  h=968
+//
+// Containment answers every question the distance heuristic was guessing at:
+// which row a Play control belongs to, what that row is called, what TYPE it is,
+// and which controls are not results at all. A row's text cannot be diluted by
+// the row above it, by the sidebar, or by the now-playing bar, because none of
+// those are inside its rectangle.
+const SPOTIFY_CHROME = /^(now playing bar|now playing view|player controls|main|your library)$/i;
+// The per-row type label Spotify prints beside each result.
+const SPOTIFY_ROW_TYPE = /^(song|episode|artist|album|playlist|podcast|show|profile)\b/i;
+// Asking for a podcast is a real request; these words in the QUERY switch the
+// rejection off rather than making it unconditional.
+const ASKED_FOR_SPOKEN = /\b(podcast|episode|show|audiobook)\b/i;
+
+function spotifyRect(element) {
+  const bounds = uiBounds(element);
+  const x = Number(bounds.x); const y = Number(bounds.y);
+  const width = Number(bounds.width); const height = Number(bounds.height);
+  if (![x, y, width, height].every(Number.isFinite)) return null;
+  return { x, y, width, height, right: x + width, bottom: y + height };
+}
+
+function spotifyCentre(element) {
+  const rect = spotifyRect(element);
+  return rect ? { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null;
+}
+
+function spotifyContains(outer, element) {
+  const rect = spotifyRect(outer);
+  const centre = spotifyCentre(element);
+  if (!rect || !centre) return false;
+  return centre.x >= rect.x && centre.x <= rect.right && centre.y >= rect.y && centre.y <= rect.bottom;
+}
+
+/**
+ * The result rows, as Spotify's own containers — or null when this build does
+ * not publish them, in which case the caller keeps the older distance heuristic.
+ */
+function spotifyResultRows(visible) {
+  const container = visible.find((element) =>
+    /^search results$/i.test(String(element?.name ?? "").trim()) && (spotifyRect(element)?.width ?? 0) > 300);
+  if (!container) return null;
+  const rows = visible.filter((element) => {
+    const type = String(element?.controlType ?? element?.role ?? "");
+    if (!/Group$/i.test(type)) return false;
+    const name = String(element?.name ?? "").trim();
+    if (!name || SPOTIFY_CHROME.test(name)) return false;
+    if (element === container) return false;
+    const rect = spotifyRect(element);
+    // A row is inside the results list and is not the list itself.
+    return rect && rect.height > 0 && rect.height < 600 && spotifyContains(container, element);
+  });
+  // Top to bottom: Spotify orders search results by its own relevance, so the
+  // first row IS the "top result" card without having to recognise the card.
+  rows.sort((left, right) => (spotifyRect(left)?.y ?? 0) - (spotifyRect(right)?.y ?? 0));
+  // De-duplicate containers that share a rectangle (Chromium publishes a Group
+  // and a DataItem for the same row); keep the first at each position.
+  const seen = new Set();
+  return rows.filter((row) => {
+    const rect = spotifyRect(row);
+    const key = `${Math.round(rect.y)}:${Math.round(rect.height)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 export function spotifyPlayCandidate(elements, query) {
   const expected = spotifyQueryTokens(query);
   if (expected.length === 0) return null;
@@ -369,12 +446,130 @@ export function spotifyPlayCandidate(elements, query) {
     return element?.offscreen !== true && element?.enabled !== false &&
       Number(bounds.width) > 0 && Number(bounds.height) > 0;
   });
-  const actions = visible.filter((element) => {
+  // THE NOW-PLAYING BAR IS NOT A SEARCH RESULT, AND IT WAS WINNING.
+  //
+  // Measured on the real tree for "tumhi ho bandhu pritam neeraj shridhar kavita
+  // seth": this function returned the bare "Play" at 815,1162 — the transport
+  // control at the bottom of the window. Its neighbourhood, under the old
+  // 1600px-wide rule, contained "Now playing: Tum Hi Ho Bandhu by Pritam, Neeraj
+  // Shridhar, Kavita Seth", so it matched seven of eight query tokens: the track
+  // ALREADY PLAYING was being used as evidence for what to play next.
+  //
+  // Clicking it resumes whatever is loaded, which is the wrong song by
+  // definition on any request that names a different one. Excluded here rather
+  // than scored down, because there is no query for which the transport's Play
+  // is the right answer to "play X".
+  const chromeBoxes = visible.filter((element) => SPOTIFY_CHROME.test(String(element?.name ?? "").trim()));
+  const inChrome = (element) => chromeBoxes.some((box) => box !== element && spotifyContains(box, element));
+  const isPlayAction = (element) => {
     const name = String(element?.name ?? element?.text ?? "").trim();
     const type = String(element?.controlType ?? element?.role ?? "");
     return /^play(?:\s|$)/i.test(name) && !/^pause(?:\s|$)/i.test(name) &&
       /(?:Button|DataItem|ListItem|Hyperlink)$/i.test(type);
-  });
+  };
+
+  // WHOSE RESULTS ARE THESE? THE SEARCH BOX SAYS SO.
+  //
+  // This ranker runs BEFORE the waits, which means it can be handed a tree that
+  // still shows the PREVIOUS request's results — `openSpotifySearch` is an
+  // asynchronous protocol hand-off and returns as soon as Windows accepts it.
+  // Ranking those confidently would play the last song asked for, which is the
+  // exact failure this whole function exists to prevent, arriving by a new road.
+  //
+  // Spotify publishes the live query as the search box's VALUE:
+  //   ComboBox "What do you want to play?"  value="tumhi ho bandhu pritam ..."
+  // so the question is answerable rather than a matter of timing. When the box
+  // holds something else the rows are stale and this returns null, and the
+  // bounded waits below — which key on the query text and therefore cannot match
+  // stale rows — do their job exactly as before.
+  //
+  // Fails OPEN: a build that does not publish the box is not gated, because a
+  // staleness check that cannot read the query must not veto every request.
+  const searchBox = visible.find((element) =>
+    /ComboBox$/i.test(String(element?.controlType ?? element?.role ?? "")) &&
+    /what do you want to play/i.test(String(element?.name ?? "")));
+  if (searchBox && String(searchBox.value ?? "").trim()) {
+    const live = spotifyTextTokens(String(searchBox.value));
+    const shared = expected.filter((token) => live.some((word) =>
+      word === token || spotifyTokenDistance(word, token) <= 1)).length;
+    if (shared < Math.max(1, Math.ceil(expected.length * 0.6))) return null;
+  }
+
+  // THE CONTAINER PATH: rank whole ROWS, then take the row's own Play control.
+  const rows = spotifyResultRows(visible);
+  if (rows && rows.length) {
+    const wantsSpoken = ASKED_FOR_SPOKEN.test(String(query ?? ""));
+    const scored = [];
+    // A row that matched the request and was turned down for being spoken word.
+    // Kept separate from "nothing matched", because the two need opposite
+    // endings — see the fall-through below.
+    let rejectedSpoken = 0;
+    for (const [index, row] of rows.entries()) {
+      const action = visible.find((element) => isPlayAction(element) && spotifyContains(row, element));
+      if (!action) continue;
+      const inside = visible.filter((element) => spotifyContains(row, element));
+      const rowText = inside.map((element) => String(element?.name ?? element?.text ?? "")).join(" ");
+      // AN EPISODE IS NOT A SONG, AND IT SAYS SO ON THE ROW.
+      //
+      // Live, 6 Sep 2026: asked for "Tumhi Ho Bandhu Pritam Neeraj Shridhar
+      // Kavita Seth", this played "Tum Hi Ho Bandhu - Neeraj Shridhar" by "Top
+      // Hits Unpacked" — a PODCAST EPISODE that repeats most of the query's
+      // words. Spotify labels that row `Text "Episode"` inside its container and
+      // the song rows `Text "Song"`; nothing was reading it.
+      //
+      // Rejected outright rather than penalised: a penalty is a number that a
+      // sufficiently word-matching episode always beats, and this codebase has
+      // already paid for that shape once — the old `episodePenalty` of 2 against
+      // a score of `hits * 10` could never change an outcome.
+      const rowType = inside
+        .map((element) => String(element?.name ?? "").trim())
+        .find((name) => SPOTIFY_ROW_TYPE.test(name));
+      const kind = rowType ? String(rowType).match(SPOTIFY_ROW_TYPE)[1].toLowerCase() : null;
+      const words = spotifyTextTokens(rowText);
+      const hits = expected.filter((token) => words.some((word) =>
+        word === token || spotifyTokenDistance(word, token) <= 1)).length;
+      if (hits < Math.max(1, Math.ceil(expected.length * 0.5))) continue;
+      // Counted only for rows that MATCHED, so an unrelated podcast further down
+      // the page cannot make the whole request unanswerable.
+      if (!wantsSpoken && (kind === "episode" || kind === "podcast" || kind === "show")) {
+        rejectedSpoken += 1;
+        continue;
+      }
+      // The row's own NAME is its title, undiluted by the artist line beneath it.
+      const titleWords = spotifyTextTokens(String(row?.name ?? ""));
+      const titleHits = expected.filter((token) => titleWords.some((word) =>
+        word === token || spotifyTokenDistance(word, token) <= 1)).length;
+      scored.push({
+        action,
+        // Spotify's own ordering breaks a tie: its first row is the answer it
+        // chose, which is the one a person clicks. Worth exactly one point, so
+        // it can never outrank a row that matches more of the request.
+        score: hits * 10 + (index === 0 ? 1 : 0) + (kind === "song" ? 1 : 0),
+        titleHits
+      });
+    }
+    scored.sort((left, right) => (right.score - left.score) || (right.titleHits - left.titleHits));
+    if (scored.length && !(scored[1] && scored[1].score === scored[0].score
+      && scored[1].titleHits === scored[0].titleHits)) {
+      return scored[0].action;
+    }
+    // A REFUSAL MUST NOT BE UNDONE BY THE FALLBACK BENEATH IT.
+    //
+    // The older heuristic cannot see row types, so falling through to it after
+    // rejecting an episode hands back the very row that was just turned down —
+    // the rejection becomes a delay rather than a decision. Measured: with this
+    // clause missing, a tree whose only match is an episode still returned that
+    // episode, and the test for it failed identically with the rule and without.
+    //
+    // So when rows WERE understood and every match was spoken word, that is the
+    // answer: nothing here is a song. The caller reports it and the model reads
+    // the screen, which is the honest ending.
+    if (scored.length === 0 && rejectedSpoken > 0) return null;
+    // A genuine tie between two rows this cannot tell apart falls through to the
+    // older heuristic rather than guessing, exactly as it did before.
+  }
+
+  const actions = visible.filter((element) => isPlayAction(element) && !inChrome(element));
   const near = (left, right) => {
     const a = uiBounds(left); const b = uiBounds(right);
     const ay = Number(a.y) + Number(a.height) / 2;
@@ -2802,6 +2997,56 @@ public static class SyscoraAudio {
       // left, which is the cold-tree wait it always was. Total is still bounded
       // by `limit`; the warm case gets FASTER because it no longer pays the
       // measured 713ms + 146ms of row selectors before looking at the card.
+      // Inspect once and choose the row locally, from the same evidence the model
+      // would otherwise need a whole extra turn to read. Run twice — before the
+      // waits, where a warm tree answers immediately, and after them, where the
+      // waits have made the tree warm.
+      const tryLocalRowRanker = async () => {
+        try {
+          const inspected = await this.inspectUi({
+            application: "spotify",
+            windowId: windowHandle,
+            maxElements: 500
+          });
+          const target = spotifyPlayCandidate(inspected?.elements ?? inspected?.targets ?? [], query);
+          if (!target) return null;
+          const bounds = uiBounds(target);
+          const centre = {
+            x: Number(bounds.x) + Number(bounds.width) / 2,
+            y: Number(bounds.y) + Number(bounds.height) / 2
+          };
+          const invoked = await this.invokeControl({
+            windowId: target.windowId ?? target.windowHandle ?? windowHandle,
+            name: target.name ?? target.text,
+            ...centre
+          });
+          // Spotify exposes some row actions as a DataItem with no InvokePattern.
+          // The target is already grounded to the right row and window, so one
+          // ordinary click is honest here rather than a second full scan.
+          const action = invoked?.performed === true ? invoked : await this.pointerAction("click", {
+            windowId: String(target.windowId ?? target.windowHandle ?? windowHandle),
+            ...centre,
+            button: "left",
+            clicks: 1
+          }).catch(() => null);
+          if (action?.performed !== true) return null;
+          return {
+            found: true,
+            invoked: true,
+            name: target.name ?? target.text ?? null,
+            matchedLabel: String(query).trim(),
+            matchedBounds: bounds,
+            reason: null,
+            semantic: action,
+            recovery: "inspected-row-containers"
+          };
+        } catch {
+          // A bounded miss yields null; the caller falls through to the waits and
+          // the last attempt returns the model-visible failure.
+          return null;
+        }
+      };
+
       const tryTopResultCard = async (budgetMs) => {
       if (budgetMs >= 50) {
         try {
@@ -2870,6 +3115,23 @@ public static class SyscoraAudio {
         }
         return null;
       };
+
+      // ONE SNAPSHOT, RANKED BY SPOTIFY'S OWN ROW CONTAINERS. THIS GOES FIRST.
+      //
+      // `spotifyPlayCandidate` is the only attempt here that can tell a Song row
+      // from an Episode row, and it ran LAST — after two selectors that cannot.
+      // So on the request that provoked this, attempt 1 matched the episode
+      // "Tum Hi Ho Bandhu - Neeraj Shridhar" by "Top Hits Unpacked", played it,
+      // and the episode-aware code below never ran. Twelfth instance of this
+      // codebase's signature defect: the machinery is correct and something above
+      // it makes it unreachable.
+      //
+      // It is also the CHEAPEST attempt — one `ui.inspect` against an already
+      // warm tree, no wait loop — so putting it first costs nothing when it
+      // misses. A cold tree has no result containers yet, it returns null in one
+      // round trip, and the waits below run exactly as they did before.
+      const ranked = await tryLocalRowRanker();
+      if (ranked) return ranked;
 
       // Warm tree: the card is already there and this returns in a few hundred
       // milliseconds. Cold: it misses cheaply and the real wait happens below.
@@ -2946,48 +3208,8 @@ public static class SyscoraAudio {
       const late = await tryTopResultCard(Math.max(0, limit - (Date.now() - startedAt)));
       if (late) return late;
 
-      // If the provider cannot express the sibling relationship through its
-      // selector, inspect once and resolve it locally from the same evidence the
-      // model would otherwise need another full turn to read. This keeps the
-      // fast path deterministic and avoids a costly manual screen/click loop.
-      try {
-        const inspected = await this.inspectUi({
-          application: "spotify",
-          windowId: windowHandle,
-          maxElements: 500
-        });
-        const target = spotifyPlayCandidate(inspected?.elements ?? inspected?.targets ?? [], query);
-        if (target) {
-          const bounds = uiBounds(target);
-          const invoked = await this.invokeControl({
-            windowId: target.windowId ?? target.windowHandle ?? windowHandle,
-            name: target.name ?? target.text,
-            x: Number(bounds.x) + Number(bounds.width) / 2,
-            y: Number(bounds.y) + Number(bounds.height) / 2
-          });
-          const action = invoked?.performed === true ? invoked : await this.pointerAction("click", {
-            windowId: String(target.windowId ?? target.windowHandle ?? windowHandle),
-            x: Number(bounds.x) + Number(bounds.width) / 2,
-            y: Number(bounds.y) + Number(bounds.height) / 2,
-            button: "left",
-            clicks: 1
-          }).catch(() => null);
-          if (action?.performed === true) {
-            return {
-              found: true,
-              invoked: true,
-              name: target.name ?? target.text ?? null,
-              matchedLabel: String(query).trim(),
-              matchedBounds: bounds,
-              reason: null,
-              semantic: action,
-              recovery: "inspected-nearby-labels"
-            };
-          }
-        }
-      } catch {
-        // A bounded miss is returned below; it is never converted to success.
-      }
+      const local = await tryLocalRowRanker();
+      if (local) return local;
       return {
         found: false,
         invoked: false,
