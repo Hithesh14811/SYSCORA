@@ -168,3 +168,113 @@ test("the budgets are still settable by the caller and by the environment", asyn
   assert.equal(budgetFromEnv("SYSCORA_TEST_BUDGET", 99), 99);
   delete process.env.SYSCORA_TEST_BUDGET;
 });
+
+// ---- The backstop, and the silence it replaced -------------------------------
+//
+// THE CEILINGS CAME OFF AND NOTHING TOOK THEIR PLACE PAST THE FOURTH CHECKPOINT.
+//
+// `maxSteps`, `maxElapsedMs` and `maxFreshTokens` all default to Infinity, on
+// purpose: every one of them was measured cutting off work that was about to
+// finish. What replaced them is BUDGET_CHECKPOINTS — four thresholds that say
+// what the run has spent and let it continue.
+//
+// The table has four entries and the loop condition was
+// `checkpointsPassed < BUDGET_CHECKPOINTS.length`. So after 700 steps / 90
+// minutes / 4M billed tokens a run emitted NOTHING further — no event for the
+// surface, no line for the model — and carried on forever.
+//
+// The two behavioural guards cannot cover this. The repeat guard keys on a call
+// and its arguments; `unchangedReadings` keys on a screen that did not move.
+// Neither can see a loop that issues DIFFERENT calls — alternating two searches,
+// or walking a tree that keeps producing new paths.
+
+test("checkpoints keep coming after the table runs out", async () => {
+  const { checkpointAt } = await import("../../packages/fast-agent/src/index.js");
+  const table = [40, 120, 300, 700];
+  for (const [index, steps] of table.entries()) {
+    assert.equal(checkpointAt(index).steps, steps, `checkpoint ${index} is the table's`);
+  }
+  // Past the end it must keep producing thresholds, each larger than the last,
+  // for as long as the run lasts. A silent run is the thing being fixed.
+  let previous = checkpointAt(table.length - 1).steps;
+  for (let index = table.length; index < table.length + 6; index += 1) {
+    const next = checkpointAt(index);
+    assert.ok(Number.isFinite(next.steps), `checkpoint ${index} must exist`);
+    assert.ok(next.steps > previous, `checkpoint ${index} must be above ${previous}, got ${next.steps}`);
+    assert.ok(next.elapsedMs > 0 && next.freshTokens > 0);
+    previous = next.steps;
+  }
+});
+
+// The backstop is not a budget — it is a statement that something is wrong. It
+// sits about two orders of magnitude above the most expensive run ever recorded
+// on this machine (38 steps / 213s / 166,997 billed tokens), so a run that
+// reaches it has been looping for hours without either behavioural guard seeing
+// anything.
+test("a run that loops forever on DIFFERENT calls is still stopped", async () => {
+  // Every call is distinct, so the repeat guard never fires; every tool succeeds,
+  // so nothing is recorded as failing; nothing reads the screen, so
+  // `unchangedReadings` stays at zero. Before the backstop this ran forever.
+  let calls = 0;
+  const provider = {
+    supportsChat: () => true,
+    async chat() {
+      calls += 1;
+      return {
+        text: "",
+        toolCalls: [{ id: `c${calls}`, name: "run", arguments: JSON.stringify({ command: `echo ${calls}` }) }],
+        finishReason: "tool_calls",
+        usage: { prompt_tokens: 1_000_000, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 0 } }
+      };
+    }
+  };
+  const agent = new FastAgent({
+    provider,
+    toolset: busyToolset(),
+    // Exactly the shipped default: unbounded. The backstop must hold anyway.
+    maxSteps: Number.POSITIVE_INFINITY,
+    maxElapsedMs: Number.POSITIVE_INFINITY,
+    maxFreshTokens: Number.POSITIVE_INFINITY
+  });
+
+  const outcome = await agent.run("keep going");
+
+  assert.equal(outcome.status, "PARTIALLY_COMPLETED");
+  assert.ok(outcome.steps > 0);
+  // 1,000,000 billed tokens a step reaches the 12M backstop in twelve steps,
+  // which is what makes this test finish in a second rather than in an hour.
+  assert.ok(outcome.steps < 100, `the backstop must end it, stopped at ${outcome.steps}`);
+  assert.match(outcome.message, /looping rather than converging/);
+  // The numbers go in the sentence, like every other budget here: a user told
+  // "I stopped" and nothing else cannot tell what to do about it.
+  assert.match(outcome.message, /billed/);
+  assert.equal(outcome.failureReason, "BUDGET");
+});
+
+// An ordinary request must not be able to see any of this.
+test("a short successful run never reaches a checkpoint or the backstop", async () => {
+  const provider = {
+    supportsChat: () => true,
+    async chat() {
+      // NOT "Done." — that is a bare acknowledgement with no tool behind it, and
+      // the honesty backstop settles it FAILED, correctly. The first version of
+      // this test used it and failed for that reason rather than for anything to
+      // do with budgets. An arithmetic answer claims nothing about the machine.
+      return {
+        text: "2 + 2 = 4",
+        toolCalls: [],
+        finishReason: "stop",
+        usage: { prompt_tokens: 12000, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 11000 } }
+      };
+    }
+  };
+  const events = [];
+  const agent = new FastAgent({
+    provider,
+    toolset: busyToolset(),
+    onEvent: (event) => events.push(event.type)
+  });
+  const outcome = await agent.run("what is 2 + 2");
+  assert.equal(outcome.status, "COMPLETED");
+  assert.ok(!events.includes("BUDGET_CHECKPOINT"), "an ordinary answer must not be told what it cost");
+});

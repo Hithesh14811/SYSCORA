@@ -79,6 +79,23 @@ export { buildToolset };
 // `SYSCORA_MAX_ELAPSED_MS=3600000`, `SYSCORA_MAX_FRESH_TOKENS=500000`.
 const UNBOUNDED = Number.POSITIVE_INFINITY;
 
+/**
+ * The nth checkpoint. Inside the table it is the table; past it, each threshold
+ * is CHECKPOINT_GROWTH times the last, so a long run keeps reporting instead of
+ * falling silent. Exported for the test that walks past the end of the table.
+ */
+export function checkpointAt(index) {
+  const table = BUDGET_CHECKPOINTS;
+  if (index < table.length) return table[index];
+  const last = table[table.length - 1];
+  const factor = CHECKPOINT_GROWTH ** (index - table.length + 1);
+  return {
+    steps: last.steps * factor,
+    elapsedMs: last.elapsedMs * factor,
+    freshTokens: last.freshTokens * factor
+  };
+}
+
 /** A budget from the environment, or unbounded. Zero and "off" mean unbounded. */
 export function budgetFromEnv(name, fallback = UNBOUNDED) {
   const raw = String(process.env[name] ?? "").trim().toLowerCase();
@@ -167,6 +184,44 @@ const BUDGET_CHECKPOINTS = Object.freeze([
   { steps: 300, elapsedMs: 40 * 60 * 1000, freshTokens: 1_500_000 },
   { steps: 700, elapsedMs: 90 * 60 * 1000, freshTokens: 4_000_000 }
 ]);
+
+// AND PAST THE LAST ONE THE RUN WENT COMPLETELY SILENT.
+//
+// The table above ends. `checkpointsPassed < BUDGET_CHECKPOINTS.length` was the
+// whole loop condition, so once the fourth threshold had fired a run emitted
+// nothing further — no event for the surface, no line for the model — and
+// carried on with `maxSteps`, `maxElapsedMs` and `maxFreshTokens` all defaulting
+// to Infinity. Nothing above eight repeated calls or eight unchanged readings
+// could end it, and neither of those guards can see a loop that issues DIFFERENT
+// calls: a run alternating two searches, or walking a directory tree that keeps
+// producing new paths, is caught by nothing at all.
+//
+// That is a regression the ceilings used to hide rather than a defect they
+// solved, and it must not be fixed by putting the ceilings back — every one of
+// them was measured cutting off work that was about to finish. What the ceilings
+// were actually for is "nobody knows what is happening", and the answer to that
+// is to keep saying what is happening.
+//
+// So the checkpoints never stop: past the table each one is 3x the last, for as
+// long as the run lasts. About forty tokens, ever less often.
+const CHECKPOINT_GROWTH = 3;
+
+// AND ONE ABSOLUTE BACKSTOP, FAR ABOVE ANY WORK THAT HAS EVER BEEN OBSERVED.
+//
+// Not a budget — a statement that something is wrong. Read out of the session
+// store over 169 real sessions, p50 is 4 steps / 18s / 27,155 billed tokens and
+// p90 is 19 / 90s / 122,123; the most expensive run ever recorded is 38 steps /
+// 213s / 166,997. These sit roughly two orders of magnitude above that, and
+// about 3x above the last checkpoint, so an hour of real coding cannot approach
+// them and a loop that has been going for four hours cannot be doing anything
+// else.
+//
+// Every one is still overridable by the environment variables that already
+// existed, and setting any of them to `off` restores the unbounded behaviour
+// exactly — including for a caller that genuinely wants it.
+const RUNAWAY_STEPS = budgetFromEnv("SYSCORA_MAX_STEPS", 2_000);
+const RUNAWAY_ELAPSED_MS = budgetFromEnv("SYSCORA_MAX_ELAPSED_MS", 4 * 60 * 60 * 1000);
+const RUNAWAY_FRESH_TOKENS = budgetFromEnv("SYSCORA_MAX_FRESH_TOKENS", 12_000_000);
 
 // A SINGLE REQUEST STILL HAS TO COME BACK, AND `setTimeout(Infinity)` DOES NOT.
 //
@@ -1682,6 +1737,31 @@ export class FastAgent {
         return this._settle("CANCELLED", lastText || "Stopped.", { steps, toolCalls, startedAt });
       }
       const elapsed = Date.now() - startedAt;
+      // THE BACKSTOP. NOT A BUDGET — A STATEMENT THAT SOMETHING IS WRONG.
+      //
+      // Checked before the caller's own budgets so that a caller who deliberately
+      // asked for an unbounded run still cannot loop forever. See RUNAWAY_STEPS:
+      // these sit about two orders of magnitude above the most expensive run this
+      // machine has ever recorded, so nothing that is converging can reach one,
+      // and a run that does has been going for four hours without the repeat
+      // guard or the unchanged-screen guard seeing anything — which means it is
+      // issuing DIFFERENT calls, and neither of those guards can see that.
+      //
+      // PARTIALLY_COMPLETED with the numbers in the sentence, like every other
+      // budget here: what was done is still done, and the user is told what it
+      // cost rather than being left to find out from a bill.
+      const runawayFresh = Math.max(0, (this._tokens?.in ?? 0) - (this._tokens?.cached ?? 0));
+      if (steps >= RUNAWAY_STEPS || elapsed >= RUNAWAY_ELAPSED_MS || runawayFresh >= RUNAWAY_FRESH_TOKENS) {
+        return this._settle(
+          "PARTIALLY_COMPLETED",
+          `${lastText ? `${lastText}\n\n` : ""}I stopped this run: ${steps} steps, ` +
+          `${Math.round(elapsed / 60000)} minutes and ${runawayFresh.toLocaleString(DISPLAY_LOCALE)} billed ` +
+          "tokens is far past anything a task on this machine has ever needed, so something here is looping " +
+          "rather than converging. Anything already done is still in place. Tell me what you can see and I " +
+          "will go straight to it rather than starting again.",
+          { steps, toolCalls, startedAt, failureReason: FailureReason.BUDGET }
+        );
+      }
       if (elapsed >= this.maxElapsedMs) {
         return this._settle(
           "PARTIALLY_COMPLETED",
@@ -1746,10 +1826,9 @@ export class FastAgent {
       //
       // Fires at most once per threshold and costs ~40 tokens each time.
       while (
-        checkpointsPassed < BUDGET_CHECKPOINTS.length
-        && (steps >= BUDGET_CHECKPOINTS[checkpointsPassed].steps
-          || elapsed >= BUDGET_CHECKPOINTS[checkpointsPassed].elapsedMs
-          || freshSoFar >= BUDGET_CHECKPOINTS[checkpointsPassed].freshTokens)
+        (steps >= checkpointAt(checkpointsPassed).steps
+          || elapsed >= checkpointAt(checkpointsPassed).elapsedMs
+          || freshSoFar >= checkpointAt(checkpointsPassed).freshTokens)
       ) {
         checkpointsPassed += 1;
         const minutes = Math.round(elapsed / 60000);
