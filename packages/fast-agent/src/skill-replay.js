@@ -41,16 +41,62 @@ export function exampleToPattern(example) {
   return { regex: new RegExp(`^\\s*${pattern}\\s*$`, "i"), names };
 }
 
+// "CAN YOU SEND AMMA A MESSAGE PLEASE" IS THE SAME REQUEST AS "SEND AMMA A MESSAGE".
+//
+// The pattern above is anchored `^...$`, so a saved route matched the sentence it
+// was recorded from and nothing else. Every ordinary way of asking politely —
+// which is how most people talk to an assistant — missed, and the run paid full
+// model price for a route it already had. arXiv:2601.21123 solves the same
+// problem with hybrid lexical and semantic RETRIEVAL over the skill library;
+// this is the deterministic half of that idea, and the half that costs nothing:
+// the request is stripped of wrapping and matched again.
+//
+// GREETINGS ARE DELIBERATELY NOT STRIPPED. "hi" and "hey" look like the same
+// class of word and are not: "hi mum how are you" is a message to send, and
+// eating its first word would replay a route with the wrong text in it. Only
+// phrases that are unambiguously a request wrapper are removed.
+const REQUEST_WRAPPER =
+  /^\s*(?:syscora\s*[,:]?\s+|please\s+|pls\s+|plz\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+|will\s+you\s+|i\s+want\s+you\s+to\s+|i\s+need\s+you\s+to\s+|go\s+ahead\s+and\s+)/i;
+const REQUEST_TRAILER = /(?:\s*,?\s*(?:please|thanks|thank\s+you)\s*|\s*)[.!?]*\s*$/i;
+
+/** The same request with the politeness taken off. Exported for the tests. */
+export function normalizeRequest(text) {
+  let out = String(text ?? "").trim();
+  // Repeatedly, because "can you please send…" is two wrappers. Bounded by the
+  // string only ever getting shorter.
+  let previous = null;
+  while (out && out !== previous) {
+    previous = out;
+    out = out.replace(REQUEST_WRAPPER, "").replace(REQUEST_TRAILER, "").trim();
+  }
+  return out;
+}
+
 /**
  * The skill that answers this request, and the values to run it with.
  *
  * Ties are broken by how much of the match was LITERAL: between two skills that
  * both fit, the one that recognised more of the sentence understood more of it.
  * A retired skill is never offered (§8).
+ *
+ * The request is tried AS TYPED first and only then normalised, so an exact
+ * match always wins over a widened one — widening may add matches and may never
+ * change which skill an already-matching sentence selects.
  */
 export function matchSkill(skills, request) {
   const text = String(request ?? "").trim();
   if (!text) return null;
+  const exact = matchAgainst(skills, text);
+  if (exact) return exact;
+  const normalized = normalizeRequest(text);
+  if (!normalized || normalized === text) return null;
+  const widened = matchAgainst(skills, normalized);
+  // Said out loud in the result: a replay that matched only after the request was
+  // rewritten is one worth being able to see in a transcript.
+  return widened ? { ...widened, normalized } : null;
+}
+
+function matchAgainst(skills, text) {
   let best = null;
   for (const skill of skills ?? []) {
     if (skill?.stats?.retired === true) continue;
@@ -150,39 +196,127 @@ export async function replaySkill({ skill, parameters = {}, execute, verifyStep,
     completed.push(`${precondition.ensure}${precondition.application ? ` (${precondition.application})` : ""}`);
   }
 
-  for (const [index, step] of (skill.steps ?? []).entries()) {
-    const args = fillArguments(step.args ?? {}, parameters);
+  // One attempt at one way of doing a step: run it, then prove it.
+  //
+  // Returns the same shape whichever branch it came from, so the caller does not
+  // have to know whether it ran the recorded step or one of its alternatives.
+  const attempt = async (branch, step) => {
+    const args = fillArguments(branch.args ?? {}, parameters);
     let result;
     try {
-      result = await execute(step.tool, args);
+      result = await execute(branch.tool, args);
     } catch (error) {
       result = { ok: false, text: error?.message ?? String(error) };
     }
     if (result?.ok === false) {
-      return handover({ step: index + 1, tool: step.tool, args, reason: String(result.text ?? "").slice(0, 300) });
+      // `delivered: false` — the tool itself refused or failed, so nothing
+      // reached the machine. The distinction matters one screen down: an
+      // irreversible step is only "already done" when it was actually
+      // DELIVERED, and reporting a failed send as already sent is how a message
+      // does not get sent at all.
+      return { ok: false, delivered: false, args, result, reason: String(result.text ?? "").slice(0, 300) };
     }
-    // Recorded BEFORE the verification runs. A send that went out and then
-    // failed its check has still gone out, and the model has to be told so in
-    // the same breath, or it sends again.
-    if (step.irreversible) alreadyDone.push(`${index + 1}. ${step.tool} ${JSON.stringify(args).slice(0, 120)}`);
-    completed.push(`${index + 1}. ${step.tool} ${JSON.stringify(args).slice(0, 120)}`);
-
-    if (step.verify && typeof verifyStep === "function") {
-      const verified = await verifyStep(fillArguments(step.verify, parameters), { step, result });
+    // A branch may carry its own check; where it does not it inherits the step's,
+    // because an alternative route to the same place should have to prove the
+    // same thing.
+    const check = branch.verify ?? step.verify;
+    if (check && typeof verifyStep === "function") {
+      const verified = await verifyStep(fillArguments(check, parameters), { step, result });
       // Three states, not two. "Could not check" is not "check failed" — but it
       // is not proof either, and the fast path may only continue on proof.
       if (verified?.status !== "VERIFIED") {
-        return handover({
-          step: index + 1,
-          tool: step.tool,
+        return {
+          ok: false,
+          // The call went through and only the CHECK failed, so whatever it did
+          // has been done. This is the case `alreadyDone` was written for.
+          delivered: true,
           args,
+          result,
+          unconfirmed: verified?.status === "UNCONFIRMED",
           reason: verified?.status === "UNCONFIRMED"
             ? `could not confirm: ${verified?.message ?? "no evidence either way"}`
-            : `verification failed: ${verified?.message ?? "the step did not do what it does"}`,
-          unconfirmed: verified?.status === "UNCONFIRMED"
-        });
+            : `verification failed: ${verified?.message ?? "the step did not do what it does"}`
+        };
       }
     }
+    return { ok: true, delivered: true, args, result };
+  };
+
+  // WHEN A BRANCH MAY BE TRIED, AND THE TWO CASES WHERE IT MAY NEVER BE.
+  //
+  // Alternatives come from arXiv:2601.21123: a skill's execution graph carries
+  // guarded branches for the ordinary UI variations that break a straight line.
+  // They are not a retry — an identical call repeated is what the loop's repeat
+  // guard refuses — they are a different route that was seen to work.
+  //
+  // 1. NEVER AFTER AN IRREVERSIBLE STEP. If a send went out and its check failed,
+  //    the message is gone. Trying "another way to send it" sends it twice, and
+  //    this codebase's founding defect is a message reported sent that was not —
+  //    its mirror image is a message sent twice because a check was unsure.
+  //    `alreadyDone` exists for precisely this and the handover names it.
+  //
+  // 2. NEVER AFTER THE USER SAID NO. A refusal is a boundary, and a branch tried
+  //    after one is the machine looking for a way around the person. `index.js`
+  //    states the rule — "a boundary is not a defect, and the user saying no is
+  //    an answer, not an obstacle" — and `shell-rules.js` records a live session
+  //    where four attempts were made to route around one refusal, two of them
+  //    successful. A skill must not automate that.
+  const mayBranch = (step, outcome) =>
+    step.irreversible !== true
+    && outcome.result?.raw?.refusedByUser !== true
+    && (step.alternatives ?? []).length > 0;
+
+  for (const [index, step] of (skill.steps ?? []).entries()) {
+    let outcome = await attempt(step, step);
+    const tried = [{ tool: step.tool, reason: outcome.reason }];
+    let branchUsed = null;
+
+    if (!outcome.ok && mayBranch(step, outcome)) {
+      for (const [order, alternative] of step.alternatives.entries()) {
+        const retry = await attempt(alternative, step);
+        tried.push({ tool: alternative.tool, reason: retry.reason });
+        if (retry.ok) {
+          outcome = retry;
+          branchUsed = order + 1;
+          break;
+        }
+        outcome = retry;
+      }
+    }
+
+    const toolUsed = branchUsed ? step.alternatives[branchUsed - 1].tool : step.tool;
+
+    // Recorded BEFORE the failure is reported, and ONLY when the call actually
+    // went through. A send that went out and then failed its check has still
+    // gone out, and the model has to be told so in the same breath or it sends
+    // again — but a send the tool REFUSED has not gone out, and reporting that
+    // one as already done is how the message never gets sent at all. That is why
+    // `attempt` returns `delivered` rather than only `ok`.
+    if (step.irreversible && outcome.delivered) {
+      alreadyDone.push(`${index + 1}. ${step.tool} ${JSON.stringify(outcome.args).slice(0, 120)}`);
+    }
+
+    if (!outcome.ok) {
+      return handover({
+        step: index + 1,
+        tool: step.tool,
+        args: outcome.args,
+        reason: tried.length > 1
+          // Every route that was tried, named. A handover saying only how the
+          // last branch failed sends the model to re-try the first one.
+          ? tried.map((entry) => `${entry.tool}: ${entry.reason}`).join(" | ")
+          : outcome.reason,
+        unconfirmed: outcome.unconfirmed === true,
+        ...(tried.length > 1 ? { triedAlternatives: tried.length - 1 } : {})
+      });
+    }
+
+    completed.push(
+      `${index + 1}. ${toolUsed} ${JSON.stringify(outcome.args).slice(0, 120)}` +
+      // Named, because a replay that quietly took a different route and reported
+      // the recorded one is a replay whose statistics mean nothing.
+      `${branchUsed ? ` (via alternative ${branchUsed})` : ""}`
+    );
   }
 
   return { replayed: true, steps: completed.length, completed, alreadyDone, elapsedMs: now() - startedAt };

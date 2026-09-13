@@ -24,6 +24,10 @@ import { resolveStateDir } from "../../shared-types/src/state-path.js";
 // deriving the task again.
 export const MAX_STEPS = 40;
 export const MAX_SKILL_BYTES = 64_000;
+// How many other ways ONE step may be attempted. Three is what a person tries
+// before concluding the route is wrong; more than that is a step that was never
+// understood, and replaying it would spend the seconds a skill exists to save.
+export const MAX_ALTERNATIVES = 3;
 
 // §8. A skill that falls back constantly is the worst of both worlds: replay
 // latency AND full model cost, felt as an unexplained slowdown rather than an
@@ -93,6 +97,43 @@ export function validateSkill(skill) {
           "than a route to save."
         );
       }
+    }
+    // A ROUTE MAY BRANCH, AND EVERY BRANCH IS HELD TO THE SAME BAR.
+    //
+    // A recorded route is a single path, and `docs/state-of-the-world.md` already
+    // concedes what that costs: "a saved skill replays a route verbatim, so it is
+    // useless the moment the task differs slightly." arXiv:2601.21123 (CUA-Skill)
+    // is the same finding from the other end — its skills carry a parameterized
+    // execution GRAPH whose branches are "guarded" alternatives for exactly the
+    // common UI variations that break a straight line: a different menu layout, a
+    // dialog that appeared, a control that moved.
+    //
+    // So a step may carry `alternatives`. They are not a retry — retrying an
+    // identical call is what the loop's repeat guard exists to refuse — they are
+    // a DIFFERENT way to reach the same place, recorded because it was seen to
+    // work.
+    //
+    // Every rule above applies to each one. An alternative that can only be
+    // expressed with a coordinate is exactly as brittle as a step that can, and
+    // letting geometry in through the branch would quietly undo the constraint
+    // this whole file is built on.
+    for (const [order, alternative] of (step?.alternatives ?? []).entries()) {
+      const where = `step ${index + 1} alternative ${order + 1}`;
+      if (!alternative?.tool) problems.push(`${where}: no tool`);
+      for (const key of Object.keys(alternative?.args ?? {})) {
+        if (FORBIDDEN_ARGS.has(key)) {
+          problems.push(
+            `${where} is positional (${key}). A branch is held to the same bar as the step it replaces: ` +
+            "a control that could not be named is a perception bug, not a route to save."
+          );
+        }
+      }
+    }
+    if ((step?.alternatives ?? []).length > MAX_ALTERNATIVES) {
+      problems.push(
+        `step ${index + 1} has ${step.alternatives.length} alternatives (max ${MAX_ALTERNATIVES}). ` +
+        "A step with more ways to fail than a person would try is a step that was never understood."
+      );
     }
     // A CHECK WITH AN EMPTY NEEDLE IS NOT A CHECK, AND IT IS WORSE THAN NO CHECK
     // BECAUSE IT READS AS ONE.
