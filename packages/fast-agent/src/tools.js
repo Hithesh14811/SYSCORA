@@ -8624,6 +8624,29 @@ export function buildToolset({
         const AUDIBLE = 0.0001;
         const contradicted = set?.muted === true
           && Number.isFinite(set?.peak) && set.peak > AUDIBLE;
+        // ASKED FOR 40, GOT 5, AND SAID "Volume is 5%." — TRUE, AND NOT AN ANSWER.
+        //
+        // Found by `scripts/probe-fault-injection.mjs`: with the endpoint
+        // reporting `applied: true` and a level nowhere near the request, this
+        // returned CONFIRMED and the render said "Volume is 5%." That sentence is
+        // not false, which is exactly why nothing caught it — but the user asked
+        // for 40% and was never told it had not happened.
+        //
+        // `applied === false` was the ONLY path comparing the two numbers, and
+        // the comment on this very block already says `applied` is the endpoint
+        // reporting on itself. Both values are right here; nothing compared them.
+        //
+        // UNCONFIRMED RATHER THAN REFUTED, DELIBERATELY. `requestedPercent` and
+        // `percent` come back from the SAME capability call, so a disagreement
+        // between them is a weaker signal than an independent read — and false
+        // failure is this codebase's most expensive defect class, seven inverted
+        // gates that threw away work which had succeeded. Two points of tolerance
+        // because a real endpoint quantises the scalar and a device with coarse
+        // steps can legitimately land just beside the number it was given.
+        const SET_TOLERANCE = 2;
+        const missedTheLevel = Number.isFinite(set?.requestedPercent)
+          && Number.isFinite(set?.percent)
+          && Math.abs(set.percent - set.requestedPercent) > SET_TOLERANCE;
         const receipt = set?.applied === false
           ? evidence({
                 observed: `asked for ${set.requestedPercent}% and the endpoint reports ${set.percent ?? "an unreadable level"}`,
@@ -8642,12 +8665,19 @@ export function buildToolset({
                   // said is that the machine is silent.
                   verdict: UNCONFIRMED
                 })
-              : evidence({
-                  observed: `the endpoint reports ${set.percent}%${set.muted ? " and its meter reads silence" : ""}`,
-                  method: "audio.endpoint:get+meter",
-                  actedVia: "audio.endpoint:set",
-                  verdict: CONFIRMED
-                });
+              : missedTheLevel
+                ? evidence({
+                    observed: `asked for ${set.requestedPercent}% and the endpoint reads ${set.percent}%`,
+                    method: "audio.endpoint:get+meter",
+                    actedVia: "audio.endpoint:set",
+                    verdict: UNCONFIRMED
+                  })
+                : evidence({
+                    observed: `the endpoint reports ${set.percent}%${set.muted ? " and its meter reads silence" : ""}`,
+                    method: "audio.endpoint:get+meter",
+                    actedVia: "audio.endpoint:set",
+                    verdict: CONFIRMED
+                  });
         // Keyed on the receipt, not on whether the code reached this line. A
         // REFUTED verdict abandons the entry — the volume did not move, so there
         // is nothing to put back — while UNCONFIRMED leaves it undoable, because
@@ -8683,6 +8713,15 @@ export function buildToolset({
             "usually means the app is playing to a different output device or holding the device in " +
             "exclusive mode.\nDo not tell the user it is silent. Say the system is muted but sound is " +
             "still coming out, and ask which device they are listening on.");
+        }
+        // The level is not the one that was asked for. Say both numbers: "Volume
+        // is 5%" is true and reads as success, and the user asked for 40%.
+        if (Number.isFinite(result.requestedPercent) && Number.isFinite(result.percent)
+          && Math.abs(result.percent - result.requestedPercent) > 2) {
+          return unconfirmed(result, `Asked for ${result.requestedPercent}% but the endpoint now reads ` +
+            `${result.percent}%. The endpoint accepted the change and did not land on the level requested, ` +
+            "so I cannot tell you the volume was set — check whether another app or device profile is " +
+            "moving it.");
         }
         if (result.muted) return confirmed(result, `${level} (muted — the endpoint is emitting nothing).`);
         return confirmed(result, `${level}.`);
