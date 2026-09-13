@@ -27,6 +27,18 @@ import { describeHandover, matchSkill, replaySkill } from "./skill-replay.js";
 import { verifyReplayStep } from "./skill-verify.js";
 import { buildSkillFromRun } from "./skill-recorder.js";
 import { conversationLimits, messageChars, trimConversation } from "./context-budget.js";
+// THE THREE HARNESS COMPONENTS THIS LOOP WAS MISSING.
+//
+// An audit against arXiv:2605.13357's eleven component responsibilities (8 Sep
+// 2026) found this harness strong on eight of them and absent on three:
+// intervention recording, entropy auditing, and the verification/outcome
+// distinction its five-label taxonomy exists to draw. All three are assembled
+// from counters this loop ALREADY keeps — nothing new is measured, no tool
+// changes, and a caller that ignores the new fields sees no difference at all.
+import fs from "node:fs/promises";
+import { InterventionKind, InterventionLog } from "./interventions.js";
+import { buildEpisodePackage, classifyOutcome, classifyVerification } from "./episode.js";
+import { CAPTURE_DIR, auditEntropy } from "./entropy-audit.js";
 
 export { buildToolset };
 
@@ -1218,6 +1230,61 @@ DO THE WHOLE THING, THE WAY A PERSON WOULD
 //
 // So the finding is recorded and the experiment is one variable away. The eval is
 // what can answer it, by running both arms over whole tasks.
+// The tools whose calls in one turn may be started together. See _prefetchReads
+// for why this list is four names and for the specific reason each obvious
+// candidate is missing from it.
+const PARALLEL_SAFE_READS = new Set(["read_file", "find_files", "search_code", "github"]);
+
+// HOW MANY TIMES ONE RUN IS RE-TOLD WHAT IT IS DOING.
+//
+// The digest below is pushed when the conversation is trimmed, which is exactly
+// when evidence starts being lost. Five is far above what any observed run has
+// needed — the trim fires only past the model's context limit and cuts back to
+// 55% of it, so it cannot fire every step — and it bounds the case where a
+// pathological run trims repeatedly and pays for a digest each time.
+const MAX_TASK_STATE_DIGESTS = 5;
+
+/**
+ * What this run has established so far, from RECEIPTS rather than from prose.
+ *
+ * THE PROBLEM THIS SOLVES. `trimConversation` shrinks old tool results to 280
+ * characters, which is correct — they describe screens that have since changed —
+ * but on a long run it means the model is deciding from a conversation whose
+ * middle has been hollowed out. The goal itself survives (the trim only touches
+ * `role: "tool"` messages), and the EVIDENCE does not. arXiv:2605.13357 names
+ * `task state` as one of the eleven harness responsibilities for this exact
+ * reason: without it an agent drifts, repeats work it has already done, and
+ * loses track of what it was trying to establish.
+ *
+ * DERIVED, NEVER NARRATED. Every line here comes from a typed receipt — what
+ * came back CONFIRMED, what came back REFUTED, what is still failing. Asking the
+ * model to summarise its own progress would put an unaudited assertion into the
+ * one message meant to be the reliable one, which is the "Done." defect with
+ * more words. Nothing in here is anything the model said.
+ */
+export function taskStateDigest({ request, performed = [], steps = 0, openFailures = [] }) {
+  const confirmed = performed.filter((call) => call?.verified === true).map((call) => call.tool);
+  const refuted = performed.filter((call) => call?.verified === false).map((call) => call.tool);
+  const counted = (list) => [...list.reduce((counts, name) => counts.set(name, (counts.get(name) ?? 0) + 1), new Map())]
+    .map(([name, count]) => (count > 1 ? `${name} x${count}` : name))
+    .join(", ");
+  const lines = [
+    "[SYSTEM] Where this task stands. Older tool results above have been shortened to fit, so this is the " +
+    "record — it is built from the receipts, not from anything either of us said.",
+    `  You were asked: ${String(request ?? "").slice(0, 300)}`,
+    `  Steps so far: ${steps}`
+  ];
+  lines.push(confirmed.length
+    ? `  CONFIRMED done (read back off the machine): ${counted(confirmed)}`
+    : "  CONFIRMED done: nothing yet has been read back off the machine.");
+  if (refuted.length) lines.push(`  REPORTED AS NOT DONE: ${counted(refuted)}`);
+  if (openFailures.length) {
+    lines.push(`  Still failing: ${openFailures.slice(0, 3).map((entry) => String(entry).slice(0, 120)).join(" | ")}`);
+  }
+  lines.push("  Carry on from here. Do not redo anything on the CONFIRMED line.");
+  return lines.join("\n");
+}
+
 const PROMPT_SECTION_HEADING = /^[A-Z][A-Z ,'’\-()/]{6,}$/;
 
 export function promptWithoutSections(prompt, names = []) {
@@ -1591,14 +1658,194 @@ export class FastAgent {
     let outcome;
     try {
       outcome = await this._run(userText, options);
-      return outcome;
+      // WHAT THIS RUN LEFT BEHIND, AND THE RECORD OF THE WHOLE THING.
+      //
+      // Here rather than inside `_settle` for one reason: the audit is async and
+      // `_settle` is not. Making it async would turn fifteen `return
+      // this._settle(...)` sites into promise-returning ones and change what
+      // every existing caller and test receives — a wide, silent change for a
+      // reporting improvement. This is the seam where the run is already
+      // awaited, so nothing else has to move.
+      //
+      // Attached to the returned outcome and emitted on its own event, NOT
+      // merged into the already-emitted AGENT_DONE: mutating an object after it
+      // has been handed to a listener is a race, and this codebase has enough
+      // of those recorded.
+      const record = await this._closeEpisode(outcome);
+      // A COPY, NOT A MUTATION, AND ITS OWN TEST CAUGHT WHY.
+      //
+      // `_settle` hands the very same object to `_emit` as AGENT_DONE and then
+      // returns it. Assigning onto it here therefore reaches inside an event that
+      // has already been delivered — a listener that stored it, or serialised it
+      // later, would see fields that were not there when it fired. That is the
+      // race this comment originally claimed to be avoiding while doing exactly
+      // it; the test asserting AGENT_DONE stays clean is what found it.
+      return record ? { ...outcome, ...record } : outcome;
     } finally {
       await this._flushAdaptiveLearning(outcome).catch(() => {});
     }
   }
 
+  /**
+   * Start the reads of this turn together, rather than one after another.
+   *
+   * THE STEP IS THE EXPENSIVE UNIT AND IT ALWAYS HAS BEEN. This codebase already
+   * acted on that once — `search` took a `queries` array and `web_open` took
+   * `urls`, turning eight round trips into one and 38,332 billed tokens into
+   * 9,674. What it did not do is the same thing for the calls the model already
+   * issues TOGETHER in one turn: three `read_file`s in a single decision were
+   * executed strictly in series, so the turn took as long as the sum of them for
+   * no reason at all. They do not depend on each other — the model asked for all
+   * three at once, before seeing any of their answers.
+   *
+   * WHAT MAY BE IN HERE IS DECIDED BY WHAT IS SHARED, NOT BY WHAT IS FAST.
+   * The tool loop runs in series with a comment that says exactly why: these
+   * share "one screen, one focused window and one pointer", and running "click
+   * the field" and "type the password" together is not faster, it is a race.
+   * That reasoning is correct and is why this list is four names rather than
+   * twenty:
+   *
+   *   read_file, find_files, search_code   local filesystem reads, no shared state
+   *   github                               an HTTPS read of somebody else's server
+   *
+   * DELIBERATELY EXCLUDED, each for a specific reason rather than caution:
+   *   `search`   already runs its queries 4-wide internally, and DuckDuckGo
+   *              answers 202 once a rolling budget is spent — two concurrent
+   *              searches is 8-wide, which is the measured failure.
+   *   `web_open` falls back to the ONE controlled browser; two of them would
+   *              drive the same CDP session.
+   *   `run`, `software`, `git`, `project`  reach the single long-lived
+   *              PowerShell host, and interleaving on one stdio pipe is a
+   *              different bug entirely.
+   *   anything with `onProgress`  progress would arrive before its own
+   *              TOOL_STARTED. Only `run`, `project`, `batch` and the android
+   *              tools use it, and none of those is here.
+   *
+   * Returns null — meaning "run them the way they have always run" — on
+   * anything unexpected at all. The sequential path is the correct fallback for
+   * every case this cannot be sure about.
+   */
+  _prefetchReads(calls) {
+    if (!Array.isArray(calls) || calls.length < 2) return null;
+    if (!calls.every((call) => PARALLEL_SAFE_READS.has(call?.name))) return null;
+    // Two calls sharing an id would share a promise, and the second would be
+    // handed the first one's answer. Providers do not do this; a provider that
+    // did would produce a wrong result rather than a slow one, so it is checked.
+    const ids = new Set(calls.map((call) => call?.id));
+    if (ids.size !== calls.length || ids.has(undefined)) return null;
+    try {
+      const started = new Map();
+      for (const call of calls) {
+        const args = call.arguments ? JSON.parse(call.arguments) : {};
+        const promise = Promise.resolve().then(() =>
+          this.toolset.execute(call.name, args, { signal: this.signal }));
+        // A prefetched call that a guard below refuses is never awaited, and an
+        // unhandled rejection ends the process on Node. This marks it handled
+        // WITHOUT consuming it: the loop still awaits the original promise, so
+        // it still sees the same value or the same throw.
+        promise.catch(() => {});
+        started.set(call.id, promise);
+      }
+      return started;
+    } catch {
+      // Malformed arguments, or a toolset that threw on the way in. The loop
+      // handles both properly one call at a time; let it.
+      return null;
+    }
+  }
+
+  /**
+   * The end-of-run audit and the episode package.
+   *
+   * Returns the fields to ADD to the outcome, and never touches the outcome
+   * itself — see the call site for the delivered-event race that caused.
+   *
+   * Never throws and never changes what the run decided. A run that worked may
+   * not be reported as anything else because a directory listing failed — which
+   * is why every part of this is wrapped and the failure is simply "not
+   * checked", a state `auditEntropy` keeps distinct from "clean".
+   *
+   * @returns {Promise<{entropy: object, episode: object}|null>}
+   */
+  async _closeEpisode(outcome) {
+    const episode = this._episode;
+    if (!episode || !outcome) return null;
+    try {
+      const entropy = await auditEntropy({
+        performed: episode.performed,
+        // Undefined when the toolset does not offer it, which reads as "not
+        // checked" rather than as "nothing is running".
+        jobs: this.toolset.runningJobs?.() ?? null,
+        captureDir: CAPTURE_DIR,
+        journalledCount: this.toolset.journalledCount?.() ?? null,
+        completed: outcome.status === "COMPLETED",
+        startedAt: episode.startedAt,
+        fs
+      });
+      const pack = buildEpisodePackage({
+        request: episode.request,
+        status: outcome.status,
+        verification: outcome.verification,
+        outcome: outcome.outcome,
+        steps: outcome.steps,
+        toolCalls: outcome.toolCalls,
+        elapsedMs: outcome.elapsedMs,
+        tokens: {
+          in: outcome.tokensIn, out: outcome.tokensOut,
+          cached: outcome.tokensCached, fresh: outcome.tokensFresh
+        },
+        performed: episode.performed,
+        failures: episode.failures,
+        interventions: episode.interventions,
+        entropy,
+        failureReason: outcome.failureReason,
+        startedAt: episode.startedAt
+      });
+      await this._emit({ type: "EPISODE_PACKAGE", details: pack });
+      // Only when there is something to say. An audit that announces itself on
+      // every clean run is noise, and noise is what gets a check switched off.
+      if (entropy.findings.length > 0) {
+        await this._emit({ type: "ENTROPY_FOUND", details: { findings: entropy.findings, worst: entropy.worst } });
+      }
+      return { entropy, episode: pack };
+    } catch {
+      // Bookkeeping may not fail a run. The outcome is already decided and
+      // already emitted; this only ever adds to it.
+      return null;
+    }
+  }
+
   async _run(userText, { history = [] } = {}) {
     const startedAt = Date.now();
+    // WHAT THIS RUN WILL BE ABLE TO SAY ABOUT ITSELF WHEN IT ENDS.
+    //
+    // Created HERE, before anything can settle, and not further down beside the
+    // other counters. `_settle` has fifteen call sites and three of them are
+    // reached before the main loop begins — the skill replay and the fast path
+    // both answer and settle on their own. An episode built later would leave
+    // those three reading whatever the PREVIOUS request left on the instance,
+    // which is the kind of cross-run bleed that is invisible until it is a
+    // support ticket.
+    //
+    // Instance state rather than a local for the same reason `_tokens` is: the
+    // settle needs it and a local cannot be seen from there. See episode.js.
+    const episode = {
+      request: String(userText),
+      startedAt,
+      performed: [],
+      actingCalls: 0,
+      confirmed: 0,
+      refuted: 0,
+      failures: [],
+      interventions: new InterventionLog()
+    };
+    this._episode = episode;
+    // The person being asked for something is not a defect and is not counted as
+    // one — see interventions.js on why this metric must never put pressure on
+    // the gates. It IS what separates an assisted success from an autonomous one.
+    this.toolset.onApprovalAsked?.((request) => {
+      episode.interventions.record(InterventionKind.APPROVAL_ASKED, { detail: request?.rule ?? request?.summary });
+    });
     // The toolset persists across turns so the agent keeps its place on the
     // machine; what it saw on screen last time does not survive the user having
     // had the keyboard in between.
@@ -1730,6 +1977,11 @@ export class FastAgent {
     // it twice.
     if (replay?.handover) {
       messages.push({ role: "user", content: `[SYSTEM] ${replay.handover}` });
+      // A route that did not survive the situation it met. Counted as avoidable
+      // and filed under project-memory, because that is the component that would
+      // have removed it: a skill with the right branch recorded would not have
+      // needed the model at all. See skill-replay.js on alternatives.
+      episode.interventions.record(InterventionKind.SKILL_HANDOVER, { detail: replay.skillId ?? null });
     }
 
     let steps = 0;
@@ -1748,7 +2000,10 @@ export class FastAgent {
     // What actually ran, in order, so a run that worked can be offered as a
     // route. Collected always and used only when a store is wired — it is two
     // fields per call and it keeps the recording decision out of the hot loop.
-    const performed = [];
+    // The SAME array the episode carries, not a copy: two lists of what happened
+    // are one bug away from disagreeing, and the one that disagreed silently
+    // would be the one in the record.
+    const performed = episode.performed;
     let malformedTurns = 0;
     // What this request cost. The provider reports it per call and it was
     // counted internally and never shown, so the one number that tells you
@@ -1785,13 +2040,16 @@ export class FastAgent {
     // How many of BUDGET_CHECKPOINTS have already been announced. Each fires once
     // and never stops the run.
     let checkpointsPassed = 0;
-    // How many ACTING tools came back CONFIRMED. See the settle: a closing
-    // sentence claiming something was done, on a run where nothing was confirmed
-    // done, is the same lie the zero-tool-call backstop catches — with steps in
-    // front of it.
-    let confirmedActions = 0;
-    // And how many said, in a receipt, that they did NOT work.
-    let refutedActions = 0;
+    // How many times this run has been re-told what it has established. See
+    // taskStateDigest — it is pushed when the conversation is trimmed, which is
+    // the moment evidence starts being lost, and it is bounded so a run that
+    // trims repeatedly does not pay for it repeatedly.
+    let taskStateDigests = 0;
+    // `confirmed` and `refuted` used to be two loose locals here. They are fields
+    // on `episode` now — declared at the top of this method, where the settles
+    // that run before this point can also see them. Their meaning is unchanged:
+    // an ACTING tool whose receipt came back CONFIRMED, and one that positively
+    // said it did not work.
 
     while (steps < this.maxSteps) {
       if (this.signal?.aborted) {
@@ -2405,12 +2663,12 @@ export class FastAgent {
         // overclaims about a second is not caught here. Pretending otherwise
         // would make this the kind of guard that fires on correct work and gets
         // switched off — the defect class this codebase has paid for seven times.
-        if (toolCalls > 0 && confirmedActions === 0 && refutedActions > 0
+        if (toolCalls > 0 && episode.confirmed === 0 && episode.refuted > 0
           && claimsWithoutEvidence(lastText)) {
           return this._settle(
             "PARTIALLY_COMPLETED",
             `${lastText}\n\n[SYSCORA] Take that last sentence with caution: ` +
-            `${refutedActions} of the ${toolCalls} tool call${toolCalls === 1 ? "" : "s"} I made this turn ` +
+            `${episode.refuted} of the ${toolCalls} tool call${toolCalls === 1 ? "" : "s"} I made this turn ` +
             "reported that it did NOT work, and none of them confirmed that anything did. So nothing here " +
             "verified what I just told you. Ask me to check and I will read it back off the machine rather " +
             "than telling you again.",
@@ -2438,6 +2696,15 @@ export class FastAgent {
       // Sequentially, because these share one screen, one focused window and one
       // pointer: running "click the field" and "type the password" at the same
       // time is not faster, it is a race.
+      //
+      // THE ONE EXCEPTION IS CALLS THAT SHARE NOTHING. A turn made entirely of
+      // local file reads has no ordering to preserve — the model asked for all of
+      // them before it saw any of the answers — so those are STARTED together
+      // here and awaited in order below. Every guard, every event and every
+      // counter below runs in exactly the order it always has; the only thing
+      // that changes is that the I/O overlaps. See _prefetchReads for the four
+      // tools this covers and the specific reason each excluded one is excluded.
+      const prefetched = this._prefetchReads(turn.toolCalls);
       for (const call of turn.toolCalls) {
         // Stop means stop. Checked before each tool rather than only between
         // model calls, because a queued sequence of clicks and keystrokes would
@@ -2549,6 +2816,11 @@ export class FastAgent {
             "STOP and ask the user. Do not try a fourth variation of the same idea. Tell them plainly what " +
             "you looked for, what you actually found, and what you need them to tell you to carry on — " +
             "then end your turn without calling another tool.";
+          // The run is about to ask a person for something it could not work out.
+          // That is the definition of a missing-harness intervention, and the
+          // component it names is the context manager: the agent had everything
+          // it could reach and it was not enough.
+          episode.interventions.record(InterventionKind.AGENT_ASKED, { detail: call.name });
           await this._emit({
             type: "TOOL_FINISHED",
             details: { callId: call.id, tool: call.name, ok: false, output: refusal, durationMs: 0, repeated: true }
@@ -2580,7 +2852,18 @@ export class FastAgent {
         // Canva took forty seconds of downloading with the byte count on winget's
         // own stdout the whole time, and the user saw none of it — a slow
         // download and a hung command looked identical.
-        const result = await this.toolset.execute(call.name, args, {
+        // Already started, if this whole turn was parallel-safe reads. Awaiting
+        // the ORIGINAL promise, so a throw still arrives here exactly as it
+        // would have from a direct call.
+        // The `await` wraps the WHOLE expression on purpose. Written as
+        // `alreadyStarted ?? await execute(...)` it binds `result` to the
+        // pending promise itself whenever the prefetch hit, and every check
+        // below — `result.ok`, the receipt, the evidence verdict — would read
+        // `undefined` off a Promise and quietly report the tool as having
+        // failed. `??` still short-circuits, so `execute` is not called when the
+        // call was already started.
+        const alreadyStarted = prefetched?.get(call.id);
+        const result = await (alreadyStarted ?? this.toolset.execute(call.name, args, {
           onProgress: (progress) => {
             this._emit({
               type: "TOOL_PROGRESS",
@@ -2591,7 +2874,7 @@ export class FastAgent {
           // ninety-second install is ninety seconds during which the button
           // did nothing.
           signal: this.signal
-        });
+        }));
         this._observeAdaptiveOutcome(call.name, shown, result);
         // A FAILURE IS ONLY FINAL UNTIL SOMETHING CHANGES.
         //
@@ -2610,11 +2893,40 @@ export class FastAgent {
         // receipt the gate wrote, so the settle below never has to read English
         // to know a run was refused rather than finished. See the DECLINED
         // settle.
-        if (result.raw?.refusedByUser === true) declinedActions += 1;
+        if (result.raw?.refusedByUser === true) {
+          declinedActions += 1;
+          // Recorded, and recorded as NOT avoidable. The user saying no is an
+          // answer, and a metric that counted it as a harness failure would make
+          // the gates the thing to optimise away. See interventions.js.
+          episode.interventions.record(InterventionKind.APPROVAL_DECLINED, { detail: call.name });
+        }
         const unconfirmed = result.raw?.evidence?.verdict === "UNCONFIRMED";
         const unchanged = result.raw?.screenUnchanged === true;
         if (result.ok && !unconfirmed && !unchanged) failedCalls.clear();
         else if (!result.ok || unconfirmed) failedCalls.set(signature, result.text);
+        // THE FAILURE-ATTRIBUTION TRACE, THROUGH THE CLASSIFIER THAT ALREADY EXISTS.
+        //
+        // arXiv:2605.13357 P4 is "attribution before recovery": a failed
+        // observation should produce a CLASSIFIED diagnosis before the agent acts
+        // again, so that a post-mortem can ask what KIND of support was missing
+        // rather than only how often something went wrong.
+        //
+        // `classifyFailureForLearning` is the same function the outcome memory
+        // uses, called rather than copied — a second table of failure shapes is
+        // how this codebase's three copies of one verb list came to disagree. The
+        // failure TEXT is deliberately not stored: it can contain a file path, a
+        // contact name or a message, and this record is meant to be shareable.
+        if (!result.ok || unconfirmed) {
+          const { learnable, failureClass } = classifyFailureForLearning(result);
+          // Bounded like every other trace here. A run with forty distinct
+          // failures has one problem, not forty.
+          if (episode.failures.length < 40) {
+            // `boundary` is the policy floor, an approval card or this loop's own
+            // repeat guard — a refusal, not a defect, and it must be readable as
+            // such or the record argues for weakening the gates.
+            episode.failures.push({ tool: call.name, failureClass, boundary: learnable === false });
+          }
+        }
         performed.push({
           tool: call.name,
           args: shown,
@@ -2630,13 +2942,19 @@ export class FastAgent {
         // and is not the question. See the settle at the end of the
         // no-tool-calls branch for what this is for.
         if (this.toolset.isActingTool?.(call.name) === true) {
-          if (result.raw?.evidence?.verdict === CONFIRMED) confirmedActions += 1;
+          // COUNTED SEPARATELY FROM ITS VERDICT, because "nothing acted" and
+          // "something acted and nothing checked" are different runs and the
+          // difference decides whether a verification verdict means anything.
+          // Most requests on this machine only LOOK, and grading those as
+          // unverified would make the number useless within a day.
+          episode.actingCalls += 1;
+          if (result.raw?.evidence?.verdict === CONFIRMED) episode.confirmed += 1;
           // REFUTED, or the tool itself reporting failure. NOT "UNCONFIRMED" and
           // not "no receipt at all": unconfirmed is not failed is a house rule
           // here, and a tool that recorded nothing is silent rather than
           // negative. Only a positive statement that it did not work counts.
           else if (result.raw?.evidence?.verdict === "REFUTED" || result.ok === false) {
-            refutedActions += 1;
+            episode.refuted += 1;
           }
         }
         await this._emit({
@@ -2816,6 +3134,29 @@ export class FastAgent {
             contextTokens: limits.contextTokens
           }
         });
+        // AND SAY WHAT SURVIVED, BECAUSE THAT IS WHAT WAS JUST LOST.
+        //
+        // The trim announces itself inside each shortened result, which tells the
+        // model that one thing is missing. It does not tell it what the run has
+        // established — and a long run whose middle has been hollowed out is
+        // exactly where an agent starts redoing finished work. For a send, redone
+        // means somebody gets the message twice.
+        //
+        // Costs ~100 tokens and only ever on a run that has already grown past
+        // the model's context window, which no ordinary request reaches. Bounded,
+        // so a run that trims repeatedly does not pay for it repeatedly.
+        if (taskStateDigests < MAX_TASK_STATE_DIGESTS) {
+          taskStateDigests += 1;
+          messages.push({
+            role: "user",
+            content: taskStateDigest({
+              request: episode.request,
+              performed: episode.performed,
+              steps,
+              openFailures: [...failedCalls.values()]
+            })
+          });
+        }
       }
     }
 
@@ -2963,9 +3304,30 @@ export class FastAgent {
   }
 
   _settle(status, message, { steps, toolCalls, startedAt, failureReason = null }) {
+    const episode = this._episode ?? null;
+    // The user pressing stop is help, and the component it names is task-state:
+    // the run did not work out for itself that it should end. Recorded here
+    // rather than at the three separate CANCELLED settles, because three copies
+    // of one rule is how this codebase's verb list drifted before anyone noticed.
+    if (status === "CANCELLED") episode?.interventions.record(InterventionKind.USER_STOPPED);
+    // DID IT WORK, AND DID ANYTHING PROVE IT — two questions, answered separately
+    // for the first time. `status` is untouched and means exactly what it always
+    // meant; every existing reader of it sees no difference. See episode.js for
+    // why this is a new field rather than a new status.
+    const verification = classifyVerification({
+      actingCalls: episode?.actingCalls ?? 0,
+      confirmed: episode?.confirmed ?? 0,
+      refuted: episode?.refuted ?? 0,
+      assisted: episode?.interventions?.assisted() === true
+    });
     const settled = {
       status,
       message,
+      verification,
+      outcome: classifyOutcome(status, verification),
+      // The numerator of M-HIR, per run. Null only when a caller settles without
+      // an episode, which the loop itself never does.
+      interventions: episode?.interventions?.summary() ?? null,
       // WHY, not inferred from the message. See FailureReason: the runtime used
       // to decide whether the model was reachable by running a regex over this
       // sentence, and spent ninety seconds in the offline pipeline when it
