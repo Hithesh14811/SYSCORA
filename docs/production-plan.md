@@ -364,12 +364,72 @@ on destinations rather than on recognising English.
 
 ---
 
+## W9 — Measure against something this project did not write — **NOT STARTED, AND IT IS NOW THE TOP OF THE LIST**
+
+Added 8 Sep 2026, after reading the four published descriptions of what a
+computer-use harness is (see `docs/state-of-the-world.md`). It outranks
+everything below it, including W6.
+
+**The problem in one sentence: the ruler is 23 tasks written by the person being
+measured.** That is enough to catch a regression and it cannot support a claim
+about anybody else. Every competitor publishes on a shared benchmark:
+
+```
+  CUA-Skill Agent (GPT-5)   WindowsAgentArena   50.3%   57.5% best-of-3
+  AgentS3 (GPT-5)           WindowsAgentArena   49.0%   56.6% best-of-3
+  OpenAI Operator           WindowsAgentArena   37.4%
+  human                     WindowsAgentArena   74.5%
+  OpenCUA-72B               OSWorld-Verified    45.0%   53.2% Pass@3
+  SYSCORA                   —                   unmeasured
+```
+
+WindowsAgentArena is the right one: 154 tasks, Windows-native,
+accessibility-rich — which is where a 418ms UIA reading should beat a screenshot
+outright. It runs in a VM, so doing this **also forces the sandbox** that W10
+wants anyway.
+
+**Done when:** a WAA number exists for this agent, produced by the benchmark's own
+harness, published in `tests/eval/scoreboard.md` beside the internal suite.
+
+**Do not skip to tuning.** The first run's value is the number and the failure
+distribution, not the score.
+
+## W10 — Sandboxing and privilege separation — **NOT STARTED**
+
+Tools run in-process in the daemon with the user's full privileges. Operator
+isolates in a VM; Codex uses Seatbelt/Bubblewrap/seccomp.
+
+A personal OS agent cannot be fully isolated — an agent that cannot reach the
+user's WhatsApp is a different product — so this is deliberately three narrow
+things rather than "put it in a container":
+
+1. **A VM target**, shared with W9.
+2. **A low-privilege worker for CONTENT.** Parsing a document or extracting a web
+   page is handling bytes somebody else wrote, and it does not need the ability
+   to write files or drive the mouse. It currently has both.
+3. **Reversibility as the host-agent substitute for isolation.** `undo-journal.js`
+   exists; extend its coverage and make "can this be put back, and how" a checked
+   precondition rather than a per-tool courtesy.
+
+**Done when:** a malicious document cannot reach the filesystem through the
+parser, and `undo` covers every tool in the CONFIRM table.
+
 ## W6 — Skills: the actual moat
 
 Recording a verified route and replaying it at **0 tokens in 0.8s** is the thing
 no competitor gets for free, and it is the answer to the cost problem for
 repeated work. Unbuilt: self-healing (`docs/skills.md` §7), the Skills panel, and
 the §12 third run.
+
+**Partly done, 8 Sep 2026.** A step may now carry `alternatives` — guarded
+branches, from arXiv:2601.21123 — so a route survives a UI variation instead of
+handing over, and `normalizeRequest` lets an ordinary polite phrasing reach a
+saved route. Two rules bound it and both are tested: **an irreversible step never
+branches** (a second route sends the message twice) and **a branch is never tried
+after a refusal** (that is automating the thing `shell-rules.js` was written to
+stop). What is still missing from that paper is the half that needs a real
+library: typed argument slots with feasible domains, a composition graph, and
+retrieval rather than a prompt-resident list.
 
 **Done:** a skill that breaks because a layout changed repairs itself once and
 records what changed; the user can see, edit and delete skills.
@@ -442,6 +502,15 @@ If this row's cost ever matters, the fix is a `save_as` verb of the same shape a
 `new_document`. Do not re-derive the old conclusion from the old number.
 
 ---
+
+## The order changed on 8 Sep 2026
+
+W9 goes first, and it is not close. Everything below it is an improvement to a
+system whose quality is asserted rather than measured against anything outside
+this repository; W9 is what makes the rest of the list arguable at all. W10
+follows because W9's VM is most of its cost.
+
+The list below is the pre-8-Sep order and is kept for its reasoning.
 
 ## Suggested order
 

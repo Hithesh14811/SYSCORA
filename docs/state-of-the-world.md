@@ -1489,8 +1489,311 @@ leaves the chain exactly as verifiable. Proven — a 200,011-byte payload stores
 32,954 bytes and `verifyChain` returns `{valid: true}`. **Existing rows are
 untouched;** this bounds growth from here.
 
+### Done 8 Sep 2026: the harness was audited against the literature, and three of eleven components were missing
+
+Not a defect hunt. The product was read end to end against four published
+descriptions of what a computer-use harness is supposed to be, and the gaps were
+built. **Everything here is additive: no tool changed, no status string changed,
+no prompt text was added, and `measure-prompt-cost.mjs` reports 11,284
+tokens/step against the 11,302 last recorded — the per-step cost of all of it is
+zero.**
+
+The sources, and what each one contributed:
+
+| source | what it says | what was missing here |
+|---|---|---|
+| arXiv:2605.13357 *AI Harness Engineering* | capability = F(model, **harness**, environment); eleven component responsibilities; a five-label outcome taxonomy separating *correct* from *verified* | intervention recording, entropy auditing, task state, verified/unverified |
+| arXiv:2601.21123 *CUA-Skill* (Microsoft) | a skill is `{app, intent, typed arguments, parameterized execution GRAPH}` with guarded branches, retrieved rather than prompt-resident | skills were a verbatim straight line |
+| arXiv:2508.09123 *OpenCUA* | pixel-first observation, reflective L3→L2→L1 CoT, 45.0% OSWorld-Verified | nothing adopted — see "not done" below |
+| OpenAI *Operator* system card | a model-based injection monitor at 99% recall over **screenshots** | invisible-text injection, which a screenshot cannot contain |
+
+**AUDITED AGAINST THE ELEVEN: eight strong, three absent.** Verification is
+genuinely ahead of everything published — `evidence.js` makes a success sentence
+unreachable without a CONFIRMED receipt and refuses to build a receipt whose
+reader equals its actor, which no system in those four papers does. What was
+absent was the bookkeeping around it.
+
+**1. `COMPLETED` WAS ONE WORD FOR TWO DIFFERENT ACHIEVEMENTS.** A run ended
+COMPLETED whether every acting tool came back CONFIRMED or none of them did. The
+receipts existed, were typed, were enforced at construction — and the run status
+threw all of it away at the last step. `packages/fast-agent/src/episode.js` adds
+`verification` (NOT_APPLICABLE / AUTONOMOUS_VERIFIED / ASSISTED_VERIFIED /
+UNVERIFIED / REFUTED) and `outcome` **beside** the status, never replacing it:
+`status` is branched on by the daemon, the desktop shell, the eval runner and
+four test files, and changing what COMPLETED means would break all of them at
+once for a classification improvement.
+
+`UNVERIFIED` is not an error and is documented as not being one. *Unconfirmed is
+not failed* is a house rule three shipped gates have already broken.
+
+**2. NOTHING RECORDED WHAT THE PERSON HAD TO DO.** The agent's every move carries
+a receipt; the user's did not, so "how often did I have to take over?" — the
+question that decides whether an OS agent is usable — was unanswerable.
+`interventions.js` records six kinds and computes the numerator of M-HIR.
+
+**The distinction that makes it safe is this codebase's own rule.** An approval
+card and a decline are recorded as **not avoidable**: a metric that counted the
+gates as defects would make asking less the way to improve the number, and
+`shell-rules.js` already records where that ends. Being stuck, being stopped and
+a skill handover ARE counted, and each names the component that would have
+removed it. `onApprovalAsked` was added to the toolset, mirroring
+`onInjectionFound` exactly, because the loop cannot see inside `askPermission`.
+
+**3. NOTHING MEASURED WHAT A RUN LEFT BEHIND — AND THIS PROJECT HAS PAID FOR THAT
+THREE TIMES.** 76 screenshots in `%TEMP%`, 15 leaked PowerShell hosts over 170
+hours, 402 MB of `audit.sqlite`. Every one was found by accident, weeks later.
+`entropy-audit.js` runs once at the end of a run, never throws, never deletes,
+and only counts what THIS run created.
+
+**Its own test caught it shipping the defect it exists to prevent.** The first
+version said `clean: checked > 0`, so one vacuous probe — an empty write list on
+a completed run — declared the whole audit clean while the two probes that matter
+had never run. `clean` now requires ALL probes, with `partial` for the rest. That
+is the fifth check in this codebase that could not fail, caught this time before
+it shipped rather than months after.
+
+**4. A SAVED ROUTE COULD NOT SURVIVE A UI THAT MOVED.** This document already
+conceded it: *"a saved skill replays a route verbatim, so it is useless the moment
+the task differs slightly."* A step may now carry `alternatives` — CUA-Skill's
+guarded branches — tried in order when the step fails or cannot be verified.
+
+**Two cases where a branch may NEVER be taken, and they are the whole design:**
+
+- **Never after an irreversible step.** A send that went out and failed its check
+  has still gone out; "another way to send it" sends it twice.
+- **Never after the user said no.** A branch after a refusal is the machine
+  looking for a way around the person, automated and made permanent.
+
+Found while writing it: pushing `alreadyDone` on any irreversible step, rather
+than only on a DELIVERED one, would have reported a *refused* send as already
+sent — the mirror of this project's founding defect, where the message then never
+gets sent at all. `attempt()` returns `delivered` separately from `ok` for that.
+
+Matching also stopped being exact-only. `normalizeRequest` strips request
+wrappers — "can you", "please", a trailing "thanks" — so an ordinary way of
+asking reaches a saved route. **Greetings are deliberately not stripped**: "hi mum
+how are you" is a message to send, and eating its first word replays the route
+with the wrong text in it. An exact match is always tried first and always wins.
+
+**5. AN INJECTION THAT NOTHING COULD SEE, INCLUDING OPERATOR.** Unicode tag
+characters (U+E0000–U+E007F) mirror ASCII, render as nothing, survive
+copy-paste, and can carry a whole instruction inside an innocent message. They
+were invisible to all seven patterns in `content-boundary.js`, to the user, and —
+this is the interesting part — **to a screenshot-reading monitor of the kind
+Operator uses at 99% recall, because a character that renders as nothing is not
+in a screenshot at any resolution.**
+
+SYSCORA reads the accessibility tree, which returns the string with the invisible
+characters still in it. That is an advantage of the text-first perception this
+product already had, and it was being thrown away. The decoded text is now run
+through **the same seven rules** — nothing new has to be recognised — and any
+destination inside it becomes a tier-2 gated destination.
+
+**The false positives are where the work went**, because this file already warns
+twice that a boundary firing on normal content gets switched off:
+
+```
+  emoji flag sequences (gbeng/gbsct/gbwls)   excluded — they decode to 5 chars
+  U+200C ZWNJ, U+200D ZWJ                    NOT flagged: required letters in
+                                             Hindi/Marathi/Persian, and emoji families
+  bidi ISOLATES U+2066-2069                  NOT flagged: real software emits them
+  bidi OVERRIDES U+202D/U+202E               flagged — the filename-spoofing pair
+```
+
+All 29 existing red-team tests still pass untouched.
+
+**6. THE LONG-RUN CONTEXT LOST ITS EVIDENCE SILENTLY.** `trimConversation`
+shortens old tool results to 280 characters, which is right — they describe
+screens that have changed — but on a long run the model then decides from a
+conversation whose middle is hollow, and starts redoing finished work. For a
+send, redone means somebody gets the message twice. A `taskStateDigest` is now
+pushed when a trim fires, **built from receipts and never from prose** — asking
+the model to summarise its own progress would put an unaudited assertion into the
+one message meant to be reliable, which is the `"Done."` defect with more words.
+~100 tokens, only on a run that has already outgrown the model's context window,
+bounded at five.
+
+**7. READS IN ONE TURN NO LONGER WAIT FOR EACH OTHER.** The tool loop runs in
+series for a good reason it states — one screen, one focused window, one pointer.
+That reasoning does not apply to three `read_file` calls the model issued
+together before seeing any of their answers, and those were strictly serial.
+
+Four tools only: `read_file`, `find_files`, `search_code`, `github`. **Each
+exclusion is a specific measured reason, not caution** — `search` already runs
+4-wide internally and DuckDuckGo answers 202 past a rolling budget; `web_open`
+falls back to the one controlled browser; `run`/`software`/`git`/`project` reach
+the single PowerShell host; anything with `onProgress` would emit progress before
+its own `TOOL_STARTED`. Every guard, event and counter below the change runs in
+exactly the order it always has.
+
+**THREE DEFECTS IN THIS WORK WERE FOUND BY ITS OWN TESTS, NOT BY REVIEW.**
+
+- `const result = alreadyStarted ?? await execute(...)` binds `result` to the
+  pending **promise** whenever the prefetch hits, so `result.ok` and the evidence
+  verdict would both read `undefined` and every prefetched read would report as
+  failed. Caught before it ran.
+- The entropy audit's vacuous `clean`, above.
+- **`outcome.episode = pack` reached inside an event that had already been
+  delivered.** `_settle` hands the same object to `_emit` as `AGENT_DONE` and then
+  returns it, so assigning onto it afterwards mutates what a listener already
+  holds — the exact race the comment beside it claimed to be avoiding. It returns
+  a copy now, and the test asserting `AGENT_DONE` stays clean is what found it.
+
+**Measured, 8 Sep 2026:**
+
+```
+  npm test          1,506 tests, 1,504 pass, 0 fail, 2 skipped, 180s
+  without the four new test files   1,435 / 1,433 / 0 fail
+                                    — exactly +69, so nothing was removed
+  prompt cost       11,284 tokens/step (was 11,302) — no schema, no prompt text
+  new tests         69 across 4 files, every one proven able to fail by
+                    neutering the thing it covers
+```
+
+**THE FIGURE RECORDED ABOVE FOR `npm test` DOES NOT REPRODUCE ON THIS TREE.**
+Entries dated 4 Sep quote 1,691–1,693 tests at ~631 seconds; this tree measures
+1,435 before any of this work, at ~180 seconds, over 128 test files with zero
+failures. The gap has not been investigated and is not attributable to anything
+here — it is recorded rather than quietly written over, because a test count that
+silently dropped by 256 is worth somebody looking at.
+
+**NOT RUN: `npm run eval`.** Explicitly deferred. Nothing in this session has
+been measured against the gate, the budgets or the real machine, and none of the
+latency or cost claims above are eval numbers — they are the prompt-cost script
+and the unit suite. **The eval is the ruler and it has not been picked up.**
+
+**NOT BUILT, and each of these is a bigger prize than anything above:**
+
+- **WindowsAgentArena.** 154 Windows tasks, public numbers — CUA-Skill 50.3%
+  (57.5% best-of-3), AgentS3 49%, Operator 37.4%, human 74.5%. This product's
+  ruler is 23 hand-written tasks on one machine, so every claim it makes is
+  internally rigorous and **externally unfalsifiable**. UIA-first perception
+  should be unusually strong on exactly that benchmark. This is the single change
+  that converts "we believe" into "we measured", and it forces the sandbox below
+  for free.
+- **A sandbox, and privilege separation.** Tools run in-process in the daemon at
+  the user's full privilege. Operator isolates in a VM; Codex uses
+  Seatbelt/Bubblewrap/seccomp. A personal OS agent cannot be fully isolated — that
+  is a different product — but content handling (document parsing, page
+  extraction) does not need the user's privileges and currently has them.
+- **A model-based injection monitor.** The obfuscation tier closes a class
+  Operator's monitor cannot see; it does not close the class Operator's monitor
+  DOES see, which is a phrasing nobody wrote a pattern for. This file still says
+  so about itself.
+- **A GUI grounding model.** `unchangedReadings >= 3` escalates to a picture and
+  then the model eyeballs a coordinate. CUA-Skill decouples this deliberately.
+- **Test-time scaling.** OpenCUA gains 45.0 → 53.2 on Pass@3. Unsafe on a real
+  machine for acting steps; available for read-only and planning ones.
+
+### Fixed 8 Sep 2026: a ticking clock switched off both convergence guards, and the user had to press stop
+
+One live request — `play ankhe khuli ho ya ho bandh on spotify` — **15 steps,
+14 tool calls, 193.3 seconds, 256,755 tokens, and the wrong song still playing.**
+It ended because the user stopped it. Nothing in the product could have.
+
+Three defects, and every one is this codebase's signature shape: the machinery is
+correct and something above it makes it unreachable.
+
+**1. `screenUnchanged` COUNTED THE PLAYBACK CLOCK, SO NOTHING COULD EVER CONVERGE.**
+
+The reading diff is a line comparison, and Spotify's position readout advances
+between any two reads. Every reading in that run differed by exactly one line:
+
+```
+  GONE  42| text "0:26" @651,1350        GONE  42| text "0:36"
+  NEW   42| text "0:36" @651,1350        NEW   42| text "0:43"
+```
+
+So `screenUnchanged` was **false on every single reading**, and that one boolean
+feeds both of the agent loop's convergence guards:
+
+```
+  unchangedReadings never increments   -> the "you cannot see it, ask the user"
+                                          nudge at 3 and the stop at 8 CANNOT FIRE
+  screenChangedSinceLastCall is true   -> callCounts.clear() runs every reading,
+    every time                            so the repeat guard NEVER REACHES 3
+```
+
+Both guards exist for exactly this situation. Both were sitting there unable to
+fire, and the run clicked the same row three times without one word of objection.
+
+`countSubstantiveChanges` now answers the loop's question separately from the
+model's. **The reading still reports the clock moving** — "SAME except for 2
+lines" is true and hiding it would be the dishonesty this project exists to
+prevent — while the loop's signal ignores a line that differs only by a
+clock-shaped token.
+
+**ONLY A CLOCK, AND THAT RESTRICTION IS THE WHOLE SAFETY ARGUMENT.** Treating any
+digit as volatile would be far worse than the bug: Calculator's entire output is
+digits and a volume readout going 20% to 40% is the change being looked for.
+`tests/unit/ticking-clock-guards.test.js` holds both halves — 8 tests, and
+neutering `TICKING` turns 2 red while the "a changing number is still a change"
+half stays green.
+
+**2. `doubleClick` EXISTED, WORKED, AND HAD NO DESCRIPTION — SO NOTHING COULD REACH IT.**
+
+The run's own narration says *"Double-clicking the correct track row to play
+it"*, and the call it then made was a plain `click`. The parameter was in the
+schema as a bare `{ type: "boolean" }` with no description, and the tool
+description listed `text`, `element`, `near`, `role`, `x,y` and `button:"right"`
+and never mentioned it.
+
+In a list — Spotify results, Explorer, a playlist — a single click only SELECTS.
+So the agent clicked the row, watched nothing happen, clicked it again, and
+guessed a coordinate. **Fourteenth instance of the class. An undocumented
+parameter is an unreachable one.** Now described in the schema, named in the tool
+description, and shown in the transcript preview so a single and a double click
+are no longer the same line afterwards.
+
+**3. `play_music`'s FAILURE ADVICE NAMED A CONTROL THAT IS NOT IN THE READING.**
+
+It said *"click the Play control on the row you want"*. A Spotify search row's
+green play button exists only while the pointer is over it and is not in the
+accessibility tree either way — only the TOP result has a listed `Play`. The
+agent read the screen, found no such control, hovered to reveal it, read again,
+found nothing, copied the x-coordinate from another row's play button, clicked
+empty space, started a *different* song, and hit an ad. **Ten of the fifteen
+steps were spent chasing a button that sentence promised was there.**
+
+It now names the route that actually acts on a list row, and says why the button
+is absent rather than implying the agent failed to find it.
+
+**What this cost, and what it bought.** Prompt cost 11,284 -> **11,342
+tokens/step** (+58, inside the cached prefix, ~6 fresh-token-equivalents per step
+after the first) against a run that spent 256,755 tokens getting nowhere.
+
+`npm test`: **1,514 tests, 1,512 pass, 0 fail, 2 skipped** (was 1,506 / 1,504).
+
+**NOT FIXED, and it is the honest limit of this.** The click confirmation
+reported `focus is on "Pause Ankhein khuli oh ya ho bandh", which is not what was
+clicked` — and a *Pause* control named after the track that was just clicked is
+fairly strong evidence the click DID work. `clickNoticed` compares labels for
+equality, so it returned UNCONFIRMED. That is not a bug: UNCONFIRMED is the
+honest answer and REFUTED would have been wrong. Loosening it to "the focused
+name contains the clicked label" would make clicks confirm more often and is
+exactly the kind of change that has re-introduced false success here five times.
+**Left alone deliberately; the loop stopping itself is the right fix and is
+above.**
+
+**Also not fixed: this was never run against the eval.** The three fixes are held
+by unit tests and by reading one live transcript. Whether the Spotify row
+actually plays on double-click on this machine has NOT been verified — the
+failure text now recommends it, and `node scripts/probe-spotify-play.mjs` is
+where that would be proven.
+
 ### Still open
 
+- **THERE IS NO EXTERNAL NUMBER.** The eval is 23 tasks written by the author,
+  run on one machine. Every published competitor reports WindowsAgentArena or
+  OSWorld-Verified. Until one of those is run here, "the best computer-use
+  harness" is not a measurable claim — see the 8 Sep entry for the bar.
+- **The 8 Sep harness work has not been through the eval.** ~1,600 lines added,
+  1,506 unit tests green, and not one run against the gate, the budgets or the
+  real machine.
+- **`npm test` counts 1,435 on this tree where 4 Sep recorded 1,691.** Nobody has
+  looked at where 256 tests went.
+- **Tools run in-process at the user's full privilege.** No sandbox, no
+  privilege separation, not even for parsing a document somebody else wrote.
 - **76 screenshots of the user's screen are still in `%TEMP%\syscora-m4`.** The
   leak is fixed at both sites (4 Sep 2026) and nothing new accumulates, but the
   existing files are the user's and were left rather than deleted — some are
