@@ -621,6 +621,55 @@ export function repairCmdIsms(command) {
 // it does not need to be — it is a default for the obvious cases, and
 // `background: true` states it explicitly for everything else.
 const KEEPS_RUNNING = /(^|[\s;&|])(jupyter(\s+(notebook|lab|console))?|npm\s+(run\s+)?(dev|start|serve|watch)|yarn\s+(dev|start)|pnpm\s+(dev|start)|vite|next\s+dev|ng\s+serve|flask\s+run|streamlit\s+run|uvicorn|gunicorn|rails\s+s(erver)?|php\s+-S|http-server|serve\b|ngrok|docker\s+compose\s+up(?!\s+-d)|tensorboard)\b/i;
+// A CLOCK IS NOT A CHANGE, AND WHILE ONE IS TICKING NOTHING CAN EVER STOP.
+//
+// A playback position, a countdown, an elapsed timer. `0:26`, `1:07`, `12:34:56`.
+//
+// This exists because a media player disables BOTH of the agent loop's
+// convergence guards at once, silently. `screenUnchanged` is computed by diffing
+// the lines of two readings, and Spotify's position readout advances between any
+// two of them — so the answer is "something changed" forever, however stuck the
+// run is. In the loop that means `unchangedReadings` never increments (so the
+// "you cannot see it, ask the user" nudge at 3 and the stop at 8 can never fire)
+// AND `screenChangedSinceLastCall` is true every time (so `callCounts.clear()`
+// runs constantly and the repeat guard never reaches 3).
+//
+// Measured on a live run, 8 Sep 2026 — "play ankhe khuli ho ya ho bandh". Every
+// reading differed from the last by exactly one line: `0:26` -> `0:36` -> `0:43`.
+// The run clicked the same row three times, spent 15 steps, 193 seconds and
+// 256,755 tokens, and ended only because THE USER PRESSED STOP. Nothing in the
+// product could have ended it, and both guards written for precisely that
+// situation were sitting there unable to fire.
+//
+// ONLY A CLOCK, AND ONLY WHEN THE REST OF THE LINE IS IDENTICAL. A digit is not
+// generally volatile and treating it as one would be far worse than this bug:
+// Calculator's entire output is digits, and a volume readout going 20% to 40% is
+// the change somebody is looking for. `\d{1,2}:\d{2}` is a playback position and
+// almost nothing else.
+const TICKING = /\b\d{1,2}:\d{2}(?::\d{2})?\b/g;
+const withoutClocks = (line) => String(line).replace(TICKING, "<time>");
+
+/**
+ * How many lines changed for a reason the agent could have caused.
+ *
+ * DIFFERENT FROM WHAT THE MODEL IS SHOWN, on purpose. The reading still reports
+ * the clock moving — "SAME as your last reading except for 2 lines" — because
+ * that is true and hiding it would be the dishonesty this codebase exists to
+ * prevent. This answers the loop's question instead: did anything change that
+ * an action could be responsible for?
+ *
+ * Exported for the test that holds it to both halves — a ticking clock is not a
+ * change, and a changing NUMBER still is.
+ */
+export function countSubstantiveChanges(previous, current) {
+  const before = new Set(previous.map(withoutClocks));
+  const after = new Set(current.map(withoutClocks));
+  let changed = 0;
+  for (const line of previous) if (!after.has(withoutClocks(line))) changed += 1;
+  for (const line of current) if (!before.has(withoutClocks(line))) changed += 1;
+  return changed;
+}
+
 // Android is a typed capability boundary. Falling out of it into PowerShell is
 // slower (PATH search alone took 39 seconds in the reported run), loses device
 // state, and bypasses the adapter's timeouts/cancellation. Detect both direct
@@ -1186,6 +1235,20 @@ export function buildToolset({
   // Missing approval UI is a broken safety channel, not consent. Fail closed.
   const askPermission = async (request) => {
     if (typeof state.confirm !== "function") return { approved: false, asked: false };
+    // THE PERSON WAS INVOLVED, AND THAT IS A FACT THE RUN NEEDS TO RECORD.
+    //
+    // A decline already announces itself downstream through the `refusedByUser`
+    // receipt. An approval announced nothing at all, so a run that stopped twice
+    // to ask and then succeeded was indistinguishable from one that never needed
+    // anybody — which is exactly the difference between `assisted_verified` and
+    // `autonomous_verified` in the outcome taxonomy (see episode.js).
+    //
+    // Fired BEFORE the answer, because the question was asked whichever way it is
+    // answered, and because the cost being measured here is the interruption
+    // rather than the verdict. Never throws: bookkeeping may not break a gate.
+    try {
+      state.onApproval?.({ rule: request?.rule ?? null, summary: request?.summary ?? null });
+    } catch { /* a listener that throws must not stop the user being asked */ }
     try {
       const answer = await state.confirm(request);
       // TWO ANSWER SHAPES, BECAUSE THE OLD ONE STILL HAS TO WORK.
@@ -4309,7 +4372,12 @@ export function buildToolset({
           // clearest possible signal that whatever is being tried cannot work —
           // and it is the loop's job to act on that, because the model demonstrably
           // does not. See the no-progress guard in the agent loop.
-          result.screenUnchanged = changed === 0;
+          // NOT `changed === 0`. See countSubstantiveChanges: `changed` is what
+          // the model is shown and it counts the clock, which is right; this is
+          // what the LOOP acts on and it must not, or a media player leaves both
+          // convergence guards permanently unable to fire. Measured live on 8 Sep
+          // 2026: 15 steps, 193s, 256,755 tokens, ended by the user pressing stop.
+          result.screenUnchanged = countSubstantiveChanges(previous, lines) === 0;
           state.identicalReadings = changed === 0 ? (state.identicalReadings ?? 0) + 1 : 0;
           // ASKING TWICE MEANS IT DOES NOT HAVE THE ANSWER.
           //
@@ -4474,8 +4542,8 @@ export function buildToolset({
       description:
         "Click something from the last screen reading. Prefer `text` (its exact label) over `element` (its " +
         "index). When labels repeat, add `near` for text on the same row and/or `role` to resolve it in one " +
-        "call; use x,y only for a place with no label. button:\"right\" opens a context menu. The window " +
-        "is brought to the front first.",
+        "call; use x,y only for a place with no label. button:\"right\" opens a context menu, " +
+        "doubleClick:true opens or plays a row in a list. The window is brought to the front first.",
       parameters: {
         type: "object",
         properties: {
@@ -4487,7 +4555,25 @@ export function buildToolset({
           y: { type: "number" },
           application: { type: "string" },
           button: { type: "string", enum: ["left", "right"] },
-          doubleClick: { type: "boolean" }
+          // THIS PARAMETER EXISTED, WORKED, AND HAD NO DESCRIPTION — SO NOTHING
+          // COULD REACH IT.
+          //
+          // A live run on 8 Sep 2026 said, in its own narration, "Double-clicking
+          // the correct track row to play it" and then issued a plain `click`,
+          // because neither this schema nor the tool description above mentioned
+          // that a double-click was available. In a list — Spotify search
+          // results, Explorer, a playlist — a single click only SELECTS, so the
+          // agent clicked the same row three times, watched nothing happen, and
+          // the user had to stop the run.
+          //
+          // Fourteenth instance of this codebase's signature defect: the
+          // machinery is correct and something above it makes it unreachable. An
+          // undocumented parameter is an unreachable one.
+          doubleClick: {
+            type: "boolean",
+            description: "Open or play the thing rather than select it. In a list — search results, files, "
+              + "a playlist — a single click only highlights the row; a double click is what acts on it."
+          }
         },
         required: []
       },
@@ -4507,7 +4593,11 @@ export function buildToolset({
         const qualifiers = [
           args.near ? `near "${String(args.near).slice(0, 40)}"` : null,
           args.role ? `role ${args.role}` : null,
-          args.button === "right" ? "right-click" : null
+          args.button === "right" ? "right-click" : null,
+          // Same argument as `near` above: a single and a double click on the
+          // same row are two different actions and printed as one line they were
+          // indistinguishable in a transcript afterwards.
+          args.doubleClick === true ? "double-click" : null
         ].filter(Boolean);
         return qualifiers.length ? `${base} (${qualifiers.join(", ")})` : base;
       },
@@ -7212,9 +7302,26 @@ export function buildToolset({
             "The window is open — read the screen and click the track.");
         }
         if (!matchesTrackQuery(nowPlaying, result.requested)) {
+          // THIS ADVICE USED TO NAME A CONTROL THAT IS NOT IN THE READING.
+          //
+          // It said "click the Play control on the row you want". A Spotify
+          // search row's play button only exists while the pointer is over it,
+          // and it does not appear in the accessibility tree either way — only
+          // the TOP result has a listed "Play". Measured live 8 Sep 2026: the
+          // agent read the screen, found no such control, hovered to reveal it,
+          // read again, found nothing, guessed the coordinate from another row's
+          // play button, clicked empty space, started a different song, and had
+          // to be stopped by the user. Ten steps, all of them chasing a button
+          // this sentence promised was there.
+          //
+          // So it now names the route that actually acts on a list row. A single
+          // click on a row SELECTS; a double click opens or plays it.
           return refuted(result, `Spotify is still playing "${nowPlaying}", which is NOT what was asked for ` +
-            `("${result.requested}"). The track did not start. The search results ARE now on screen: read ` +
-            "them and click the Play control on the row you want — do not call this tool again for this track.");
+            `("${result.requested}"). The track did not start. The search results ARE now on screen. ` +
+            "Read them, find the row whose title matches, and DOUBLE-CLICK its title — " +
+            "`click {text: \"<the row's exact title>\", doubleClick: true}`. A single click only highlights " +
+            "a row, and the green play button on a row is not in the reading because it only exists while " +
+            "the pointer is over it. Do not call this tool again for this track.");
         }
         // A PODCAST ABOUT THE SONG IS NOT THE SONG.
         //
@@ -9280,6 +9387,24 @@ export function buildToolset({
     // this boundary.
     isActingTool: (name) => byName.get(name)?.acts === true,
 
+    // WHAT IS STILL RUNNING WHEN THE ANSWER IS GIVEN.
+    //
+    // `run {defer:true}` exists so a ninety-second install does not block the
+    // loop, and the price of that is that a run can finish while its own job is
+    // still going. That is not a defect — it is the feature — but it IS a fact
+    // the user needs, because "it said it was done" and "the install is still
+    // running" are both true and only one of them was ever on screen. Read once
+    // by the end-of-run entropy audit; nothing on the hot path calls it.
+    runningJobs: () => [...(state.commandJobs?.values() ?? [])]
+      .filter((job) => job?.state === "running")
+      .map((job) => ({ state: job.state, command: job.command ?? job.id ?? null })),
+
+    // How many actions this run wrote a reversal for. Read once by the same
+    // audit: a run that changed several things and journalled none of them is
+    // one the user cannot walk back at all, and they should be told while it is
+    // still recent rather than when they come looking for `undo`.
+    journalledCount: () => state.journal?.all?.().length ?? null,
+
     // WHETHER THE CONFIGURED MODEL HAS EYES. Set once per run by the agent loop,
     // which is the only thing that holds the provider. The toolset must not go
     // looking for it: a tool that reaches for the model is a tool that cannot be
@@ -9496,6 +9621,14 @@ export function buildToolset({
     // puts the attempt in their transcript rather than only in a log.
     onInjectionFound(fn) {
       state.onInjection = typeof fn === "function" ? fn : null;
+    },
+
+    // How the run is told that it had to stop and ask somebody. Same shape and
+    // same reason as onInjectionFound above: the loop cannot see inside
+    // `askPermission`, and "was a person involved in this run" is not something
+    // that should have to be inferred from the wording of a result.
+    onApprovalAsked(fn) {
+      state.onApproval = typeof fn === "function" ? fn : null;
     },
 
     // How to reach the person watching THIS run. Set before each turn by the
