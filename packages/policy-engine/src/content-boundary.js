@@ -100,6 +100,113 @@ const TARGET_PATTERNS = Object.freeze([
   { kind: "wallet", pattern: /\b(?:0x[a-f0-9]{40}|(?:bc1|[13])[a-hj-np-z0-9]{25,59})\b/gi, normalize: (value) => value.toLowerCase() }
 ]);
 
+// AN INSTRUCTION NOBODY CAN SEE, INCLUDING THE DEFENCES.
+//
+// Every rule above reads the text a person would read. There is a whole class of
+// injection that is not in that text at all: Unicode has a block of TAG
+// CHARACTERS (U+E0000–U+E007F) that mirror ASCII, render as absolutely nothing in
+// every application, survive copy-paste, and can therefore carry a complete
+// instruction inside what looks like an ordinary message.
+//
+// This is the one attack shape that the strongest published defence also misses.
+// OpenAI's Operator monitors injections by reading SCREENSHOTS (99% recall on 77
+// red-teamed attempts, per its system card) — and a character that renders as
+// nothing is not in a screenshot at any resolution. SYSCORA reads the
+// accessibility tree, which returns the string with the invisible characters
+// still in it, so it is one of the few places this CAN be caught. That is an
+// advantage of the text-first perception this product already has, and it was
+// being thrown away.
+//
+// WHAT IS FLAGGED, AND WHAT IS DELIBERATELY NOT.
+//
+// The whole file's design rule applies here hardest: "a boundary that fires on
+// normal content gets switched off." So this is limited to characters with no
+// ordinary use in application text:
+//
+//   TAG CHARACTERS      no legitimate use outside three emoji flag sequences,
+//                       which are excluded below. Decoded, not merely detected.
+//   BIDI OVERRIDES      U+202D/U+202E — the filename-spoofing pair. The bidi
+//                       ISOLATES (U+2066–U+2069) are NOT here: they are used
+//                       correctly by real software all the time.
+//   ZERO-WIDTH RUNS     five or more in a row. One is a line-break hint from a
+//                       web page.
+//
+// U+200C (ZWNJ) and U+200D (ZWJ) ARE EXCLUDED FROM THE RUN CHECK ON PURPOSE.
+// ZWJ joins emoji into families and professions; ZWNJ is a REQUIRED letter in
+// Persian, Hindi, Marathi and Bengali. Flagging either would fire this boundary
+// on the user's own language and on ordinary emoji, which is the failure mode
+// this file warns about twice.
+// EVERY ONE OF THESE IS AN ESCAPE, NOT THE CHARACTER ITSELF.
+//
+// Writing the literal character into the source would make this file's own
+// defence invisible in the editor that maintains it — the exact property the
+// attack relies on — and one careless copy-paste or encoding conversion would
+// silently empty the character class while the regex still compiled. A rule that
+// can stop working without looking any different is not a rule.
+const TAG_CHARACTERS = /[\u{E0000}-\u{E007F}]/gu;
+// The three regional flags that legitimately use tag sequences — England,
+// Scotland and Wales — are U+1F3F4 followed by tag letters and the U+E007F
+// cancel tag. They decode to "gbeng", "gbsct" and "gbwls", which is enough
+// characters to trip the threshold below, so they are removed BEFORE counting.
+// Flagging somebody's flag emoji as a hidden instruction is precisely the
+// false positive that gets a boundary switched off.
+const EMOJI_TAG_SEQUENCE = /\u{1F3F4}[\u{E0060}-\u{E007E}]+\u{E007F}/gu;
+const MIN_HIDDEN_CHARACTERS = 4;
+// U+202D LEFT-TO-RIGHT OVERRIDE and U+202E RIGHT-TO-LEFT OVERRIDE. The isolates
+// (U+2066-U+2069) are deliberately absent — real software emits those correctly.
+const BIDI_OVERRIDE = /[\u202D\u202E]/;
+// U+200B zero-width space, U+2060 word joiner, U+FEFF zero-width no-break space.
+// U+200C and U+200D are NOT here: see the note above on Persian, Hindi, Marathi
+// and emoji.
+const ZERO_WIDTH_RUN = /[\u200B\u2060\uFEFF]{5,}/;
+
+/**
+ * The text hidden inside these characters, made visible.
+ *
+ * Tag characters map to ASCII by subtracting U+E0000, so U+E0068 is "h". This is
+ * a decode, not a guess: the result is exactly the bytes somebody encoded.
+ */
+export function decodeTagCharacters(text) {
+  // Emoji flag sequences out first, so a legitimate 🏴󠁧󠁢󠁥󠁮󠁧󠁿 cannot look like a
+  // six-character hidden payload.
+  const body = String(text ?? "").replace(EMOJI_TAG_SEQUENCE, "");
+  const matches = body.match(TAG_CHARACTERS);
+  if (!matches || matches.length < MIN_HIDDEN_CHARACTERS) return "";
+  return matches
+    .map((character) => String.fromCharCode(character.codePointAt(0) - 0xE0000))
+    // Only the printable range. A tag sequence that decodes to control
+    // characters is not a hidden sentence and quoting it would be noise.
+    .filter((character) => character >= " " && character <= "~")
+    .join("");
+}
+
+/**
+ * Is anything in this content deliberately invisible?
+ *
+ * Returns what was found AND the decoded text, because the decoded text is then
+ * run through the ordinary injection rules — an instruction that was hidden is
+ * still an instruction, and it should be caught by the same seven patterns once
+ * it can be seen.
+ */
+export function findHiddenText(text) {
+  const body = String(text ?? "");
+  if (!body) return { found: false };
+  const kinds = [];
+  const decoded = decodeTagCharacters(body);
+  if (decoded) kinds.push("tag-characters");
+  if (BIDI_OVERRIDE.test(body)) kinds.push("bidi-override");
+  if (ZERO_WIDTH_RUN.test(body)) kinds.push("zero-width-run");
+  if (kinds.length === 0) return { found: false };
+  return {
+    found: true,
+    kinds,
+    decoded,
+    summary: decoded
+      ? "carries text that is invisible on screen"
+      : "carries characters that hide or reorder what is displayed"
+  };
+}
+
 // A phone number needs enough digits to be one. Seven is a local number; below
 // that it is a date, a price or a version.
 const MIN_PHONE_DIGITS = 7;
@@ -145,22 +252,59 @@ export function findInjectedInstruction(text, { source = "observed content" } = 
     hits.push(rule);
     if (match.index < firstAt) firstAt = match.index;
   }
+
+  // AND THE SAME SEVEN RULES OVER THE PART NOBODY CAN SEE.
+  //
+  // An instruction encoded in tag characters is invisible to a person, to a
+  // screenshot, and — until this ran — to every pattern above, because those read
+  // the string as displayed. Decoded, it is an ordinary instruction and the
+  // ordinary rules catch it. So the decode happens first and the SAME rules are
+  // applied to what comes out; nothing new has to be recognised.
+  //
+  // Hidden text is also a finding in its own right, even when the decode matches
+  // no rule. There is no innocent reason for a WhatsApp message or a web page to
+  // carry four or more invisible characters that spell something, and saying
+  // "this content is hiding text from you" is useful to the user whether or not
+  // this file happens to recognise what it says.
+  const hidden = findHiddenText(body);
+  const hiddenTargets = [];
+  if (hidden.found) {
+    hits.push({ id: "hidden-instruction", summary: hidden.summary });
+    if (firstAt === Infinity) firstAt = 0;
+    if (hidden.decoded) {
+      for (const rule of INJECTION_RULES) {
+        if (rule.pattern.test(hidden.decoded) && !hits.some((hit) => hit.id === rule.id)) hits.push(rule);
+      }
+      // A destination hidden inside invisible characters is the whole point of
+      // hiding it. These join the visible ones so tier 2 gates on them exactly
+      // as it would if they had been typed in plain sight.
+      hiddenTargets.push(...extractTargets(hidden.decoded));
+    }
+  }
+
   if (hits.length === 0) return { found: false };
   // The sentence it was found in, so the user can see the actual words rather
   // than being told an abstraction. Quoting is the whole point: an accusation
   // with no evidence is not something anybody can act on.
   const start = Math.max(0, firstAt - 40);
-  const quote = body.slice(start, start + MAX_QUOTE).replace(/\s+/g, " ").trim();
+  const visibleQuote = body.slice(start, start + MAX_QUOTE).replace(/\s+/g, " ").trim();
+  // Quote the DECODED text when there is some: the visible slice of a message
+  // whose payload is invisible shows the user innocent words and tells them
+  // nothing. What they need to read is what was hidden.
+  const quote = hidden.decoded
+    ? `[hidden in invisible characters] ${hidden.decoded.slice(0, MAX_QUOTE)}`
+    : visibleQuote;
   return {
     found: true,
     source,
     rules: hits.map((rule) => rule.id),
     summary: hits[0].summary,
     quote,
+    ...(hidden.found ? { hidden: { kinds: hidden.kinds, decoded: hidden.decoded || null } } : {}),
     // Only the targets named NEAR the instruction, not every number on the
     // screen. A whole WhatsApp window contains dozens of innocent numbers, and
     // gating on all of them would make the feature unusable within a day.
-    targets: extractTargets(body.slice(start, start + 600))
+    targets: [...extractTargets(body.slice(start, start + 600)), ...hiddenTargets]
   };
 }
 
