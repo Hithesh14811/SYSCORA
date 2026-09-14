@@ -719,15 +719,41 @@ function el(tag, className, text) {
   return node;
 }
 
-function scrollToEnd() {
+// FOLLOW THE STREAM ONLY WHILE THE USER IS ALREADY AT THE BOTTOM.
+//
+// This used to set scrollTop on every streamed token, so scrolling up to read an
+// earlier answer while the model was still writing was impossible — each token
+// dragged the view back down until the run ended. The overlay already had the
+// right rule (overlay.js, `stickToBottom`); the chat window never got it.
+// Scrolling back to within a few pixels of the end resumes following. The
+// user's own message always jumps to the end: they just asked, and that is
+// where the answer is coming.
+const STICK_DISTANCE_PX = 48;
+let chatSticksToBottom = true;
+chatLog.addEventListener("scroll", () => {
+  chatSticksToBottom = chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight < STICK_DISTANCE_PX;
+});
+// The scroll event alone is not enough: it is dispatched at the next rendering
+// frame, so a token landing between the wheel turning and that frame would pull
+// the view back down before the listener ever learned the user moved. Input
+// events arrive immediately, so an upward gesture releases the view at once.
+chatLog.addEventListener("wheel", (event) => { if (event.deltaY < 0) chatSticksToBottom = false; }, { passive: true });
+chatLog.addEventListener("touchmove", () => { chatSticksToBottom = false; }, { passive: true });
+chatLog.addEventListener("keydown", (event) => {
+  if (["ArrowUp", "PageUp", "Home"].includes(event.key)) chatSticksToBottom = false;
+});
+
+function scrollToEnd({ force = false } = {}) {
+  if (!force && !chatSticksToBottom) return;
   chatLog.scrollTop = chatLog.scrollHeight;
+  chatSticksToBottom = true;
 }
 
 function addBubble(role, node) {
   const wrap = el("div", `bubble ${role}`);
   wrap.appendChild(node);
   chatLog.appendChild(wrap);
-  scrollToEnd();
+  scrollToEnd({ force: role === "user" });
   return wrap;
 }
 
@@ -2801,6 +2827,7 @@ function busyWithRun() {
 
 function showWelcome() {
   chatLog.textContent = "";
+  chatSticksToBottom = true;
   const welcome = el("div", "welcome");
   welcome.appendChild(el("h2", null, "What would you like SYSCORA to do?"));
   welcome.appendChild(el("p", "muted",
@@ -2949,6 +2976,7 @@ function rewindAndResend(turn, edited) {
 // the tool rows, the narration and the final answer come back as they were.
 function renderStoredChat(chat, { resumed = true } = {}) {
   chatLog.textContent = "";
+  chatSticksToBottom = true;
   if (chat.turns.length === 0) {
     showWelcome();
     return;
