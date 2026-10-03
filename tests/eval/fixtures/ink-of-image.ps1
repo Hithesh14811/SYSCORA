@@ -16,6 +16,16 @@
 # them, and the pixel question stays in ink-check.mjs. Neither is code the agent
 # runs, which is what a verification has to be.
 #
+# AND "WINDOWS" HAS TO MEAN WIC, NOT JUST GDI+. Measured 3 Oct 2026: asked for
+# `circle.bmp`, Paint wrote a HEIF image under that name -- magic bytes
+# `ftypmif1`, 1826x856, perfectly valid. System.Drawing is GDI+, which decodes
+# BMP/PNG/JPEG/GIF/TIFF and has never heard of HEIF, so it threw "Parameter is
+# not valid" and the row failed with the drawing sitting on disk. The same defect
+# as the PNG-under-a-.bmp-name one above, one format further on: a checker that
+# knows fewer formats than the application does will keep failing correct work.
+# WIC is the OS codec set the Photos app uses, so the fallback inherits every
+# decoder the machine has, including ones that ship later.
+#
 # Transparency is flattened onto WHITE first, because a canvas that was never
 # drawn on is saved as fully transparent by some encoders, and every transparent
 # pixel is identical — which would read as a uniform image and report BLANK for
@@ -47,6 +57,26 @@ param(
 if (-not (Test-Path -LiteralPath $Path)) { Write-Output 'MISSING'; exit }
 
 Add-Type -AssemblyName System.Drawing
+
+function Convert-WithWic {
+  param([string]$From, [string]$To)
+  # Returns $null on success, or the reason WIC could not read it either.
+  # Decoded to a plain BMP so the flatten-and-count path below stays one
+  # implementation rather than two that can disagree.
+  try {
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    $decoder = [Windows.Media.Imaging.BitmapDecoder]::Create(
+      (New-Object System.Uri $From), 'None', 'OnLoad')
+    $encoder = New-Object Windows.Media.Imaging.BmpBitmapEncoder
+    $encoder.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($decoder.Frames[0]))
+    $out = [IO.File]::Open($To, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $encoder.Save($out) } finally { $out.Dispose() }
+    return $null
+  } catch {
+    if ($_.Exception.InnerException) { return $_.Exception.InnerException.Message }
+    return $_.Exception.Message
+  }
+}
 
 function Read-FlattenedCopy {
   param([string]$From, [string]$To)
@@ -87,6 +117,18 @@ while ($true) {
   $size = (Get-Item -LiteralPath $Path).Length
   if ($size -gt 0) {
     $failure = Read-FlattenedCopy -From $Path -To $temp
+    if ($failure) {
+      # GDI+ could not read it. Before believing that, ask WIC -- Paint has
+      # already been caught writing both PNG and HEIF under a .bmp name.
+      $viaWic = [IO.Path]::ChangeExtension($temp, '.wic.bmp')
+      $wicFailure = Convert-WithWic -From $Path -To $viaWic
+      if (-not $wicFailure) {
+        $failure = Read-FlattenedCopy -From $viaWic -To $temp
+        Remove-Item -LiteralPath $viaWic -Force -ErrorAction SilentlyContinue
+      } else {
+        $failure = "$failure; WIC also: $wicFailure"
+      }
+    }
     if ($failure) {
       $lastError = "$failure (at $size bytes)"
     } else {
