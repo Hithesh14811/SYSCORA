@@ -69,17 +69,43 @@ measured on tasks we wrote, on one machine, and are used descriptively.
 
 ## 2. Fifteen false claims, and their one mechanism
 
-> **FILL:** complete this table from the incident log in
-> `docs/state-of-the-world.md`. Columns: what was said, what was true, the
-> capability that acted, what (if anything) read it back.
+Every row below is a real incident from a deployed agent, recovered from its own
+session store and transcripts. The right-hand column is the mechanism, and it is
+the same mechanism fifteen times.
 
-| Claimed | Reality | Mechanism |
+### Claims the agent made about actions
+
+| Claimed | What was true | The actor | What read it back |
+|---|---|---|---|
+| "Sent." | The message text sat unsent in a search box | `keyboard.press` | nothing |
+| "Sent." (every keystroke) | Rendered for ctrl+s, escape, f5 alike — wording written for Enter and left as the fallback | `keyboard.press` | nothing |
+| "Muted." | Audio still audible. "Volume is 28% (muted)" was reported twice while music played | `audio.endpoint:set` | `GetMute` — the same device, agreeing with itself |
+| "Muted." | 1 step, **zero tool calls**, twice in five turns | nothing acted | nothing |
+| "Focused." | The app shell never learned it was active and discarded every keystroke | `window.activate` | `window.activate`'s own return value |
+| "Wrote notes.md" | The file was empty: the caller sent `contents`, the capability takes `content` | `filesystem.write` | nothing |
+| "Done." | No file existed. The model returned an **empty** turn; the word was the loop's own fallback string | nothing acted | nothing |
+| Track "playing" | A *different* song was playing; `nowPlaying` disagreed with the request | `spotify.track.play` | the same call's own payload |
+| A version number | Invented; no tool had been called | nothing acted | nothing |
+
+### Claims the *verification* made (checks that could not fail)
+
+| The check | Why it could never fail | Cost |
 |---|---|---|
-| "Sent." | The text sat unsent in a search box | `keyboard.press` returned; nothing read the conversation |
-| "Muted." | Audio still audible | The mute was accepted and `GetMute` agreed; nothing sampled the output |
-| "Focused." | The shell discarded every keystroke | `window.activate` reported on itself |
-| "Wrote notes.md" | The file was empty | The caller sent `contents`; the capability takes `content` |
-| "Done." | The file was never created | **The loop's own fallback string**, not the model's |
+| Message-sent verify | `Write-Output 'checked-by-human'` — passed unconditionally | The highest-stakes row in the suite showed green for months |
+| "Input box is empty" | WhatsApp publishes `value="
+"` when empty, so every emptiness test passed vacuously | A send could not be distinguished from a draft |
+| Volume verify | Called a module not installed on the machine, so it printed `unreadable` whatever happened | The row could never pass, however well the agent did |
+| Volume setup | The machine already sat at the target value | Would have passed with the agent doing nothing |
+| Skill-replay verify | Searched for an **empty needle**; `"anything".includes("")` is true | A `write_file` step verified because the window behind it had buttons on it |
+| Entropy audit | `clean: checked > 0` — one vacuous probe declared the whole audit clean | The two probes that mattered had never run |
+
+### Claims made about reading the screen
+
+| Claimed | What was true |
+|---|---|
+| "IDENTICAL — nothing at all has changed on screen" | Perception was reading the WebView2 **frame**, not the content window; the agent concluded the tool was broken and burned five steps |
+| A finished answer | The turn had been **truncated** at the output ceiling; the provider said `finish_reason: "length"` and the loop discarded the signal |
+| A finished answer | The reply ended on a colon with `finish_reason: "stop"` — the model announced a list and stopped |
 
 The last row is the one worth dwelling on. Four layers of honesty enforcement all
 looked the other way, because every one of them was watching what the *model* said
@@ -121,8 +147,46 @@ evidence({ observed, method, verdict, actedVia })
 **Cost.** Zero tokens per step. The invariant is structural, not prompted — it adds
 nothing to the system prompt or the tool schema.
 
-> **FILL:** code listing of `evidence()` plus one representative tool, showing the
-> acting capability and the reading capability side by side.
+The constructor is the whole enforcement point. There is no configuration flag and
+no way to opt out:
+
+```js
+export function evidence({ observed, method, verdict, actedVia = null }) {
+  if (!VERDICTS.has(verdict)) throw new EvidenceError(...);
+  // A CHECK WITH AN EMPTY NEEDLE IS NOT A CHECK.
+  if (!String(observed ?? "").trim()) throw new EvidenceError(
+    "an empty observation is not one");
+  // VERIFICATION MUST NOT SHARE A CODE PATH WITH THE THING IT VERIFIES.
+  // Except when what it says about itself is that it FAILED.
+  if (acted && acted === read && verdict !== REFUTED) throw new EvidenceError(
+    `would verify ${acted} with ${read} - the action grading its own homework`);
+  // "Nothing looked" can never be the basis of a CONFIRMED anything.
+  if (read === NOTHING_READ_IT_BACK && verdict !== UNCONFIRMED) throw new EvidenceError(...);
+  return Object.freeze({ observed, method: read, at, verdict, actedVia: acted });
+}
+
+// A success sentence is reachable only through this.
+export const confirmed = (result, sentence) =>
+  gate(result, CONFIRMED, sentence, "confirmed");
+```
+
+A representative tool, with the two capabilities side by side. The click is
+delivered by the pointer; it is confirmed by asking the accessibility tree which
+control now holds focus — a different subsystem, reached by a different code path:
+
+| Tool | `actedVia` (performed it) | `method` (read it back) |
+|---|---|---|
+| `click` | `pointer.clickAt` | `adapter.focusedElement` (UI automation) |
+| `focus` | `window.activate` | `getForegroundWindow` (the desktop) |
+| `write_file` | `filesystem.write` | `filesystem.read` (the bytes, off disk) |
+| `clipboard` | `clipboard.write` | `clipboard.read` |
+| `launch` | `application.launch` | `window.enumerate` |
+| `key` (bare keystroke) | `keyboard.press` | `NOTHING_READ_IT_BACK` -> forced `UNCONFIRMED` |
+
+The last row is the one that makes the invariant honest rather than decorative.
+Some actions have no cheap reading behind them, and the temptation is to name a
+check that did not happen. `NOTHING_READ_IT_BACK` says so out loud, and the
+constructor refuses to pair it with any verdict but `UNCONFIRMED`.
 
 ---
 
