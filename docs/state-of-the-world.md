@@ -1781,6 +1781,56 @@ actually plays on double-click on this machine has NOT been verified — the
 failure text now recommends it, and `node scripts/probe-spotify-play.mjs` is
 where that would be proven.
 
+### Measured 3 Oct 2026: two eval rows were failing on the checker, not the agent
+
+The suite was re-run on a new endpoint (`api.deepseek.com`, `deepseek-flash`) after
+the Baseten account ran out of credit: **19 automatic rows x 3 = 60 runs, 85%
+(17/20), $1.265, cache 98%, offline pipeline reached 0 times**, machine measured
+quiet at 7.9% CPU before the run. Three rows failed and **two of them were the
+harness**.
+
+**1. `packages-search-winget` -- the detector could not see an installed command.**
+The agent reported *"winget isn't on this machine"* while `Get-Command winget`
+resolved it at `%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe`.
+`inspectCommand` filters WindowsApps paths out on purpose -- a Store stub
+`python.exe` installs nothing and answering yes to "is python installed?" from one
+is a defect this project already fixed. **But winget ships nowhere else**, so the
+rule that protects the python answer makes the winget answer always wrong. Fixed
+with an explicit `ALIAS_IS_THE_REAL_COMMAND` set rather than by probing aliases,
+because `inspectCommand does not count a Store execution alias as installed`
+asserts a stub is never even SPAWNED -- running one can open the Store UI.
+**3/3 after, was 2/3.** Fifteenth instance of the class.
+
+**2. `draw-shape-in-paint` -- Paint saved HEIF and the checker only knew GDI+.**
+`ink-of-image.ps1` reported `UNREADABLE Exception calling "FromFile"`. The file was
+10,989 bytes, complete, and its magic bytes were `ftypmif1`: **Paint had written a
+HEIF image, 1826x856, under the name `circle.bmp`**. System.Drawing is GDI+, which
+decodes BMP/PNG/JPEG/GIF/TIFF and has never heard of HEIF. This is the same defect
+as the 21 Aug one where Paint wrote a PNG under a .bmp name, one format further on:
+**a checker that knows fewer formats than the application does will keep failing
+correct work.** Now falls back to WIC, the OS codec set, which read it first try
+and reported `INK 0.752%`. **3/3 after.**
+
+The fixture also stopped racing the save -- it opens through a
+`FileShare::ReadWrite` handle rather than `Image::FromFile`'s exclusive read, and
+retries until it finds ink, because **BLANK is what a half-written file looks like**
+and only one of those two gets better by waiting. Held against five cases: drawn,
+blank, missing, permanently-invalid, and a file written 2s late. A genuinely blank
+canvas costs 8s, which is a row that was already failing.
+
+**NOT FIXED: `undo-file-overwrite` (2/3), and that one is real.** Expected
+`closing 1155`, got `CLOBBERED` -- the undo did not restore the file.
+
+**THE BUDGET BREACHES IN THAT RUN ARE NOT A REGRESSION AND MUST NOT BE CHASED.**
+Fifteen rows breached, nearly all ~+33% on tokens SENT, uniformly, including
+trivial ones -- which is the signature of fixed per-step cost, not behaviour.
+`measure-prompt-cost.mjs` reports **11,342 tokens/step, unchanged**. What changed is
+the tokenizer: the budgets were recorded 20 Aug against `DeepSeek-V4-Flash-0731` on
+Baseten, and the same text tokenizes about a third larger on `deepseek-flash`.
+**Comparing budgets across tokenizers is invalid.** They need re-recording with
+`--write-budgets`, which needs a full sweep including `--manual`, and that has not
+been done.
+
 ### Still open
 
 - **THERE IS NO EXTERNAL NUMBER.** The eval is 23 tasks written by the author,
