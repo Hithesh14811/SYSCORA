@@ -1831,6 +1831,51 @@ Baseten, and the same text tokenizes about a third larger on `deepseek-flash`.
 `--write-budgets`, which needs a full sweep including `--manual`, and that has not
 been done.
 
+### THE CURRENT NUMBER, measured 3 Oct 2026 on a quiet machine
+
+`npm run eval -- --repeat 3 --manual --write-budgets`, commit `af35fe4`, all 24
+task files, 25 rows x 3 = **75 runs**:
+
+```
+  pass rate          96%  (24 of 25 rows passing EVERY repeat)
+  median time        4.7s      (4.0-5.5s across the run's own 3 sweeps)
+  median steps       3
+  median fresh       1,825     (1,209-4,855 -- a 213% band, see below)
+  cost               $1.818
+  cache hit          96.6%
+  offline pipeline   reached 0 times
+  machine load       8.5% mean of 16 cores, measured before the run
+```
+
+**Budgets were re-recorded in this run**, against `deepseek-flash` at
+`api.deepseek.com`. The previous set was recorded 20 Aug against a different model
+on Baseten, and a third of every row's apparent growth was that tokenizer rather
+than any behaviour -- fifteen rows "breached" on 3 Oct with
+`measure-prompt-cost.mjs` reporting an unchanged 11,342 tokens/step. **A budget
+file is only comparable within one model.** `budgets.json` now records the model
+beside the numbers so this cannot be misread again.
+
+**The headline median fresh figure moved 213% across three identical sweeps and is
+not usable as a gate** -- it is a median-of-medians over a suite where most rows
+cost a few hundred tokens. The per-row budgets are the instrument; 14 of the 20
+rows big enough to matter are steady enough to catch a 20% regression at this
+repeat count, and the scoreboard names them.
+
+**Both checker defects found earlier the same day are fixed and hold at 3/3:**
+`packages-search-winget` and `draw-shape-in-paint`. `undo-file-overwrite`, which
+failed 2/3 in the morning run, passed **3/3** here -- so it is flaky rather than
+broken, and it has not been diagnosed.
+
+**THE ONE FAILURE IS THE FLAGSHIP, AND IT IS THE ONE THAT MATTERS.**
+`messaging-send-to-self` passed 2 of 3: one run reported
+`NO-NEW-MESSAGE before=0 now=0` after 22 steps and 45s -- the verify counted the
+message text in the WhatsApp CONVERSATION, before and after, over a raw UIA view
+in its own process, and it was not there either time. **The message was not sent
+and the run did not claim it was**, which is the honesty layer working. But a
+one-in-three failure rate on the highest-stakes action in the product is the
+headline defect of this suite, and this row has a documented history of its cost
+and behaviour being decided by which chat WhatsApp happens to open on.
+
 ### Still open
 
 - **THERE IS NO EXTERNAL NUMBER.** The eval is 23 tasks written by the author,

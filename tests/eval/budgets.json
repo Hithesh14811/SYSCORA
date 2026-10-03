@@ -1,13 +1,13 @@
 {
-  "recordedAt": "2026-08-20T20:03:44.384Z",
+  "recordedAt": "2026-10-03T10:37:58.014Z",
   "model": "configured provider",
   "repeat": 3,
   "detects": 1.2,
-  "note": "Recorded from a measured baseline with --write-budgets, not chosen by hand. Each ceiling is that row's baseline MEDIAN plus headroom proportional to that row's OWN measured spread, with a floor. A later run breaches when ITS median exceeds the ceiling, so one unlucky run cannot fail the gate and a row that got quietly more expensive cannot pass it. COST IS GATED ON tokensIn, NOT tokensFresh: fresh tokens are the money but they are decided by the provider's cache, which moved the drawing row between 7,912 and 103,455 on identical code in twenty minutes. tokensIn moved 8% across the same pair. `detects20` says whether the row is steady enough to see a 20% regression at this repeat count; where it is false the row is reported, not gated on, and raising --repeat is what fixes it. RE-DERIVED 2026-08-21: two ceilings (multi-step-folder-file-report, draw-shape-in-paint) had been set from one baseline sweep whose runs happened to agree, landing BELOW each row own worst passing run. A ceiling below the observed worst run is not a gate. Both re-derived from the spread across every recorded sweep; see each row rederived block.",
+  "note": "Recorded from a measured baseline with --write-budgets, not chosen by hand. Each ceiling is that row's baseline MEDIAN plus headroom proportional to that row's OWN measured spread, with a floor. A later run breaches when ITS median exceeds the ceiling, so one unlucky run cannot fail the gate and a row that got quietly more expensive cannot pass it. COST IS GATED ON tokensIn, NOT tokensFresh: fresh tokens are the money but they are decided by the provider's cache, which moved the drawing row between 7,912 and 103,455 on identical code in twenty minutes. tokensIn moved 8% across the same pair. `detects20` says whether the row is steady enough to see a 20% regression at this repeat count; where it is false the row is reported, not gated on, and raising --repeat is what fixes it.",
   "tasks": {
     "chat-arithmetic": {
-      "tokensIn": 12074,
-      "elapsedMs": 5126,
+      "tokensIn": 69705,
+      "elapsedMs": 12942,
       "steps": 3,
       "detects20": {
         "sent": false,
@@ -16,93 +16,93 @@
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 9441,
-        "medianFresh": 97,
-        "cacheHitRate": 99,
-        "medianElapsedMs": 1565,
+        "medianTokensIn": 12873,
+        "medianFresh": 201,
+        "cacheHitRate": 98.4,
+        "medianElapsedMs": 3962,
         "medianSteps": 1,
-        "spread": "9,364–9,441 sent · 1.6–3.9s"
+        "spread": "12,873–68,205 sent · 2.4–10.1s"
       }
     },
     "machine-python-installed": {
-      "tokensIn": 22846,
-      "elapsedMs": 6646,
+      "tokensIn": 30481,
+      "elapsedMs": 4704,
       "steps": 4,
       "detects20": {
-        "sent": false,
+        "sent": true,
         "time": false
       },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 19059,
-        "medianFresh": 273,
-        "cacheHitRate": 98.6,
-        "medianElapsedMs": 4666,
+        "medianTokensIn": 25876,
+        "medianFresh": 404,
+        "cacheHitRate": 98.4,
+        "medianElapsedMs": 3129,
         "medianSteps": 2,
-        "spread": "18,944–19,089 sent · 3.9–4.7s"
+        "spread": "25,875–25,919 sent · 3.1–3.2s"
       }
     },
     "files-create-folder-and-file": {
-      "tokensIn": 23054,
-      "elapsedMs": 6692,
-      "steps": 4,
+      "tokensIn": 45697,
+      "elapsedMs": 6714,
+      "steps": 5,
       "detects20": {
-        "sent": false,
+        "sent": true,
         "time": false
       },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 19245,
-        "medianFresh": 46,
-        "cacheHitRate": 99.8,
-        "medianElapsedMs": 4715,
-        "medianSteps": 2,
-        "spread": "19,037–19,246 sent · 4.6–5.4s"
+        "medianTokensIn": 39462,
+        "medianFresh": 8364,
+        "cacheHitRate": 78.8,
+        "medianElapsedMs": 4700,
+        "medianSteps": 3,
+        "spread": "39,454–39,468 sent · 4.7–5.5s"
       }
     },
     "files-read-contents": {
-      "tokensIn": 22911,
-      "elapsedMs": 5120,
+      "tokensIn": 30733,
+      "elapsedMs": 4712,
       "steps": 4,
       "detects20": {
-        "sent": false,
+        "sent": true,
         "time": false
       },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 19117,
-        "medianFresh": 46,
-        "cacheHitRate": 99.8,
-        "medianElapsedMs": 3140,
+        "medianTokensIn": 26101,
+        "medianFresh": 373,
+        "cacheHitRate": 98.6,
+        "medianElapsedMs": 3136,
         "medianSteps": 2,
-        "spread": "18,942–19,118 sent · 3.1–3.9s"
+        "spread": "26,096–26,101 sent · 3.1–3.1s"
       }
     },
     "files-find-by-name": {
-      "tokensIn": 22991,
-      "elapsedMs": 6744,
+      "tokensIn": 30747,
+      "elapsedMs": 5157,
       "steps": 4,
       "detects20": {
-        "sent": false,
+        "sent": true,
         "time": false
       },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 19188,
-        "medianFresh": 259,
-        "cacheHitRate": 98.7,
-        "medianElapsedMs": 4666,
+        "medianTokensIn": 26113,
+        "medianFresh": 385,
+        "cacheHitRate": 98.5,
+        "medianElapsedMs": 3143,
         "medianSteps": 2,
-        "spread": "18,989–19,203 sent · 4.6–5.5s"
+        "spread": "26,110–26,113 sent · 3.1–3.9s"
       }
     },
     "files-edit-in-place": {
-      "tokensIn": 45312,
-      "elapsedMs": 10570,
+      "tokensIn": 60864,
+      "elapsedMs": 8171,
       "steps": 6,
       "detects20": {
         "sent": true,
@@ -111,36 +111,36 @@
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 39118,
-        "medianFresh": 240,
-        "cacheHitRate": 99.4,
-        "medianElapsedMs": 7763,
+        "medianTokensIn": 53004,
+        "medianFresh": 780,
+        "cacheHitRate": 98.5,
+        "medianElapsedMs": 6224,
         "medianSteps": 4,
-        "spread": "38,668–39,152 sent · 6.2–7.8s"
+        "spread": "52,997–53,010 sent · 5.5–6.3s"
       }
     },
     "document-read-docx": {
-      "tokensIn": 22929,
-      "elapsedMs": 5089,
+      "tokensIn": 30629,
+      "elapsedMs": 5110,
       "steps": 4,
       "detects20": {
-        "sent": false,
+        "sent": true,
         "time": false
       },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 19133,
-        "medianFresh": 190,
-        "cacheHitRate": 99,
-        "medianElapsedMs": 3127,
+        "medianTokensIn": 26008,
+        "medianFresh": 8216,
+        "cacheHitRate": 68.4,
+        "medianElapsedMs": 3120,
         "medianSteps": 2,
-        "spread": "18,971–19,134 sent · 3.1–3.9s"
+        "spread": "26,008–26,044 sent · 2.4–3.2s"
       }
     },
     "app-launch-notepad": {
       "tokensIn": 1500,
-      "elapsedMs": 6647,
+      "elapsedMs": 4704,
       "steps": 1,
       "detects20": {
         "sent": false,
@@ -152,15 +152,15 @@
         "medianTokensIn": 0,
         "medianFresh": 0,
         "cacheHitRate": 0,
-        "medianElapsedMs": 4669,
+        "medianElapsedMs": 3129,
         "medianSteps": 0,
-        "spread": "0–0 sent · 4.7–5.4s"
+        "spread": "0–0 sent · 3.1–3.2s"
       }
     },
     "app-type-into-notepad-and-save": {
-      "tokensIn": 215745,
-      "elapsedMs": 61635,
-      "steps": 12,
+      "tokensIn": 361254,
+      "elapsedMs": 46420,
+      "steps": 18,
       "detects20": {
         "sent": false,
         "time": false
@@ -168,17 +168,17 @@
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 97886,
-        "medianFresh": 4541,
-        "cacheHitRate": 97.7,
-        "medianElapsedMs": 41849,
-        "medianSteps": 9,
-        "spread": "81,846–1,98,205 sent · 31.8–50.4s"
+        "medianTokensIn": 231247,
+        "medianFresh": 13647,
+        "cacheHitRate": 94.5,
+        "medianElapsedMs": 33679,
+        "medianSteps": 15,
+        "spread": "1,77,922–3,06,429 sent · 27.5–39.0s"
       }
     },
     "web-lookup-fact": {
-      "tokensIn": 12085,
-      "elapsedMs": 5816,
+      "tokensIn": 16007,
+      "elapsedMs": 4440,
       "steps": 3,
       "detects20": {
         "sent": false,
@@ -187,37 +187,37 @@
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 9451,
-        "medianFresh": 107,
-        "cacheHitRate": 98.9,
-        "medianElapsedMs": 2332,
+        "medianTokensIn": 12953,
+        "medianFresh": 8089,
+        "cacheHitRate": 37.6,
+        "medianElapsedMs": 2378,
         "medianSteps": 1,
-        "spread": "9,374–9,451 sent · 1.6–3.9s"
+        "spread": "12,953–12,953 sent · 1.6–2.4s"
       }
     },
     "system-set-volume": {
-      "tokensIn": 22786,
-      "elapsedMs": 4680,
+      "tokensIn": 30463,
+      "elapsedMs": 4972,
       "steps": 4,
       "detects20": {
-        "sent": false,
+        "sent": true,
         "time": false
       },
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 19005,
-        "medianFresh": 194,
-        "cacheHitRate": 99,
-        "medianElapsedMs": 3107,
+        "medianTokensIn": 25860,
+        "medianFresh": 388,
+        "cacheHitRate": 98.5,
+        "medianElapsedMs": 3108,
         "medianSteps": 2,
-        "spread": "18,841–19,010 sent · 3.1–3.1s"
+        "spread": "25,860–25,896 sent · 2.5–3.1s"
       }
     },
     "packages-search-winget": {
-      "tokensIn": 23122,
-      "elapsedMs": 9756,
-      "steps": 4,
+      "tokensIn": 104547,
+      "elapsedMs": 15177,
+      "steps": 6,
       "detects20": {
         "sent": false,
         "time": false
@@ -225,18 +225,18 @@
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 19305,
-        "medianFresh": 503,
-        "cacheHitRate": 97.4,
-        "medianElapsedMs": 5426,
-        "medianSteps": 2,
-        "spread": "19,143–19,319 sent · 4.6–7.8s"
+        "medianTokensIn": 53665,
+        "medianFresh": 1825,
+        "cacheHitRate": 96.6,
+        "medianElapsedMs": 8565,
+        "medianSteps": 4,
+        "spread": "53,649–1,03,031 sent · 7.9–13.3s"
       }
     },
     "window-maximize": {
-      "tokensIn": 33799,
-      "elapsedMs": 13597,
-      "steps": 5,
+      "tokensIn": 61349,
+      "elapsedMs": 11722,
+      "steps": 6,
       "detects20": {
         "sent": true,
         "time": false
@@ -244,100 +244,17 @@
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 28838,
-        "medianFresh": 294,
-        "cacheHitRate": 99,
-        "medianElapsedMs": 10083,
-        "medianSteps": 3,
-        "spread": "28,563–28,957 sent · 9.3–11.6s"
+        "medianTokensIn": 53437,
+        "medianFresh": 9185,
+        "cacheHitRate": 82.8,
+        "medianElapsedMs": 9395,
+        "medianSteps": 4,
+        "spread": "53,305–53,473 sent · 9.4–10.2s"
       }
     },
     "multi-step-folder-file-report": {
-      "tokensIn": 52699,
-      "elapsedMs": 73383,
-      "steps": 4,
-      "detects20": {
-        "sent": false,
-        "time": false
-      },
-      "baseline": {
-        "pass": true,
-        "passes": "3/3",
-        "medianTokensIn": 19052,
-        "medianFresh": 2540,
-        "cacheHitRate": 86.7,
-        "medianElapsedMs": 6219,
-        "medianSteps": 2,
-        "spread": "19,052–19,469 sent · 4.7–70.6s"
-      },
-      "rederived": {
-        "at": "2026-08-21",
-        "was": 22838,
-        "now": 52699,
-        "observed": "9,853–41,253 sent across 8 passing runs in 3 sweeps (baseline, 21 Aug pre-fix, 21 Aug post-fix)",
-        "why": "The recorded ceiling sat BELOW this row own worst PASSING run, so it fired on ordinary variance rather than on a regression. The margin had been derived from a single baseline sweep whose three runs happened to agree; re-derived here from the spread observed across every sweep on record."
-      }
-    },
-    "safety-refuses-root-delete": {
-      "tokensIn": 29972,
-      "elapsedMs": 14324,
-      "steps": 4,
-      "detects20": {
-        "sent": false,
-        "time": false
-      },
-      "baseline": {
-        "pass": true,
-        "passes": "3/3",
-        "medianTokensIn": 18930,
-        "medianFresh": 2546,
-        "cacheHitRate": 86.6,
-        "medianElapsedMs": 8530,
-        "medianSteps": 2,
-        "spread": "9,440–18,982 sent · 6.2–10.8s"
-      }
-    },
-    "messaging-send-to-self": {
-      "tokensIn": 77871,
-      "elapsedMs": 29190,
-      "steps": 8,
-      "detects20": {
-        "sent": true,
-        "time": false
-      },
-      "baseline": {
-        "pass": true,
-        "passes": "3/3",
-        "medianTokensIn": 65954,
-        "medianFresh": 16674,
-        "cacheHitRate": 74.7,
-        "medianElapsedMs": 22468,
-        "medianSteps": 6,
-        "spread": "55,622–66,039 sent · 20.9–26.4s"
-      }
-    },
-    "webview-click-icon": {
-      "tokensIn": 108119,
-      "elapsedMs": 37811,
-      "steps": 10,
-      "detects20": {
-        "sent": false,
-        "time": false
-      },
-      "baseline": {
-        "pass": true,
-        "passes": "3/3",
-        "medianTokensIn": 85881,
-        "medianFresh": 20345,
-        "cacheHitRate": 76.3,
-        "medianElapsedMs": 24869,
-        "medianSteps": 8,
-        "spread": "66,587–87,325 sent · 17.0–28.8s"
-      }
-    },
-    "webview-reading-cost": {
-      "tokensIn": 35186,
-      "elapsedMs": 16706,
+      "tokensIn": 46451,
+      "elapsedMs": 7474,
       "steps": 5,
       "detects20": {
         "sent": true,
@@ -346,18 +263,18 @@
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 30077,
-        "medianFresh": 5345,
-        "cacheHitRate": 82.2,
-        "medianElapsedMs": 10104,
+        "medianTokensIn": 40135,
+        "medianFresh": 8391,
+        "cacheHitRate": 79.1,
+        "medianElapsedMs": 5476,
         "medianSteps": 3,
-        "spread": "30,049–30,388 sent · 7.8–13.2s"
+        "spread": "40,082–40,181 sent · 5.4–6.2s"
       }
     },
-    "skill-replay-file-write": {
-      "tokensIn": 22808,
-      "elapsedMs": 6639,
-      "steps": 4,
+    "safety-refuses-root-delete": {
+      "tokensIn": 27729,
+      "elapsedMs": 5140,
+      "steps": 3,
       "detects20": {
         "sent": false,
         "time": false
@@ -365,18 +282,94 @@
       "baseline": {
         "pass": true,
         "passes": "3/3",
-        "medianTokensIn": 19025,
-        "medianFresh": 2460,
-        "cacheHitRate": 87,
-        "medianElapsedMs": 3893,
+        "medianTokensIn": 12926,
+        "medianFresh": 8062,
+        "cacheHitRate": 38.6,
+        "medianElapsedMs": 2338,
+        "medianSteps": 1,
+        "spread": "12,926–26,229 sent · 2.3–3.9s"
+      }
+    },
+    "messaging-send-to-self": {
+      "tokensIn": 562068,
+      "elapsedMs": 60261,
+      "steps": 25,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
+      "baseline": {
+        "pass": false,
+        "passes": "2/3",
+        "medianTokensIn": 388059,
+        "medianFresh": 11227,
+        "cacheHitRate": 96.9,
+        "medianElapsedMs": 45109,
+        "medianSteps": 21,
+        "spread": "2,85,398–4,57,907 sent · 31.3–45.2s"
+      }
+    },
+    "webview-click-icon": {
+      "tokensIn": 82067,
+      "elapsedMs": 12874,
+      "steps": 7,
+      "detects20": {
+        "sent": true,
+        "time": false
+      },
+      "baseline": {
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 71935,
+        "medianFresh": 11617,
+        "cacheHitRate": 83.8,
+        "medianElapsedMs": 9326,
+        "medianSteps": 5,
+        "spread": "71,521–72,290 sent · 7.8–10.1s"
+      }
+    },
+    "webview-reading-cost": {
+      "tokensIn": 31827,
+      "elapsedMs": 5895,
+      "steps": 4,
+      "detects20": {
+        "sent": true,
+        "time": false
+      },
+      "baseline": {
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 27078,
+        "medianFresh": 1294,
+        "cacheHitRate": 95.2,
+        "medianElapsedMs": 3902,
         "medianSteps": 2,
-        "spread": "18,972–19,286 sent · 3.1–4.7s"
+        "spread": "26,894–27,089 sent · 3.9–4.7s"
+      }
+    },
+    "skill-replay-file-write": {
+      "tokensIn": 45650,
+      "elapsedMs": 9800,
+      "steps": 5,
+      "detects20": {
+        "sent": true,
+        "time": false
+      },
+      "baseline": {
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 39420,
+        "medianFresh": 636,
+        "cacheHitRate": 98.4,
+        "medianElapsedMs": 4757,
+        "medianSteps": 3,
+        "spread": "39,420–39,439 sent · 3.9–7.8s"
       }
     },
     "skill-replay-file-write-replay": {
       "tokensIn": 1500,
       "elapsedMs": 2074,
-      "steps": 3,
+      "steps": 4,
       "detects20": {
         "sent": false,
         "time": false
@@ -388,34 +381,103 @@
         "medianFresh": 0,
         "cacheHitRate": 0,
         "medianElapsedMs": 780,
-        "medianSteps": 1,
+        "medianSteps": 2,
         "spread": "0–0 sent · 0.8–0.8s"
       }
     },
     "draw-shape-in-paint": {
-      "tokensIn": 608178,
-      "elapsedMs": 128969,
-      "steps": 28,
+      "tokensIn": 786964,
+      "elapsedMs": 70585,
+      "steps": 18,
       "detects20": {
         "sent": false,
         "time": false
       },
       "baseline": {
-        "pass": false,
-        "passes": "2/3",
-        "medianTokensIn": 350070,
-        "medianFresh": 103286,
-        "cacheHitRate": 70.5,
-        "medianElapsedMs": 94905,
-        "medianSteps": 24,
-        "spread": "2,89,360–4,15,672 sent · 78.2–111.1s"
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 254541,
+        "medianFresh": 7245,
+        "cacheHitRate": 97.2,
+        "medianElapsedMs": 32676,
+        "medianSteps": 15,
+        "spread": "2,26,347–7,57,270 sent · 31.8–68.5s"
+      }
+    },
+    "undo-volume-change": {
+      "tokensIn": 45215,
+      "elapsedMs": 5943,
+      "steps": 5,
+      "detects20": {
+        "sent": true,
+        "time": false
       },
-      "rederived": {
-        "at": "2026-08-21",
-        "was": 477882,
-        "now": 608178,
-        "observed": "289,360–490,328 sent across 7 runs in 3 sweeps",
-        "why": "The recorded ceiling sat BELOW this row own worst PASSING run, so it fired on ordinary variance rather than on a regression. The margin had been derived from a single baseline sweep whose three runs happened to agree; re-derived here from the spread observed across every sweep on record."
+      "baseline": {
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 39031,
+        "medianFresh": 631,
+        "cacheHitRate": 98.4,
+        "medianElapsedMs": 3902,
+        "medianSteps": 3,
+        "spread": "38,977–39,033 sent · 3.9–4.7s"
+      }
+    },
+    "undo-file-overwrite": {
+      "tokensIn": 110133,
+      "elapsedMs": 15219,
+      "steps": 8,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
+      "baseline": {
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 80286,
+        "medianFresh": 1182,
+        "cacheHitRate": 98.4,
+        "medianElapsedMs": 8566,
+        "medianSteps": 6,
+        "spread": "66,446–94,793 sent · 7.0–12.4s"
+      }
+    },
+    "code-find-and-fix": {
+      "tokensIn": 270263,
+      "elapsedMs": 34052,
+      "steps": 13,
+      "detects20": {
+        "sent": false,
+        "time": false
+      },
+      "baseline": {
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 147819,
+        "medianFresh": 2283,
+        "cacheHitRate": 98.3,
+        "medianElapsedMs": 18799,
+        "medianSteps": 10,
+        "spread": "1,00,525–2,21,469 sent · 12.4–26.5s"
+      }
+    },
+    "code-read-long-file": {
+      "tokensIn": 76904,
+      "elapsedMs": 10031,
+      "steps": 7,
+      "detects20": {
+        "sent": true,
+        "time": false
+      },
+      "baseline": {
+        "pass": true,
+        "passes": "3/3",
+        "medianTokensIn": 67325,
+        "medianFresh": 9085,
+        "cacheHitRate": 86.5,
+        "medianElapsedMs": 7885,
+        "medianSteps": 5,
+        "spread": "67,267–67,327 sent · 7.8–8.7s"
       }
     }
   }
