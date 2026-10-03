@@ -73,6 +73,27 @@ const COMMAND_PROBE_ALIASES = Object.freeze({
   powershell: "powershell"
 });
 
+// COMMANDS WHOSE ONLY HOME *IS* WindowsApps.
+//
+// The alias rule in inspectCommand exists because a WindowsApps `python.exe` is a
+// Store stub that installs nothing and answers nothing - treating it as a Python
+// install is how "is python installed?" came back yes on a machine without it.
+//
+// But winget ships ONLY as an app-execution alias. There is no other copy of it
+// anywhere on a Windows 11 machine, so the very rule that protects the python
+// answer makes the winget answer always wrong. Measured 3 Oct 2026: the eval row
+// `packages-search-winget` failed with the agent reporting "winget isn't on this
+// machine" while Get-Command resolved it under
+// %LOCALAPPDATA%\Microsoft\WindowsApps. That is this project's "a running app
+// was not installed" class, in the detector rather than in the agent.
+//
+// An explicit list rather than probing every alias, because the test
+// `inspectCommand does not count a Store execution alias as installed` asserts a
+// stub is never even SPAWNED - running one can open the Store UI, which is not
+// something a capability check may do. Add a command here only when it has no
+// non-alias installation path at all.
+const ALIAS_IS_THE_REAL_COMMAND = Object.freeze(new Set(["winget"]));
+
 const SAFE_VERSION_ARGUMENTS = Object.freeze({
   python: ["--version"],
   py: ["--version"],
@@ -1098,7 +1119,8 @@ export class WindowsAdapter {
     // WindowsApps entries are app-execution aliases which may only open the
     // Store. They are not evidence that a runtime is installed. Prefer a real
     // executable and report no CLI installation when aliases are all we found.
-    const realPaths = paths.filter((entry) => !/[\\/]Microsoft[\\/]WindowsApps[\\/]/i.test(entry));
+    const realPaths = paths.filter((entry) => ALIAS_IS_THE_REAL_COMMAND.has(canonical)
+      || !/[\\/]Microsoft[\\/]WindowsApps[\\/]/i.test(entry));
     const executablePath = realPaths[0] ?? null;
     if (!executablePath) {
       return {

@@ -64,6 +64,34 @@ test("WindowsAdapter - inspectCommand does not count a Store execution alias as 
   assert.equal(versionSpawned, false);
 });
 
+test("WindowsAdapter - inspectCommand finds winget, whose only home IS WindowsApps", async () => {
+  // THE DEFECT THIS PINS, measured 3 Oct 2026. The alias rule is right about a
+  // Store stub and wrong about winget, which ships nowhere else: the eval row
+  // `packages-search-winget` failed with the agent reporting "winget isn't on
+  // this machine" while Get-Command resolved it under WindowsApps. A detector
+  // that cannot see an installed command is this project's "a running app was
+  // not installed" class, one layer below the agent.
+  const adapter = new WindowsAdapter();
+  // Written with doubled backslashes on purpose: a single one makes this
+  // "C:Usersme...WindowsAppswinget.exe" at runtime, the WindowsApps filter never
+  // matches, and the test passes whether or not the fix is present. It did.
+  const alias = "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\winget.exe";
+  adapter.executeCommand = async (_cwd, command, args) => {
+    if (command === "where.exe") {
+      return args[0] === "winget"
+        ? { exitCode: 0, stdout: alias + "\n", stderr: "" }
+        : { exitCode: 1, stdout: "", stderr: "" };
+    }
+    return { exitCode: 0, stdout: "v1.29.380\n", stderr: "" };
+  };
+
+  const result = await adapter.inspectCommand("winget");
+
+  assert.equal(result.installed, true);
+  assert.equal(result.path, alias);
+  assert.equal(result.version, "v1.29.380");
+});
+
 test("WindowsAdapter - inspectCommand refuses anything shaped like arguments", async () => {
   const adapter = new WindowsAdapter();
   let spawned = false;
