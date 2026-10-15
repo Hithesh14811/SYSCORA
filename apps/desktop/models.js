@@ -22,16 +22,53 @@
  * cheapest CAPABLE model, so the numbers need to rank correctly, not to be
  * invoices.
  */
+//
+// THE ENTRY DESCRIBES WHATEVER THE PERSON CONFIGURED; IT DOES NOT CHOOSE IT.
+//
+// This was a hard-coded catalogue of one: "DeepSeek V4 Flash", the model this
+// project was built against. A fresh clone set up with GPT or Claude still read
+// "Auto chose DeepSeek V4 Flash" under every message — the id never reached the
+// daemon, which always used the configured provider — and had images refused
+// as if its model were blind. The daemon knows the real model name and whether
+// it can see (`modelSupportsVision`, the same test the agent loop uses before
+// it attaches a screenshot), and `applyConfiguredModel` copies that in here.
+// Until it has, the entry claims nothing it does not know: no name, no eyes.
+export const CONFIGURED = "configured";
+
 export const MODELS = [
   {
-    id: "deepseek-v4-flash",
-    label: "DeepSeek V4 Flash",
-    blurb: "Fast and inexpensive. The default for everyday work.",
+    id: CONFIGURED,
+    label: "Your model",
+    blurb: "The provider you set up in Settings.",
     capabilities: { text: true, images: false, documents: true, contextTokens: 128000 },
-    costPerMTok: 0.28,
+    costPerMTok: 1,
     available: true
   }
 ];
+
+const PROVIDER_LABELS = {
+  openai: "OpenAI-compatible",
+  anthropic: "Anthropic",
+  agentrouter: "AgentRouter",
+  deepseek: "DeepSeek",
+  gemini: "Google Gemini",
+  google: "Google Gemini",
+  mistral: "Mistral"
+};
+
+/**
+ * Describe the configured model, from what `GET /api/settings/model` reports.
+ * Returns the entry, which both surfaces then redraw their pickers from.
+ */
+export function applyConfiguredModel(status = {}) {
+  const entry = MODELS[0];
+  const name = String(status?.model ?? "").trim();
+  const provider = PROVIDER_LABELS[String(status?.provider ?? "").toLowerCase()] ?? null;
+  entry.label = name || provider || "Your model";
+  entry.blurb = provider && name ? `${provider}, set up in Settings.` : "The provider you set up in Settings.";
+  entry.capabilities.images = status?.vision === true;
+  return entry;
+}
 
 export const AUTO = "auto";
 
@@ -63,6 +100,11 @@ export function requirementsFor({ attachments = [] } = {}) {
     // Whether the images are somewhere SYSCORA could go and look at them, which
     // decides what the refusal is able to offer. See noVisionAdvice.
     imagesHavePaths: attachments.some((file) => file.kind === "image" && file.path),
+    // Every one of them, which is what decides whether a model that CAN see
+    // will actually be shown them: the picture reaches it as a file the agent
+    // opens (read_file on an image path), never as bytes in the message, so an
+    // image with no path — a plain browser has none — would go nowhere.
+    everyImageHasPath: attachments.every((file) => file.kind !== "image" || Boolean(file.path)),
     // Four characters to a token is the approximation used everywhere else in
     // this project; it is a ratio for comparing, not a tokeniser.
     approxTokens: Math.ceil(extractedChars / 4)
@@ -116,7 +158,15 @@ export function chooseModel(requirements = {}) {
           "SYSCORA to read the file from your machine a part at a time."
     };
   }
+  if (requirements.needsImages && requirements.everyImageHasPath === false) {
+    return { model: null, reason: NO_PATH_ADVICE };
+  }
   const cheapest = [...capable].sort((a, b) => a.costPerMTok - b.costPerMTok)[0];
+  // NOTHING WAS CHOSEN, SO NOTHING IS SAID. With one configured model the old
+  // line, "Auto chose X — cheapest model that fits this request", sat under
+  // every message claiming a decision and a price comparison that never
+  // happened. The reason is for when Auto really picked between models.
+  if (capable.length === 1 && selectableModels().length === 1) return { model: cheapest, reason: null };
   const why = [];
   if (requirements.needsImages) why.push("it can read images");
   if (requirements.approxTokens > 20000) why.push("the attached text is long");
@@ -127,6 +177,11 @@ export function chooseModel(requirements = {}) {
       : `Auto chose ${cheapest.label} — cheapest model that fits this request.`
   };
 }
+
+// A model that can see is still shown nothing if SYSCORA cannot reach the file:
+// the picture goes to it through read_file on the image's path.
+const NO_PATH_ADVICE = "This window cannot give SYSCORA the image file itself, so it would not be looked at. " +
+  "Use the SYSCORA desktop app, or save the image on this machine and ask SYSCORA to open it.";
 
 /**
  * Can the CHOSEN model handle these attachments? Used when the user has picked
@@ -154,5 +209,6 @@ export function checkAttachments(modelId, attachments = []) {
         : noVisionAdvice(requirementsFor({ attachments }))
     };
   }
+  if (images.some((file) => !file.path)) return { ok: false, model, reason: NO_PATH_ADVICE };
   return { ok: true, model, reason: null };
 }

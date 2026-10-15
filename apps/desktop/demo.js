@@ -26,7 +26,7 @@ import { setMarkdown } from "./markdown.js";
 // Which model answers, and what the user attached. Both are decided in the
 // composer and neither may be guessed at send time — see models.js for why
 // "Auto" is a router with a stated reason rather than a silent default.
-import { AUTO, MODELS, checkAttachments, selectableModels } from "./models.js";
+import { AUTO, MODELS, applyConfiguredModel, checkAttachments, selectableModels } from "./models.js";
 import { describeAttachments, prepareAttachment, prepareFolder } from "./attachments.js";
 // The compose card. The agent drafts; a person sends — see the note at the top
 // of email-card.js and the one in apps/daemon/src/gmail.js.
@@ -131,6 +131,7 @@ connectForm.addEventListener("submit", (e) => {
   sessionStorage.setItem(TOKEN_STORAGE_KEY, v);
   connectToken.value = "";
   hideConnect();
+  void refreshConfiguredModel();
   if (storedValue(ONBOARDING_STORAGE_KEY, "0") !== "1") openSafetySettings({ firstRun: true });
 });
 
@@ -138,9 +139,16 @@ const nativeFetch = window.fetch.bind(window);
 window.fetch = async (input, init = {}) => {
   const url = typeof input === "string" ? input : (input?.url ?? "");
   const isApi = url.startsWith("/api/") || url.includes("://127.0.0.1");
-  if (isApi && apiToken) init = { ...init, headers: { ...(init.headers || {}), "x-syscora-token": apiToken } };
+  const sentToken = isApi && Boolean(apiToken);
+  if (sentToken) init = { ...init, headers: { ...(init.headers || {}), "x-syscora-token": apiToken } };
   const res = await nativeFetch(input, init);
-  if (isApi && res.status === 401) handleUnauthorized();
+  // A 401 on a request that carried NO token is not a rejection. The page polls
+  // the daemon before anyone has pasted a token, and every first visit opened
+  // on "Token was rejected" above an empty box.
+  if (isApi && res.status === 401) {
+    if (sentToken) handleUnauthorized();
+    else if (connectPanel.hidden) showConnect();
+  }
   return res;
 };
 
@@ -187,13 +195,38 @@ const readableBytes = (bytes) => {
   return `${(value / 1024 ** 3).toFixed(2)} GB`;
 };
 
+// A FRESH INSTALL HAS NOTHING TO KEEP. The form was written for changing an
+// existing setup — "Keep current provider", "Leave blank to keep the protected
+// key" — and a first-time user read those on an empty install, beside a status
+// line that began "No usable provider credential is configured" and, after
+// Test, ended "Connection verified." (the offline mock passing its own check;
+// the daemon now refuses to test when nothing is saved). So whether anything is
+// saved decides what the form says.
+function hasSavedProvider(status) {
+  return Boolean(status?.provider) && String(status.provider).toLowerCase() !== "mock";
+}
+
+function describeProviderForm(status) {
+  const saved = hasSavedProvider(status);
+  const set = (element, text) => { if (element) element.placeholder = text; };
+  set(providerModel, saved ? "Keep current model" : "Model name, e.g. gpt-4o-mini");
+  set(providerBaseUrl, saved ? "Keep current endpoint" : "Optional; leave blank for the provider's own");
+  set(providerApiKey, saved ? "Leave blank to keep the saved key" : "Paste your API key");
+  const blank = providerName?.querySelector('option[value=""]');
+  if (blank) blank.textContent = saved ? "Keep current provider" : "Choose a provider";
+  if (providerResetButton) providerResetButton.hidden = !saved;
+  if (providerTestButton) providerTestButton.hidden = !saved;
+}
+
 function showProviderStatus(status) {
   if (!providerStatus) return;
+  describeProviderForm(status);
   const health = status?.health;
   const credential = status?.credentialStatus;
-  const base = status?.configured
-    ? `${status.provider || "Current provider"} · ${status.model || "current model"}`
-    : "No usable provider credential is configured";
+  const saved = hasSavedProvider(status);
+  const base = !saved
+    ? "No provider saved yet"
+    : `${status.provider} · ${status.model || "default model"}${status.configured ? "" : " (no API key saved)"}`;
   const condition = credential === "unreadable"
     ? "The protected key cannot be decrypted by this Windows account. Remove it and enter a new key."
     : credential === "plaintext"
@@ -201,8 +234,10 @@ function showProviderStatus(status) {
       : health?.ok === true
         ? "Connection verified."
         : health?.ok === false
-          ? "The saved provider did not pass its connection test."
-          : "The protected key is never shown.";
+          ? (health.reason ? `Connection test failed: ${health.reason}` : "The saved provider did not pass its connection test.")
+          : saved
+            ? "The saved key is never shown."
+            : "Choose a provider, paste your key and press Save and continue. Saving tests the connection.";
   providerStatus.textContent = `${base}. ${condition}`;
   if (providerMigrateButton) providerMigrateButton.hidden = status?.migrationAvailable !== true && credential !== "plaintext";
 }
@@ -256,6 +291,14 @@ function closeSafetySettings() {
 
 developerTerminalToggle?.addEventListener("change", syncTerminalSettings);
 providerTestButton?.addEventListener("click", async () => {
+  // Test checks what is SAVED. Typed-but-unsaved values are not what it would
+  // be testing, and saying "verified" next to them would be about something else.
+  const unsaved = [providerName?.value, providerModel?.value, providerBaseUrl?.value, providerApiKey?.value]
+    .some((value) => String(value ?? "").trim());
+  if (unsaved) {
+    providerStatus.textContent = "Test checks the provider that is already saved. Press Save and continue: what you typed is tested when it is saved.";
+    return;
+  }
   providerStatus.textContent = "Testing the configured provider…";
   try {
     const response = await fetch("/api/settings/model/test", { method: "POST" });
@@ -283,6 +326,7 @@ providerResetButton?.addEventListener("click", async () => {
     const status = await response.json();
     if (!response.ok) throw new Error(status.error || `HTTP ${response.status}`);
     showProviderStatus(status);
+    void refreshConfiguredModel();
   } catch (error) {
     providerStatus.textContent = `The provider was not removed: ${error.message}`;
   }
@@ -651,6 +695,7 @@ onboardingForm?.addEventListener("submit", async (event) => {
     localStorage.setItem(SHELL_MODE_STORAGE_KEY, selectedShellMode);
     localStorage.setItem(ONBOARDING_STORAGE_KEY, "1");
   } catch {}
+  void refreshConfiguredModel();
   closeSafetySettings();
 });
 
@@ -892,7 +937,7 @@ function messageActions({ getText, onEdit = null }) {
 // what is in it and wants to see the folder's name.
 function stripAttachmentBlocks(text) {
   return String(text ?? "")
-    .replace(/\n\n--- Attached (?:file|folder): [\s\S]*?--- end of .*? ---/g, "")
+    .replace(/\n\n--- Attached (?:file|folder|image): [\s\S]*?--- end of .*? ---/g, "")
     .trim();
 }
 
@@ -3904,6 +3949,9 @@ document.addEventListener("keydown", (event) => {
 // only one that can pick a model able to read what has been attached.
 function fillModelPicker() {
   if (!modelSelect) return;
+  // Redrawn whenever the configured model is learned or changes, so it starts
+  // from empty rather than appending a second copy of every option.
+  modelSelect.textContent = "";
   const auto = document.createElement("option");
   auto.value = AUTO;
   auto.textContent = "Auto";
@@ -4233,6 +4281,22 @@ chatInput?.addEventListener("paste", (event) => {
 });
 
 fillModelPicker();
+if (apiToken) void refreshConfiguredModel();
+
+// What the picker shows is the model the person configured, learned from the
+// daemon — see applyConfiguredModel in models.js for the label it replaced.
+async function refreshConfiguredModel(known = null) {
+  try {
+    let status = known;
+    if (!status) {
+      const response = await fetch("/api/settings/model");
+      if (!response.ok) return;
+      status = await response.json();
+    }
+    applyConfiguredModel(status);
+    fillModelPicker();
+  } catch { /* the picker keeps its generic entry; sending is unaffected */ }
+}
 
 chatForm.addEventListener("submit", (e) => {
   e.preventDefault();

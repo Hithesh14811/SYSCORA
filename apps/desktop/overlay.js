@@ -17,7 +17,7 @@
 // them is the source of truth.
 
 import { readIntentSession } from "./intent-client.js";
-import { AUTO, checkAttachments, modelById, selectableModels } from "./models.js";
+import { AUTO, applyConfiguredModel, checkAttachments, modelById, selectableModels } from "./models.js";
 import { describeAttachments, prepareAttachment, prepareFolder } from "./attachments.js";
 import { activeChatTitle, appendMessage, readHistory, recordTurn, startNewChat } from "./chat-store.js";
 import { withApiToken } from "./api-fetch.js";
@@ -201,7 +201,7 @@ function renderModelMenu() {
     });
     modelMenu.append(button);
   };
-  pick(AUTO, "Auto", "Picks the cheapest model that can do it");
+  pick(AUTO, "Auto", selectableModels().length > 1 ? "Picks the cheapest model that can do it" : "Uses the model you set up");
   for (const model of selectableModels()) pick(model.id, model.label, model.blurb);
 }
 
@@ -850,6 +850,17 @@ function handleStreamEvent(event) {
 
 renderModelMenu();
 modelLabel.textContent = modelById(selectedModel)?.label ?? "Auto";
+// The configured model's real name and whether it can see, from the daemon.
+// Same source as the chat window; see applyConfiguredModel in models.js.
+fetch("/api/settings/model")
+  .then((response) => (response.ok ? response.json() : null))
+  .then((status) => {
+    if (!status) return;
+    applyConfiguredModel(status);
+    renderModelMenu();
+    modelLabel.textContent = modelById(selectedModel)?.label ?? "Auto";
+  })
+  .catch(() => { /* the menu keeps its generic entry; sending is unaffected */ });
 setState("idle");
 showChatName();
 // SAY WHICH KEY HIDES IT. The accelerator is chosen at startup from a list —

@@ -35,10 +35,17 @@ test("a long document is measured, so it can be routed on size", () => {
   assert.equal(requirements.approxTokens, 10_000);
 });
 
-test("Auto picks a model and always gives a reason", () => {
+test("Auto picks a model, and claims a choice only when there was one", () => {
   const { model, reason } = chooseModel(requirementsFor({ attachments: [] }));
   assert.ok(model, "Auto must choose something when a capable model exists");
-  assert.match(reason, /Auto chose/, "a picker that chooses silently is one nobody trusts");
+  if (selectableModels().length > 1) {
+    assert.match(reason, /Auto chose/, "a picker that chooses silently is one nobody trusts");
+  } else {
+    // With one configured model nothing was compared, and "Auto chose X —
+    // cheapest model that fits" under every message was a claim about a
+    // decision that never happened.
+    assert.equal(reason, null);
+  }
 });
 
 test("Auto refuses rather than picking something blind for an image", () => {

@@ -853,6 +853,20 @@ export class FailoverModelProvider extends LanguageModelProvider {
 
   supportsChat() { return this.providers.some((provider) => provider.supportsChat?.()); }
 
+  // THE WRAPPERS SAID EVERY MODEL WAS BLIND. Neither this nor
+  // ConsentAwareModelProvider forwarded supportsVision, so the loop asked the
+  // base class, which tests `this.model` — undefined on a wrapper. In the
+  // running daemon `screen {vision}` therefore always answered "cannot see",
+  // on Claude and GPT-4o alike, while every unit test passed against an
+  // unwrapped provider. Found 15 Oct 2026 when an image read_file opened never
+  // reached a stand-in endpoint. Every provider that could answer must see:
+  // failover can move to the next one mid-task, and a blind one sent a picture
+  // fails the whole request.
+  supportsVision() {
+    const answering = this.providers.filter((provider) => provider.supportsChat?.());
+    return answering.length > 0 && answering.every((provider) => provider.supportsVision?.() === true);
+  }
+
   async chat(request = {}) {
     const errors = [];
     for (let offset = 0; offset < this.providers.length; offset += 1) {
@@ -1005,6 +1019,10 @@ export class ConsentAwareModelProvider extends LanguageModelProvider {
     if (this.consentScopes.includes(ExternalAIConsentScope.DISABLED)) return false;
     return Boolean(this.provider?.supportsChat?.());
   }
+
+  // See FailoverModelProvider.supportsVision: a wrapper must say what the model
+  // it wraps can do, or the base class answers for a model it does not have.
+  supportsVision() { return this.provider?.supportsVision?.() === true; }
 
   // The consent boundary applies to the CONTENT that leaves this machine, so it
   // redacts each message the same way it redacts a structured prompt. It does
@@ -2091,6 +2109,18 @@ export class GeminiModelProvider extends LanguageModelProvider {
         // A turn with neither prose nor calls has nothing in it; Gemini rejects
         // an empty parts array.
         if (parts.length > 0) contents.push({ role: "model", parts });
+        continue;
+      }
+      // A PICTURE MESSAGE HAS NO STRING CONTENT, AND WAS DROPPED. The loop sends
+      // a look at the pixels as a user turn whose content is an array — text plus
+      // a vendor-neutral `input_image` — and `text` above is "" for it, so every
+      // `screen {vision}` and every image read_file opened reached Gemini as
+      // nothing, while modelSupportsVision told the loop Gemini could see.
+      if (Array.isArray(message.content)) {
+        const parts = message.content.map((block) => (block?.type === "input_image"
+          ? { inlineData: { mimeType: block.mediaType, data: block.data } }
+          : { text: String(block?.text ?? "") })).filter((part) => part.inlineData || part.text);
+        if (parts.length > 0) contents.push({ role: "user", parts });
         continue;
       }
       if (text) contents.push({ role: "user", parts: [{ text }] });

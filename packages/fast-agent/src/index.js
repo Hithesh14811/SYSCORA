@@ -2992,7 +2992,7 @@ export class FastAgent {
           messages.push({
             role: "user",
             content: [
-              { type: "text", text: `[the window you asked to see — ${call.name}]` },
+              { type: "text", text: result.raw.imageAttachment.caption ?? `[the window you asked to see — ${call.name}]` },
               {
                 type: "input_image",
                 mediaType: result.raw.imageAttachment.mediaType,

@@ -259,7 +259,7 @@
           <div class="settings-grid">
             <label>Provider
               <select id="providerName">
-                <option value="">Keep current provider</option>
+                <option value="">Choose a provider</option>
                 <option value="openai">OpenAI-compatible</option>
                 <option value="anthropic">Anthropic-compatible</option>
                 <option value="agentrouter">AgentRouter</option>
@@ -268,13 +268,13 @@
                 <option value="mistral">Mistral</option>
               </select>
             </label>
-            <label>Model<input id="providerModel" type="text" autocomplete="off" placeholder="Keep current model" /></label>
+            <label>Model<input id="providerModel" type="text" autocomplete="off" placeholder="Model name, e.g. gpt-4o-mini" /></label>
             <label class="settings-wide">Base URL
-              <input id="providerBaseUrl" type="url" autocomplete="off" placeholder="Keep current endpoint" />
+              <input id="providerBaseUrl" type="url" autocomplete="off" placeholder="Optional; leave blank for the provider's own" />
             </label>
             <label class="settings-wide">API key
               <input id="providerApiKey" type="password" autocomplete="new-password"
-                     placeholder="Leave blank to keep the protected key" />
+                     placeholder="Paste your API key" />
             </label>
           </div>
           <p id="providerStatus" class="settings-status">The current key is never shown here.</p>

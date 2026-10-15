@@ -350,6 +350,18 @@ export function describeAttachments(attachments) {
         `${item.text}${clipped}\n--- end of ${item.name} ---`
       );
     }
+    // AN IMAGE TRAVELS AS ITS PATH, AND THE AGENT OPENS IT. Nothing here put
+    // an image into the message at all, so a screenshot attached to a question
+    // reached the model as nothing. The send gate (models.js) only lets one
+    // through when the configured model can see and the path is known, and
+    // read_file on an image path hands the model the picture.
+    if (item.kind === "image" && item.path) {
+      blocks.push(
+        `\n\n--- Attached image: ${item.name} at ${item.path} ---\n` +
+        `Look at it with read_file {path: ${JSON.stringify(item.path)}}; an image file comes back as a picture.\n` +
+        `--- end of ${item.name} ---`
+      );
+    }
     if (item.kind === "folder") {
       // The PATH first and on its own line, because it is the actionable part:
       // with it the agent can list, read and search the folder itself instead of

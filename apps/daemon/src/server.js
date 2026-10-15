@@ -24,6 +24,7 @@ import { resolveStateDir } from "../../../packages/shared-types/src/state-path.j
 import { normalizeAccessPolicy } from "../../../packages/shared-types/src/access-policy.js";
 import { canonicalizePath } from "../../../packages/shared-types/src/canonical-path.js";
 import { isProtectedReference, protectToFile } from "../../../packages/secrets/src/protected-value.js";
+import { modelSupportsVision } from "../../../packages/model-providers/src/index.js";
 import { installCrashGuards, reportInterruptedRun } from "./crash-guard.js";
 import { reportPreflight } from "./preflight.js";
 // The same extractor the agent uses on files it finds on disk. See documents.js:
@@ -336,6 +337,9 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
         sendJson(response, 200, {
           provider: resolved.provider ?? model.provider ?? null,
           model: resolved.model ?? model.model ?? null,
+          // Whether the composer may let an image through: the same test the
+          // agent loop makes before it shows a model a picture (supportsVision).
+          vision: modelSupportsVision(resolved.model ?? model.model),
           configured: Boolean(resolved.apiKey || resolved.apiKeys?.length),
           protected: resolved.credentialStatus === "protected",
           credentialStatus: resolved.credentialStatus,
@@ -348,6 +352,14 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
       if (requestUrl.pathname === "/api/settings/model/test" && request.method === "POST") {
         try {
           const status = reloadRuntimeModelProvider(runtime, basePath);
+          // NOTHING SAVED IS NOT A PASSING TEST. With no provider configured the
+          // chain is the offline Mock, whose health is always ok, so a fresh
+          // install that pressed Test before Save was told "Connection verified"
+          // about a provider that did not exist.
+          if (!status.remote) {
+            sendJson(response, 200, { ...status, health: { ok: false, providers: [], reason: "No provider is saved yet, so there is nothing to test." } });
+            return;
+          }
           const health = await runtime.reasoningEngine.modelProvider.health();
           sendJson(response, 200, { ...status, health: { ok: health?.ok === true, providers: health?.providers ?? [], reason: health?.reason ?? null } });
         } catch (error) {

@@ -106,6 +106,9 @@ import {
 
 const MAX_OUTPUT_CHARS = 6000;
 const MAX_SCREEN_TEXT_CHARS = 2500;
+// The image formats every provider here accepts as a picture; a .bmp or .tiff
+// would be refused by the API, so read_file treats only these as images.
+const IMAGE_TYPES = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
 // How many rows are LISTED. Everything observed stays clickable regardless (see
 // renderElements). Sixty was too few for a real application: Paint's toolbar
 // alone exceeds it, and the rows that fell off were the tools.
@@ -6490,6 +6493,35 @@ export function buildToolset({
       acts: false,
       execute: async (args) => {
         const filePath = String(args.path ?? "");
+        // AN IMAGE FILE IS A PICTURE, NOT TEXT. This read it as UTF-8, so a
+        // screenshot the user attached came back as a page of mojibake. It now
+        // goes to a model that can see the same way `screen {vision}` does — as
+        // `imageAttachment`, which the loop turns into a picture message for any
+        // provider — and to one that cannot, as a plain refusal saying so.
+        const imageType = IMAGE_TYPES[path.extname(filePath).toLowerCase()];
+        if (imageType) {
+          const bytes = await fs.readFile(filePath);
+          const result = { filePath, image: true, mediaType: imageType, bytes: bytes.length };
+          if (state.visionAvailable !== true) result.visionUnavailable = true;
+          else if (bytes.length > MAX_VISION_BYTES) result.visionTooLarge = bytes.length;
+          else {
+            result.imageAttachment = {
+              mediaType: imageType,
+              data: bytes.toString("base64"),
+              bytes: bytes.length,
+              caption: `[the image file you opened — ${filePath}]`
+            };
+          }
+          // The receipt is about the FILE, read off disk here; whether the
+          // model then understood the picture is not something a tool can see.
+          result.evidence = evidence({
+            observed: `${filePath} is a ${bytes.length}-byte ${imageType} image` +
+              (result.imageAttachment ? ", attached as a picture" : ", not attached"),
+            method: "filesystem.read",
+            verdict: result.imageAttachment ? CONFIRMED : REFUTED
+          });
+          return result;
+        }
         if (!isDocumentPath(filePath)) {
           const read = await runCapability("filesystem.read", { filePath });
           const body = String(read?.contents ?? read?.content ?? "");
@@ -6545,6 +6577,16 @@ export function buildToolset({
         // attachment, a PDF from a download, a README from a repository — all of
         // them reach here because the user asked what is IN them, which is
         // exactly the opening an instruction hidden in one is waiting for.
+        if (result.image) {
+          if (result.imageAttachment) {
+            return reported(result, `${result.filePath} (${result.mediaType}, ${result.bytes} bytes) — the picture is attached below.`);
+          }
+          return refuted(result, result.visionTooLarge
+            ? `${result.filePath} is ${Math.round(result.visionTooLarge / 1_000_000)} MB, too large to attach as a picture. ` +
+              "Open it in an application and read the screen instead."
+            : `${result.filePath} is an image, and the model running you cannot see images. ` +
+              "Open it in an application and read the screen for any text in it, or tell the user you cannot see it.");
+        }
         const body = result.document ? result.text : (result.contents ?? result.content ?? "");
         // Scanned on the window's OWN text, not the whole file: an instruction
         // 4,000 lines below what was read is not something this reading handed
