@@ -97,10 +97,30 @@ export function redirectedTarget(target) {
     // FIRE ON THE CASE IT EXISTS FOR IS NOT A CHECK. `realpathSync.native`
     // asks Windows to resolve the path and returns the container location.
     const real = fs.realpathSync.native(target);
-    return path.resolve(real) === path.resolve(target) ? null : real;
+    return sameSpelledDifferently(real, target) ? null : real;
   } catch {
     return null; // absent, or unreadable
   }
+}
+
+// THE SAME FOLDER, SPELLED TWO WAYS, IS NOT A REDIRECT. realpath.native also
+// expands 8.3 short names and normalises case. On GitHub's Windows runner TEMP
+// is C:\Users\RUNNER~1\..., which comes back as C:\Users\runneradmin\..., so
+// every ordinary temp directory was reported as redirected and CI failed on
+// master for weeks while passing on a machine whose profile has no short name.
+// A container redirect changes the path's SHAPE (it inserts
+// Packages\<app>\LocalCache); a spelling difference keeps every component and
+// only differs in case or in a component that is itself an 8.3 name.
+function sameSpelledDifferently(real, target) {
+  const a = path.resolve(real);
+  const b = path.resolve(target);
+  if (a === b) return true;
+  if (process.platform !== "win32") return false;
+  const realParts = a.split(/[\\/]+/);
+  const targetParts = b.split(/[\\/]+/);
+  if (realParts.length !== targetParts.length) return false;
+  return realParts.every((part, index) =>
+    part.toLowerCase() === targetParts[index].toLowerCase() || /~\d+/.test(targetParts[index]));
 }
 
 /**

@@ -21,6 +21,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { SessionStore, boundSession, MAX_SESSION_BYTES } from "../../packages/agent-runtime/src/session-store.js";
 import {
   resolveStateDir,
@@ -318,4 +319,28 @@ test("the redirect check uses a signal that can actually fire", async () => {
   const seen = redirectedTarget(child);
   assert.ok(seen, "a path that is not a link and still resolves elsewhere must be reported, not passed as clean");
   assert.equal(fsSync.realpathSync.native(seen), fsSync.realpathSync.native(path.join(plain, "sub")));
+});
+
+// GitHub's runner has TEMP at C:\Users\RUNNER~1\..., and the test above failed
+// there on its very first assertion: the 8.3 short name came back expanded, so
+// an ordinary directory looked redirected. Reproduced here by asking Windows for
+// a short name directly; volumes with 8.3 names turned off have nothing to test.
+test("an 8.3 short name or a change of case is not a redirect", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows path spelling");
+  const { redirectedTarget } = await import("../../packages/shared-types/src/state-path.js");
+  const root = await tempRoot();
+  const long = path.join(root, "a-directory-with-a-long-name");
+  await fs.mkdir(long, { recursive: true });
+
+  assert.equal(redirectedTarget(long.toUpperCase()), null, "case alone must not count as a redirect");
+
+  // redirectedTarget also returns null for a path that does not exist, so a
+  // malformed probe would pass this test vacuously — and the first version did:
+  // without windowsVerbatimArguments node escaped the quotes for cmd and this
+  // "short name" came back as C:\"C:\Users\...\". Hence the existence check.
+  const short = execFileSync("cmd.exe", ["/d", "/s", "/c", `"for %I in ("${long}") do @echo %~sI"`],
+    { encoding: "utf8", windowsVerbatimArguments: true }).trim();
+  if (!short || short.toLowerCase() === long.toLowerCase()) return t.skip("8.3 names are disabled on this volume");
+  assert.ok(fsSync.existsSync(short), `the probe returned ${short}, which is not a real path`);
+  assert.equal(redirectedTarget(short), null, `${short} is ${long}, not a redirect`);
 });
