@@ -1,5 +1,7 @@
 # SYSCORA
 
+[![CI](https://github.com/Hithesh14811/SYSCORA/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Hithesh14811/SYSCORA/actions/workflows/ci.yml)
+
 An AI agent that runs your Windows PC from plain English, and doesn't lie
 about what it did.
 
