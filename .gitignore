@@ -66,3 +66,28 @@ syscora-architecture.svg
 # header that it is safe to delete once the prompt has landed.
 scripts/rewrite-system-prompt.mjs
 scripts/system-prompt.txt
+
+# Personal and coursework material: college reports, diaries, decks and their
+# build scratch. Kept on this machine, never part of the product.
+report/
+.codex-build/
+output/
+_factcheck_render/
+
+# Working notes and drafts that live on this machine only: the running
+# engineering log, the plan, product strategy, old audits, and the paper draft
+# (the paper is co-authored and unpublished, so it is not mine alone to post).
+docs/paper/
+docs/product/
+docs/state-of-the-world.md
+docs/production-plan.md
+docs/production-audit-*.md
+docs/mvp-*.md
+docs/capability-framework.md
+docs/architecture/general-intelligence-readiness-report.md
+docs/architecture/os-agent-readiness-audit-*.md
+docs/architecture/mvp-*.md
+docs/architecture/m4-implementation-map.md
+docs/architecture/hardening-log.md
+docs/releases/RC1_VALIDATION_REPORT.md
+docs/releases/repository-hygiene-audit.md
