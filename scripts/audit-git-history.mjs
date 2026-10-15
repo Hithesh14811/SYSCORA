@@ -54,7 +54,11 @@ const reviewedHistoricalObjects = new Set([
   "dd638666e928c01c010fbc5fe33f34b3b5a81ea4",
   "407bfe92a0673c5244a993c3206400b58233fc39",
   "0aa258432396e2bd49f89c7bb7b488a4da98d242",
-  "35cd915c33111d958865c6fd142f76f988b22056"
+  "35cd915c33111d958865c6fd142f76f988b22056",
+  // The README demo GIF, both versions committed on 16 Oct 2026 (5.8 MB and
+  // 8.2 MB). Over the 5 MB bound on purpose: a screen recording of a real run.
+  "c575318af67d68a03eaa9332526e5f185b9785d1",
+  "3cfc14acf613e4a8425c481983be7ef7f436d063"
 ]);
 const findings = [];
 const scanItems = [];
