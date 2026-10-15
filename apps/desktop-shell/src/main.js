@@ -140,11 +140,12 @@ function createWindow({ port, apiToken }) {
   });
 
   window.once("ready-to-show", () => window.show());
-  // The chat renderer needs no camera, microphone, geolocation, notifications,
-  // MIDI, USB, serial or clipboard permission from Chromium. Agent capabilities
-  // live behind the authenticated daemon instead of browser permission prompts.
-  window.webContents.session.setPermissionCheckHandler(() => false);
-  window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  // The chat renderer needs no camera, geolocation, notifications, MIDI, USB,
+  // serial or clipboard permission from Chromium. Agent capabilities live behind
+  // the authenticated daemon instead of browser permission prompts. The one
+  // exception is the microphone, for the composer's voice input — see
+  // allowMicrophoneOnly.
+  allowMicrophoneOnly(window.webContents.session, port);
   window.webContents.on("will-attach-webview", (event) => event.preventDefault());
   sendLinksToTheRealBrowser(window, port);
   window.loadURL(`http://127.0.0.1:${port}`);
@@ -223,8 +224,7 @@ function createOverlayWindow({ port, apiToken }) {
   // mouse MOVE events coming so the renderer can still see the pointer approach
   // the pill and ask for interactivity back.
   overlay.setIgnoreMouseEvents(true, { forward: true });
-  overlay.webContents.session.setPermissionCheckHandler(() => false);
-  overlay.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  allowMicrophoneOnly(overlay.webContents.session, port);
   overlay.webContents.on("will-attach-webview", (event) => event.preventDefault());
   sendLinksToTheRealBrowser(overlay, port);
   overlay.loadURL(`http://127.0.0.1:${port}/overlay.html`);
@@ -545,6 +545,29 @@ function setupLegalDocuments() {
 // uses, and leave the application where it was. Only http(s) — a `file:` link in
 // an answer opening something on this machine with one click is not a thing this
 // window should be able to do, and the agent has tools for that anyway.
+// THE MICROPHONE, AND NOTHING ELSE. Every other permission is still refused.
+// Audio only (a request that also wants the camera is refused whole), and only
+// for pages served by this daemon — a link that somehow navigated a window
+// elsewhere gets nothing. Windows' own microphone privacy switch still applies
+// on top of this; voice-input.js names it when capture is denied.
+function allowMicrophoneOnly(session, port) {
+  const daemonOrigin = `http://127.0.0.1:${port}`;
+  const fromDaemon = (url) => {
+    try { return new URL(url).origin === daemonOrigin; } catch { return false; }
+  };
+  session.setPermissionCheckHandler((_contents, permission, requestingOrigin, details) => (
+    permission === "media" && details?.mediaType === "audio" && fromDaemon(requestingOrigin)
+  ));
+  session.setPermissionRequestHandler((contents, permission, callback, details) => {
+    const types = details?.mediaTypes ?? [];
+    callback(
+      permission === "media" &&
+      types.length > 0 && types.every((type) => type === "audio") &&
+      fromDaemon(details?.requestingUrl ?? contents.getURL())
+    );
+  });
+}
+
 function sendLinksToTheRealBrowser(window, port) {
   const isOurOwnPage = (url) => {
     try {

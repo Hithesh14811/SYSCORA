@@ -36,6 +36,7 @@ import { fileCard, sealReplayedFile } from "./file-card.js";
 // already kept. Until these existed the loop emitted SKILL_OFFERED to nobody and
 // the daemon's save endpoint had no caller but the eval harness.
 import { skillCard, sealReplayedSkill } from "./skill-card.js";
+import { attachVoiceInput } from "./voice-input.js";
 
 const TOKEN_STORAGE_KEY = "syscora_token";
 // A KNOWN TOKEN IS NOT A TOKEN.
@@ -4364,20 +4365,7 @@ if (overlayBridge) {
   });
 }
 
-// Voice, on this composer as on the pill's. The button is real and holds its
-// state; capture is not wired yet, and it says so rather than doing nothing.
-const voiceButton = document.getElementById("voiceButton");
-voiceButton?.addEventListener("click", () => {
-  const on = voiceButton.getAttribute("aria-pressed") === "true";
-  voiceButton.setAttribute("aria-pressed", String(!on));
-  // Said on the control itself rather than through a notification system this
-  // file does not have. The title reverts, so the admission is not permanent.
-  if (!on) {
-    const was = voiceButton.title;
-    voiceButton.title = "Voice input is not wired up yet — type it for now.";
-    setTimeout(() => {
-      voiceButton.title = was;
-      voiceButton.setAttribute("aria-pressed", "false");
-    }, 2000);
-  }
-});
+// Voice, on this composer as on the pill's. See voice-input.js: the words land
+// in the box at the caret and wait for Send. This surface has no notification
+// line, so the recording bar says what went wrong itself.
+attachVoiceInput({ button: document.getElementById("voiceButton"), input: chatInput, onChange: growComposer });

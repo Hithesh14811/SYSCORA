@@ -1,0 +1,85 @@
+/* THE RECORDING BAR — stands in the text box's place while the mic is live.
+ * Shared by the chat and the pill; voice-input.js inserts it right after the
+ * textarea, so it inherits whichever layout that slot has (a flex child in the
+ * pill, a full-width block in the chat). */
+.voice-bar {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 4px 2px;
+  color: var(--text, #e8eef6);
+}
+
+.voice-bar[hidden] { display: none !important; }
+
+.voice-wave {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  color: var(--text, #e8eef6);
+  /* Fade the oldest bars out at the left edge, as ChatGPT's does. */
+  -webkit-mask-image: linear-gradient(to right, transparent 0, #000 48px);
+  mask-image: linear-gradient(to right, transparent 0, #000 48px);
+}
+
+.voice-status {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px;
+  color: var(--text-dim, #a6b3c4);
+}
+
+.voice-bar-button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--border, #212b38);
+  background: transparent;
+  color: var(--text-dim, #a6b3c4);
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+
+.voice-bar-button:hover { background: rgba(255, 255, 255, .07); color: var(--text, #e8eef6); }
+.voice-confirm { background: var(--text, #e8eef6); color: #0b0f15; border-color: transparent; }
+.voice-confirm:hover { background: #fff; color: #0b0f15; }
+.voice-confirm:disabled { opacity: .4; cursor: default; }
+
+/* Transcribing: the wave holds still and dims; the status says what is happening. */
+.voice-bar[data-state="transcribing"] .voice-wave { opacity: .35; }
+.voice-bar[data-state="transcribing"] .voice-status { animation: voice-pulse 1.2s ease-in-out infinite; }
+
+/* A message (mic blocked, nothing heard): just the words. */
+.voice-bar[data-state="message"] .voice-wave,
+.voice-bar[data-state="message"] .voice-bar-button { display: none; }
+.voice-bar[data-state="message"] .voice-status {
+  flex: 1;
+  white-space: normal;
+  color: var(--danger, #ff6b62);
+  padding: 6px 8px;
+}
+
+/* The mic itself while live: a red dot that breathes. */
+#voiceButton[data-voice="recording"] {
+  color: #fff;
+  background: var(--danger, #ff6b62);
+  border-color: transparent;
+  animation: voice-breathe 1.6s ease-in-out infinite;
+}
+#voiceButton[data-voice="transcribing"] { opacity: .5; pointer-events: none; }
+
+@keyframes voice-pulse { 50% { opacity: .45; } }
+@keyframes voice-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 107, 98, .45); }
+  50% { box-shadow: 0 0 0 5px rgba(255, 107, 98, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #voiceButton[data-voice="recording"], .voice-bar[data-state="transcribing"] .voice-status { animation: none; }
+}

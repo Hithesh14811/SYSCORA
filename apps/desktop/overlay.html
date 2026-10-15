@@ -5,6 +5,7 @@
     <title>SYSCORA</title>
     <link rel="icon" href="/icon.ico" />
     <link rel="stylesheet" href="/overlay.css" />
+    <link rel="stylesheet" href="/voice-input.css" />
   </head>
   <!-- THE PILL.
        SYSCORA opens as a text box floating over whatever the user is already
@@ -123,10 +124,8 @@
               </svg>
             </button>
 
-            <!-- WIRED LATER, AND IT SAYS SO. The button exists, holds its own
-                 pressed state and announces itself; nothing behind it captures
-                 audio yet. A control that silently does nothing is worse than one
-                 that says it is not ready. -->
+            <!-- Voice input — see voice-input.js. Transcribes into the box;
+                 never sends on its own. -->
             <button id="voiceButton" class="pill-icon" type="button" aria-pressed="false"
                     aria-label="Voice input" title="Voice input">
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"

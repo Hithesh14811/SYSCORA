@@ -57,8 +57,11 @@ test("the toast is suppressed while the chat window is in front", () => {
 });
 
 test("renderer permissions are still denied", () => {
-  assert.match(main, /setPermissionRequestHandler\(\(_contents, _permission, callback\) => callback\(false\)\)/,
+  // The microphone is the one grant, for voice input; tests/unit/voice-input.test.js
+  // checks it lets through audio from the daemon and nothing else.
+  assert.match(main, /permission === "media" &&/,
     "the notification bridge must not have been paid for by weakening this");
+  assert.doesNotMatch(main, /permission === "notifications"/);
 });
 
 // REPLAYING A CONVERSATION IS NOT A RUN FINISHING.

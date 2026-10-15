@@ -30,6 +30,7 @@ import { reportPreflight } from "./preflight.js";
 // a .docx is a ZIP of XML and a .pdf is a set of FlateDecode streams, both of
 // which Node can take apart without a dependency.
 import { extractDocumentText, isDocumentPath } from "../../../packages/fast-agent/src/documents.js";
+import { transcribe } from "./speech.js";
 // Mail. Reachable only from the compose card, never from the agent loop — the
 // reason is the long note at the top of this module.
 import { connectGmail, disconnectGmail, gmailStatus, sendGmail, setDefaultGmailAddress } from "./gmail.js";
@@ -942,6 +943,20 @@ export function startServer({ port = 4317, basePath = process.cwd(), runtime: in
           limit,
           sessions
         });
+        return;
+      }
+
+      // VOICE INPUT. The composer's mic records a WAV and gets words back; it
+      // never submits them. See speech.js for why a transcript is only ever a
+      // draft in the text box.
+      if (request.method === "POST" && requestUrl.pathname === "/api/voice/transcribe") {
+        const body = await readJsonBody(request, MAX_ATTACHMENT_BODY_BYTES);
+        const wav = Buffer.from(String(body?.base64 ?? ""), "base64");
+        if (wav.length < 44 || wav.toString("ascii", 0, 4) !== "RIFF") {
+          sendJson(response, 400, { ok: false, reason: "Expected a WAV recording." });
+          return;
+        }
+        sendJson(response, 200, await transcribe(wav, { basePath }));
         return;
       }
 

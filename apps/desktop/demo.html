@@ -6,6 +6,7 @@
     <title>SYSCORA</title>
     <link rel="icon" href="/icon.ico" sizes="any" />
     <link rel="stylesheet" href="/demo.css" />
+    <link rel="stylesheet" href="/voice-input.css" />
   </head>
   <body>
     <header class="demo-topbar">
@@ -590,10 +591,8 @@
             </button>
             <div id="modelMenu" class="model-menu" role="menu" hidden></div>
           </div>
-          <!-- WIRED LATER, AND IT SAYS SO WHEN PRESSED. The control exists and
-               holds its own pressed state; nothing behind it captures audio yet.
-               A button that silently does nothing is worse than one that admits
-               it is not ready — the same reasoning as the pill's. -->
+          <!-- Voice input — see voice-input.js. Transcribes into the box;
+               never sends on its own. -->
           <button id="voiceButton" class="composer-icon" type="button" aria-pressed="false"
                   aria-label="Voice input" title="Voice input">
             <svg class="icon" viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"

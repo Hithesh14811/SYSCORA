@@ -21,6 +21,7 @@ import { AUTO, checkAttachments, modelById, selectableModels } from "./models.js
 import { describeAttachments, prepareAttachment, prepareFolder } from "./attachments.js";
 import { activeChatTitle, appendMessage, readHistory, recordTurn, startNewChat } from "./chat-store.js";
 import { withApiToken } from "./api-fetch.js";
+import { attachVoiceInput } from "./voice-input.js";
 import { STATUS, pendingVerbFor, runningVerbFor } from "./status-words.js";
 
 const bridge = globalThis.syscora?.overlay ?? null;
@@ -300,18 +301,11 @@ newChatButton.addEventListener("click", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Voice. The button is real and holds its state; nothing behind it captures
-// audio yet, and it says so rather than doing nothing.
+// Voice. See voice-input.js: the words land in the box and are never sent by
+// themselves. Problems are said where everything else on the pill is said.
 // ---------------------------------------------------------------------------
 
-voiceButton.addEventListener("click", () => {
-  const on = voiceButton.getAttribute("aria-pressed") === "true";
-  voiceButton.setAttribute("aria-pressed", String(!on));
-  if (!on) {
-    note("Voice input is not wired up yet — type it for now.", "error");
-    setTimeout(() => voiceButton.setAttribute("aria-pressed", "false"), 1500);
-  }
-});
+attachVoiceInput({ button: voiceButton, input, onNote: note });
 
 // ---------------------------------------------------------------------------
 // WHAT IT SAW AND WHAT IT IS DOING — the narration, streaming, above the box.

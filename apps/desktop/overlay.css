@@ -424,8 +424,6 @@ body.dragging, body.dragging .pill { cursor: grabbing; }
  * to press. */
 .pill-send[data-mode="stop"] { background: var(--danger); color: #fff; }
 
-#voiceButton[aria-pressed="true"] { color: var(--danger); }
-
 /* ---- the corner control ----------------------------------------------- */
 
 .pill-corner {
