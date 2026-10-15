@@ -10,6 +10,11 @@ todo list in it" or "send hi to myself on WhatsApp", and SYSCORA actually does
 it: clicks, types, opens apps, edits files, drives a browser. Think Claude Code,
 but pointed at the whole operating system instead of one repo.
 
+![SYSCORA drawing a car in Paint from one sentence, then playing a song on Spotify](assets/demo.gif)
+
+*"draw a simple car in ms paint", then "play dracula on spotify". The drawing
+is sped up 5x; in real time it took about 95 seconds.*
+
 ## The problem I kept running into
 
 Computer-use agents fail quietly. Early on, mine would happily tell me
