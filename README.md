@@ -12,8 +12,15 @@ but pointed at the whole operating system instead of one repo.
 
 ![SYSCORA drawing a car in Paint from one sentence, then playing a song on Spotify](assets/demo.gif)
 
-*"draw a simple car in ms paint", then "play dracula on spotify". The drawing
-is sped up 5x; in real time it took about 95 seconds.*
+*"draw a simple car in ms paint", then "play dracula on spotify", running on
+DeepSeek's small, fast `deepseek-flash` model. The drawing is sped up 5x; in
+real time it took about 95 seconds. [Full recording](assets/demo-full.mp4).*
+
+If you look closely, the colours in the car summary don't all match the canvas.
+In Paint a shape stays selected after you draw it, so when the model picked the
+next colour it recoloured the previous shape as well. A stronger model should
+avoid that mistake; the harness doesn't verify colours yet, so the summary
+reports what the model meant to draw.
 
 ## The problem I kept running into
 
