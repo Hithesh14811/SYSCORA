@@ -148,6 +148,8 @@ class CdpConnection {
   }
 }
 
+const CDP_STARTUP_TIMEOUT_MS = 30000;
+
 export class CdpBrowserAdapter {
   constructor({ executablePath = null, port = 0, requestTimeoutMs = 10000 } = {}) {
     this.executablePath = executablePath;
@@ -261,7 +263,13 @@ export class CdpBrowserAdapter {
     let endpoint = "";
     try {
       await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(browserError("CDP_TIMEOUT", "Browser debug endpoint did not start")), 10000);
+      // A COLD FIRST LAUNCH IS NOT A HUNG ONE. A fresh profile on a slow disk
+      // can take longer than ten seconds to print "DevTools listening": GitHub's
+      // runner missed the old 10s bound on one run in three, on a test that
+      // passed the run before and after. The exit handler below still fails a
+      // browser that dies at once, so a longer wait only costs time on a launch
+      // that is genuinely stuck.
+      const timer = setTimeout(() => reject(browserError("CDP_TIMEOUT", "Browser debug endpoint did not start")), CDP_STARTUP_TIMEOUT_MS);
       this.process.stderr.on("data", (chunk) => {
         const match = String(chunk).match(/DevTools listening on (ws:\/\/[^\s]+)/);
         if (!match) return;
