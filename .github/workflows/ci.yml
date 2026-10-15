@@ -46,7 +46,7 @@ jobs:
       - run: npm run sbom
       - run: npm run security:audit
       - run: npm run history:audit
-      - run: npm run dist
+      - run: npm run dist -- --publish never
       - shell: pwsh
         run: |
           $installer = Get-ChildItem dist -Filter 'SYSCORA-*.exe' | Select-Object -First 1
