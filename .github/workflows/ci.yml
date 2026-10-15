@@ -19,7 +19,29 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
-      - run: npm test
+      # Raw logs are visible only to signed-in users, but annotations are
+      # public. For months this step failed with nothing anywhere but "exit
+      # code 1", so each failing test's name and error goes up as an
+      # annotation, and when nothing says "not ok" (a crash or the runner's
+      # ceiling) the end of the output does instead.
+      - name: npm test
+        shell: pwsh
+        run: |
+          npm test 2>&1 | Tee-Object -FilePath test-output.txt
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $lines = Get-Content test-output.txt
+            $failed = @($lines | Select-String -Pattern '^\s*not ok \d+ - ')
+            foreach ($hit in $failed | Select-Object -First 20) {
+              $detail = $lines[($hit.LineNumber - 1)..([Math]::Min($hit.LineNumber + 18, $lines.Count - 1))] -join '%0A'
+              Write-Output "::error title=Test failed::$detail"
+            }
+            if ($failed.Count -eq 0) {
+              $tail = ($lines | Select-Object -Last 25) -join '%0A'
+              Write-Output "::error title=npm test exited $code with no failing test::$tail"
+            }
+            exit $code
+          }
       - run: npm run license:check
       - run: npm run sbom
       - run: npm run security:audit

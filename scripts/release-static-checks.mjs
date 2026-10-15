@@ -41,7 +41,7 @@ const failures = [];
 if (forbiddenTracked.length) failures.push(`Forbidden tracked paths:\n${forbiddenTracked.join("\n")}`);
 if (secretHits.length) failures.push(`Secret-shaped values found in:\n${secretHits.join("\n")}`);
 if (presentStaleFiles.length) failures.push(`Deleted stale product files have returned:\n${presentStaleFiles.join("\n")}`);
-if (packageJson.devDependencies?.electron !== "43.4.1") failures.push("Electron must remain exactly pinned to the reviewed release.");
+if (packageJson.devDependencies?.electron !== "44.7.0") failures.push("Electron must remain exactly pinned to the reviewed release.");
 if (failures.length) {
   console.error(failures.join("\n\n"));
   process.exit(1);

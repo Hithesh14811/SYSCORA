@@ -43,7 +43,7 @@ test("the local renderer is served with a script-restricting CSP", () => {
 
 test("Electron is pinned to the reviewed supported release", () => {
   const manifest = JSON.parse(read("package.json"));
-  assert.equal(manifest.devDependencies.electron, "43.4.1");
+  assert.equal(manifest.devDependencies.electron, "44.7.0");
 });
 
 test("packaged startup uses app.asar as modules, never as the daemon working directory", () => {
