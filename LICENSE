@@ -1,17 +1,15 @@
-SYSCORA PROPRIETARY LICENSE
+SYSCORA - source available for review
 
 Copyright (c) 2026 Hithesh. All rights reserved.
 
-This repository and all source code, binaries, documentation, designs, and
-other materials in it are proprietary and confidential unless a separate
-written agreement says otherwise.
+You're welcome to read this code, run it on your own machine to evaluate it,
+and talk about it, for example when reviewing my work or deciding whether to
+hire me.
 
-No permission is granted to copy, modify, distribute, sublicense, sell, host,
-reverse engineer, or create derivative works from these materials. Possession
-of a copy does not grant any license or ownership right.
+You may not copy it into another project, redistribute it, sell it, host it as
+a service, or build a product on it without my written permission.
 
-Third-party components remain subject to their respective licenses. Their
-notices and an SBOM are generated as part of the release process.
+Third-party components keep their own licenses.
 
-THE MATERIALS ARE PROVIDED "AS IS" FOR AUTHORIZED EVALUATION ONLY, WITHOUT
-WARRANTY OF ANY KIND, TO THE MAXIMUM EXTENT PERMITTED BY LAW.
+The software is provided "as is", without warranty of any kind. Use it at your
+own risk; it controls the mouse, keyboard and files of the machine it runs on.
