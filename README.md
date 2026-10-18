@@ -7,19 +7,19 @@ about what it did.
 
 You type something like "make a folder called notes on my desktop and put a
 todo list in it" or "send hi to myself on WhatsApp", and SYSCORA actually does
-it: clicks, types, opens apps, edits files, drives a browser. Think Claude Code,
+it. It clicks, types, opens apps, edits files and drives a browser. Think Claude Code,
 but pointed at the whole operating system instead of one repo.
 
 ![SYSCORA drawing a car in Paint from one sentence, then playing a song on Spotify](assets/demo.gif)
 
 *"draw a simple car in ms paint", then "play dracula on spotify", running on
-DeepSeek's small, fast `deepseek-flash` model. The drawing is sped up 5x; in
+DeepSeek's small, fast `deepseek-flash` model. The drawing is sped up 5x. In
 real time it took about 95 seconds. [Full recording (MP4, 2.5 MB)](https://github.com/Hithesh14811/SYSCORA/raw/master/assets/demo-full.mp4).*
 
 If you look closely, the colours in the car summary don't all match the canvas.
 In Paint a shape stays selected after you draw it, so when the model picked the
 next colour it recoloured the previous shape as well. A stronger model should
-avoid that mistake; the harness doesn't verify colours yet, so the summary
+avoid that mistake. The harness doesn't verify colours yet, so the summary
 reports what the model meant to draw.
 
 ## The problem I kept running into
@@ -29,10 +29,10 @@ Computer-use agents fail quietly. Early on, mine would happily tell me
 "Muted." while the music kept playing. The click went through, the tool
 returned OK, and the agent believed itself.
 
-So the core idea here is simple: **the agent isn't allowed to say something
+So the core idea here is simple. **The agent isn't allowed to say something
 worked unless it actually checked.**
 
-Every tool result carries a small typed receipt: what was observed, which
+Every tool result carries a small typed receipt. It records what was observed, which
 part of the system read the machine back, which part did the action, and a
 verdict. The success message ("Sent.", "Saved notes.md") can only be built from
 a receipt that says `CONFIRMED`, and a receipt is rejected if the thing that
@@ -51,7 +51,7 @@ the machine itself (the file on disk, the volume level, the message in the chat)
 never the agent's own answer. Each task runs 3 times and only counts as a pass
 if all 3 pass.
 
-Latest run (3 Oct 2026, 25 tasks × 3 = 75 runs):
+Latest run, on 3 Oct 2026, with 25 tasks run 3 times each (75 runs in total).
 
 | | |
 |---|---|
@@ -75,15 +75,15 @@ those broken cases. With them, zero.
 - **See the screen** mostly through Windows accessibility (UIA) data, falling
   back to OCR, and only to screenshots when text can't see the thing. That's
   cheaper and more predictable than pixels-only, though it's not perfect.
-- **Use apps**: click by label, type, scroll, drag, draw, open/close/focus
-  windows, set the volume.
-- **Work with files and code**: find, read, create and edit files, search a
-  codebase, read .docx, run git.
+- **Use apps.** Click by label, type, scroll, drag, draw, open/close/focus
+  windows and set the volume.
+- **Work with files and code.** Find, read, create and edit files, search a
+  codebase, read .docx files and run git.
 - **Browse** in its own Chromium over CDP, or read pages over plain HTTP when
   that's enough.
 - **Draft Gmail emails**, but never send them. You press Send. That's on
-  purpose: the Send button is where a prompt injection would want to end up.
-- **Replay skills**: once a task has been done and verified, it can be saved
+  purpose, because the Send button is where a prompt injection would want to end up.
+- **Replay skills.** Once a task has been done and verified, it can be saved
   and replayed later with zero model calls.
 - **Undo** some actions, keep an audit log, and remember things you tell it.
 
@@ -92,11 +92,11 @@ wouldn't call it a feature yet.
 
 ## Safety
 
-An agent that can click anything on your PC needs guard rails. The main ones:
+An agent that can click anything on your PC needs guard rails. These are the main ones.
 
-- **Dangerous shell commands are blocked as data**, in
-  [`packages/policy-engine/src/shell-rules.js`](packages/policy-engine/src/shell-rules.js):
-  a hard deny list (stuff like wiping a drive) and a confirm list that asks you
+- **Dangerous shell commands are blocked as data** in
+  [`packages/policy-engine/src/shell-rules.js`](packages/policy-engine/src/shell-rules.js).
+  There's a hard deny list (stuff like wiping a drive) and a confirm list that asks you
   first. The terminal is off by default and runs in Windows Sandbox, with no
   fallback to your real machine if the sandbox isn't available.
 - **What it reads is not what it was told to do.** A web page, email or document
@@ -120,13 +120,13 @@ npm run desktop:dev
 ```
 
 That starts the Electron app and the local daemon together. If you'd rather use
-it in a browser:
+it in a browser, run this instead.
 
 ```powershell
 npm run mvp:ui
 ```
 
-then open `http://127.0.0.1:4317` and paste the token it prints. Don't expose
+Then open `http://127.0.0.1:4317` and paste the token it prints. Don't expose
 that port to other machines.
 
 ### Picking a model
@@ -135,7 +135,7 @@ Bring your own API key. In Settings you can use OpenAI-compatible, Anthropic,
 Gemini, Mistral, DeepSeek or AgentRouter endpoints. Keys you enter in the app are
 encrypted with Windows DPAPI and never sent back to the UI.
 
-You can also set it through environment variables:
+You can also set it through these environment variables.
 
 ```
 SYSCORA_MODEL_PROVIDER
@@ -145,7 +145,7 @@ SYSCORA_MODEL_BASE_URL
 SYSCORA_EXTERNAL_AI_CONSENT_SCOPES   # needed for headless use
 ```
 
-Heads up on privacy: your prompts and whatever the task needs (screen text,
+A heads up on privacy. Your prompts and whatever the task needs (screen text,
 files, page content) go to the model provider you picked. Nothing goes to me,
 and there's no analytics.
 
@@ -178,7 +178,7 @@ tests/eval                the real-machine eval harness
 A request goes UI → daemon → agent loop → tool → policy check → Windows
 adapter, and results stream back into the chat.
 
-One design note: this used to have a big staged pipeline (plan, assess risk,
+One design note. This used to have a big staged pipeline (plan, assess risk,
 apply policy, schedule) sitting under the agent loop. I added instrumentation
 and found it ran 0 times across 335 eval runs and 143 real sessions, so I
 deleted it along with the eight packages only it used. If no model is
@@ -201,8 +201,8 @@ More design notes are in [`docs/`](docs/README.md).
 This is a developer preview (v0.1). It can build a Windows installer, but I'm
 not publishing a release until it's signed and tested on a clean machine.
 
-Bugs and questions: open a GitHub issue. Security issues: see
-[SECURITY.md](SECURITY.md). Also: [privacy](PRIVACY.md), [terms](TERMS.md),
-[supported platforms](docs/releases/supported-platforms.md).
+For bugs and questions, open a GitHub issue. For security issues, see
+[SECURITY.md](SECURITY.md). There's also a [privacy policy](PRIVACY.md), the
+[terms](TERMS.md) and a list of [supported platforms](docs/releases/supported-platforms.md).
 
 All rights reserved, see [LICENSE](LICENSE).
