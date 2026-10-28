@@ -33,7 +33,7 @@
     "release:gate": "node scripts/release-gate.mjs"
   },
   "dependencies": {
-    "electron-updater": "6.8.9"
+    "electron-updater": "6.8.11"
   },
   "devDependencies": {
     "electron": "44.7.0",
