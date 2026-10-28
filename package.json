@@ -37,7 +37,7 @@
   },
   "devDependencies": {
     "electron": "44.7.0",
-    "electron-builder": "26.17.0"
+    "electron-builder": "26.18.0"
   },
   "build": {
     "appId": "com.syscora.desktop",
