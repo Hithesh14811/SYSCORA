@@ -1,10 +1,8 @@
-﻿Readme.txt
-
-PROJECT TITLE
+﻿PROJECT TITLE
 SYSCORA: An Intent-Aware Semantic Modeling and Predictive Execution Framework
 for Autonomous Operating System Management
 
-TEAM NUMBER      : ______
+TEAM NUMBER      : P04
 TEAM MEMBERS
   1. Hithesh D Shetty   USN: 4CB23AI034
   2. Nishal K           USN: 4CB23AI060
@@ -36,14 +34,6 @@ EXECUTABLE CODE
   Entry points: apps/daemon/src/server.js (server), apps/desktop (UI),
   packages/fast-agent/src/index.js (agent loop).
 
-DATASET USED
-  None. The project does not train a model; it calls a hosted LLM.
-
-DATASET GENERATED
-  No ML dataset. For evaluation, a 24-task suite run against the real machine
-  (tests/eval/, results described in the report) was created. It was run three
-  times (median 4.7 s per task, 96% of rows passed every run) and also with
-  injected faults to measure false success claims (0% with SYSCORA).
 
 REPORT
   Report_Syscora.pdf (included in this folder)
